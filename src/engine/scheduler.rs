@@ -1,21 +1,24 @@
-//! The watch loop: startup recovery, GitHub discovery, slot-limited
-//! dispatch. GitHub issues (labels) are the queue; sqlite only tracks runs.
+//! The watch loop: startup recovery, per-loop discovery, slot-limited
+//! dispatch. Loops discover targets (e.g. labeled GitHub issues); sqlite
+//! only tracks runs, and `runs.loop_kind` routes each run to its loop.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::{Deps, worker};
-use crate::forge;
+use super::{Deps, Loop};
 use crate::mux::PaneId;
-use crate::store::{RunStatus, Store};
+use crate::store::{RunRecord, RunStatus, Store};
 
 pub struct Scheduler {
     /// One Deps per configured project (mux/store shared via clones).
     pub projects: Vec<Deps>,
+    /// The loops to run; dispatch resolves a run's loop via `runs.loop_kind`.
+    pub loops: Vec<Arc<dyn Loop>>,
     pub poll_interval: Duration,
     pub max_concurrent: usize,
 }
@@ -31,7 +34,7 @@ impl Scheduler {
         // Re-dispatch interrupted runs before discovering new work.
         for run in store.list_runs(true)? {
             if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
-                self.dispatch(&run.id, &run.project_id, &mut running, &mut active_run_ids);
+                self.dispatch(&run, &mut running, &mut active_run_ids);
             }
         }
 
@@ -60,53 +63,41 @@ impl Scheduler {
         }
     }
 
-    /// Find `meguri:ready` issues (not held, not claimed, not already
-    /// shipped by a succeeded run) with no active run and enqueue them,
-    /// respecting the slot budget.
+    /// Ask every loop for actionable targets in every project and enqueue
+    /// them, respecting the slot budget.
     async fn discover(
         &self,
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) -> Result<()> {
         for deps in &self.projects {
-            if active.len() >= self.max_concurrent {
-                return Ok(());
-            }
-            let issues = deps
-                .forge
-                .list_issues_with_label(forge::LABEL_READY)
-                .await?;
-            for issue in issues {
+            for lp in &self.loops {
                 if active.len() >= self.max_concurrent {
                     return Ok(());
                 }
-                if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
-                    continue;
+                for target in lp.discover(deps).await? {
+                    if active.len() >= self.max_concurrent {
+                        return Ok(());
+                    }
+                    // Unique active run per (project, loop, issue) — enforced
+                    // by the DB index; a violation just means someone raced us.
+                    let run = match deps.store.create_run_for_loop(
+                        &deps.project.id,
+                        lp.kind(),
+                        target.issue_number,
+                        &target.title,
+                    ) {
+                        Ok(run) => run,
+                        Err(_) => continue,
+                    };
+                    deps.store.emit(
+                        Some(&run.id),
+                        "run.discovered",
+                        json!({ "issue": target.issue_number, "title": target.title,
+                                "loop": lp.kind() }),
+                    )?;
+                    self.dispatch(&run, running, active);
                 }
-                // Already shipped by a succeeded run: don't re-file (avoids
-                // duplicate PRs when the ready label lingers or reappears).
-                // Humans can force a rerun with `meguri run --issue N`.
-                if deps
-                    .store
-                    .issue_has_succeeded_run(&deps.project.id, issue.number)?
-                {
-                    continue;
-                }
-                // Unique active run per (project, worker, issue) — enforced
-                // by the DB index; a violation just means someone raced us.
-                let run = match deps
-                    .store
-                    .create_run(&deps.project.id, issue.number, &issue.title)
-                {
-                    Ok(run) => run,
-                    Err(_) => continue,
-                };
-                deps.store.emit(
-                    Some(&run.id),
-                    "run.discovered",
-                    json!({ "issue": issue.number, "title": issue.title }),
-                )?;
-                self.dispatch(&run.id, &deps.project.id, running, active);
             }
         }
         Ok(())
@@ -114,24 +105,36 @@ impl Scheduler {
 
     fn dispatch(
         &self,
-        run_id: &str,
-        project_id: &str,
+        run: &RunRecord,
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) {
         let Some(deps) = self
             .projects
             .iter()
-            .find(|d| d.project.id == project_id)
+            .find(|d| d.project.id == run.project_id)
             .cloned()
         else {
-            tracing::warn!("run {run_id} references unknown project {project_id}");
+            tracing::warn!(
+                "run {} references unknown project {}",
+                run.id,
+                run.project_id
+            );
             return;
         };
-        let run_id = run_id.to_string();
+        let Some(lp) = self
+            .loops
+            .iter()
+            .find(|l| l.kind() == run.loop_kind)
+            .cloned()
+        else {
+            tracing::warn!("run {} references unknown loop {}", run.id, run.loop_kind);
+            return;
+        };
+        let run_id = run.id.clone();
         active.insert(run_id.clone());
         running.spawn(async move {
-            if let Err(e) = worker::run_worker(&deps, &run_id).await {
+            if let Err(e) = lp.drive(&deps, &run_id).await {
                 tracing::warn!("run {run_id} failed: {e:#}");
             }
             run_id

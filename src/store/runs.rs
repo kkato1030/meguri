@@ -159,9 +159,20 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
 }
 
 impl Store {
+    /// Create a run for the worker loop (the schema default `loop_kind`).
     pub fn create_run(
         &self,
         project_id: &str,
+        issue_number: i64,
+        issue_title: &str,
+    ) -> Result<RunRecord> {
+        self.create_run_for_loop(project_id, "worker", issue_number, issue_title)
+    }
+
+    pub fn create_run_for_loop(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
         issue_number: i64,
         issue_title: &str,
     ) -> Result<RunRecord> {
@@ -170,9 +181,10 @@ impl Store {
         let id = format!("run-{}", &id[..8]);
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO runs (id, project_id, issue_number, issue_title, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
-                params![id, project_id, issue_number, issue_title, now()],
+                "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                                   status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                params![id, project_id, loop_kind, issue_number, issue_title, now()],
             )?;
             Ok(())
         })?;
@@ -419,6 +431,26 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.create_run("demo", 7, "t").unwrap();
         assert!(store.create_run("demo", 7, "t").is_err());
+    }
+
+    #[test]
+    fn active_run_uniqueness_is_scoped_by_loop_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 7, "t").unwrap();
+        assert_eq!(run.loop_kind, "worker");
+
+        // Same issue under another loop: allowed.
+        let other = store
+            .create_run_for_loop("demo", "reviewer", 7, "t")
+            .unwrap();
+        assert_eq!(other.loop_kind, "reviewer");
+
+        // Same (project, loop, issue) while active: rejected.
+        assert!(
+            store
+                .create_run_for_loop("demo", "reviewer", 7, "t")
+                .is_err()
+        );
     }
 
     #[test]

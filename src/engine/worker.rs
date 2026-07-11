@@ -5,10 +5,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl};
+pub use super::WorkerOutcome;
+use super::{Deps, StoreControl, Target};
 use crate::forge::{self, Issue};
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
@@ -46,17 +48,49 @@ pub struct WorkerCheckpoint {
 #[error("needs human: {0}")]
 pub struct NeedsHuman(pub String);
 
-/// Terminal outcomes of driving one run.
-#[derive(Debug)]
-pub enum WorkerOutcome {
-    Succeeded {
-        pr_url: String,
-    },
-    Stopped,
-    Interrupted(String),
-    /// Benign race: the issue was held or de-labeled between discovery and
-    /// claim (e.g. another run already shipped it). No escalation.
-    Skipped(String),
+/// `runs.loop_kind` value for worker runs (the schema default).
+pub const KIND: &str = "worker";
+
+/// The worker as a schedulable loop: `meguri:ready` issues in, PRs out.
+pub struct WorkerLoop;
+
+#[async_trait]
+impl super::Loop for WorkerLoop {
+    fn kind(&self) -> &'static str {
+        KIND
+    }
+
+    /// Find `meguri:ready` issues that are actionable: not held, not claimed
+    /// by another host, not already shipped by a succeeded run (avoids
+    /// duplicate PRs when the ready label lingers or reappears; humans can
+    /// force a rerun with `meguri run --issue N`).
+    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        let issues = deps
+            .forge
+            .list_issues_with_label(forge::LABEL_READY)
+            .await?;
+        let mut targets = Vec::new();
+        for issue in issues {
+            if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
+                continue;
+            }
+            if deps
+                .store
+                .issue_has_succeeded_run(&deps.project.id, issue.number)?
+            {
+                continue;
+            }
+            targets.push(Target {
+                issue_number: issue.number,
+                title: issue.title,
+            });
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
+        run_worker(deps, run_id).await
+    }
 }
 
 pub async fn run_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

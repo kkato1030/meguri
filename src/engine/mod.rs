@@ -3,6 +3,7 @@ pub mod worker;
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::config::{Config, ProjectConfig};
@@ -19,6 +20,48 @@ pub struct Deps {
     pub forge: Arc<dyn Forge>,
     pub config: Config,
     pub project: ProjectConfig,
+}
+
+/// A unit of work a loop wants a run for: the issue to drive.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub issue_number: i64,
+    pub title: String,
+}
+
+/// Terminal outcomes of driving one run (shared by every loop).
+#[derive(Debug)]
+pub enum WorkerOutcome {
+    Succeeded {
+        pr_url: String,
+    },
+    Stopped,
+    Interrupted(String),
+    /// Benign race: the issue was held or de-labeled between discovery and
+    /// claim (e.g. another run already shipped it). No escalation.
+    Skipped(String),
+}
+
+/// A schedulable loop: discovers actionable targets for a project and drives
+/// runs to a terminal outcome. `kind()` is persisted in `runs.loop_kind` so
+/// the scheduler can route a run back to its loop after a restart.
+#[async_trait]
+pub trait Loop: Send + Sync {
+    /// Stable identifier stored in `runs.loop_kind`.
+    fn kind(&self) -> &'static str;
+
+    /// Find targets that need a run for this project. Discovery must be
+    /// idempotent: targets already covered by an active run are filtered by
+    /// the scheduler via the unique (project, loop, issue) run index.
+    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>>;
+
+    /// Drive one run to a terminal outcome, resuming from its checkpoint.
+    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome>;
+}
+
+/// The loops meguri ships today.
+pub fn default_loops() -> Vec<Arc<dyn Loop>> {
+    vec![Arc::new(worker::WorkerLoop)]
 }
 
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
