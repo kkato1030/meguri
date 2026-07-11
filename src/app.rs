@@ -110,6 +110,7 @@ pub async fn cmd_watch() -> Result<()> {
     );
     let scheduler = Scheduler {
         projects,
+        loops: crate::engine::default_loops(),
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
     };

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::Deps;
 use meguri::engine::scheduler::Scheduler;
+use meguri::engine::{Deps, Loop, Target, WorkerOutcome, default_loops};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
@@ -127,6 +127,7 @@ async fn watch_discovers_and_completes_labeled_issue() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
+        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
     };
@@ -179,6 +180,7 @@ async fn watch_skips_working_and_hold_issues() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
+        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
     };
@@ -212,6 +214,7 @@ async fn watch_does_not_refile_issue_with_succeeded_run() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
+        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
     };
@@ -264,6 +267,7 @@ async fn recovery_resumes_interrupted_run_to_success() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
+        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
     };
@@ -291,4 +295,72 @@ async fn recovery_resumes_interrupted_run_to_success() {
     let events = store.events_for_run(&run.id, 200).unwrap();
     assert!(events.iter().any(|e| e.kind == "run.recovered"));
     assert_eq!(forge.prs().len(), 1);
+}
+
+/// A minimal non-worker loop: discovers one fixed target and drives its run
+/// straight to success.
+struct FixedLoop;
+
+#[async_trait::async_trait]
+impl Loop for FixedLoop {
+    fn kind(&self) -> &'static str {
+        "fixed"
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        if deps.store.issue_has_succeeded_run(&deps.project.id, 99)? {
+            return Ok(vec![]);
+        }
+        Ok(vec![Target {
+            issue_number: 99,
+            title: "Fixed target".into(),
+        }])
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "fixed://pr".into(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_dispatches_any_registered_loop_by_kind() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = setup(root.path(), forge).await;
+    let store = deps.store.clone();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(FixedLoop)],
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "fixed-loop run never succeeded; runs: {:?}",
+                store.list_runs(false).unwrap()
+            );
+        }
+        let runs = store.list_runs(false).unwrap();
+        if runs
+            .iter()
+            .any(|r| r.status == RunStatus::Succeeded && r.issue_number == 99)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    watch.abort();
+
+    let runs = store.list_runs(false).unwrap();
+    assert_eq!(runs.len(), 1, "one run per discovered target: {runs:?}");
+    assert_eq!(runs[0].loop_kind, "fixed");
 }
