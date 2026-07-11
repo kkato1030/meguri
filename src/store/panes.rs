@@ -228,8 +228,8 @@ mod tests {
 
     #[test]
     fn migration_backfills_panes_from_latest_run() {
-        // Simulate a pre-0002 database: apply only 0001, record a run with a
-        // pane, then let Store::open run the 0002 backfill.
+        // Simulate a pre-0004 database: apply only 0001, record a run with a
+        // pane, then let Store::open run the 0004 backfill.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("meguri.sqlite");
         {

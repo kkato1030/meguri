@@ -1,6 +1,6 @@
 //! The reaper: reclaim panes and worktrees whose issue is closed on the
 //! forge ("Authority": the issue's lifecycle, not local state, decides when
-//! a pane/worktree may go). Shared by `meguri clean` and the watch-loop
+//! a pane/worktree may go). Shared by `meguri prune` and the watch-loop
 //! sweep. Reclamation is reversible: the agent's native session id is saved
 //! before a pane is killed, so `claude --resume <id>` restores the context.
 
@@ -429,7 +429,7 @@ async fn release_pane_record(deps: &Deps, issue: i64, reason: &str) -> Result<Re
 
 /// Watch-poll sweep: reclaim panes and worktrees of closed issues, never
 /// forcing. Panes go first so their worktrees become reclaimable in the same
-/// tick; dirty worktrees are left for `meguri clean --force`.
+/// tick; dirty worktrees are left for `meguri prune --force`.
 pub async fn sweep(deps: &Deps) -> Result<()> {
     let mut states = IssueStates::default();
     for p in reclaim_panes(deps, &plan_panes(deps, &mut states).await?).await? {
@@ -447,7 +447,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     for c in candidates.iter().filter(|c| c.verdict == Verdict::Dirty) {
         tracing::warn!(
             "worktree {} has uncommitted changes for closed issue #{} — \
-             skipped (reclaim with `meguri clean --force`)",
+             skipped (reclaim with `meguri prune --force`)",
             c.path.display(),
             c.issue.unwrap_or(0),
         );

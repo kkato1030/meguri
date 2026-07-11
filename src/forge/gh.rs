@@ -5,7 +5,10 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread};
+use super::{
+    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
+    ReviewThread,
+};
 
 pub struct GhForge {
     /// "owner/repo"
@@ -105,6 +108,19 @@ impl GhForge {
         })
     }
 
+    /// Issues and PRs share GitHub's number space and `gh issue view`
+    /// resolves both, reporting `MERGED` for a merged PR. Merged means the
+    /// lifecycle is over, so it maps to Closed like `closed` does. Anything
+    /// unrecognized is an error, never a silent Open — the reaper must land
+    /// on StateUnknown (skip), not keep a dead worktree alive forever.
+    fn parse_issue_state(state: &str) -> Result<IssueState> {
+        match state.to_ascii_lowercase().as_str() {
+            "closed" | "merged" => Ok(IssueState::Closed),
+            "open" => Ok(IssueState::Open),
+            other => bail!("unrecognized issue state `{other}`"),
+        }
+    }
+
     /// --edit doesn't create missing labels — ensure it exists first
     /// (idempotent; ignore "already exists" failures).
     async fn ensure_label(&self, label: &str) {
@@ -159,11 +175,7 @@ impl Forge for GhForge {
             .get("state")
             .and_then(Value::as_str)
             .with_context(|| format!("unexpected issue state shape: {raw}"))?;
-        Ok(if state.eq_ignore_ascii_case("closed") {
-            IssueState::Closed
-        } else {
-            IssueState::Open
-        })
+        Self::parse_issue_state(state)
     }
 
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>> {
@@ -186,6 +198,41 @@ impl Forge for GhForge {
         let v: Value = serde_json::from_str(&raw).context("parsing gh issue list output")?;
         Ok(v.as_array()
             .map(|items| items.iter().filter_map(Self::issue_from_json).collect())
+            .unwrap_or_default())
+    }
+
+    /// GitHub-native issue dependencies. Missing fields degrade to an
+    /// unresolved blocker (never to resolved), matching the gate's
+    /// "unreadable means unresolved" rule.
+    async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>> {
+        let raw = self
+            .gh(&[
+                "api",
+                &format!(
+                    "repos/{}/issues/{issue}/dependencies/blocked_by?per_page=100",
+                    self.repo
+                ),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing blocked_by output")?;
+        Ok(v.as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|b| Blocker {
+                        number: b.get("number").and_then(Value::as_i64).unwrap_or(0),
+                        state: b
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_lowercase(),
+                        state_reason: b
+                            .get("state_reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_lowercase),
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -261,6 +308,32 @@ impl Forge for GhForge {
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
         Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",
+    /// "CONFLICTING" or "UNKNOWN" (still computing). `mergeStateStatus` is
+    /// requested too so a future caller can distinguish e.g. blocked-but-
+    /// mergeable, but only the conflict axis matters here.
+    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "mergeable,mergeStateStatus",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view mergeable")?;
+        Ok(
+            match v.get("mergeable").and_then(Value::as_str).unwrap_or("") {
+                s if s.eq_ignore_ascii_case("mergeable") => MergeableState::Mergeable,
+                s if s.eq_ignore_ascii_case("conflicting") => MergeableState::Conflicting,
+                _ => MergeableState::Unknown,
+            },
+        )
     }
 
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
@@ -493,5 +566,51 @@ impl Forge for GhForge {
         ])
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_pr_state_is_closed() {
+        // gh reports a merged PR's state as MERGED through the issue view.
+        assert_eq!(
+            GhForge::parse_issue_state("MERGED").unwrap(),
+            IssueState::Closed
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("merged").unwrap(),
+            IssueState::Closed
+        );
+    }
+
+    #[test]
+    fn open_and_closed_states_parse_case_insensitively() {
+        assert_eq!(
+            GhForge::parse_issue_state("OPEN").unwrap(),
+            IssueState::Open
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("open").unwrap(),
+            IssueState::Open
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("CLOSED").unwrap(),
+            IssueState::Closed
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("closed").unwrap(),
+            IssueState::Closed
+        );
+    }
+
+    #[test]
+    fn unknown_state_is_an_error_not_open() {
+        // Unknown must surface as Err (reaper: StateUnknown), never as a
+        // silent Open that pins the worktree forever.
+        assert!(GhForge::parse_issue_state("DRAFT").is_err());
+        assert!(GhForge::parse_issue_state("").is_err());
     }
 }

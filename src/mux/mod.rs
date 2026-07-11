@@ -24,6 +24,18 @@ pub enum AgentState {
     Unknown,
 }
 
+impl AgentState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MuxCapabilities {
     /// True when the mux itself detects agent state (herdr manifests).
@@ -104,6 +116,15 @@ pub trait Multiplexer: Send + Sync {
     async fn read_tail(&self, pane: &PaneId, lines: usize) -> MuxResult<Vec<String>>;
 
     async fn agent_state(&self, pane: &PaneId) -> MuxResult<AgentState>;
+
+    /// Native session id of the agent CLI in the pane, when the mux can
+    /// supply it (herdr carries it on `pane get` after the agent integration
+    /// calls `pane report-agent-session`). Used to `--resume` the agent after
+    /// its pane dies; muxes without the capability return None.
+    async fn agent_session_id(&self, pane: &PaneId) -> MuxResult<Option<String>> {
+        let _ = pane;
+        Ok(None)
+    }
 
     /// Wait until state ∈ `targets`, polling or via native events.
     /// Returns the matched state, or `WaitTimeout`.

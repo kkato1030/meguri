@@ -225,7 +225,12 @@ impl Flavor for FixerFlavor {
         // The completion contract is appended by prepare_turn.
     }
 
-    fn verify_work(&self, _run: &RunRecord, _worktree: &Path) -> std::result::Result<(), String> {
+    fn verify_work(
+        &self,
+        _run: &RunRecord,
+        _cp: &Checkpoint,
+        _worktree: &Path,
+    ) -> std::result::Result<(), String> {
         Ok(()) // committed fixes are all the fixer requires
     }
 

@@ -16,6 +16,9 @@ pub enum RunStatus {
     /// The run turned out to have nothing to do (e.g. the issue was
     /// de-labeled between discovery and claim) — terminal, no escalation.
     Skipped,
+    /// The agent found a design decision must precede implementation and the
+    /// issue was routed to the planner (issue #22) — terminal, not a failure.
+    NeedsPlan,
 }
 
 impl RunStatus {
@@ -28,6 +31,7 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::NeedsPlan => "needs_plan",
         }
     }
 
@@ -40,6 +44,7 @@ impl RunStatus {
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
             "skipped" => Some(Self::Skipped),
+            "needs_plan" => Some(Self::NeedsPlan),
             _ => None,
         }
     }
@@ -82,7 +87,8 @@ impl InteractionState {
 /// Control channel written by CLI commands, honored by the orchestrator.
 /// This is a *target* the orchestrator converges to; clearing it (NULL)
 /// means "run normally" — so `resume` and `handback` just clear it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DesiredState {
     Paused,
     Stopped,
@@ -108,7 +114,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
     pub id: String,
     pub project_id: String,
@@ -127,7 +133,13 @@ pub struct RunRecord {
     pub mux_pane_id: Option<String>,
     pub turn_no: i64,
     pub current_turn_id: Option<String>,
+    /// Native session id of the agent CLI last seen in the run's pane
+    /// (reported via the turn contract or the mux); used to `--resume`
+    /// the conversation when the pane dies.
+    pub agent_session_id: Option<String>,
     pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub created_at: String,
 }
 
@@ -153,9 +165,26 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         mux_pane_id: row.get("mux_pane_id")?,
         turn_no: row.get("turn_no")?,
         current_turn_id: row.get("current_turn_id")?,
+        agent_session_id: row.get("agent_session_id")?,
         error: row.get("error")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
     })
+}
+
+/// One agent turn as recorded in the `turns` table (read path for the UI).
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRecord {
+    pub id: String,
+    pub run_id: String,
+    pub turn_no: i64,
+    pub purpose: String,
+    pub prompt_path: Option<String>,
+    pub result_json: Option<String>,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
 }
 
 impl Store {
@@ -255,6 +284,28 @@ impl Store {
         })
     }
 
+    /// Number of succeeded runs of a loop for one issue/PR — the conflict
+    /// resolver's resolve budget: a PR that keeps re-conflicting after this
+    /// many successful resolves stops being rediscovered instead of looping
+    /// forever. Skipped/failed runs don't consume the budget (benign races
+    /// and escalations have their own convergence).
+    pub fn succeeded_run_count(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            let count = c.query_row(
+                "SELECT COUNT(*) FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                   AND issue_number = ?3 AND status = 'succeeded'",
+                params![project_id, loop_kind, issue_number],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+    }
+
     /// Runs that own a worktree, matched by branch name or recorded path
     /// (newest first). Both keys are tried because the reaper resolves
     /// worktrees from `git worktree list`, whose paths may be canonicalized
@@ -306,7 +357,8 @@ impl Store {
                 RunStatus::Succeeded
                 | RunStatus::Failed
                 | RunStatus::Cancelled
-                | RunStatus::Skipped => (None, Some(now())),
+                | RunStatus::Skipped
+                | RunStatus::NeedsPlan => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(
@@ -345,6 +397,17 @@ impl Store {
             c.execute(
                 "UPDATE runs SET mux_kind = ?2, mux_session = ?3, mux_pane_id = ?4 WHERE id = ?1",
                 params![id, kind, session, pane],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record (or clear, with None) the run's native agent session id.
+    pub fn update_run_agent_session(&self, id: &str, session: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET agent_session_id = ?2 WHERE id = ?1",
+                params![id, session],
             )?;
             Ok(())
         })
@@ -421,6 +484,32 @@ impl Store {
                 params![turn_id, outcome, result_json, now()],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn list_turns(&self, run_id: &str) -> Result<Vec<TurnRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, run_id, turn_no, purpose, prompt_path, result_json,
+                        outcome, started_at, finished_at
+                 FROM turns WHERE run_id = ?1 ORDER BY turn_no ASC",
+            )?;
+            let turns = stmt
+                .query_map([run_id], |row| {
+                    Ok(TurnRecord {
+                        id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        turn_no: row.get(2)?,
+                        purpose: row.get(3)?,
+                        prompt_path: row.get(4)?,
+                        result_json: row.get(5)?,
+                        outcome: row.get(6)?,
+                        started_at: row.get(7)?,
+                        finished_at: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(turns)
         })
     }
 }
@@ -516,6 +605,32 @@ mod tests {
     }
 
     #[test]
+    fn succeeded_run_count_counts_only_terminal_successes() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        // Terminal statuses only: an active run would trip the unique
+        // (project, loop, issue) index on the next create.
+        for status in [RunStatus::Skipped, RunStatus::Failed, RunStatus::Cancelled] {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store.update_run_status(&run.id, status, None).unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        for _ in 0..2 {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store
+                .update_run_status(&run.id, RunStatus::Succeeded, None)
+                .unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 2);
+        // Scoped by loop, project, and issue.
+        assert_eq!(store.succeeded_run_count("demo", "planner", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("other", "worker", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("demo", "worker", 10).unwrap(), 0);
+    }
+
+    #[test]
     fn runs_for_worktree_matches_branch_or_path() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 5, "t").unwrap();
@@ -569,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert_eq!(run.agent_session_id, None);
+
+        store
+            .update_run_agent_session(&run.id, Some("sess-abc"))
+            .unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id.as_deref(), Some("sess-abc"));
+
+        store.update_run_agent_session(&run.id, None).unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id, None);
+    }
+
+    #[test]
     fn turns_recorded() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 1, "t").unwrap();
@@ -579,5 +711,52 @@ mod tests {
         let got = store.get_run(&run.id).unwrap().unwrap();
         assert_eq!(got.turn_no, 1);
         assert_eq!(got.current_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn list_turns_in_turn_order() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert!(store.list_turns(&run.id).unwrap().is_empty());
+
+        store
+            .begin_turn(&run.id, "turn-1", "execute", "/tmp/p1.md")
+            .unwrap();
+        store.finish_turn("turn-1", "success", Some("{}")).unwrap();
+        store
+            .begin_turn(&run.id, "turn-2", "validate-fix", "/tmp/p2.md")
+            .unwrap();
+
+        let turns = store.list_turns(&run.id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_no, 1);
+        assert_eq!(turns[0].purpose, "execute");
+        assert_eq!(turns[0].outcome.as_deref(), Some("success"));
+        assert!(turns[0].finished_at.is_some());
+        assert_eq!(turns[1].turn_no, 2);
+        assert_eq!(turns[1].outcome, None);
+    }
+
+    #[test]
+    fn run_record_serializes_snake_case_states() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 5, "t").unwrap();
+        store
+            .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+            .unwrap();
+        store
+            .set_desired_state(&run.id, Some(DesiredState::Paused))
+            .unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Running, None)
+            .unwrap();
+
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["interaction_state"], "awaiting_human");
+        assert_eq!(v["desired_state"], "paused");
+        assert!(v["started_at"].is_string());
+        assert!(v["finished_at"].is_null());
     }
 }

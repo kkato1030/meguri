@@ -138,6 +138,7 @@ impl Flavor for FixedBranchFlavor {
     fn verify_work(
         &self,
         _run: &meguri::store::RunRecord,
+        _cp: &Checkpoint,
         _worktree: &Path,
     ) -> std::result::Result<(), String> {
         Ok(())

@@ -453,3 +453,32 @@ async fn planner_discovery_filters_hold_working_and_shipped() {
         .unwrap();
     assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_discovery_gates_on_unresolved_blockers() {
+    let env = setup(None).await;
+
+    // Open blocker: skipped.
+    env.forge.block_issue(5, 4);
+    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // duplicate does not resolve the dependency either (same as not_planned).
+    env.forge.close_issue_as(4, "duplicate");
+    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // Only closed-as-completed lets the issue through.
+    env.forge.close_issue(4);
+    let targets = PlannerLoop.discover(&env.deps).await.unwrap();
+    assert_eq!(
+        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        vec![5]
+    );
+
+    // Unreadable blockers count as unresolved, never as resolved.
+    env.forge.fail_blocked_by(5);
+    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // Every skip above was silent: no comment, no extra label.
+    assert!(env.forge.comments_of(5).is_empty());
+    assert_eq!(env.forge.labels_of(5), vec![LABEL_PLAN.to_string()]);
+}
