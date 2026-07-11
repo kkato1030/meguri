@@ -118,13 +118,8 @@ impl Flavor for PlannerFlavor {
     /// `meguri:spec-reviewing` — the PR is the reviewable artifact from here
     /// on. The PR label is load-bearing (review discovery keys off it), so
     /// failing to apply it fails the run instead of passing silently.
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        pr_number: Option<i64>,
-    ) -> Result<()> {
-        if let Some(pr) = pr_number {
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+        if let Some(pr) = cp.pr_number {
             deps.forge
                 .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
                 .await?;
