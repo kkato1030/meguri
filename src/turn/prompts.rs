@@ -18,6 +18,27 @@ pub enum TurnStatus {
     /// (issue #22). Only the worker's execute prompt invites this status;
     /// everywhere else it escalates like `NeedsHuman`.
     NeedsPlan,
+    /// The agent found the issue too big for one spec and proposes to split
+    /// it into sub-issues (issue #24), described in
+    /// [`TurnResultFile::children`]. Only the planner's execute prompt
+    /// invites this status; everywhere else it escalates like `NeedsHuman`.
+    Decompose,
+}
+
+/// One sub-issue proposed by a `decompose` turn (issue #24). meguri files
+/// the issue itself — the agent only describes it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChildIssue {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// How the child enters the loops: "ready" (small enough to implement
+    /// directly) or "plan" (needs its own design pass first).
+    pub kind: String,
+    /// Zero-based indices of *earlier* `children` entries this one depends
+    /// on; meguri wires them as GitHub-native `blocked_by`.
+    #[serde(default)]
+    pub blocked_by: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +55,10 @@ pub struct TurnResultFile {
     /// letting recovery `--resume` the conversation after the pane dies.
     #[serde(default)]
     pub agent_session_id: Option<String>,
+    /// Sub-issues proposed by a `decompose` turn, in dependency order
+    /// (issue #24). Empty for every other status.
+    #[serde(default)]
+    pub children: Vec<ChildIssue>,
 }
 
 pub fn meguri_dir(worktree: &Path) -> PathBuf {
@@ -168,6 +193,41 @@ mod tests {
         let result = read_result(dir.path(), "t1").unwrap();
         assert_eq!(result.status, TurnStatus::NeedsPlan);
         assert_eq!(result.summary, "design first");
+    }
+
+    #[test]
+    fn result_status_decompose_parses_with_children() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"decompose","summary":"too big",
+                "children":[
+                  {"title":"part 1","body":"do A","kind":"ready"},
+                  {"title":"part 2","kind":"plan","blocked_by":[0]}
+                ]}"#,
+        )
+        .unwrap();
+        let result = read_result(dir.path(), "t1").unwrap();
+        assert_eq!(result.status, TurnStatus::Decompose);
+        assert_eq!(result.children.len(), 2);
+        assert_eq!(result.children[0].title, "part 1");
+        assert_eq!(result.children[0].kind, "ready");
+        assert!(result.children[0].blocked_by.is_empty());
+        assert_eq!(result.children[1].body, "");
+        assert_eq!(result.children[1].blocked_by, vec![0]);
+    }
+
+    #[test]
+    fn result_children_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert!(read_result(dir.path(), "t1").unwrap().children.is_empty());
     }
 
     #[test]

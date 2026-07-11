@@ -19,6 +19,9 @@ pub enum RunStatus {
     /// The agent found a design decision must precede implementation and the
     /// issue was routed to the planner (issue #22) — terminal, not a failure.
     NeedsPlan,
+    /// The planner split the issue into sub-issues instead of writing a spec
+    /// (issue #24) — terminal, the second normal planner ending.
+    Decomposed,
 }
 
 impl RunStatus {
@@ -32,6 +35,7 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
             Self::NeedsPlan => "needs_plan",
+            Self::Decomposed => "decomposed",
         }
     }
 
@@ -45,6 +49,7 @@ impl RunStatus {
             "cancelled" => Some(Self::Cancelled),
             "skipped" => Some(Self::Skipped),
             "needs_plan" => Some(Self::NeedsPlan),
+            "decomposed" => Some(Self::Decomposed),
             _ => None,
         }
     }
@@ -336,7 +341,8 @@ impl Store {
                 | RunStatus::Failed
                 | RunStatus::Cancelled
                 | RunStatus::Skipped
-                | RunStatus::NeedsPlan => (None, Some(now())),
+                | RunStatus::NeedsPlan
+                | RunStatus::Decomposed => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(

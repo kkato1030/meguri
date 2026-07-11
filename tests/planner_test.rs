@@ -8,12 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::planner::{self, PlannerLoop, run_planner, spec_rel_path};
+use meguri::engine::planner::{
+    self, DECOMPOSED_MARKER, PlannerLoop, decompose_child_footer, run_planner, spec_rel_path,
+};
 use meguri::engine::worker;
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_SPEC_REVIEWING, LABEL_WORKING,
+    Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_SPEC_REVIEWING,
+    LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -347,6 +350,155 @@ async fn planner_corrective_turn_when_spec_missing() {
         "correction must name the spec file: {}",
         correction.data
     );
+}
+
+/// Result file for a decompose ending: three children, sequential deps, one
+/// of them still needing its own design pass.
+fn write_decompose_result(worktree: &Path, turn_id: &str) {
+    let result = serde_json::json!({
+        "turn_id": turn_id, "status": "decompose",
+        "summary": "read path, write path and invalidation are separable",
+        "children": [
+            {"title": "Cache read path", "body": "Read-through cache.", "kind": "ready"},
+            {"title": "Cache write path", "body": "Write-behind cache.", "kind": "ready",
+             "blocked_by": [0]},
+            {"title": "Cache invalidation design", "body": "Needs its own spec.",
+             "kind": "plan", "blocked_by": [0, 1]},
+        ],
+    });
+    std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_decompose_files_children_with_deps_labels_and_parent_comment() {
+    let env = setup(None).await;
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_decompose_result(wt, turn_id);
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id))
+        .await
+        .expect("planner timed out")
+        .unwrap();
+    agent.abort();
+
+    let WorkerOutcome::Decomposed(reason) = outcome else {
+        panic!("expected Decomposed, got {outcome:?}");
+    };
+    assert!(reason.contains("separable"));
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Decomposed);
+
+    // Children were filed in order with size-appropriate labels, and every
+    // body references the parent (plus the machine marker for the one-level
+    // guard).
+    let issues = env.forge.all_issues();
+    assert_eq!(issues.len(), 4, "parent + 3 children: {issues:?}");
+    let children = &issues[1..];
+    assert_eq!(children[0].title, "Cache read path");
+    assert_eq!(children[1].title, "Cache write path");
+    assert_eq!(children[2].title, "Cache invalidation design");
+    assert!(children[0].labels.contains(&LABEL_READY.to_string()));
+    assert!(children[1].labels.contains(&LABEL_READY.to_string()));
+    assert!(children[2].labels.contains(&LABEL_PLAN.to_string()));
+    for child in children {
+        assert!(child.body.contains("#5"), "body: {}", child.body);
+        assert!(child.body.contains(DECOMPOSED_MARKER));
+    }
+
+    // Dependencies: sibling order via blocked_by, and the parent waits for
+    // every child.
+    let (c0, c1, c2) = (children[0].number, children[1].number, children[2].number);
+    assert!(env.forge.blockers_of(c0).is_empty());
+    assert_eq!(env.forge.blockers_of(c1), vec![c0]);
+    assert_eq!(env.forge.blockers_of(c2), vec![c0, c1]);
+    assert_eq!(env.forge.blockers_of(5), vec![c0, c1, c2]);
+
+    // The rationale landed on the parent, naming the children.
+    let comments = env.forge.comments_of(5);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("separable"));
+    assert!(comments[0].contains(&format!("#{c0}")));
+    assert!(comments[0].contains(&format!("#{c2}")));
+
+    // The parent left the planner queue without escalation: no plan label,
+    // no claim, no needs-human — and no spec PR.
+    let labels = env.forge.labels_of(5);
+    assert!(
+        !labels.contains(&LABEL_PLAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+    assert!(env.forge.prs().is_empty());
+
+    // Nothing was pushed either — decompose ends the run before open-pr.
+    let branches = run_git(
+        &env.deps.project.repo_path,
+        &["ls-remote", "--heads", "origin"],
+    )
+    .await
+    .unwrap();
+    assert!(!branches.contains("meguri/"), "{branches}");
+
+    // The prompt invited the decompose ending.
+    let wt = find_worktree(&env.worktree_root).unwrap();
+    let prompts = prompts_in(&wt);
+    let execute_prompt = prompts
+        .iter()
+        .find(|p| p.contains("# Issue:"))
+        .expect("execute prompt exists");
+    assert!(execute_prompt.contains("# Too big for one spec?"));
+    assert!(execute_prompt.contains(r#""status": "decompose""#));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_re_decompose_on_child_escalates_to_needs_human() {
+    let env = setup(None).await;
+    // The issue is itself a decomposition child (as filed by a previous
+    // decompose run): its body carries the parent reference + marker.
+    env.forge
+        .issues
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|i| i.number == 5)
+        .unwrap()
+        .body = format!("Do one part.{}", decompose_child_footer(3));
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_decompose_result(wt, turn_id);
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id))
+        .await
+        .expect("planner timed out");
+    agent.abort();
+
+    // One level only: the second decompose fails the run and hands the
+    // issue to a human.
+    assert!(result.is_err(), "re-decompose must fail the run");
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let labels = env.forge.labels_of(5);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+
+    let comments = env.forge.comments_of(5);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("needs a human"));
+    assert!(comments[0].contains("one level"));
+
+    // No grandchildren were filed.
+    assert_eq!(env.forge.all_issues().len(), 1);
+    assert!(env.forge.blockers_of(5).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

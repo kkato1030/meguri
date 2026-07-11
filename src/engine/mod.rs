@@ -50,6 +50,10 @@ pub enum WorkerOutcome {
     /// issue was handed to the planner (issue #22). A normal ending, not a
     /// failure — the reason (agent's summary) is left as an issue comment.
     NeedsPlan(String),
+    /// The planner split the issue into sub-issues instead of writing a spec
+    /// (issue #24). The second normal planner ending — the rationale
+    /// (agent's summary) is left as an issue comment.
+    Decomposed(String),
 }
 
 /// A schedulable loop: discovers actionable targets for a project and drives
