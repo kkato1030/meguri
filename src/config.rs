@@ -65,6 +65,8 @@ pub struct Config {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
@@ -232,6 +234,33 @@ fn default_max_concurrent() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// `meguri serve` listen port.
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    /// Bind address. Loopback by default — the dashboard has no auth; serve
+    /// warns (but proceeds) on anything else.
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: default_server_port(),
+            bind: default_server_bind(),
+        }
+    }
+}
+
+fn default_server_port() -> u16 {
+    8607
+}
+fn default_server_bind() -> String {
+    "127.0.0.1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
     /// Absolute path to the primary clone.
@@ -303,6 +332,22 @@ mod tests {
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
         assert!(back.pr.draft);
+        assert_eq!(back.server.port, 8607);
+        assert_eq!(back.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.server.port, 8607);
+        assert_eq!(cfg.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_section_overrides_defaults() {
+        let cfg: Config = toml::from_str("[server]\nport = 9000\nbind = \"0.0.0.0\"\n").unwrap();
+        assert_eq!(cfg.server.port, 9000);
+        assert_eq!(cfg.server.bind, "0.0.0.0");
     }
 
     #[test]

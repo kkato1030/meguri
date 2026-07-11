@@ -24,6 +24,18 @@ pub enum AgentState {
     Unknown,
 }
 
+impl AgentState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MuxCapabilities {
     /// True when the mux itself detects agent state (herdr manifests).

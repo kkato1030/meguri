@@ -79,6 +79,7 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
+meguri serve              # read-only web dashboard on http://127.0.0.1:8607
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -87,6 +88,10 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
+
+### Web dashboard
+
+`meguri serve` starts a read-only dashboard at `http://127.0.0.1:8607` (override with `--port` / `--bind` or the `[server]` config section): a runs table like `meguri ps` with `awaiting_human` runs highlighted front and center, plus a per-run page with the event trail, a terminal-style pane tail, turn history, and the attach command ready to copy. It is an independent process that reads the same sqlite database — it works even when `meguri watch` is not running, and shows watch liveness from the heartbeat the scheduler writes each tick. There is no authentication, so it binds loopback by default; binding anything else prints a warning.
 
 ### Labels
 
@@ -139,6 +144,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[server]
+port = 8607            # meguri serve listen port
+bind = "127.0.0.1"     # no auth — keep it loopback unless you know your network
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]

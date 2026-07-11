@@ -79,6 +79,7 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
+meguri serve              # 読み取り専用 web ダッシュボード (http://127.0.0.1:8607)
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -87,6 +88,10 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
+
+### web ダッシュボード
+
+`meguri serve` で読み取り専用ダッシュボードが `http://127.0.0.1:8607` に立ちます（`--port` / `--bind` または config の `[server]` セクションで変更可）。`meguri ps` 相当の runs テーブル（`awaiting_human` の run を最上部で強調表示）に加え、run ごとの詳細ページでイベントトレイル、端末風のペインテール、turn 履歴、コピー可能な attach コマンドが見られます。同じ sqlite を読む独立プロセスなので `meguri watch` が動いていなくても使え、watch の生死は scheduler が tick ごとに書くハートビートから表示されます。認証はないためデフォルトは loopback バインドです（それ以外を指定すると警告が出ます）。
 
 ### ラベル
 
@@ -139,6 +144,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[server]
+port = 8607            # meguri serve のリッスンポート
+bind = "127.0.0.1"     # 認証なしのため loopback 推奨
 
 [pr]
 draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き
