@@ -108,7 +108,7 @@ Labels and comments on GitHub are the durable workflow state (looper's "Authorit
 See `meguri init` output for the full default `config.toml`. Highlights:
 
 ```toml
-# Language for agent-authored deliverables (PR descriptions, summaries, specs).
+# Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
 # Free-form text, e.g. "日本語" or "Japanese"; omit to leave the agent to its
 # default (usually English). Override per project with `language` in [[projects]].
 language = "日本語"

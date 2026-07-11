@@ -706,10 +706,11 @@ pub fn language_instruction(language: Option<&str>) -> String {
     };
     format!(
         "\n\n# Output language\n\
-         Write every human-readable deliverable in {lang}: the `summary` and \
-         `pr_body` fields of the result file, and any documents you author \
-         (specs, ADRs, ...). Code identifiers and commit messages follow the \
-         repository's existing conventions."
+         Write every human-readable deliverable in {lang}: the free-text \
+         fields of the result file (`summary`, `pr_body`) and anything you \
+         author for humans (specs, ADRs, review comments, ...). Code \
+         identifiers and commit messages follow the repository's existing \
+         conventions."
     )
 }
 
