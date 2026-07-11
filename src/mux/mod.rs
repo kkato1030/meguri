@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 pub mod herdr;
+mod herdr_socket;
 pub mod tmux;
 
 pub mod fake;
