@@ -8,7 +8,7 @@
 //! reviewer's. After pushing, the fixer replies on every thread it
 //! addressed, which parks the thread until the reviewer either resolves it
 //! (done) or answers again (next fixer round). Spec-ready and merged PRs are
-//! the worker's and the humans' territory — the fixer never touches them.
+//! the spec worker's and the humans' territory — the fixer never touches them.
 
 use std::path::Path;
 
@@ -19,7 +19,6 @@ pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
 use super::{Deps, Target};
 use crate::forge::{self, PullRequest, ReviewThread};
-use crate::gitops;
 use crate::store::RunRecord;
 use serde_json::json;
 
@@ -191,26 +190,7 @@ impl Flavor for FixerFlavor {
 
     /// Attach to the PR's existing branch instead of cutting a new one.
     async fn prepare_worktree(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
-        let branch = run
-            .branch
-            .clone()
-            .or_else(|| cp.head_branch.clone())
-            .context("fixer checkpoint has no PR head branch")?;
-        let root = deps
-            .project
-            .worktree_root
-            .clone()
-            .unwrap_or_else(crate::config::worktrees_root);
-        let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-        gitops::attach_worktree(&deps.project.repo_path, &wt, &branch).await?;
-        deps.store
-            .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())?;
-        deps.store.emit(
-            Some(&run.id),
-            "worktree.attached",
-            json!({ "branch": branch, "path": wt.to_string_lossy() }),
-        )?;
-        Ok(())
+        flow::attach_pr_worktree(deps, run, cp).await
     }
 
     fn execute_prompt(

@@ -60,7 +60,9 @@ mod hex {
     }
 }
 
-/// Issue number encoded in a `meguri/<issue>-<slug>-<runhash>` branch name.
+/// The issue number a [`branch_name`]-style branch encodes
+/// (`meguri/<issue>-<slug>-<runhash>`); None for branches that don't follow
+/// the convention (human-made heads).
 pub fn issue_from_branch(branch: &str) -> Option<i64> {
     branch
         .strip_prefix("meguri/")?
@@ -361,7 +363,13 @@ mod tests {
             Some(28)
         );
         assert_eq!(issue_from_branch("meguri/7-fix-bug-000000"), Some(7));
+        assert_eq!(
+            issue_from_branch(&branch_name(21, "Take over", "r")),
+            Some(21)
+        );
+        assert_eq!(issue_from_branch("meguri/7"), Some(7));
         assert_eq!(issue_from_branch("meguri/not-a-number-x"), None);
+        assert_eq!(issue_from_branch("meguri/-no-number"), None);
         assert_eq!(issue_from_branch("feature/28-something"), None);
         assert_eq!(issue_from_branch("main"), None);
     }
