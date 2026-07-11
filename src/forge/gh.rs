@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{CreatedPr, Forge, Issue};
+use super::{CreatedPr, Forge, Issue, PullRequest, ReviewComment, ReviewThread};
 
 pub struct GhForge {
     /// "owner/repo"
@@ -45,6 +45,35 @@ impl GhForge {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            labels: v
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|l| l.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    fn pr_from_json(v: &Value) -> Option<PullRequest> {
+        Some(PullRequest {
+            number: v.get("number")?.as_i64()?,
+            title: v.get("title")?.as_str()?.to_string(),
+            url: v
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            head_branch: v.get("headRefName")?.as_str()?.to_string(),
+            state: v
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("open")
+                .to_lowercase(),
             labels: v
                 .get("labels")
                 .and_then(Value::as_array)
@@ -163,11 +192,39 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--remove-label",
+            label,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
         self.gh(&[
             "issue",
             "comment",
             &issue.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn pr_comment(&self, pr: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "comment",
+            &pr.to_string(),
             "--repo",
             &self.repo,
             "--body",
@@ -206,5 +263,127 @@ impl Forge for GhForge {
             .and_then(|n| n.parse::<i64>().ok())
             .unwrap_or(0);
         Ok(CreatedPr { number, url })
+    }
+
+    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,url,headRefName,state,labels",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
+        Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    async fn list_open_prs(&self) -> Result<Vec<PullRequest>> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "list",
+                "--repo",
+                &self.repo,
+                "--state",
+                "open",
+                "--limit",
+                "50",
+                "--json",
+                "number,title,url,headRefName,state,labels",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr list output")?;
+        Ok(v.as_array()
+            .map(|items| items.iter().filter_map(Self::pr_from_json).collect())
+            .unwrap_or_default())
+    }
+
+    /// Thread resolution state only exists in GitHub's GraphQL API; the REST
+    /// review-comment endpoints don't expose it.
+    async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>> {
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        let query = "query($owner:String!,$name:String!,$number:Int!){\
+             repository(owner:$owner,name:$name){pullRequest(number:$number){\
+             reviewThreads(first:100){nodes{id isResolved path line \
+             comments(first:100){nodes{author{login} body}}}}}}}";
+        let raw = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+                "-F",
+                &format!("number={pr}"),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing review-threads GraphQL")?;
+        let nodes = v
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(nodes
+            .iter()
+            .filter_map(|t| {
+                Some(ReviewThread {
+                    id: t.get("id")?.as_str()?.to_string(),
+                    resolved: t
+                        .get("isResolved")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    path: t.get("path").and_then(Value::as_str).map(str::to_string),
+                    line: t.get("line").and_then(Value::as_i64),
+                    comments: t
+                        .pointer("/comments/nodes")
+                        .and_then(Value::as_array)
+                        .map(|cs| {
+                            cs.iter()
+                                .map(|c| ReviewComment {
+                                    author: c
+                                        .pointer("/author/login")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    body: c
+                                        .get("body")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    async fn reply_review_thread(&self, _pr: i64, thread_id: &str, body: &str) -> Result<()> {
+        let mutation = "mutation($threadId:ID!,$body:String!){\
+             addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
+             {comment{id}}}";
+        self.gh(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={mutation}"),
+            "-f",
+            &format!("threadId={thread_id}"),
+            "-f",
+            &format!("body={body}"),
+        ])
+        .await?;
+        Ok(())
     }
 }
