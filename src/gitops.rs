@@ -334,6 +334,63 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Current head sha of the default branch, preferring the remote's view.
+/// Fetch is best-effort; offline or remote-less repos fall back to the local
+/// branch.
+pub async fn default_branch_head(repo_path: &Path, default_branch: &str) -> Result<String> {
+    let _ = run_git(repo_path, &["fetch", "origin", default_branch]).await;
+    if let Ok(sha) = run_git(
+        repo_path,
+        &["rev-parse", &format!("origin/{default_branch}")],
+    )
+    .await
+    {
+        return Ok(sha);
+    }
+    run_git(repo_path, &["rev-parse", default_branch]).await
+}
+
+/// A branch on origin as the cleaner's stale-branch check sees it.
+#[derive(Debug, Clone)]
+pub struct RemoteBranch {
+    /// Branch name without the `origin/` prefix.
+    pub name: String,
+    /// Committer time (unix epoch seconds) of the branch tip.
+    pub committer_unix: i64,
+}
+
+/// Branches on origin with their tip committer times. Fetches with `--prune`
+/// first (best-effort) so deleted branches drop out of the listing.
+pub async fn list_remote_branches(repo_path: &Path) -> Result<Vec<RemoteBranch>> {
+    let _ = run_git(repo_path, &["fetch", "--prune", "origin"]).await;
+    let out = run_git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(committerdate:unix)",
+            "refs/remotes/origin",
+        ],
+    )
+    .await?;
+    let mut branches = Vec::new();
+    for line in out.lines() {
+        let Some((refname, date)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/remotes/origin/") else {
+            continue;
+        };
+        if name == "HEAD" {
+            continue; // symbolic ref, not a branch
+        }
+        branches.push(RemoteBranch {
+            name: name.to_string(),
+            committer_unix: date.parse().unwrap_or(0),
+        });
+    }
+    Ok(branches)
+}
+
 /// True when nothing is uncommitted (untracked counts as dirty).
 pub async fn status_clean(worktree: &Path) -> Result<bool> {
     Ok(run_git(worktree, &["status", "--porcelain"])

@@ -43,6 +43,8 @@ pub struct FakeForge {
     /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
     /// before it finished computing).
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
+    /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
+    pub pr_for_branch_errors: Mutex<HashSet<String>>,
 }
 
 impl FakeForge {
@@ -83,6 +85,14 @@ impl FakeForge {
     /// Make blocked_by lookups for `issue` fail (unreadable blockers).
     pub fn fail_blocked_by(&self, issue: i64) {
         self.blocked_by_errors.lock().unwrap().insert(issue);
+    }
+
+    /// Make pr_for_branch lookups for `branch` fail (forge outage).
+    pub fn fail_pr_for_branch(&self, branch: &str) {
+        self.pr_for_branch_errors
+            .lock()
+            .unwrap()
+            .insert(branch.to_string());
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
@@ -390,6 +400,15 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        let mut issues = self.issues.lock().unwrap();
+        let Some(i) = issues.iter_mut().find(|i| i.number == number) else {
+            bail!("issue #{number} not found");
+        };
+        i.body = body.to_string();
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         let mut issues = self.issues.lock().unwrap();
         let Some(i) = issues.iter_mut().find(|i| i.number == issue) else {
@@ -438,6 +457,20 @@ impl Forge for FakeForge {
             .find(|p| p.number == number)
             .map(Self::pr_to_public)
             .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
+    }
+
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        if self.pr_for_branch_errors.lock().unwrap().contains(branch) {
+            bail!("forge lookup of branch {branch} is unavailable");
+        }
+        let prs = self.prs.lock().unwrap();
+        let matching: Vec<&RecordedPr> = prs.iter().filter(|p| p.head == branch).collect();
+        // Like `gh pr view <branch>`: an open PR wins over closed/merged ones.
+        Ok(matching
+            .iter()
+            .find(|p| p.state == "open")
+            .or(matching.last())
+            .map(|p| Self::pr_to_public(p)))
     }
 
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {

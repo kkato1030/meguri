@@ -1,3 +1,4 @@
+pub mod agent_session;
 pub mod app;
 pub mod cli;
 pub mod config;
@@ -7,6 +8,7 @@ pub mod events;
 pub mod forge;
 pub mod gitops;
 pub mod mux;
+pub mod notify;
 pub mod server;
 pub mod store;
 pub mod turn;

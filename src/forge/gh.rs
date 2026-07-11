@@ -237,6 +237,7 @@ impl Forge for GhForge {
     }
 
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        // `gh issue create --label` fails on labels that don't exist yet.
         for label in labels {
             self.ensure_label(label).await;
         }
@@ -279,6 +280,20 @@ impl Forge for GhForge {
             &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
             "-F",
             &format!("issue_id={id}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
         ])
         .await?;
         Ok(())
@@ -356,6 +371,33 @@ impl Forge for GhForge {
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
         Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    /// `gh pr view` resolves a branch name to its PR (preferring an open one
+    /// when several exist, which is the safe direction: open means keep).
+    /// "No PR" is a normal answer, not an error — only real lookup failures
+    /// (network, auth) propagate so the caller can fall back to keeping.
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        let raw = match self
+            .gh(&[
+                "pr",
+                "view",
+                branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,body,labels,headRefName,headRefOid,state,url",
+            ])
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) if e.to_string().contains("no pull requests found") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
+        Ok(Some(
+            Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))?,
+        ))
     }
 
     /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",

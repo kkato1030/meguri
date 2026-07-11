@@ -13,6 +13,7 @@ use crate::engine::scheduler::Scheduler;
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::forge::gh::GhForge;
 use crate::mux;
+use crate::notify::Notifier;
 use crate::store::{DesiredState, RunRecord, RunStatus, Store};
 
 pub fn open_store() -> Result<Store> {
@@ -26,6 +27,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         store: open_store()?,
         mux,
         forge: Arc::new(GhForge::new(&project.repo_slug)),
+        notifier: Arc::new(Notifier::from_config(&cfg.notifications)),
         config: cfg.clone(),
         project: project.clone(),
     })
@@ -182,13 +184,45 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
 
     for project in projects {
         let deps = build_deps(&cfg, project, None)?;
-        let candidates = reaper::plan(&deps).await?;
+        let mut states = reaper::IssueStates::default();
+        let pane_candidates = reaper::plan_panes(&deps, &mut states).await?;
+
+        // Panes go first so their worktrees become reclaimable in this same
+        // pass (a closed issue's live pane no longer protects its worktree).
+        if !pane_candidates.is_empty() {
+            println!("{}:", project.id);
+            println!("  {:<9} {:<18} PANE", "ISSUE", "STATE");
+            for c in &pane_candidates {
+                let state = match c.verdict {
+                    reaper::Verdict::Reclaim => "reclaim".to_string(),
+                    other => format!("{} (skip)", other.as_str()),
+                };
+                println!("  {:<9} {:<18} {}", format!("#{}", c.issue), state, c.pane);
+            }
+        }
+        if !dry_run {
+            let reclaimed = reaper::reclaim_panes(&deps, &pane_candidates).await?;
+            if !reclaimed.is_empty() {
+                println!("  reclaimed {} pane(s)", reclaimed.len());
+                for p in &reclaimed {
+                    if let Some(id) = &p.agent_session_id {
+                        println!("  saved session for #{}: claude --resume {id}", p.issue);
+                    }
+                }
+            }
+        }
+
+        let candidates = reaper::plan_with(&deps, &mut states).await?;
         if candidates.is_empty() {
-            println!("{}: no meguri worktrees", project.id);
+            if pane_candidates.is_empty() {
+                println!("{}: no meguri panes or worktrees", project.id);
+            }
             continue;
         }
 
-        println!("{}:", project.id);
+        if pane_candidates.is_empty() {
+            println!("{}:", project.id);
+        }
         println!("  {:<9} {:<18} {:>9}  PATH", "ISSUE", "STATE", "SIZE");
         for c in &candidates {
             let state = match c.verdict {
@@ -305,12 +339,9 @@ pub async fn cmd_logs(needle: &str) -> Result<()> {
 pub fn cmd_attach(needle: &str) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
-    let run = require_run(&store, needle)?;
-    let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id) else {
-        bail!("run {} has no pane yet", run.id);
-    };
-    let mux = mux::from_kind(kind, &cfg.mux.session)?;
-    let command = mux.attach_command(&mux::PaneId(pane.clone()));
+    let (kind, pane) = resolve_attach_pane(&store, needle)?;
+    let mux = mux::from_kind(&kind, &cfg.mux.session)?;
+    let command = mux.attach_command(&mux::PaneId(pane));
     println!("attaching: {command}");
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new("sh")
@@ -318,6 +349,44 @@ pub fn cmd_attach(needle: &str) -> Result<()> {
         .arg(&command)
         .exec();
     bail!("exec failed: {err}");
+}
+
+/// Resolve what `meguri attach <needle>` should attach to. The pane belongs
+/// to the issue (1 issue = 1 pane, kept until the issue closes), so the
+/// issue's persistent pane wins over whatever pane id a run once recorded —
+/// and a bare issue number keeps working after its runs finished.
+fn resolve_attach_pane(store: &Store, needle: &str) -> Result<(String, String)> {
+    if let Some(run) = store.find_run(needle)? {
+        if let Some(p) = store.get_pane(&run.project_id, run.issue_number)?
+            && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
+        {
+            return Ok((kind, id));
+        }
+        if let (Some(kind), Some(id)) = (&run.mux_kind, &run.mux_pane_id) {
+            return Ok((kind.clone(), id.clone()));
+        }
+        bail!("run {} has no pane yet", run.id);
+    }
+    if let Ok(issue) = needle.parse::<i64>() {
+        let panes = store.panes_for_issue(issue)?;
+        match panes.as_slice() {
+            [] => {}
+            [p] => {
+                if let (Some(kind), Some(id)) = (&p.mux_kind, &p.mux_pane_id) {
+                    return Ok((kind.clone(), id.clone()));
+                }
+            }
+            many => {
+                let projects: Vec<&str> = many.iter().map(|p| p.project_id.as_str()).collect();
+                bail!(
+                    "issue #{issue} has panes in multiple projects ({}) — \
+                     pass a run id instead",
+                    projects.join(", ")
+                );
+            }
+        }
+    }
+    bail!("no run or pane matches {needle:?} (try `meguri ps --all`)")
 }
 
 fn set_desired(needle: &str, desired: Option<DesiredState>, verb: &str) -> Result<()> {
@@ -378,17 +447,28 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
 
     // No driver is running this (queued/interrupted): finalize here.
     store.update_run_status(&run.id, RunStatus::Cancelled, Some("stopped by user"))?;
-    if let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
+    let released = match cfg.project(&run.project_id) {
+        Some(project) => match build_deps(&cfg, project, None) {
+            Ok(deps) => {
+                // Session id is saved before the kill — resumable later.
+                let released =
+                    reaper::release_pane(&deps, run.issue_number, "stopped by user").await;
+                let _ = deps
+                    .forge
+                    .remove_label(run.issue_number, crate::forge::LABEL_WORKING)
+                    .await;
+                released.is_some()
+            }
+            Err(_) => false,
+        },
+        None => false,
+    };
+    if !released
+        && let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
         && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session)
     {
+        // Fallback for panes that predate the pane registry.
         let _ = mux.kill_pane(&mux::PaneId(pane.clone())).await;
-    }
-    if let Some(project) = cfg.project(&run.project_id) {
-        let forge = GhForge::new(&project.repo_slug);
-        use crate::forge::Forge;
-        let _ = forge
-            .remove_label(run.issue_number, crate::forge::LABEL_WORKING)
-            .await;
     }
     store.emit(Some(&run.id), "run.cancelled", serde_json::json!({}))?;
     println!("run {} cancelled", run.id);

@@ -47,6 +47,11 @@ repo_slug = "owner/repo"
 #
 # [agent]
 # args = ["--permission-mode", "acceptEdits"]  # yolo をやめて確認ダイアログ運用にする例
+#
+# [notifications]
+# macos = true                       # awaiting_human を macOS 通知で知らせる
+# webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
+# throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -69,9 +74,47 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub notifications: NotificationsConfig,
+    #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
+    pub clean: CleanConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+/// Settings for the cleaner loop (read-only repository sweeps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanConfig {
+    /// Minimum hours between sweeps; a moved head alone does not trigger one.
+    #[serde(default = "default_clean_interval_hours")]
+    pub interval_hours: u64,
+    /// Remote branches whose last commit is older than this many days are
+    /// reported as stale (merged branches are reported regardless of age).
+    #[serde(default = "default_stale_branch_days")]
+    pub stale_branch_days: u64,
+    /// False-positive silencer: findings whose file/note (or branch name /
+    /// `#N` reference) contains any of these substrings are dropped from the
+    /// report at render time.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl Default for CleanConfig {
+    fn default() -> Self {
+        Self {
+            interval_hours: default_clean_interval_hours(),
+            stale_branch_days: default_stale_branch_days(),
+            ignore: Vec::new(),
+        }
+    }
+}
+
+fn default_clean_interval_hours() -> u64 {
+    24
+}
+fn default_stale_branch_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +144,10 @@ pub struct MuxConfig {
     /// mux session name that holds all meguri panes
     #[serde(default = "default_session")]
     pub session: String,
-    /// "on-failure" | "always" | "never"
+    /// Pane lifetime policy: "until-issue-closed" (default — the reaper
+    /// reclaims the pane when the issue closes on the forge) | "never"
+    /// (kill the pane as soon as its run ends; high-throughput operation).
+    /// Any other value is treated as "until-issue-closed".
     #[serde(default = "default_keep_pane")]
     pub keep_pane: String,
 }
@@ -123,7 +169,7 @@ fn default_session() -> String {
     "meguri".into()
 }
 fn default_keep_pane() -> String {
-    "on-failure".into()
+    "until-issue-closed".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +194,11 @@ pub struct AgentConfig {
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
+    /// Where the agent keeps its native session transcripts (default:
+    /// `$CLAUDE_CONFIG_DIR` or `~/.claude`). The reaper reads it to save a
+    /// resumable session id before closing a pane.
+    #[serde(default)]
+    pub session_dir: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -157,6 +208,7 @@ impl Default for AgentConfig {
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
             herdr_agent_hint: None,
+            session_dir: None,
         }
     }
 }
@@ -319,6 +371,38 @@ fn default_server_bind() -> String {
     "127.0.0.1".into()
 }
 
+/// awaiting_human escalations paged to a human (issue #7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// macOS notification via `osascript` (no-op on other platforms).
+    #[serde(default = "default_notifications_macos")]
+    pub macos: bool,
+    /// URL POSTed a JSON payload (run id / issue / reason / attach command).
+    /// None disables the webhook.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Minimum seconds between notifications for the same run.
+    #[serde(default = "default_notifications_throttle")]
+    pub throttle_secs: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            macos: default_notifications_macos(),
+            webhook_url: None,
+            throttle_secs: default_notifications_throttle(),
+        }
+    }
+}
+
+fn default_notifications_macos() -> bool {
+    true
+}
+fn default_notifications_throttle() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -340,6 +424,10 @@ pub struct ProjectConfig {
     /// Per-project PR settings; overrides the global `[pr]` section.
     #[serde(default)]
     pub pr: Option<PrConfig>,
+    /// Per-project cleaner settings; overrides the global `[clean]` section
+    /// (the ignore list in particular is inherently project-specific).
+    #[serde(default)]
+    pub clean: Option<CleanConfig>,
 }
 
 fn default_branch() -> String {
@@ -376,6 +464,11 @@ impl Config {
     pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
         project.language.as_deref().or(self.language.as_deref())
     }
+
+    /// Effective cleaner settings for a project (project override wins).
+    pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
+        project.clean.as_ref().unwrap_or(&self.clean)
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +481,7 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
         assert_eq!(back.mux.kind, "auto");
+        assert_eq!(back.mux.keep_pane, "until-issue-closed");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
         assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
@@ -395,6 +489,34 @@ mod tests {
         assert!(back.pr.draft);
         assert_eq!(back.server.port, 8607);
         assert_eq!(back.server.bind, "127.0.0.1");
+        assert!(back.notifications.macos);
+        assert_eq!(back.notifications.webhook_url, None);
+        assert_eq!(back.notifications.throttle_secs, 60);
+    }
+
+    #[test]
+    fn notifications_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.notifications.macos);
+        assert_eq!(cfg.notifications.webhook_url, None);
+        assert_eq!(cfg.notifications.throttle_secs, 60);
+    }
+
+    #[test]
+    fn notifications_section_overrides_defaults() {
+        let raw = r#"
+[notifications]
+macos = false
+webhook_url = "https://example.com/hook"
+throttle_secs = 10
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.notifications.macos);
+        assert_eq!(
+            cfg.notifications.webhook_url.as_deref(),
+            Some("https://example.com/hook")
+        );
+        assert_eq!(cfg.notifications.throttle_secs, 10);
     }
 
     #[test]
@@ -543,6 +665,47 @@ language = "English"
         assert_eq!(cfg.limits.idle_grace_secs, 90);
         assert_eq!(cfg.scheduler.max_concurrent_runs, 2);
         assert!(cfg.pr.draft);
+    }
+
+    #[test]
+    fn clean_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.clean.interval_hours, 24);
+        assert_eq!(cfg.clean.stale_branch_days, 30);
+        assert!(cfg.clean.ignore.is_empty());
+    }
+
+    #[test]
+    fn clean_project_override_wins() {
+        let raw = r#"
+[clean]
+interval_hours = 12
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "quiet"
+repo_path = "/tmp/quiet"
+repo_slug = "me/quiet"
+
+[projects.clean]
+interval_hours = 48
+ignore = ["docs/legacy"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.clean_for(demo).interval_hours, 12);
+        assert_eq!(cfg.clean_for(demo).stale_branch_days, 30);
+
+        let quiet = cfg.project("quiet").unwrap();
+        assert_eq!(cfg.clean_for(quiet).interval_hours, 48);
+        // The override replaces the whole section; omitted keys fall back to
+        // the built-in defaults, not the global section.
+        assert_eq!(cfg.clean_for(quiet).stale_branch_days, 30);
+        assert_eq!(cfg.clean_for(quiet).ignore, vec!["docs/legacy"]);
     }
 
     #[test]

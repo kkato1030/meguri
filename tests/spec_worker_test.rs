@@ -113,10 +113,12 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let deps = Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: Arc::new(FakeMux::new(false)),
         forge: forge.clone(),
         config,
