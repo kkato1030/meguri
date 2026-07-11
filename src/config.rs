@@ -27,6 +27,11 @@ pub fn worktrees_root() -> PathBuf {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    /// Language for agent-authored deliverables (PR descriptions, summaries,
+    /// specs). Free-form, passed verbatim into the prompt (e.g. "日本語",
+    /// "Japanese"). None leaves the agent to its default (usually English).
+    #[serde(default)]
+    pub language: Option<String>,
     #[serde(default)]
     pub mux: MuxConfig,
     #[serde(default)]
@@ -211,6 +216,9 @@ pub struct ProjectConfig {
     pub repo_slug: String,
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    /// Per-project deliverable language; overrides the top-level `language`.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Command the orchestrator runs in the worktree to validate agent work.
     #[serde(default)]
     pub check_command: Option<String>,
@@ -259,6 +267,11 @@ impl Config {
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
+    }
+
+    /// Effective deliverable language for a project (project override wins).
+    pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
+        project.language.as_deref().or(self.language.as_deref())
     }
 }
 
@@ -326,6 +339,35 @@ draft = false
         assert!(cfg.pr.draft, "global default stays true");
         let p = cfg.project("demo").unwrap();
         assert!(!cfg.pr_for(p).draft);
+    }
+
+    #[test]
+    fn language_defaults_to_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn language_project_override_wins() {
+        let raw = r#"
+language = "日本語"
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "en"
+repo_path = "/tmp/en"
+repo_slug = "me/en"
+language = "English"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.language_for(demo), Some("日本語"));
+        let en = cfg.project("en").unwrap();
+        assert_eq!(cfg.language_for(en), Some("English"));
     }
 
     #[test]

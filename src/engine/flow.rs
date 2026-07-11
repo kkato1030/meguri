@@ -696,6 +696,23 @@ fn find_pr_template(worktree: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Prompt section pinning the language of agent-authored deliverables.
+/// Returns "" when no language is configured (the agent's default, usually
+/// English, wins). Prefixed with a blank line so callers can append it
+/// unconditionally.
+pub fn language_instruction(language: Option<&str>) -> String {
+    let Some(lang) = language else {
+        return String::new();
+    };
+    format!(
+        "\n\n# Output language\n\
+         Write every human-readable deliverable in {lang}: the `summary` and \
+         `pr_body` fields of the result file, and any documents you author \
+         (specs, ADRs, ...). Code identifiers and commit messages follow the \
+         repository's existing conventions."
+    )
+}
+
 /// Prompt section asking the agent to author the PR description (`pr_body`).
 pub fn pr_body_instruction(worktree: &Path) -> String {
     let template = find_pr_template(worktree).unwrap_or_else(|| DEFAULT_PR_TEMPLATE.to_string());
@@ -738,6 +755,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pull_request_template.md"), "  \n\n").unwrap();
         assert_eq!(find_pr_template(dir.path()), None);
+    }
+
+    #[test]
+    fn language_instruction_is_empty_unless_configured() {
+        assert_eq!(language_instruction(None), "");
+        let section = language_instruction(Some("日本語"));
+        assert!(section.contains("# Output language"));
+        assert!(section.contains("日本語"));
     }
 
     #[test]
