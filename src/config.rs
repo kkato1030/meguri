@@ -319,7 +319,7 @@ impl RestartPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_restart_policy")]
     pub restart_policy: RestartPolicy,
@@ -372,7 +372,7 @@ fn default_server_bind() -> String {
 }
 
 /// awaiting_human escalations paged to a human (issue #7).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationsConfig {
     /// macOS notification via `osascript` (no-op on other platforms).
     #[serde(default = "default_notifications_macos")]
@@ -446,8 +446,12 @@ impl Config {
                 path.display()
             )
         })?;
-        let cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("invalid config at {}", path.display()))?;
+        Self::parse(&raw, path)
+    }
+
+    fn parse(raw: &str, path: &Path) -> Result<Self> {
+        let cfg: Config =
+            toml::from_str(raw).with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(cfg)
     }
 
@@ -468,6 +472,122 @@ impl Config {
     /// Effective cleaner settings for a project (project override wins).
     pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
         project.clean.as_ref().unwrap_or(&self.clean)
+    }
+}
+
+/// Hot reload for a long-lived process (`meguri watch`): re-reads the config
+/// file when its content changes and swaps it in atomically — `apply` builds
+/// everything derived from the candidate config, and only when it succeeds
+/// does the candidate become `current`. A bad edit (unreadable file, invalid
+/// TOML, no projects) never kills the process: it is rejected with a warning
+/// and the last good config stays in effect.
+///
+/// Settings bound to the process lifetime are exempt from reload and pinned
+/// to their startup values: `mux.kind` / `mux.session` (the daemon already
+/// holds panes in that session) and the `[daemon]` section (consumed at
+/// start/install time by the OS supervisor). A change to them logs a
+/// restart-required warning instead.
+pub struct ConfigReloader {
+    path: PathBuf,
+    /// Raw content of the last load attempt (good or rejected), so each edit
+    /// is parsed — and warned about — once, not on every poll. `None` means
+    /// the last attempt could not even be read.
+    last_seen: Option<String>,
+    current: Config,
+}
+
+impl ConfigReloader {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "cannot read config at {} (run `meguri init`)",
+                path.display()
+            )
+        })?;
+        let current = Config::parse(&raw, path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            last_seen: Some(raw),
+            current,
+        })
+    }
+
+    /// The config currently in effect (the last one that loaded and applied).
+    pub fn current(&self) -> &Config {
+        &self.current
+    }
+
+    /// Reload if the file changed since the last attempt. `apply` receives
+    /// (current, candidate) and rebuilds whatever depends on the config; an
+    /// `Err` keeps `current` untouched and retries on the next poll (apply
+    /// failures are environmental, unlike parse errors which are final for
+    /// that content). Returns `None` when nothing changed or the reload was
+    /// rejected.
+    pub fn poll<T>(&mut self, apply: impl FnOnce(&Config, &Config) -> Result<T>) -> Option<T> {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                if self.last_seen.take().is_some() {
+                    tracing::warn!(
+                        "cannot read {}: {e} — keeping the last good config",
+                        self.path.display()
+                    );
+                }
+                return None;
+            }
+        };
+        if self.last_seen.as_deref() == Some(raw.as_str()) {
+            return None;
+        }
+
+        let mut next = match Config::parse(&raw, &self.path) {
+            Ok(next) => next,
+            Err(e) => {
+                self.last_seen = Some(raw);
+                tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
+                return None;
+            }
+        };
+        if next.projects.is_empty() {
+            self.last_seen = Some(raw);
+            tracing::warn!(
+                "config reload rejected: no projects configured — keeping the last good config"
+            );
+            return None;
+        }
+
+        // Pin the process-bound settings so `current` always reflects what is
+        // actually in effect.
+        if next.mux.kind != self.current.mux.kind || next.mux.session != self.current.mux.session {
+            tracing::warn!(
+                "mux.kind / mux.session are fixed for the daemon's lifetime — \
+                 restart `meguri watch` to apply them"
+            );
+            next.mux.kind = self.current.mux.kind.clone();
+            next.mux.session = self.current.mux.session.clone();
+        }
+        if next.daemon != self.current.daemon {
+            tracing::warn!(
+                "[daemon] settings apply at start/install time — \
+                 restart (or `meguri daemon install`) to apply them"
+            );
+            next.daemon = self.current.daemon.clone();
+        }
+
+        match apply(&self.current, &next) {
+            Ok(applied) => {
+                tracing::info!("config reloaded from {}", self.path.display());
+                self.last_seen = Some(raw);
+                self.current = next;
+                Some(applied)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "config reload failed to apply: {e:#} — keeping the last good config"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -665,6 +785,141 @@ language = "English"
         assert_eq!(cfg.limits.idle_grace_secs, 90);
         assert_eq!(cfg.scheduler.max_concurrent_runs, 2);
         assert!(cfg.pr.draft);
+    }
+
+    /// Minimal valid config with one project and the given extra lines.
+    fn write_config(path: &Path, extra: &str) {
+        let raw = format!(
+            "{extra}\n[[projects]]\nid = \"demo\"\nrepo_path = \"/tmp/demo\"\nrepo_slug = \"me/demo\"\n"
+        );
+        std::fs::write(path, raw).unwrap();
+    }
+
+    #[test]
+    fn reloader_ignores_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "language = \"A\"");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        let mut applied = false;
+        let out = r.poll(|_, _| -> Result<()> {
+            applied = true;
+            Ok(())
+        });
+        assert!(out.is_none());
+        assert!(!applied, "apply must not run when the file is unchanged");
+    }
+
+    #[test]
+    fn reloader_applies_changed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "language = \"A\"");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        write_config(&path, "language = \"B\"");
+        let got = r.poll(|prev, next| {
+            assert_eq!(prev.language.as_deref(), Some("A"));
+            Ok(next.language.clone())
+        });
+        assert_eq!(got, Some(Some("B".to_string())));
+        assert_eq!(r.current().language.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn reloader_rejects_invalid_toml_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "language = \"A\"");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(&path, "language = not valid toml").unwrap();
+        let mut applied = false;
+        assert!(
+            r.poll(|_, _| -> Result<()> {
+                applied = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!applied);
+        assert_eq!(r.current().language.as_deref(), Some("A"));
+        // Same bad content again: still rejected, still on the last good config.
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_none());
+
+        // Fixing the file resumes reloading.
+        write_config(&path, "language = \"C\"");
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_some());
+        assert_eq!(r.current().language.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn reloader_rejects_empty_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(&path, "language = \"B\"\n").unwrap();
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_none());
+        assert!(!r.current().projects.is_empty());
+    }
+
+    #[test]
+    fn reloader_survives_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "language = \"A\"");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_none());
+        assert_eq!(r.current().language.as_deref(), Some("A"));
+
+        write_config(&path, "language = \"B\"");
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_some());
+        assert_eq!(r.current().language.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn reloader_pins_process_bound_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        write_config(
+            &path,
+            "language = \"B\"\n[mux]\nsession = \"other\"\nkind = \"tmux\"\n[daemon]\nthrottle_secs = 99",
+        );
+        let got = r.poll(|_, next| Ok(next.clone())).unwrap();
+        // The reloadable change went through…
+        assert_eq!(got.language.as_deref(), Some("B"));
+        // …but process-bound settings keep their startup values.
+        assert_eq!(got.mux.session, "meguri");
+        assert_eq!(got.mux.kind, "auto");
+        assert_eq!(got.daemon.throttle_secs, 10);
+        assert_eq!(r.current().mux.session, "meguri");
+    }
+
+    #[test]
+    fn reloader_keeps_current_and_retries_when_apply_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "language = \"A\"");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        write_config(&path, "language = \"B\"");
+        assert!(
+            r.poll(|_, _| -> Result<()> { anyhow::bail!("transient") })
+                .is_none()
+        );
+        assert_eq!(r.current().language.as_deref(), Some("A"));
+
+        // Unlike a parse error, an apply failure retries on the next poll.
+        assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_some());
+        assert_eq!(r.current().language.as_deref(), Some("B"));
     }
 
     #[test]

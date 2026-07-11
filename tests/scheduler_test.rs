@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::scheduler::Scheduler;
+use meguri::engine::scheduler::{Reload, Scheduler};
 use meguri::engine::{Deps, Loop, Target, WorkerOutcome, default_loops};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
@@ -151,6 +151,7 @@ async fn watch_discovers_and_completes_labeled_issue() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -204,6 +205,7 @@ async fn watch_skips_working_and_hold_issues() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -235,6 +237,7 @@ async fn watch_gates_on_open_blocker_until_closed_as_completed() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -298,6 +301,7 @@ async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -338,6 +342,7 @@ async fn watch_does_not_refile_issue_with_succeeded_run() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -391,6 +396,7 @@ async fn recovery_resumes_interrupted_run_to_success() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -442,6 +448,7 @@ async fn watch_dispatches_multiple_ready_issues_concurrently() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -490,6 +497,7 @@ async fn watch_reclaims_worktree_after_issue_closes() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -653,6 +661,7 @@ async fn watch_prioritizes_loops_in_list_order() {
         ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -679,6 +688,7 @@ async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
         })],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 3).await;
@@ -714,6 +724,7 @@ async fn watch_prioritizes_loop_order_over_project_order() {
         ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -736,6 +747,7 @@ async fn watch_ticks_write_a_heartbeat() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -814,6 +826,7 @@ async fn drive_order(
         poll_interval: Duration::from_millis(100),
         // One slot at a time so drive order mirrors dispatch priority.
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -940,6 +953,7 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
         loops: vec![Arc::new(FixedLoop)],
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -965,4 +979,95 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
     let runs = store.list_runs(false).unwrap();
     assert_eq!(runs.len(), 1, "one run per discovered target: {runs:?}");
     assert_eq!(runs[0].loop_kind, "fixed");
+}
+
+/// A loop that records the `config.language` each of its drives sees:
+/// issues 71 and 72, driven straight to success.
+struct LanguageRecordingLoop {
+    log: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Loop for LanguageRecordingLoop {
+    fn kind(&self) -> &'static str {
+        "lang"
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for n in [71, 72] {
+            if !deps
+                .store
+                .issue_has_succeeded_run(&deps.project.id, self.kind(), n)?
+            {
+                targets.push(Target {
+                    issue_number: n,
+                    title: format!("lang {n}"),
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        self.log.lock().unwrap().push(deps.config.language.clone());
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "lang://pr".into(),
+        })
+    }
+}
+
+/// Config hot reload (issue #73): a swap delivered by the reload hook reaches
+/// the runs spawned after it, while the run already driven keeps the startup
+/// config.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_applies_reloaded_config_to_new_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Simulated config edit: once the first run has driven, the hook starts
+    // returning Deps whose config carries a language.
+    let mut reloaded = deps.clone();
+    reloaded.config.language = Some("日本語".into());
+    let hook_log = log.clone();
+    let reload = Box::new(move || {
+        (hook_log.lock().unwrap().len() == 1).then(|| Reload {
+            projects: vec![reloaded.clone()],
+            poll_interval: Duration::from_millis(100),
+            max_concurrent: 1,
+        })
+    });
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(LanguageRecordingLoop { log: log.clone() })],
+        poll_interval: Duration::from_millis(100),
+        // One slot: issue 71 drives before the "edit", issue 72 after it.
+        max_concurrent: 1,
+        reload: Some(reload),
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if log.lock().unwrap().len() >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("both runs never drove: {:?}", log.lock().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    let languages = log.lock().unwrap().clone();
+    assert_eq!(languages[0], None, "the first run uses the startup config");
+    assert_eq!(
+        languages[1].as_deref(),
+        Some("日本語"),
+        "runs spawned after the reload see the new config"
+    );
 }
