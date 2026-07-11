@@ -1,3 +1,4 @@
+pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
 pub mod fixer;
@@ -85,6 +86,7 @@ pub trait Loop: Send + Sync {
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
         Arc::new(conflict_resolver::ConflictResolverLoop),
+        Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(reviewer::ReviewerLoop),

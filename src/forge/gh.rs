@@ -1,14 +1,20 @@
 //! GitHub gateway backed by the `gh` CLI (reuses the user's existing auth,
 //! same approach as looper).
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
-    ReviewThread,
+    Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
+    MergeableState, PullRequest, ReviewComment, ReviewThread,
 };
+
+/// How much of each failed job log survives into the fix prompt (logs can be
+/// megabytes; the failure is almost always at the tail).
+const FAILED_LOG_TAIL_LINES: usize = 200;
 
 pub struct GhForge {
     /// "owner/repo"
@@ -118,6 +124,80 @@ impl GhForge {
             "closed" | "merged" => Ok(IssueState::Closed),
             "open" => Ok(IssueState::Open),
             other => bail!("unrecognized issue state `{other}`"),
+        }
+    }
+
+    /// A GitHub Actions check run: `status` says whether it finished,
+    /// `conclusion` how. Anything not completed is Pending; a completed run
+    /// passes only on SUCCESS/NEUTRAL/SKIPPED — CANCELLED, TIMED_OUT,
+    /// ACTION_REQUIRED, STALE and friends block the merge just like FAILURE,
+    /// so they count as Failure.
+    fn check_state_from_check_run(status: &str, conclusion: &str) -> CheckState {
+        if !status.eq_ignore_ascii_case("completed") {
+            return CheckState::Pending;
+        }
+        match conclusion.to_ascii_uppercase().as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckState::Success,
+            _ => CheckState::Failure,
+        }
+    }
+
+    /// A classic commit status: SUCCESS/PENDING/EXPECTED/ERROR/FAILURE.
+    fn check_state_from_status_context(state: &str) -> CheckState {
+        match state.to_ascii_uppercase().as_str() {
+            "SUCCESS" => CheckState::Success,
+            "PENDING" | "EXPECTED" => CheckState::Pending,
+            _ => CheckState::Failure,
+        }
+    }
+
+    /// The rollup's context nodes (CheckRun | StatusContext) as [`CheckRun`]s.
+    fn checks_from_rollup_nodes(nodes: &[Value]) -> Vec<CheckRun> {
+        nodes
+            .iter()
+            .filter_map(|n| {
+                let str_of = |key: &str| {
+                    n.get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                match n.get("__typename").and_then(Value::as_str)? {
+                    "CheckRun" => Some(CheckRun {
+                        name: str_of("name"),
+                        state: Self::check_state_from_check_run(
+                            &str_of("status"),
+                            &str_of("conclusion"),
+                        ),
+                        url: str_of("detailsUrl"),
+                    }),
+                    "StatusContext" => Some(CheckRun {
+                        name: str_of("context"),
+                        state: Self::check_state_from_status_context(&str_of("state")),
+                        url: str_of("targetUrl"),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The workflow run id inside a check's details URL
+    /// (`.../actions/runs/<id>/job/<job>`), if it points at GitHub Actions.
+    fn actions_run_id(url: &str) -> Option<String> {
+        let (_, rest) = url.split_once("/actions/runs/")?;
+        let id: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        (!id.is_empty()).then_some(id)
+    }
+
+    fn tail_lines(s: &str, n: usize) -> String {
+        let lines: Vec<&str> = s.lines().collect();
+        let skipped = lines.len().saturating_sub(n);
+        let tail = lines[skipped..].join("\n");
+        if skipped > 0 {
+            format!("[... {skipped} earlier lines omitted ...]\n{tail}")
+        } else {
+            tail
         }
     }
 
@@ -426,6 +506,96 @@ impl Forge for GhForge {
         )
     }
 
+    /// Checks and classic commit statuses both live in GraphQL's
+    /// `statusCheckRollup` contexts; `gh pr checks` is avoided because it
+    /// exits non-zero on pending/failing checks (indistinguishable from a
+    /// real gh failure). The aggregate verdict is computed locally by
+    /// [`CheckRollup::state`], not taken from GitHub's rollup `state`, so
+    /// "one check failed, others still running" stays Pending.
+    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup> {
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        let query = "query($owner:String!,$name:String!,$number:Int!){\
+             repository(owner:$owner,name:$name){pullRequest(number:$number){\
+             commits(last:1){nodes{commit{statusCheckRollup{\
+             contexts(first:100){nodes{__typename \
+             ... on CheckRun{name status conclusion detailsUrl} \
+             ... on StatusContext{context state targetUrl}}}}}}}}}}";
+        let raw = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+                "-F",
+                &format!("number={number}"),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing check-rollup GraphQL")?;
+        // A null rollup means no CI ever ran on this head: an empty rollup.
+        let nodes = v
+            .pointer(
+                "/data/repository/pullRequest/commits/nodes/0/commit\
+                 /statusCheckRollup/contexts/nodes",
+            )
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(CheckRollup {
+            checks: Self::checks_from_rollup_nodes(&nodes),
+        })
+    }
+
+    /// One section per failing workflow run (`gh run view --log-failed`),
+    /// deduped when several failed checks belong to the same run. Failures
+    /// from external CI (plain commit statuses) have no fetchable log — they
+    /// contribute a pointer to their details URL instead.
+    async fn pr_failed_check_logs(&self, number: i64) -> Result<String> {
+        let rollup = self.pr_check_rollup(number).await?;
+        let mut sections = Vec::new();
+        let mut seen_runs = HashSet::new();
+        for check in rollup.failed() {
+            match Self::actions_run_id(&check.url) {
+                Some(run_id) => {
+                    if !seen_runs.insert(run_id.clone()) {
+                        continue;
+                    }
+                    let section = match self
+                        .gh(&["run", "view", &run_id, "--repo", &self.repo, "--log-failed"])
+                        .await
+                    {
+                        Ok(log) => format!(
+                            "### {} (workflow run {run_id})\n```\n{}\n```",
+                            check.name,
+                            Self::tail_lines(&log, FAILED_LOG_TAIL_LINES),
+                        ),
+                        Err(e) => format!(
+                            "### {} (workflow run {run_id})\n(log fetch failed: {e:#})",
+                            check.name
+                        ),
+                    };
+                    sections.push(section);
+                }
+                None => sections.push(format!(
+                    "### {}\n(no workflow-run log on GitHub; details: {})",
+                    check.name,
+                    if check.url.is_empty() {
+                        "none"
+                    } else {
+                        &check.url
+                    }
+                )),
+            }
+        }
+        Ok(sections.join("\n\n"))
+    }
+
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
         let raw = self
             .gh(&[
@@ -702,5 +872,99 @@ mod tests {
         // silent Open that pins the worktree forever.
         assert!(GhForge::parse_issue_state("DRAFT").is_err());
         assert!(GhForge::parse_issue_state("").is_err());
+    }
+
+    #[test]
+    fn check_run_states_map_to_the_three_way_verdict() {
+        use CheckState::*;
+        // Not completed yet: pending regardless of any (stale) conclusion.
+        assert_eq!(
+            GhForge::check_state_from_check_run("IN_PROGRESS", ""),
+            Pending
+        );
+        assert_eq!(GhForge::check_state_from_check_run("QUEUED", ""), Pending);
+        // Completed: only a pass-shaped conclusion is green.
+        assert_eq!(
+            GhForge::check_state_from_check_run("COMPLETED", "SUCCESS"),
+            Success
+        );
+        assert_eq!(
+            GhForge::check_state_from_check_run("COMPLETED", "NEUTRAL"),
+            Success
+        );
+        assert_eq!(
+            GhForge::check_state_from_check_run("COMPLETED", "SKIPPED"),
+            Success
+        );
+        for red in [
+            "FAILURE",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "STALE",
+        ] {
+            assert_eq!(
+                GhForge::check_state_from_check_run("COMPLETED", red),
+                Failure,
+                "{red} must count as a failure"
+            );
+        }
+    }
+
+    #[test]
+    fn status_context_states_map_to_the_three_way_verdict() {
+        use CheckState::*;
+        assert_eq!(GhForge::check_state_from_status_context("SUCCESS"), Success);
+        assert_eq!(GhForge::check_state_from_status_context("PENDING"), Pending);
+        assert_eq!(
+            GhForge::check_state_from_status_context("EXPECTED"),
+            Pending
+        );
+        assert_eq!(GhForge::check_state_from_status_context("FAILURE"), Failure);
+        assert_eq!(GhForge::check_state_from_status_context("ERROR"), Failure);
+    }
+
+    #[test]
+    fn rollup_nodes_parse_check_runs_and_status_contexts() {
+        let nodes: Vec<Value> = serde_json::from_str(
+            r#"[
+              {"__typename":"CheckRun","name":"test","status":"COMPLETED",
+               "conclusion":"FAILURE",
+               "detailsUrl":"https://github.com/me/proj/actions/runs/42/job/7"},
+              {"__typename":"StatusContext","context":"external-ci",
+               "state":"SUCCESS","targetUrl":"https://ci.example/x"},
+              {"__typename":"SomethingElse","name":"ignored"}
+            ]"#,
+        )
+        .unwrap();
+        let checks = GhForge::checks_from_rollup_nodes(&nodes);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "test");
+        assert_eq!(checks[0].state, CheckState::Failure);
+        assert!(checks[0].url.contains("/actions/runs/42/"));
+        assert_eq!(checks[1].name, "external-ci");
+        assert_eq!(checks[1].state, CheckState::Success);
+    }
+
+    #[test]
+    fn actions_run_id_only_parses_actions_urls() {
+        assert_eq!(
+            GhForge::actions_run_id("https://github.com/me/proj/actions/runs/42/job/7").as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            GhForge::actions_run_id("https://github.com/me/proj/actions/runs/42").as_deref(),
+            Some("42")
+        );
+        assert_eq!(GhForge::actions_run_id("https://ci.example/build/42"), None);
+        assert_eq!(GhForge::actions_run_id(""), None);
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_tail_and_marks_the_cut() {
+        assert_eq!(GhForge::tail_lines("a\nb", 5), "a\nb");
+        let tailed = GhForge::tail_lines("a\nb\nc\nd", 2);
+        assert!(tailed.starts_with("[... 2 earlier lines omitted ...]"));
+        assert!(tailed.ends_with("c\nd"));
     }
 }
