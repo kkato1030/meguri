@@ -107,6 +107,19 @@ impl GhForge {
         })
     }
 
+    /// Issues and PRs share GitHub's number space and `gh issue view`
+    /// resolves both, reporting `MERGED` for a merged PR. Merged means the
+    /// lifecycle is over, so it maps to Closed like `closed` does. Anything
+    /// unrecognized is an error, never a silent Open — the reaper must land
+    /// on StateUnknown (skip), not keep a dead worktree alive forever.
+    fn parse_issue_state(state: &str) -> Result<IssueState> {
+        match state.to_ascii_lowercase().as_str() {
+            "closed" | "merged" => Ok(IssueState::Closed),
+            "open" => Ok(IssueState::Open),
+            other => bail!("unrecognized issue state `{other}`"),
+        }
+    }
+
     /// --edit doesn't create missing labels — ensure it exists first
     /// (idempotent; ignore "already exists" failures).
     async fn ensure_label(&self, label: &str) {
@@ -161,11 +174,7 @@ impl Forge for GhForge {
             .get("state")
             .and_then(Value::as_str)
             .with_context(|| format!("unexpected issue state shape: {raw}"))?;
-        Ok(if state.eq_ignore_ascii_case("closed") {
-            IssueState::Closed
-        } else {
-            IssueState::Open
-        })
+        Self::parse_issue_state(state)
     }
 
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>> {
@@ -530,5 +539,51 @@ impl Forge for GhForge {
         ])
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_pr_state_is_closed() {
+        // gh reports a merged PR's state as MERGED through the issue view.
+        assert_eq!(
+            GhForge::parse_issue_state("MERGED").unwrap(),
+            IssueState::Closed
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("merged").unwrap(),
+            IssueState::Closed
+        );
+    }
+
+    #[test]
+    fn open_and_closed_states_parse_case_insensitively() {
+        assert_eq!(
+            GhForge::parse_issue_state("OPEN").unwrap(),
+            IssueState::Open
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("open").unwrap(),
+            IssueState::Open
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("CLOSED").unwrap(),
+            IssueState::Closed
+        );
+        assert_eq!(
+            GhForge::parse_issue_state("closed").unwrap(),
+            IssueState::Closed
+        );
+    }
+
+    #[test]
+    fn unknown_state_is_an_error_not_open() {
+        // Unknown must surface as Err (reaper: StateUnknown), never as a
+        // silent Open that pins the worktree forever.
+        assert!(GhForge::parse_issue_state("DRAFT").is_err());
+        assert!(GhForge::parse_issue_state("").is_err());
     }
 }
