@@ -1,5 +1,7 @@
 # meguri（巡り）
 
+*日本語版は [README.ja.md](README.ja.md) をご覧ください。*
+
 **Run AI coding agents on a loop — inside your terminal multiplexer, so you can step in anytime.**
 
 meguri is a reimplementation of the ideas in [nexu-io/looper](https://github.com/nexu-io/looper) with one deliberate architectural difference: instead of headless one-shot agent runs (`claude --print …`), meguri runs each agent as a **live interactive session in a [herdr](https://herdr.dev) or tmux pane**. The orchestrator injects prompts and waits for results, while you can attach to the pane at any moment — watch, type extra instructions, answer permission dialogs, or take over completely — without breaking the loop.
