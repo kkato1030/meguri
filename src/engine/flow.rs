@@ -64,7 +64,12 @@ pub trait Flavor: Send + Sync {
     /// Loop-specific check of an already git-verified (clean, committed)
     /// worktree; the Err text is fed back to the agent as a corrective
     /// prompt.
-    fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String>;
+    fn verify_work(
+        &self,
+        run: &RunRecord,
+        cp: &Checkpoint,
+        worktree: &Path,
+    ) -> std::result::Result<(), String>;
 
     /// Base ref the execute step counts commits against. Default: the
     /// project's default branch (new-branch loops); the fixer counts against
@@ -118,6 +123,10 @@ pub struct Checkpoint {
     /// Existing PR head branch to attach to (fixer runs).
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// Base-branch tip pinned at claim time (conflict-resolver runs); the
+    /// merge target the agent must bring in and verify_work checks for.
+    #[serde(default)]
+    pub base_sha: Option<String>,
     /// Review threads the run set out to address (fixer runs); replied to
     /// after the push.
     #[serde(default)]
@@ -596,7 +605,7 @@ async fn execute(
                  - commits ahead of {base}: {ahead} (must be > 0)",
             ))
         } else {
-            flavor.verify_work(run, worktree).err()
+            flavor.verify_work(run, cp, worktree).err()
         };
         let Some(problem) = problem else {
             // Keep what the agent said for the PR body (persisted by the

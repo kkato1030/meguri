@@ -36,6 +36,17 @@ pub enum IssueState {
     Closed,
 }
 
+/// Whether a PR can merge into its base, as computed by the forge — the
+/// trigger for the conflict-resolver loop. `Unknown` is GitHub's transient
+/// "still computing" state; discovery treats it as not actionable and simply
+/// retries on the next poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeableState {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub number: i64,
@@ -132,6 +143,8 @@ pub trait Forge: Send + Sync {
         draft: bool,
     ) -> Result<CreatedPr>;
     async fn get_pr(&self, number: i64) -> Result<PullRequest>;
+    /// Whether the PR can merge into its base (conflict-resolver discovery).
+    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
     /// All review threads on a PR, resolved or not.

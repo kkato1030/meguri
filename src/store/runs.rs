@@ -255,6 +255,28 @@ impl Store {
         })
     }
 
+    /// Number of succeeded runs of a loop for one issue/PR — the conflict
+    /// resolver's resolve budget: a PR that keeps re-conflicting after this
+    /// many successful resolves stops being rediscovered instead of looping
+    /// forever. Skipped/failed runs don't consume the budget (benign races
+    /// and escalations have their own convergence).
+    pub fn succeeded_run_count(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            let count = c.query_row(
+                "SELECT COUNT(*) FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                   AND issue_number = ?3 AND status = 'succeeded'",
+                params![project_id, loop_kind, issue_number],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+    }
+
     /// Runs that own a worktree, matched by branch name or recorded path
     /// (newest first). Both keys are tried because the reaper resolves
     /// worktrees from `git worktree list`, whose paths may be canonicalized
@@ -513,6 +535,32 @@ mod tests {
         assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
+    }
+
+    #[test]
+    fn succeeded_run_count_counts_only_terminal_successes() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        // Terminal statuses only: an active run would trip the unique
+        // (project, loop, issue) index on the next create.
+        for status in [RunStatus::Skipped, RunStatus::Failed, RunStatus::Cancelled] {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store.update_run_status(&run.id, status, None).unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        for _ in 0..2 {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store
+                .update_run_status(&run.id, RunStatus::Succeeded, None)
+                .unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 2);
+        // Scoped by loop, project, and issue.
+        assert_eq!(store.succeeded_run_count("demo", "planner", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("other", "worker", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("demo", "worker", 10).unwrap(), 0);
     }
 
     #[test]
