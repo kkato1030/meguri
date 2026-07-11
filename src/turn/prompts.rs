@@ -14,6 +14,10 @@ pub enum TurnStatus {
     Success,
     Failure,
     NeedsHuman,
+    /// The agent found that a design decision must precede implementation
+    /// (issue #22). Only the worker's execute prompt invites this status;
+    /// everywhere else it escalates like `NeedsHuman`.
+    NeedsPlan,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +145,20 @@ mod tests {
 
         std::fs::write(result_path(dir.path()), "not json").unwrap();
         assert!(read_result(dir.path(), "t1").is_none());
+    }
+
+    #[test]
+    fn result_status_needs_plan_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"needs_plan","summary":"design first"}"#,
+        )
+        .unwrap();
+        let result = read_result(dir.path(), "t1").unwrap();
+        assert_eq!(result.status, TurnStatus::NeedsPlan);
+        assert_eq!(result.summary, "design first");
     }
 
     #[test]

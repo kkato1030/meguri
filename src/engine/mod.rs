@@ -46,6 +46,10 @@ pub enum WorkerOutcome {
     /// Benign race: the issue was held or de-labeled between discovery and
     /// claim (e.g. another run already shipped it). No escalation.
     Skipped(String),
+    /// The agent found a design decision must precede implementation; the
+    /// issue was handed to the planner (issue #22). A normal ending, not a
+    /// failure — the reason (agent's summary) is left as an issue comment.
+    NeedsPlan(String),
 }
 
 /// A schedulable loop: discovers actionable targets for a project and drives

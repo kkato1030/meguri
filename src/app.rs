@@ -87,6 +87,13 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
             println!("⏭️  skipped: {reason}");
             Ok(())
         }
+        WorkerOutcome::NeedsPlan(reason) => {
+            println!(
+                "📝 needs a plan first — issue handed to {}: {reason}",
+                crate::forge::LABEL_PLAN
+            );
+            Ok(())
+        }
     }
 }
 

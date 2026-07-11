@@ -16,6 +16,9 @@ pub enum RunStatus {
     /// The run turned out to have nothing to do (e.g. the issue was
     /// de-labeled between discovery and claim) — terminal, no escalation.
     Skipped,
+    /// The agent found a design decision must precede implementation and the
+    /// issue was routed to the planner (issue #22) — terminal, not a failure.
+    NeedsPlan,
 }
 
 impl RunStatus {
@@ -28,6 +31,7 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::NeedsPlan => "needs_plan",
         }
     }
 
@@ -40,6 +44,7 @@ impl RunStatus {
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
             "skipped" => Some(Self::Skipped),
+            "needs_plan" => Some(Self::NeedsPlan),
             _ => None,
         }
     }
@@ -306,7 +311,8 @@ impl Store {
                 RunStatus::Succeeded
                 | RunStatus::Failed
                 | RunStatus::Cancelled
-                | RunStatus::Skipped => (None, Some(now())),
+                | RunStatus::Skipped
+                | RunStatus::NeedsPlan => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(
