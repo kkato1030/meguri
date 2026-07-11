@@ -222,14 +222,14 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     bail!("unknown step {step:?}");
 }
 
-enum StepFlow {
+pub(crate) enum StepFlow {
     Continue,
     Stopped,
     Interrupted(String),
 }
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
-async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
+pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
     let Some(pane_id) = &run.mux_pane_id else {
         return;
     };
@@ -408,7 +408,7 @@ async fn ensure_pane(
 
 /// Run one prompt-turn: prepare files, deliver the trigger (spawn or
 /// send_line), then wait it out.
-async fn run_turn(
+pub(crate) async fn run_turn(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,

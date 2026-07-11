@@ -1,20 +1,23 @@
 //! In-memory Forge for tests: records every mutation for assertions.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::{CreatedPr, Forge, Issue};
+use super::{CreatedPr, Forge, Issue, PullRequest};
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
+    pub number: i64,
     pub head: String,
     pub base: String,
     pub title: String,
     pub body: String,
     pub draft: bool,
     pub labels: Vec<String>,
+    pub head_sha: String,
 }
 
 #[derive(Default)]
@@ -22,6 +25,8 @@ pub struct FakeForge {
     pub issues: Mutex<Vec<Issue>>,
     pub comments: Mutex<Vec<(i64, String)>>,
     pub prs: Mutex<Vec<RecordedPr>>,
+    pub pr_comments: Mutex<Vec<(i64, String)>>,
+    pub pr_diffs: Mutex<HashMap<i64, String>>,
 }
 
 impl FakeForge {
@@ -36,6 +41,42 @@ impl FakeForge {
         forge
     }
 
+    /// Seed a pull request as if it already existed on the forge (reviewer
+    /// tests; `create_pr` records worker/planner-created ones).
+    pub fn add_pr(
+        &self,
+        number: i64,
+        title: &str,
+        body: &str,
+        labels: &[&str],
+        head_branch: &str,
+        head_sha: &str,
+    ) {
+        self.prs.lock().unwrap().push(RecordedPr {
+            number,
+            head: head_branch.into(),
+            base: "main".into(),
+            title: title.into(),
+            body: body.into(),
+            draft: false,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            head_sha: head_sha.into(),
+        });
+    }
+
+    pub fn set_pr_diff(&self, number: i64, diff: &str) {
+        self.pr_diffs.lock().unwrap().insert(number, diff.into());
+    }
+
+    /// Simulate a new push to the PR branch (head moves, review marker for
+    /// the old head no longer matches).
+    pub fn set_pr_head(&self, number: i64, head_sha: &str) {
+        let mut prs = self.prs.lock().unwrap();
+        if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
+            pr.head_sha = head_sha.into();
+        }
+    }
+
     pub fn labels_of(&self, number: i64) -> Vec<String> {
         self.issues
             .lock()
@@ -43,6 +84,16 @@ impl FakeForge {
             .iter()
             .find(|i| i.number == number)
             .map(|i| i.labels.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn pr_labels_of(&self, number: i64) -> Vec<String> {
+        self.prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == number)
+            .map(|p| p.labels.clone())
             .unwrap_or_default()
     }
 
@@ -58,6 +109,28 @@ impl FakeForge {
             .filter(|(n, _)| *n == number)
             .map(|(_, c)| c.clone())
             .collect()
+    }
+
+    pub fn pr_comments_of(&self, number: i64) -> Vec<String> {
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    fn pr_to_public(pr: &RecordedPr) -> PullRequest {
+        PullRequest {
+            number: pr.number,
+            title: pr.title.clone(),
+            body: pr.body.clone(),
+            labels: pr.labels.clone(),
+            head_branch: pr.head.clone(),
+            head_sha: pr.head_sha.clone(),
+            url: format!("https://fake.example/pr/{}", pr.number),
+        }
     }
 }
 
@@ -106,17 +179,61 @@ impl Forge for FakeForge {
 
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
         let mut prs = self.prs.lock().unwrap();
-        // PR numbers are 1-based indices into the recorded list.
-        let Some(rec) = usize::try_from(pr)
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|i| prs.get_mut(i))
-        else {
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
             bail!("PR #{pr} not found");
         };
         if !rec.labels.iter().any(|l| l == label) {
             rec.labels.push(label.to_string());
         }
+        Ok(())
+    }
+
+    async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.labels.retain(|l| l != label);
+        Ok(())
+    }
+
+    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
+        self.prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == number)
+            .map(Self::pr_to_public)
+            .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
+    }
+
+    async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
+        Ok(self
+            .prs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.labels.iter().any(|l| l == label))
+            .map(Self::pr_to_public)
+            .collect())
+    }
+
+    async fn pr_diff(&self, number: i64) -> Result<String> {
+        Ok(self
+            .pr_diffs
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn pr_comments(&self, number: i64) -> Result<Vec<String>> {
+        Ok(self.pr_comments_of(number))
+    }
+
+    async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
+        self.pr_comments.lock().unwrap().push((pr, body.into()));
         Ok(())
     }
 
@@ -134,17 +251,20 @@ impl Forge for FakeForge {
         draft: bool,
     ) -> Result<CreatedPr> {
         let mut prs = self.prs.lock().unwrap();
+        let number = prs.len() as i64 + 1;
         prs.push(RecordedPr {
+            number,
             head: head.into(),
             base: base.into(),
             title: title.into(),
             body: body.into(),
             draft,
             labels: Vec::new(),
+            head_sha: String::new(),
         });
         Ok(CreatedPr {
-            number: prs.len() as i64,
-            url: format!("https://fake.example/pr/{}", prs.len()),
+            number,
+            url: format!("https://fake.example/pr/{number}"),
         })
     }
 }

@@ -3,8 +3,8 @@
 //! `meguri:spec-reviewing`. Spec-first is opt-in; `meguri:ready` issues keep
 //! going straight to the worker.
 //!
-//! The spec PR and the implementation PR are the same PR: after human review
-//! flips the PR to `meguri:spec-ready`, the worker takes over the branch and
+//! The spec PR and the implementation PR are the same PR: after review (the
+//! reviewer loop, or a human) flips the PR to `meguri:spec-ready`, the worker takes over the branch and
 //! stacks implementation commits on it (issue #21). Branch naming, run
 //! bookkeeping, and escalation therefore follow the worker conventions
 //! exactly — only the trigger label, prompt, spec-file verification, and PR
