@@ -53,6 +53,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             repo_path: clone,
             repo_slug: "me/proj".into(),
             default_branch: "main".into(),
+            language: None,
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
             pr: None,

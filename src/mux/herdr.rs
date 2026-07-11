@@ -1,31 +1,80 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use super::{
     AgentState, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId, PaneSpec,
+    herdr_socket::{self, EventStream},
 };
 
 /// Delay between typing text and pressing Enter (paste-detection quirks).
 const ENTER_DELAY: Duration = Duration::from_millis(300);
 
-/// herdr-backed multiplexer, driven through the `herdr` CLI (a thin wrapper
-/// over its local socket API).
+/// A watcher this quiet re-reads `pane.get`, bounding cache staleness when
+/// events are dropped or missed.
+const REVALIDATE_EVERY: Duration = Duration::from_secs(15);
+
+/// Poll cadence for `wait_state`'s last resort, when both the event socket
+/// and `herdr wait` are unusable (herdr down or restarting).
+const FALLBACK_POLL: Duration = Duration::from_secs(2);
+
+/// What the status cache knows about a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneStatus {
+    Alive(AgentState),
+    /// The pane no longer exists.
+    Dead,
+}
+
+/// A live per-pane status subscription: the receiver serves cached reads,
+/// the task feeds it from `events.subscribe`.
+struct PaneWatch {
+    rx: watch::Receiver<PaneStatus>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PaneWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// herdr-backed multiplexer, driven through the local socket API where
+/// possible (no subprocess per call) with the `herdr` CLI as fallback.
 ///
 /// Layout: one workspace labeled with the configured session name, one tab
 /// per run. The agent is launched *inside the tab's shell* (`pane run`), so
 /// the pane and its final screen survive agent exit.
+///
+/// Agent state is served from a per-pane cache fed by a
+/// `pane.agent_status_changed` subscription, so the turn engine's poll loop
+/// costs no subprocess spawns and `wait_state` reacts within milliseconds of
+/// a transition instead of a poll interval.
 pub struct HerdrMux {
     /// Workspace label that groups all meguri panes.
     session: String,
+    /// Unix socket for direct requests and event subscriptions.
+    socket: PathBuf,
+    /// Event-fed status watchers, keyed by pane id.
+    watchers: tokio::sync::Mutex<HashMap<String, PaneWatch>>,
 }
 
 impl HerdrMux {
     pub fn new(session: &str) -> Self {
+        Self::with_socket(session, Self::socket_path())
+    }
+
+    /// Like [`new`](Self::new) but against an explicit socket path
+    /// (tests point this at a dead path to exercise fallbacks).
+    pub fn with_socket(session: &str, socket: PathBuf) -> Self {
         Self {
             session: session.to_string(),
+            socket,
+            watchers: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -137,6 +186,206 @@ impl HerdrMux {
                 detail: format!("workspace create returned no id: {result}"),
             })
     }
+
+    /// Get or create the event-fed status watcher for `pane`.
+    ///
+    /// An error means the socket is unusable for subscriptions (herdr down,
+    /// or too old for `events.subscribe`) — callers fall back to the CLI.
+    async fn watch(&self, pane: &PaneId) -> MuxResult<watch::Receiver<PaneStatus>> {
+        let mut watchers = self.watchers.lock().await;
+        if let Some(w) = watchers.get(&pane.0) {
+            if !w.task.is_finished() {
+                return Ok(w.rx.clone());
+            }
+            watchers.remove(&pane.0);
+        }
+        // Subscribe before seeding so no transition slips between the two.
+        let stream = herdr_socket::subscribe_pane_events(&self.socket, &pane.0).await?;
+        let seed = socket_pane_status(&self.socket, &pane.0).await?;
+        let (tx, rx) = watch::channel(seed);
+        if seed == PaneStatus::Dead {
+            // Don't cache dead panes: ids may be reused after a herdr restart.
+            return Ok(rx);
+        }
+        let task = tokio::spawn(watch_pane(stream, tx, self.socket.clone(), pane.0.clone()));
+        watchers.insert(
+            pane.0.clone(),
+            PaneWatch {
+                rx: rx.clone(),
+                task,
+            },
+        );
+        Ok(rx)
+    }
+
+    async fn drop_watcher(&self, pane: &PaneId) {
+        self.watchers.lock().await.remove(&pane.0);
+    }
+
+    /// Race one `herdr wait agent-status` process per target; first match
+    /// wins. `Ok(None)` is a clean herdr-reported timeout; `Err` means herdr
+    /// was unusable and the caller should degrade to polling.
+    async fn cli_wait(
+        &self,
+        pane: &PaneId,
+        targets: &[AgentState],
+        remaining: Duration,
+    ) -> MuxResult<Option<AgentState>> {
+        let timeout_ms = remaining.as_millis().to_string();
+        let mut children = tokio::task::JoinSet::new();
+        for &target in targets {
+            let pane = pane.0.clone();
+            let status = agent_status_arg(target).to_string();
+            let timeout_ms = timeout_ms.clone();
+            children.spawn(async move {
+                let out = tokio::process::Command::new("herdr")
+                    .args([
+                        "wait",
+                        "agent-status",
+                        &pane,
+                        "--status",
+                        &status,
+                        "--timeout",
+                        &timeout_ms,
+                    ])
+                    .kill_on_drop(true)
+                    .output()
+                    .await;
+                (target, out)
+            });
+        }
+        let mut timed_out = false;
+        let mut first_err: Option<MuxError> = None;
+        while let Some(joined) = children.join_next().await {
+            let Ok((target, out)) = joined else { continue };
+            match out {
+                // Dropping the set kills the still-waiting siblings.
+                Ok(out) if out.status.success() => return Ok(Some(target)),
+                Ok(out) => {
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    if text.contains("timed out") {
+                        timed_out = true;
+                    } else {
+                        first_err.get_or_insert(MuxError::CommandFailed {
+                            kind: "herdr",
+                            detail: extract_error(text.trim())
+                                .unwrap_or_else(|| format!("herdr wait: {}", text.trim())),
+                        });
+                    }
+                }
+                Err(e) => {
+                    first_err.get_or_insert(MuxError::Io(e));
+                }
+            }
+        }
+        match (first_err, timed_out) {
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(None),
+            (None, false) => Err(MuxError::Other("herdr wait returned no verdict".into())),
+        }
+    }
+}
+
+/// Current pane status via a one-shot socket `pane.get`.
+async fn socket_pane_status(socket: &Path, pane_id: &str) -> MuxResult<PaneStatus> {
+    match herdr_socket::request(socket, "pane.get", json!({ "pane_id": pane_id })).await {
+        Ok(result) => {
+            let status = result
+                .pointer("/pane/agent_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            Ok(PaneStatus::Alive(map_agent_status(status)))
+        }
+        Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
+            Ok(PaneStatus::Dead)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Feed `tx` from the pane's event stream. Exits — dropping `tx`, which
+/// invalidates the cache entry — when the stream dies, the socket stops
+/// answering, or the pane is confirmed gone.
+async fn watch_pane(
+    mut stream: EventStream,
+    tx: watch::Sender<PaneStatus>,
+    socket: PathBuf,
+    pane_id: String,
+) {
+    let publish = |status: PaneStatus| {
+        tx.send_if_modified(|current| {
+            let changed = *current != status;
+            *current = status;
+            changed
+        });
+    };
+    loop {
+        match tokio::time::timeout(REVALIDATE_EVERY, stream.next_event()).await {
+            // Quiet for a while: revalidate against pane.get.
+            Err(_) => match socket_pane_status(&socket, &pane_id).await {
+                Ok(PaneStatus::Dead) => {
+                    publish(PaneStatus::Dead);
+                    return;
+                }
+                Ok(status) => publish(status),
+                Err(_) => return,
+            },
+            Ok(Ok(Some((event, data)))) => {
+                // herdr does not reliably filter lifecycle events by pane.
+                if data.get("pane_id").and_then(Value::as_str) != Some(pane_id.as_str()) {
+                    continue;
+                }
+                match event.as_str() {
+                    "pane.agent_status_changed" => {
+                        let status = data
+                            .get("agent_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        publish(PaneStatus::Alive(map_agent_status(status)));
+                    }
+                    // Close/exit events can be stale replays from subscribe
+                    // time — verify before declaring the pane dead.
+                    "pane.closed" | "pane_closed" | "pane.exited" | "pane_exited" => {
+                        match socket_pane_status(&socket, &pane_id).await {
+                            Ok(PaneStatus::Dead) => {
+                                publish(PaneStatus::Dead);
+                                return;
+                            }
+                            Ok(status) => publish(status),
+                            Err(_) => return,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => return,
+        }
+    }
+}
+
+fn map_agent_status(status: &str) -> AgentState {
+    match status {
+        "working" => AgentState::Working,
+        "idle" => AgentState::Idle,
+        "blocked" => AgentState::Blocked,
+        "done" => AgentState::Done,
+        _ => AgentState::Unknown,
+    }
+}
+
+/// The `--status` argument `herdr wait agent-status` expects.
+fn agent_status_arg(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "working",
+        AgentState::Idle => "idle",
+        AgentState::Blocked => "blocked",
+        AgentState::Done => "done",
+        AgentState::Unknown => "unknown",
+    }
 }
 
 fn extract_error(stdout: &str) -> Option<String> {
@@ -215,10 +464,16 @@ impl Multiplexer for HerdrMux {
         let command_line = shell_join(&spec.command);
         self.herdr_ok(&["pane", "run", &pane_id, &command_line])
             .await?;
-        Ok(PaneId(pane_id))
+        let pane = PaneId(pane_id);
+        // Defensive: a reused pane id must not inherit a stale watcher.
+        self.drop_watcher(&pane).await;
+        Ok(pane)
     }
 
     async fn pane_alive(&self, pane: &PaneId) -> MuxResult<bool> {
+        if let Ok(rx) = self.watch(pane).await {
+            return Ok(!matches!(*rx.borrow(), PaneStatus::Dead));
+        }
         match self.herdr_json(&["pane", "get", &pane.0]).await {
             Ok(_) => Ok(true),
             Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
@@ -237,19 +492,41 @@ impl Multiplexer for HerdrMux {
     }
 
     async fn read_tail(&self, pane: &PaneId, lines: usize) -> MuxResult<Vec<String>> {
-        let lines_arg = lines.to_string();
-        // `pane read` emits plain text (not ndjson).
-        let raw = self
-            .herdr_raw(&[
-                "pane", "read", &pane.0, "--source", "visible", "--lines", &lines_arg,
-            ])
-            .await?;
+        let raw = match herdr_socket::request(
+            &self.socket,
+            "pane.read",
+            json!({ "pane_id": pane.0, "source": "visible", "lines": lines }),
+        )
+        .await
+        {
+            Ok(result) => result
+                .pointer("/read/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // Socket transport unusable → CLI (`pane read` emits plain text).
+            Err(MuxError::Io(_)) => {
+                let lines_arg = lines.to_string();
+                self.herdr_raw(&[
+                    "pane", "read", &pane.0, "--source", "visible", "--lines", &lines_arg,
+                ])
+                .await?
+            }
+            Err(e) => return Err(e),
+        };
         let all: Vec<String> = raw.lines().map(str::to_string).collect();
         let skip = all.len().saturating_sub(lines);
         Ok(all[skip..].to_vec())
     }
 
     async fn agent_state(&self, pane: &PaneId) -> MuxResult<AgentState> {
+        // Served from the event-fed cache: no subprocess, no round trip.
+        if let Ok(rx) = self.watch(pane).await {
+            return Ok(match *rx.borrow() {
+                PaneStatus::Dead => AgentState::Unknown,
+                PaneStatus::Alive(state) => state,
+            });
+        }
         let result = match self.herdr_json(&["pane", "get", &pane.0]).await {
             Ok(r) => r,
             Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
@@ -261,16 +538,64 @@ impl Multiplexer for HerdrMux {
             .pointer("/pane/agent_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        Ok(match status {
-            "working" => AgentState::Working,
-            "idle" => AgentState::Idle,
-            "blocked" => AgentState::Blocked,
-            "done" => AgentState::Done,
-            _ => AgentState::Unknown,
-        })
+        Ok(map_agent_status(status))
+    }
+
+    /// Native wait: the event subscription reacts within milliseconds of a
+    /// transition; `herdr wait agent-status` (one racing process per target)
+    /// covers a missing subscription; tolerant polling covers a dead herdr —
+    /// which degrades to `WaitTimeout`, never an instant error.
+    async fn wait_state(
+        &self,
+        pane: &PaneId,
+        targets: &[AgentState],
+        timeout: Duration,
+    ) -> MuxResult<AgentState> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        if let Ok(mut rx) = self.watch(pane).await {
+            loop {
+                let state = match *rx.borrow_and_update() {
+                    PaneStatus::Dead => AgentState::Unknown,
+                    PaneStatus::Alive(state) => state,
+                };
+                if targets.contains(&state) {
+                    return Ok(state);
+                }
+                match tokio::time::timeout_at(deadline, rx.changed()).await {
+                    Err(_) => return Err(MuxError::WaitTimeout(timeout)),
+                    Ok(Ok(())) => {}
+                    // Watcher died mid-wait: degrade to the CLI ladder.
+                    Ok(Err(_)) => break,
+                }
+            }
+        }
+
+        loop {
+            let now = tokio::time::Instant::now();
+            let remaining = match deadline.checked_duration_since(now) {
+                Some(d) if !d.is_zero() => d,
+                _ => return Err(MuxError::WaitTimeout(timeout)),
+            };
+            match self.cli_wait(pane, targets, remaining).await {
+                Ok(Some(state)) => return Ok(state),
+                Ok(None) => return Err(MuxError::WaitTimeout(timeout)),
+                Err(_) => {
+                    // herdr unreachable: keep checking gently until the
+                    // deadline in case it comes back.
+                    tokio::time::sleep(FALLBACK_POLL.min(remaining)).await;
+                    if let Ok(state) = self.agent_state(pane).await
+                        && targets.contains(&state)
+                    {
+                        return Ok(state);
+                    }
+                }
+            }
+        }
     }
 
     async fn kill_pane(&self, pane: &PaneId) -> MuxResult<()> {
+        self.drop_watcher(pane).await;
         self.herdr_ok(&["pane", "close", &pane.0]).await?;
         Ok(())
     }
@@ -297,6 +622,20 @@ mod tests {
             shell_join(&argv),
             "claude --permission-mode acceptEdits 'Read the file '\\''.meguri/prompt.md'\\'' and go'"
         );
+    }
+
+    #[test]
+    fn agent_status_round_trips_through_wait_args() {
+        for state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Blocked,
+            AgentState::Done,
+            AgentState::Unknown,
+        ] {
+            assert_eq!(map_agent_status(agent_status_arg(state)), state);
+        }
+        assert_eq!(map_agent_status("something-new"), AgentState::Unknown);
     }
 
     #[test]
