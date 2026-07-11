@@ -26,6 +26,10 @@ pub struct TurnResultFile {
     /// body when present; `summary` is the fallback.
     #[serde(default)]
     pub pr_body: Option<String>,
+    /// The agent CLI's own session id (e.g. a Claude Code session UUID),
+    /// letting recovery `--resume` the conversation after the pane dies.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 pub fn meguri_dir(worktree: &Path) -> PathBuf {
@@ -63,6 +67,10 @@ When you have FULLY completed the task above, write a JSON file at
 - `pr_body` (on success): a Markdown pull-request description of what you
   actually changed. If the prompt includes a PR template, fill in each of its
   sections; escape newlines as \n inside the JSON string.
+- `agent_session_id` (optional): if you know your own CLI session id (e.g.
+  your Claude Code session UUID), include it so this conversation can be
+  resumed if the terminal dies. Omit the field entirely if you are not sure —
+  never invent one.
 - WRITE THE FILE; do not merely print the JSON to the terminal.
 - Do not commit or stage anything under `{MEGURI_DIR}/`.
 - If you are unsure whether you are done, prefer "needs_human" over guessing."#
@@ -125,6 +133,7 @@ mod tests {
         assert!(content.contains(r#""turn_id": "abc-123""#));
         assert!(content.contains("needs_human"));
         assert!(content.contains("pr_body"));
+        assert!(content.contains("agent_session_id"));
     }
 
     #[test]
@@ -162,6 +171,34 @@ mod tests {
         assert_eq!(
             read_result(dir.path(), "t1").unwrap().pr_body.as_deref(),
             Some("## Summary\nDid it.")
+        );
+    }
+
+    #[test]
+    fn result_agent_session_id_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1").unwrap().agent_session_id,
+            None
+        );
+
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done","agent_session_id":"sess-42"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1")
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("sess-42")
         );
     }
 

@@ -14,10 +14,17 @@
 #   "work:1,block,result:success"    work, ask a question, then (after human
 #                                     answers) write the result
 # The turn id is read from the prompt file line `turn_id: <uuid>`.
+#
+# Session resume (mirrors real agent CLIs like `claude --resume <id>`):
+#   FAKE_AGENT_SESSION_ID (env)   session id reported in result.json as
+#                                 `agent_session_id`
+#   --resume <id> (argv)          "resume" that session: announce it and
+#                                 report <id> back (unless the env overrides)
 
 set -u
 MEGURI_DIR=".meguri"
 CURRENT_TURN=""
+SESSION_ID="${FAKE_AGENT_SESSION_ID:-}"
 
 banner() {
   echo "┌──────────────────────────────┐"
@@ -28,8 +35,13 @@ banner() {
 write_result() {
   local status="$1"
   mkdir -p "$MEGURI_DIR"
-  printf '{"turn_id":"%s","status":"%s","summary":"fake agent finished with %s"}\n' \
-    "$CURRENT_TURN" "$status" "$status" > "$MEGURI_DIR/result.json"
+  if [[ -n "$SESSION_ID" ]]; then
+    printf '{"turn_id":"%s","status":"%s","summary":"fake agent finished with %s","agent_session_id":"%s"}\n' \
+      "$CURRENT_TURN" "$status" "$status" "$SESSION_ID" > "$MEGURI_DIR/result.json"
+  else
+    printf '{"turn_id":"%s","status":"%s","summary":"fake agent finished with %s"}\n' \
+      "$CURRENT_TURN" "$status" "$status" > "$MEGURI_DIR/result.json"
+  fi
   echo "[fake-agent] wrote result.json (status=$status, turn=$CURRENT_TURN)"
 }
 
@@ -77,6 +89,15 @@ handle_do() {
 }
 
 banner
+# Real agent CLIs resume a previous session with `--resume <id>`; the id
+# is reported back so the orchestrator keeps a valid handle.
+if [[ $# -ge 2 && "$1" == "--resume" ]]; then
+  echo "[fake-agent] resuming session $2"
+  if [[ -z "$SESSION_ID" ]]; then
+    SESSION_ID="$2"
+  fi
+  shift 2
+fi
 # Real agent CLIs accept an initial prompt as an argument (turn 1 spawns the
 # pane with the trigger line as argv); emulate that here.
 if [[ $# -gt 0 ]]; then

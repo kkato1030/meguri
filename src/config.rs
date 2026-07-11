@@ -138,6 +138,11 @@ pub struct AgentConfig {
     /// "acceptEdits"]` and answer dialogs by attaching to the pane.
     #[serde(default = "default_agent_args")]
     pub args: Vec<String>,
+    /// Args that resume a previous native session; the session id follows
+    /// them (`{command} {args} {resume_args} <session-id> <trigger>`).
+    /// Defaults to Claude Code's `--resume`.
+    #[serde(default = "default_agent_resume_args")]
+    pub resume_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -148,6 +153,7 @@ impl Default for AgentConfig {
         Self {
             command: default_agent_command(),
             args: default_agent_args(),
+            resume_args: default_agent_resume_args(),
             herdr_agent_hint: None,
         }
     }
@@ -160,6 +166,10 @@ fn default_agent_command() -> String {
 fn default_agent_args() -> Vec<String> {
     // Yolo by default; see AgentConfig::args for the rationale and opt-out.
     vec!["--dangerously-skip-permissions".into()]
+}
+
+fn default_agent_resume_args() -> Vec<String> {
+    vec!["--resume".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +379,18 @@ args = ["--permission-mode", "acceptEdits"]
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.agent.args, vec!["--permission-mode", "acceptEdits"]);
+        // resume_args keeps its Claude Code default unless overridden.
+        assert_eq!(cfg.agent.resume_args, vec!["--resume"]);
+    }
+
+    #[test]
+    fn agent_resume_args_can_be_overridden() {
+        let raw = r#"
+[agent]
+resume_args = ["resume", "--session"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.agent.resume_args, vec!["resume", "--session"]);
     }
 
     #[test]

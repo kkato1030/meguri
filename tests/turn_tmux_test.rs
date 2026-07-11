@@ -119,6 +119,114 @@ async fn full_turn_happy_path_in_tmux() {
 }
 
 #[tokio::test]
+async fn fake_agent_reports_session_id_through_result_contract() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let session = format!("meguri-turnsess-{}", std::process::id());
+    let mux = Arc::new(TmuxMux::new(&session));
+    let dir = tempfile::tempdir().unwrap();
+    let control = RecordingControl::new();
+
+    let prepared = prepare_turn(dir.path(), "Implement the feature.").unwrap();
+
+    let pane = mux
+        .spawn_pane(&PaneSpec {
+            title: "worker".into(),
+            cwd: dir.path().to_path_buf(),
+            command: vec![
+                "bash".into(),
+                fake_agent_path().to_string_lossy().to_string(),
+                prepared.trigger_line.clone(),
+            ],
+            env: vec![
+                ("FAKE_AGENT_SCRIPT".into(), "work:1,result:success".into()),
+                ("FAKE_AGENT_SESSION_ID".into(), "sess-tmux-1".into()),
+            ],
+        })
+        .await
+        .expect("spawn pane");
+
+    let engine = TurnEngine {
+        mux: mux.clone(),
+        cfg: fast_cfg(),
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+    )
+    .await
+    .expect("turn timed out")
+    .unwrap();
+
+    match outcome {
+        TurnOutcome::Completed(r) => {
+            assert_eq!(r.status, TurnStatus::Success);
+            assert_eq!(r.agent_session_id.as_deref(), Some("sess-tmux-1"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    mux.kill_pane(&pane).await.ok();
+    cleanup(&session).await;
+}
+
+#[tokio::test]
+async fn fake_agent_resumed_with_session_argv_reports_it_back() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let session = format!("meguri-turnres-{}", std::process::id());
+    let mux = Arc::new(TmuxMux::new(&session));
+    let dir = tempfile::tempdir().unwrap();
+    let control = RecordingControl::new();
+
+    let prepared = prepare_turn(dir.path(), "Pick up where you left off.").unwrap();
+
+    // The recovery spawn shape: `<agent> --resume <id> <trigger>`.
+    let pane = mux
+        .spawn_pane(&PaneSpec {
+            title: "worker".into(),
+            cwd: dir.path().to_path_buf(),
+            command: vec![
+                "bash".into(),
+                fake_agent_path().to_string_lossy().to_string(),
+                "--resume".into(),
+                "sess-resumed-9".into(),
+                prepared.trigger_line.clone(),
+            ],
+            env: vec![("FAKE_AGENT_SCRIPT".into(), "work:1,result:success".into())],
+        })
+        .await
+        .expect("spawn pane");
+
+    let engine = TurnEngine {
+        mux: mux.clone(),
+        cfg: fast_cfg(),
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+    )
+    .await
+    .expect("turn timed out")
+    .unwrap();
+
+    match outcome {
+        TurnOutcome::Completed(r) => {
+            assert_eq!(r.status, TurnStatus::Success);
+            assert_eq!(r.agent_session_id.as_deref(), Some("sess-resumed-9"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    mux.kill_pane(&pane).await.ok();
+    cleanup(&session).await;
+}
+
+#[tokio::test]
 async fn blocked_turn_waits_for_human_answer_in_tmux() {
     if !tmux_available() {
         eprintln!("skipping: tmux not available");
