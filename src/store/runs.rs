@@ -13,6 +13,9 @@ pub enum RunStatus {
     Succeeded,
     Failed,
     Cancelled,
+    /// The run turned out to have nothing to do (e.g. the issue was
+    /// de-labeled between discovery and claim) — terminal, no escalation.
+    Skipped,
 }
 
 impl RunStatus {
@@ -24,6 +27,7 @@ impl RunStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -35,6 +39,7 @@ impl RunStatus {
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -216,6 +221,21 @@ impl Store {
         })
     }
 
+    /// Whether the issue has already been shipped by a succeeded run — used
+    /// by watch discovery to avoid re-filing (and duplicate PRs) after the
+    /// success de-labeled the issue. `meguri run --issue N` bypasses this.
+    pub fn issue_has_succeeded_run(&self, project_id: &str, issue_number: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let exists = c
+                .prepare(
+                    "SELECT 1 FROM runs WHERE project_id = ?1 AND issue_number = ?2
+                       AND status = 'succeeded' LIMIT 1",
+                )?
+                .exists(params![project_id, issue_number])?;
+            Ok(exists)
+        })
+    }
+
     pub fn list_runs(&self, active_only: bool) -> Result<Vec<RunRecord>> {
         self.with_conn(|c| {
             let sql = if active_only {
@@ -241,9 +261,10 @@ impl Store {
         self.with_conn(|c| {
             let (started, finished) = match status {
                 RunStatus::Running => (Some(now()), None),
-                RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled => {
-                    (None, Some(now()))
-                }
+                RunStatus::Succeeded
+                | RunStatus::Failed
+                | RunStatus::Cancelled
+                | RunStatus::Skipped => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(
@@ -408,6 +429,26 @@ mod tests {
         assert_eq!(store.find_run(prefix).unwrap().unwrap().id, run.id);
         assert_eq!(store.find_run("42").unwrap().unwrap().id, run.id);
         assert!(store.find_run("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn issue_has_succeeded_run_tracks_terminal_success() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 9, "t").unwrap();
+        assert!(!store.issue_has_succeeded_run("demo", 9).unwrap());
+
+        store
+            .update_run_status(&run.id, RunStatus::Skipped, None)
+            .unwrap();
+        assert!(!store.issue_has_succeeded_run("demo", 9).unwrap());
+
+        let run2 = store.create_run("demo", 9, "t").unwrap();
+        store
+            .update_run_status(&run2.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert!(store.issue_has_succeeded_run("demo", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("other", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("demo", 10).unwrap());
     }
 
     #[test]

@@ -192,6 +192,43 @@ async fn watch_skips_working_and_hold_issues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn watch_does_not_refile_issue_with_succeeded_run() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        15,
+        "Already shipped",
+        "A PR exists; the ready label lingered.",
+        &[LABEL_READY],
+    ));
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    // A previous run already shipped this issue.
+    let done = store.create_run("proj", 15, "Already shipped").unwrap();
+    store
+        .update_run_status(&done.id, RunStatus::Succeeded, None)
+        .unwrap();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    watch.abort();
+
+    let runs = store.list_runs(false).unwrap();
+    assert_eq!(
+        runs.len(),
+        1,
+        "discovery must not re-file a shipped issue: {runs:?}"
+    );
+    assert_eq!(runs[0].id, done.id);
+    assert!(forge.prs().is_empty(), "no duplicate PR may be opened");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn recovery_resumes_interrupted_run_to_success() {
     let root = tempfile::tempdir().unwrap();
     let forge = Arc::new(FakeForge::with_issue(

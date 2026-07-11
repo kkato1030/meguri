@@ -42,9 +42,14 @@ pub struct NeedsHuman(pub String);
 /// Terminal outcomes of driving one run.
 #[derive(Debug)]
 pub enum WorkerOutcome {
-    Succeeded { pr_url: String },
+    Succeeded {
+        pr_url: String,
+    },
     Stopped,
     Interrupted(String),
+    /// Benign race: the issue was held or de-labeled between discovery and
+    /// claim (e.g. another run already shipped it). No escalation.
+    Skipped(String),
 }
 
 pub async fn run_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -82,6 +87,12 @@ pub async fn run_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                         json!({ "reason": reason }),
                     )?;
                 }
+                WorkerOutcome::Skipped(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::Skipped, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -103,7 +114,10 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
     let mut step = run.step.clone();
 
     if step == STEP_PREPARE_WORK {
-        let issue = prepare_work(deps, run).await?;
+        let issue = match prepare_work(deps, run).await? {
+            PreparedWork::Claimed(issue) => issue,
+            PreparedWork::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
+        };
         checkpoint.issue_title = issue.title;
         checkpoint.issue_body = issue.body;
         step = save_step(deps, run, STEP_PREPARE_WORKTREE, &checkpoint)?;
@@ -212,19 +226,32 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &WorkerCheckpoint) ->
     Ok(step.to_string())
 }
 
+/// What prepare-work decided: the issue was claimed, or the run should end
+/// quietly because the issue is no longer actionable.
+enum PreparedWork {
+    Claimed(Issue),
+    Skip(String),
+}
+
 /// prepare-work: re-verify labels on the forge, then claim with
-/// `meguri:working` (the durable claim marker).
-async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Issue> {
+/// `meguri:working` (the durable claim marker). A hold or missing ready
+/// label here is a benign race (the issue changed between discovery and
+/// claim, e.g. another run just shipped it) — skip, don't escalate.
+async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<PreparedWork> {
     let issue = deps.forge.get_issue(run.issue_number).await?;
     if issue.has_label(forge::LABEL_HOLD) {
-        bail!("issue #{} is on hold ({})", issue.number, forge::LABEL_HOLD);
+        return Ok(PreparedWork::Skip(format!(
+            "issue #{} is on hold ({})",
+            issue.number,
+            forge::LABEL_HOLD
+        )));
     }
     if !issue.has_label(forge::LABEL_READY) {
-        bail!(
+        return Ok(PreparedWork::Skip(format!(
             "issue #{} is not labeled {} (removed since discovery?)",
             issue.number,
             forge::LABEL_READY
-        );
+        )));
     }
     deps.forge
         .add_label(issue.number, forge::LABEL_WORKING)
@@ -234,7 +261,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Issue> {
         "issue.claimed",
         json!({ "issue": issue.number }),
     )?;
-    Ok(issue)
+    Ok(PreparedWork::Claimed(issue))
 }
 
 async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &WorkerCheckpoint) -> Result<()> {
