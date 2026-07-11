@@ -19,6 +19,15 @@ pub enum Command {
     Doctor,
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
+    /// Serve the read-only web dashboard on localhost
+    Serve {
+        /// Listen port (default: config `[server].port`, 8607)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Bind address (default: config `[server].bind`, 127.0.0.1)
+        #[arg(long)]
+        bind: Option<String>,
+    },
     /// Run the worker loop once for a single issue
     Run {
         /// Project id from config.toml (defaults to the sole configured project)

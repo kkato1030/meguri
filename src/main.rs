@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
         Command::Init => cmd_init(),
         Command::Doctor => cmd_doctor(),
         Command::Watch => app::cmd_watch().await,
+        Command::Serve { port, bind } => app::cmd_serve(port, bind.as_deref()).await,
         Command::Run {
             project,
             issue,

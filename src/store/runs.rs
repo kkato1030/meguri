@@ -82,7 +82,8 @@ impl InteractionState {
 /// Control channel written by CLI commands, honored by the orchestrator.
 /// This is a *target* the orchestrator converges to; clearing it (NULL)
 /// means "run normally" — so `resume` and `handback` just clear it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DesiredState {
     Paused,
     Stopped,
@@ -108,7 +109,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
     pub id: String,
     pub project_id: String,
@@ -128,6 +129,8 @@ pub struct RunRecord {
     pub turn_no: i64,
     pub current_turn_id: Option<String>,
     pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub created_at: String,
 }
 
@@ -154,8 +157,24 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         turn_no: row.get("turn_no")?,
         current_turn_id: row.get("current_turn_id")?,
         error: row.get("error")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
     })
+}
+
+/// One agent turn as recorded in the `turns` table (read path for the UI).
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRecord {
+    pub id: String,
+    pub run_id: String,
+    pub turn_no: i64,
+    pub purpose: String,
+    pub prompt_path: Option<String>,
+    pub result_json: Option<String>,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
 }
 
 impl Store {
@@ -400,6 +419,32 @@ impl Store {
             Ok(())
         })
     }
+
+    pub fn list_turns(&self, run_id: &str) -> Result<Vec<TurnRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, run_id, turn_no, purpose, prompt_path, result_json,
+                        outcome, started_at, finished_at
+                 FROM turns WHERE run_id = ?1 ORDER BY turn_no ASC",
+            )?;
+            let turns = stmt
+                .query_map([run_id], |row| {
+                    Ok(TurnRecord {
+                        id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        turn_no: row.get(2)?,
+                        purpose: row.get(3)?,
+                        prompt_path: row.get(4)?,
+                        result_json: row.get(5)?,
+                        outcome: row.get(6)?,
+                        started_at: row.get(7)?,
+                        finished_at: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(turns)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -518,5 +563,52 @@ mod tests {
         let got = store.get_run(&run.id).unwrap().unwrap();
         assert_eq!(got.turn_no, 1);
         assert_eq!(got.current_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn list_turns_in_turn_order() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert!(store.list_turns(&run.id).unwrap().is_empty());
+
+        store
+            .begin_turn(&run.id, "turn-1", "execute", "/tmp/p1.md")
+            .unwrap();
+        store.finish_turn("turn-1", "success", Some("{}")).unwrap();
+        store
+            .begin_turn(&run.id, "turn-2", "validate-fix", "/tmp/p2.md")
+            .unwrap();
+
+        let turns = store.list_turns(&run.id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_no, 1);
+        assert_eq!(turns[0].purpose, "execute");
+        assert_eq!(turns[0].outcome.as_deref(), Some("success"));
+        assert!(turns[0].finished_at.is_some());
+        assert_eq!(turns[1].turn_no, 2);
+        assert_eq!(turns[1].outcome, None);
+    }
+
+    #[test]
+    fn run_record_serializes_snake_case_states() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 5, "t").unwrap();
+        store
+            .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+            .unwrap();
+        store
+            .set_desired_state(&run.id, Some(DesiredState::Paused))
+            .unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Running, None)
+            .unwrap();
+
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["interaction_state"], "awaiting_human");
+        assert_eq!(v["desired_state"], "paused");
+        assert!(v["started_at"].is_string());
+        assert!(v["finished_at"].is_null());
     }
 }
