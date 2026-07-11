@@ -99,9 +99,8 @@ fn spawn_dialog_answerer(
     mux: Arc<TmuxMux>,
     store: Store,
     run_id: String,
-) -> tokio::task::JoinHandle<u32> {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut answered = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             let Ok(Some(run)) = store.get_run(&run_id) else {
@@ -113,15 +112,11 @@ fn spawn_dialog_answerer(
             let pane = PaneId(pane_id);
             if mux.agent_state(&pane).await.ok() == Some(AgentState::Blocked) {
                 eprintln!("[human-sim] answering a dialog with '1'");
-                if mux.send_line(&pane, "1").await.is_ok() {
-                    answered += 1;
-                }
+                let _ = mux.send_line(&pane, "1").await;
                 // Give the TUI a moment so we don't double-answer.
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
-        #[allow(unreachable_code)]
-        answered
     })
 }
 
