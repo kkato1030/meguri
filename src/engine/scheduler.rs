@@ -60,8 +60,9 @@ impl Scheduler {
         }
     }
 
-    /// Find `meguri:ready` issues (not held, not claimed) with no active run
-    /// and enqueue them, respecting the slot budget.
+    /// Find `meguri:ready` issues (not held, not claimed, not already
+    /// shipped by a succeeded run) with no active run and enqueue them,
+    /// respecting the slot budget.
     async fn discover(
         &self,
         running: &mut JoinSet<String>,
@@ -80,6 +81,15 @@ impl Scheduler {
                     return Ok(());
                 }
                 if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
+                    continue;
+                }
+                // Already shipped by a succeeded run: don't re-file (avoids
+                // duplicate PRs when the ready label lingers or reappears).
+                // Humans can force a rerun with `meguri run --issue N`.
+                if deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, issue.number)?
+                {
                     continue;
                 }
                 // Unique active run per (project, worker, issue) — enforced

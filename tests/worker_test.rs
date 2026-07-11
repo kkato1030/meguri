@@ -10,7 +10,7 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{LABEL_NEEDS_HUMAN, LABEL_READY, LABEL_WORKING};
+use meguri::forge::{Forge, LABEL_NEEDS_HUMAN, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -276,6 +276,41 @@ async fn worker_corrective_turn_when_no_commits() {
         "missing correction event: {:?}",
         events.iter().map(|e| e.kind.clone()).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_skips_quietly_when_ready_label_removed_after_discovery() {
+    let env = setup(None).await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // The benign race: between discovery and claim, a concurrent run
+    // succeeded and removed the ready label.
+    env.forge.remove_label(7, LABEL_READY).await.unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Skipped(_)),
+        "expected skip, got {outcome:?}"
+    );
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Skipped);
+
+    // Quiet skip: no escalation label, no claim, no comment.
+    let labels = env.forge.labels_of(7);
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(env.forge.comments_of(7).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

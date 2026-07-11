@@ -82,6 +82,10 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
         WorkerOutcome::Interrupted(reason) => {
             bail!("run interrupted: {reason} — rerun `meguri run --issue {issue}` to resume");
         }
+        WorkerOutcome::Skipped(reason) => {
+            println!("⏭️  skipped: {reason}");
+            Ok(())
+        }
     }
 }
 
