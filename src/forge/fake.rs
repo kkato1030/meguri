@@ -7,7 +7,8 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread,
+    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
+    ReviewThread,
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,9 @@ pub struct FakeForge {
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
     pub pr_comments: Mutex<Vec<(i64, String)>>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
+    /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
+    /// before it finished computing).
+    pub mergeable: Mutex<HashMap<i64, MergeableState>>,
 }
 
 impl FakeForge {
@@ -107,6 +111,11 @@ impl FakeForge {
 
     pub fn set_pr_diff(&self, number: i64, diff: &str) {
         self.pr_diffs.lock().unwrap().insert(number, diff.into());
+    }
+
+    /// Simulate the forge's mergeability verdict (conflict-resolver tests).
+    pub fn set_pr_mergeable(&self, number: i64, state: MergeableState) {
+        self.mergeable.lock().unwrap().insert(number, state);
     }
 
     /// Simulate a new push to the PR branch (head moves, review marker for
@@ -375,6 +384,16 @@ impl Forge for FakeForge {
             .find(|p| p.number == number)
             .map(Self::pr_to_public)
             .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
+    }
+
+    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
+        Ok(self
+            .mergeable
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or(MergeableState::Unknown))
     }
 
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {

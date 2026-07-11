@@ -1,3 +1,4 @@
+pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
 pub mod planner;
@@ -74,6 +75,7 @@ pub trait Loop: Send + Sync {
 /// the head of this list, so ordering alone is the priority mechanism.
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
+        Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(reviewer::ReviewerLoop),

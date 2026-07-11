@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread,
+    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
+    ReviewThread,
 };
 
 pub struct GhForge {
@@ -298,6 +299,32 @@ impl Forge for GhForge {
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
         Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",
+    /// "CONFLICTING" or "UNKNOWN" (still computing). `mergeStateStatus` is
+    /// requested too so a future caller can distinguish e.g. blocked-but-
+    /// mergeable, but only the conflict axis matters here.
+    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "mergeable,mergeStateStatus",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view mergeable")?;
+        Ok(
+            match v.get("mergeable").and_then(Value::as_str).unwrap_or("") {
+                s if s.eq_ignore_ascii_case("mergeable") => MergeableState::Mergeable,
+                s if s.eq_ignore_ascii_case("conflicting") => MergeableState::Conflicting,
+                _ => MergeableState::Unknown,
+            },
+        )
     }
 
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
