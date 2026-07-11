@@ -127,6 +127,21 @@ impl FakeForge {
         }
     }
 
+    /// Numbers of the issues recorded as blocking `number`.
+    pub fn blockers_of(&self, number: i64) -> Vec<i64> {
+        self.blocked_by
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of every issue on the fake forge (creation-order).
+    pub fn all_issues(&self) -> Vec<Issue> {
+        self.issues.lock().unwrap().clone()
+    }
+
     pub fn labels_of(&self, number: i64) -> Vec<String> {
         self.issues
             .lock()
@@ -348,6 +363,31 @@ impl Forge for FakeForge {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        let mut issues = self.issues.lock().unwrap();
+        let number = issues.iter().map(|i| i.number).max().unwrap_or(0) + 1;
+        issues.push(Issue {
+            number,
+            title: title.into(),
+            body: body.into(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        });
+        Ok(number)
+    }
+
+    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        {
+            let issues = self.issues.lock().unwrap();
+            for number in [issue, blocker] {
+                if !issues.iter().any(|i| i.number == number) {
+                    bail!("issue #{number} not found");
+                }
+            }
+        }
+        self.block_issue(issue, blocker);
+        Ok(())
     }
 
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {

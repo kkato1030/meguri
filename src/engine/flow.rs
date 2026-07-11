@@ -17,7 +17,7 @@ use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
 use crate::store::{RunRecord, RunStatus};
-use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnStatus, prepare_turn};
+use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
 pub const STEP_PREPARE_WORK: &str = "prepare-work";
 pub const STEP_PREPARE_WORKTREE: &str = "prepare-worktree";
@@ -118,6 +118,27 @@ pub trait Flavor: Send + Sync {
             "agent asked for a plan on issue #{} but this loop has no plan \
              handoff: {reason}",
             run.issue_number
+        ))
+        .into())
+    }
+
+    /// The agent ended its execute turn with `decompose`: the issue is too
+    /// big for one deliverable and should be split into sub-issues
+    /// (issue #24). Returns the run's terminal outcome. Default: no
+    /// decompose handoff exists for this loop — a human must look (only the
+    /// planner overrides this to file the sub-issues).
+    async fn on_decompose(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &Checkpoint,
+        result: &TurnResultFile,
+    ) -> Result<WorkerOutcome> {
+        let _ = (deps, cp);
+        Err(NeedsHuman(format!(
+            "agent asked to decompose issue #{} but this loop has no \
+             decompose handoff: {}",
+            run.issue_number, result.summary
         ))
         .into())
     }
@@ -249,6 +270,12 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                     deps.store
                         .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
                 }
+                WorkerOutcome::Decomposed(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::Decomposed, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.decomposed", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -302,6 +329,13 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
                 cleanup_pane(deps, &run, true).await;
                 return Ok(outcome);
             }
+            StepFlow::Decompose(result) => {
+                let outcome = flavor
+                    .on_decompose(deps, &run, &checkpoint, &result)
+                    .await?;
+                cleanup_pane(deps, &run, true).await;
+                return Ok(outcome);
+            }
         }
         step = save_step(deps, &run, STEP_VALIDATE, &checkpoint)?;
     }
@@ -317,6 +351,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
                 return Err(NeedsHuman(format!(
                     "agent asked for a plan during validation on issue #{}: {reason}",
                     run.issue_number
+                ))
+                .into());
+            }
+            StepFlow::Decompose(result) => {
+                // Unreachable: validate() escalates a decompose fix turn
+                // (the work is already committed by then).
+                return Err(NeedsHuman(format!(
+                    "agent asked to decompose during validation on issue #{}: {}",
+                    run.issue_number, result.summary
                 ))
                 .into());
             }
@@ -340,6 +383,10 @@ pub(crate) enum StepFlow {
     /// The agent's execute turn ended with `needs_plan` (+ the reason); the
     /// flavor's [`Flavor::on_needs_plan`] decides the terminal outcome.
     NeedsPlan(String),
+    /// The agent's execute turn ended with `decompose` (the full result
+    /// carries the proposed children); the flavor's
+    /// [`Flavor::on_decompose`] decides the terminal outcome.
+    Decompose(TurnResultFile),
 }
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
@@ -795,6 +842,9 @@ async fn execute(
             TurnStatus::NeedsPlan => {
                 return Ok(StepFlow::NeedsPlan(result.summary));
             }
+            TurnStatus::Decompose => {
+                return Ok(StepFlow::Decompose(result));
+            }
         }
 
         // Trust but verify: success means commits exist, nothing dangles,
@@ -917,9 +967,12 @@ async fn validate(
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
                 TurnStatus::Success => continue,
-                // needs_plan makes no sense once work is committed and
-                // failing validation — escalate like the other two.
-                TurnStatus::Failure | TurnStatus::NeedsHuman | TurnStatus::NeedsPlan => {
+                // needs_plan/decompose make no sense once work is committed
+                // and failing validation — escalate like the other two.
+                TurnStatus::Failure
+                | TurnStatus::NeedsHuman
+                | TurnStatus::NeedsPlan
+                | TurnStatus::Decompose => {
                     return Err(NeedsHuman(format!(
                         "agent could not fix validation: {}",
                         r.summary
