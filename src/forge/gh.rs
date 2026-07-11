@@ -58,6 +58,24 @@ impl GhForge {
                 .unwrap_or_default(),
         })
     }
+
+    /// --edit doesn't create missing labels — ensure it exists first
+    /// (idempotent; ignore "already exists" failures).
+    async fn ensure_label(&self, label: &str) {
+        let _ = self
+            .gh(&[
+                "label",
+                "create",
+                label,
+                "--repo",
+                &self.repo,
+                "--color",
+                "1D76DB",
+                "--description",
+                "managed by meguri",
+            ])
+            .await;
+    }
 }
 
 #[async_trait]
@@ -102,21 +120,7 @@ impl Forge for GhForge {
     }
 
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
-        // --edit creates missing labels? It doesn't — ensure it exists first
-        // (idempotent; ignore "already exists" failures).
-        let _ = self
-            .gh(&[
-                "label",
-                "create",
-                label,
-                "--repo",
-                &self.repo,
-                "--color",
-                "1D76DB",
-                "--description",
-                "managed by meguri",
-            ])
-            .await;
+        self.ensure_label(label).await;
         self.gh(&[
             "issue",
             "edit",
@@ -138,6 +142,21 @@ impl Forge for GhForge {
             "--repo",
             &self.repo,
             "--remove-label",
+            label,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
+        self.ensure_label(label).await;
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--add-label",
             label,
         ])
         .await?;

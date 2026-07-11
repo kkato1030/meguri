@@ -14,6 +14,7 @@ pub struct RecordedPr {
     pub title: String,
     pub body: String,
     pub draft: bool,
+    pub labels: Vec<String>,
 }
 
 #[derive(Default)]
@@ -103,6 +104,22 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        // PR numbers are 1-based indices into the recorded list.
+        let Some(rec) = usize::try_from(pr)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| prs.get_mut(i))
+        else {
+            bail!("PR #{pr} not found");
+        };
+        if !rec.labels.iter().any(|l| l == label) {
+            rec.labels.push(label.to_string());
+        }
+        Ok(())
+    }
+
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
         self.comments.lock().unwrap().push((issue, body.into()));
         Ok(())
@@ -123,6 +140,7 @@ impl Forge for FakeForge {
             title: title.into(),
             body: body.into(),
             draft,
+            labels: Vec::new(),
         });
         Ok(CreatedPr {
             number: prs.len() as i64,

@@ -233,17 +233,24 @@ impl Store {
         })
     }
 
-    /// Whether the issue has already been shipped by a succeeded run — used
-    /// by watch discovery to avoid re-filing (and duplicate PRs) after the
-    /// success de-labeled the issue. `meguri run --issue N` bypasses this.
-    pub fn issue_has_succeeded_run(&self, project_id: &str, issue_number: i64) -> Result<bool> {
+    /// Whether the issue has already been shipped by a succeeded run of the
+    /// given loop — used by watch discovery to avoid re-filing (and duplicate
+    /// PRs) after the success de-labeled the issue. Scoped by loop kind so
+    /// e.g. a planner success doesn't block a later worker run on the same
+    /// issue. `meguri run --issue N` bypasses this.
+    pub fn issue_has_succeeded_run(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<bool> {
         self.with_conn(|c| {
             let exists = c
                 .prepare(
-                    "SELECT 1 FROM runs WHERE project_id = ?1 AND issue_number = ?2
-                       AND status = 'succeeded' LIMIT 1",
+                    "SELECT 1 FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'succeeded' LIMIT 1",
                 )?
-                .exists(params![project_id, issue_number])?;
+                .exists(params![project_id, loop_kind, issue_number])?;
             Ok(exists)
         })
     }
@@ -467,20 +474,22 @@ mod tests {
     fn issue_has_succeeded_run_tracks_terminal_success() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 9, "t").unwrap();
-        assert!(!store.issue_has_succeeded_run("demo", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("demo", "worker", 9).unwrap());
 
         store
             .update_run_status(&run.id, RunStatus::Skipped, None)
             .unwrap();
-        assert!(!store.issue_has_succeeded_run("demo", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("demo", "worker", 9).unwrap());
 
         let run2 = store.create_run("demo", 9, "t").unwrap();
         store
             .update_run_status(&run2.id, RunStatus::Succeeded, None)
             .unwrap();
-        assert!(store.issue_has_succeeded_run("demo", 9).unwrap());
-        assert!(!store.issue_has_succeeded_run("other", 9).unwrap());
-        assert!(!store.issue_has_succeeded_run("demo", 10).unwrap());
+        assert!(store.issue_has_succeeded_run("demo", "worker", 9).unwrap());
+        // Scoped: another loop's discovery on the same issue is unaffected.
+        assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
+        assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
     }
 
     #[test]
