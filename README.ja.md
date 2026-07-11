@@ -86,7 +86,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
-meguri prune              # reclaim worktrees of closed issues (--dry-run / --force)
+meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
 ### 常駐させる（daemon）
@@ -146,7 +146,7 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 **cleaner** ループは default branch の head を定期的に歩いて回り、蓄積した乖離 — spec と実装のずれ、dead code の候補、規約からの逸脱、置き去りの TODO、stale なリモートブランチ、孤児化した `meguri:working` ラベル — を `meguri:clean-report` ラベル付きの **1 本のレポート issue**（1 project = 1 issue）に書き留めます。修正は一切しません: 書き込みはこの issue の作成・更新だけで、push もブランチ操作も、他の issue / PR へのラベルやコメントもしません。本文は巡回のたびに完全に書き直されるスナップショットで、隠しマーカーの head sha により同じ head が二度走査されることはなく、head が進んでも `clean.interval_hours` を過ぎるまで次の巡回は走りません。検出項目を採用するなら通常の issue を切って `meguri:plan` / `meguri:ready` を付け、誤検知なら `clean.ignore` に部分文字列を足し、ループを止めたければレポート issue に `meguri:hold` を貼ってください。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 watch 中は issue が close されると対応する worktree（とマージ済みローカルブランチ）も自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 pane と worktree は issue 単位で生きます（1 issue = 1 pane。同じ issue の後続 run は生きている session を再利用）: watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。回収前にエージェントのネイティブ session id が保存されるので、`claude --resume <id>` で文脈ごと復帰できます。一発実行運用では `meguri prune` で同じ掃除ができます。
 
 ## 設定
 
@@ -161,7 +161,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-keep_pane = "on-failure"  # also: always | never
+# pane は issue 単位（1 issue = 1 pane）で保持され、issue が close されると回収
+# されます。回収前にエージェントのネイティブ session id を保存（claude --resume <id>）。
+# "never" は run 終了と同時に pane を閉じます（高速大量運転向け）。
+keep_pane = "until-issue-closed"  # also: never
 
 [agent]
 command = "claude"

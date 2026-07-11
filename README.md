@@ -86,7 +86,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
-meguri prune              # reclaim worktrees of closed issues (--dry-run / --force)
+meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
 ### Keep it running (daemon)
@@ -147,7 +147,7 @@ Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop 
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. While watching, meguri also reclaims the worktree (and merged local branch) of every issue that closes; `meguri prune` does the same on demand for one-shot usage.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes and worktrees live per issue (1 issue = 1 pane; later runs on the same issue reuse the live session): while watching, meguri reclaims the pane, worktree, and merged local branch of every issue that closes, saving the agent's native session id first so `claude --resume <id>` can restore the context. `meguri prune` does the same on demand for one-shot usage.
 
 ## Configuration
 
@@ -162,7 +162,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-keep_pane = "on-failure"  # also: always | never
+# Panes live per issue (1 issue = 1 pane) and are reclaimed when the issue
+# closes; the agent's native session id is saved first (claude --resume <id>).
+# "never" kills the pane as soon as its run ends (high-throughput operation).
+keep_pane = "until-issue-closed"  # also: never
 
 [agent]
 command = "claude"

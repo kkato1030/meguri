@@ -363,9 +363,9 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
             ExecuteFlow::GiveUp(reason) => {
                 // Quiet skip (no needs-human, no comment) — but bump the
                 // marker's `scanned` so retries are paced by the interval
-                // instead of the poll, then reclaim the worktree (D9).
+                // instead of the poll, then reclaim the pane and worktree (D9).
                 settle_skip(deps, &run, &cp).await;
-                flow::cleanup_pane(deps, &run, false).await;
+                super::reaper::release_pane(deps, run.issue_number, "cleaner sweep gave up").await;
                 remove_worktree_best_effort(deps, &run, &worktree).await;
                 return Ok(WorkerOutcome::Skipped(reason));
             }
@@ -375,9 +375,10 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
 
     if step == STEP_SETTLE {
         let issue = settle(deps, &run, &cp).await?;
-        flow::cleanup_pane(deps, &run, true).await;
         // The report issue never closes, so the reaper would keep this
-        // detached worktree forever — the cleaner reclaims it itself (D9).
+        // pane and detached worktree forever — the cleaner reclaims them
+        // itself (D9).
+        super::reaper::release_pane(deps, run.issue_number, "cleaner sweep finished").await;
         remove_worktree_best_effort(deps, &run, &worktree).await;
         return Ok(WorkerOutcome::Succeeded {
             pr_url: format!("issue #{issue}"),
