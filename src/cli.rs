@@ -66,8 +66,9 @@ pub enum Command {
     /// Kill the pane and cancel the run
     Stop { run: String },
     /// Reclaim worktrees (and merged local branches) of closed issues
-    Clean {
-        /// Only clean this project (default: all configured projects)
+    #[command(alias = "clean")]
+    Prune {
+        /// Only prune this project (default: all configured projects)
         #[arg(long)]
         project: Option<String>,
         /// List what would be reclaimed without removing anything
@@ -103,4 +104,37 @@ pub enum DaemonCommand {
     },
     /// Remove OS supervision (bootout + delete the LaunchAgent)
     Uninstall,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn prune_parses_with_flags() {
+        let cli = Cli::try_parse_from(["meguri", "prune", "--dry-run", "--force"]).unwrap();
+        match cli.command {
+            Command::Prune {
+                project,
+                dry_run,
+                force,
+            } => {
+                assert_eq!(project, None);
+                assert!(dry_run);
+                assert!(force);
+            }
+            other => panic!("expected Prune, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_is_a_hidden_alias_for_prune() {
+        let cli = Cli::try_parse_from(["meguri", "clean", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Prune { force: true, .. }));
+        // Hidden alias: `clean` must not surface in the top-level help.
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("prune"));
+        assert!(!help.contains("clean"));
+    }
 }

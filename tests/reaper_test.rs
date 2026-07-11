@@ -1,4 +1,4 @@
-//! Reaper tests: `meguri clean` classification and reclamation of worktrees
+//! Reaper tests: `meguri prune` classification and reclamation of worktrees
 //! whose issue closed on the forge.
 
 use std::path::{Path, PathBuf};
