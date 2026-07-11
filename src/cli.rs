@@ -51,7 +51,8 @@ pub enum Command {
     Handback { run: String },
     /// Kill the pane and cancel the run
     Stop { run: String },
-    /// Reclaim worktrees (and merged local branches) of closed issues
+    /// Reclaim panes and worktrees (and merged local branches) of closed
+    /// issues; agent session ids are saved first so panes stay resumable
     Clean {
         /// Only clean this project (default: all configured projects)
         #[arg(long)]

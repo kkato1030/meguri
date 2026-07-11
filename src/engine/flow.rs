@@ -259,7 +259,7 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
 
     if step == STEP_OPEN_PR {
         let pr_url = open_pr(deps, &run, &mut checkpoint, &worktree, flavor).await?;
-        cleanup_pane(deps, &run, true).await;
+        finish_pane(deps, &run).await;
         return Ok(WorkerOutcome::Succeeded { pr_url });
     }
 
@@ -272,38 +272,23 @@ pub(crate) enum StepFlow {
     Interrupted(String),
 }
 
-/// Apply the keep_pane policy after a run reaches a terminal state.
-pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
-    // The caller's record may predate the pane spawn (execute updates the
-    // store, not the in-memory run) — read the current pane id.
-    let pane_id = deps
-        .store
-        .get_run(&run.id)
-        .ok()
-        .flatten()
-        .and_then(|r| r.mux_pane_id)
-        .or_else(|| run.mux_pane_id.clone());
-    let Some(pane_id) = &pane_id else {
-        return;
-    };
-    let keep = match deps.config.mux.keep_pane.as_str() {
-        "always" => true,
-        "never" => false,
-        _ => !success, // "on-failure": keep only when something went wrong
-    };
-    if !keep {
-        let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
+/// Apply the keep_pane policy when a run succeeds. The default
+/// ("until-issue-closed") keeps the pane for the reaper, which reclaims it
+/// once the issue closes on the forge; "never" releases it right away
+/// (high-throughput operation).
+pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
+    if deps.config.mux.keep_pane == "never" {
+        super::reaper::release_pane(deps, run.issue_number, "keep_pane = never").await;
     }
 }
 
-/// `meguri stop`: cancel the run, release the claim, kill the pane.
+/// `meguri stop`: cancel the run, release the claim, release the pane (its
+/// session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
     flavor.release_claim(deps, run).await;
-    if let Some(pane_id) = &run.mux_pane_id {
-        let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
-    }
+    super::reaper::release_pane(deps, run.issue_number, "stopped by user").await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }
@@ -448,20 +433,39 @@ fn turn_engine(deps: &Deps) -> TurnEngine {
     }
 }
 
-/// Get the run's pane, spawning it (with the trigger as the agent's initial
-/// prompt argument) if it doesn't exist or died.
+/// Get the issue's pane, spawning it (with the trigger as the agent's
+/// initial prompt argument) if it doesn't exist or died. 1 issue = 1 pane:
+/// the pane is keyed by `(project, issue)` and outlives runs, so a later run
+/// on the same issue (fixer after worker, resumed runs) reuses the live
+/// session instead of stacking a new pane.
 async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     initial_trigger: &str,
 ) -> Result<(PaneId, bool)> {
-    if let Some(id) = &run.mux_pane_id {
+    let worktree_str = worktree.to_string_lossy();
+    if let Some(record) = deps.store.get_pane(&deps.project.id, run.issue_number)?
+        && let Some(id) = &record.mux_pane_id
+    {
         let pane = PaneId(id.clone());
-        if run.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
+        if record.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            return Ok((pane, false));
+            if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
+                // Adopt the issue's live pane for this run.
+                deps.store.update_run_mux(
+                    &run.id,
+                    deps.mux.kind().as_str(),
+                    &deps.config.mux.session,
+                    &pane.0,
+                )?;
+                return Ok((pane, false));
+            }
+            // The issue moved to another worktree (e.g. a fresh branch): the
+            // old pane can't see it. Retire it — session id saved — and
+            // respawn below.
+            super::reaper::release_pane(deps, run.issue_number, "worktree moved").await;
         }
     }
 
@@ -489,6 +493,14 @@ async fn ensure_pane(
         deps.mux.kind().as_str(),
         &deps.config.mux.session,
         &pane.0,
+    )?;
+    deps.store.upsert_pane(
+        &deps.project.id,
+        run.issue_number,
+        deps.mux.kind().as_str(),
+        &deps.config.mux.session,
+        &pane.0,
+        &worktree_str,
     )?;
     deps.store.emit(
         Some(&run.id),

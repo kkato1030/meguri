@@ -4,10 +4,15 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+mod panes;
 mod runs;
+pub use panes::*;
 pub use runs::*;
 
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("migrations/0001_init.sql")),
+    ("0002_panes", include_str!("migrations/0002_panes.sql")),
+];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).
 ///
@@ -110,7 +115,7 @@ mod tests {
             .with_conn(|c| {
                 let n: i64 =
                     c.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))?;
-                assert_eq!(n, 1);
+                assert_eq!(n, MIGRATIONS.len() as i64);
                 Ok(())
             })
             .unwrap();

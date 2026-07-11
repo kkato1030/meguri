@@ -19,7 +19,6 @@ use super::flow::{self, NeedsHuman, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPAR
 use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
-use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus};
 use crate::turn::{TurnOutcome, TurnStatus};
 
@@ -222,7 +221,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
 
     if step == STEP_SETTLE {
         let pr_url = settle(deps, &run, &cp).await?;
-        flow::cleanup_pane(deps, &run, true).await;
+        flow::finish_pane(deps, &run).await;
         return Ok(WorkerOutcome::Succeeded { pr_url });
     }
 
@@ -235,7 +234,8 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &ReviewCheckpoint) ->
     Ok(step.to_string())
 }
 
-/// `meguri stop`: cancel the run, release the PR claim, kill the pane.
+/// `meguri stop`: cancel the run, release the PR claim, release the pane
+/// (its session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
@@ -243,9 +243,7 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
         .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
         .await
         .ok();
-    if let Some(pane_id) = &run.mux_pane_id {
-        let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
-    }
+    super::reaper::release_pane(deps, run.issue_number, "stopped by user").await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }

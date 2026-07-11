@@ -83,7 +83,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
-meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
+meguri clean              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
 ### ラベル
@@ -102,7 +102,7 @@ meguri clean              # reclaim worktrees of closed issues (--dry-run / --fo
 
 `meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 watch 中は issue が close されると対応する worktree（とマージ済みローカルブランチ）も自動回収されます。一発実行運用では `meguri clean` で同じ掃除ができます。
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 pane と worktree は issue 単位で生きます（1 issue = 1 pane。同じ issue の後続 run は生きている session を再利用）: watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。回収前にエージェントのネイティブ session id が保存されるので、`claude --resume <id>` で文脈ごと復帰できます。一発実行運用では `meguri clean` で同じ掃除ができます。
 
 ## 設定
 
@@ -117,7 +117,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-keep_pane = "on-failure"  # also: always | never
+# pane は issue 単位（1 issue = 1 pane）で保持され、issue が close されると回収
+# されます。回収前にエージェントのネイティブ session id を保存（claude --resume <id>）。
+# "never" は run 終了と同時に pane を閉じます（高速大量運転向け）。
+keep_pane = "until-issue-closed"  # also: never
 
 [agent]
 command = "claude"
