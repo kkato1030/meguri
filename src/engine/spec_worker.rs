@@ -10,6 +10,12 @@
 //! so run bookkeeping, dedup, and escalation match the worker's exactly.
 //! Success consumes the PR's `meguri:spec-ready` label — from then on the
 //! PR is a normal in-flight meguri implementation PR (fixer territory).
+//!
+//! The spec is transient review scaffolding: this loop prunes it as part of
+//! the implementation (the prompt asks for the deletion, [`Flavor::verify_work`]
+//! enforces it), so `docs/specs/` never accumulates on the default branch
+//! (issue #48). Durable knowledge lives in ADRs / domain docs instead — the
+//! planner's prompt routes it there.
 
 use std::path::Path;
 
@@ -191,6 +197,10 @@ impl Flavor for SpecWorkerFlavor {
              - Implement the issue completely, including tests where the \
                project has them.\n\
              - Run the relevant tests/checks yourself before declaring success.\n\
+             - The spec above is disposable review scaffolding. Once the \
+               implementation is complete, delete `{spec_path}` and commit \
+               the deletion — the spec must not survive onto the default \
+               branch.\n\
              - COMMIT all your work to the current branch with clear messages. \
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; the PR already \
@@ -207,8 +217,19 @@ impl Flavor for SpecWorkerFlavor {
         // section: the PR already exists, nothing consumes `pr_body` here.
     }
 
-    fn verify_work(&self, _run: &RunRecord, _worktree: &Path) -> std::result::Result<(), String> {
-        Ok(()) // committed implementation work is all the takeover requires
+    /// The planner's "spec must exist" check, inverted: the spec is
+    /// disposable scaffolding, so a spec that survived implementation gets a
+    /// corrective turn asking for its deletion.
+    fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String> {
+        let spec = super::planner::spec_rel_path(run.issue_number);
+        if worktree.join(&spec).is_file() {
+            Err(format!(
+                "- spec file `{spec}` still exists (it is disposable review \
+                 scaffolding: delete it and commit the deletion)"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// New commits are counted against the spec PR branch's pushed tip, not
@@ -294,6 +315,31 @@ mod tests {
             "the PR exists; nothing consumes pr_body"
         );
         assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_tells_the_agent_to_prune_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let prompt =
+            SpecWorkerFlavor.execute_prompt(&fake_deps(), &run, &Checkpoint::default(), dir.path());
+        assert!(prompt.contains("disposable review scaffolding"));
+        assert!(prompt.contains("delete `docs/specs/issue-7.md` and commit"));
+        assert!(prompt.contains("must not survive onto the default branch"));
+    }
+
+    #[test]
+    fn verify_work_rejects_a_surviving_spec_and_accepts_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+
+        assert!(SpecWorkerFlavor.verify_work(&run, dir.path()).is_ok());
+
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
+        let err = SpecWorkerFlavor.verify_work(&run, dir.path()).unwrap_err();
+        assert!(err.contains("docs/specs/issue-7.md"), "{err}");
+        assert!(err.contains("delete it"), "{err}");
     }
 
     #[test]
