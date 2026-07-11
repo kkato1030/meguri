@@ -101,7 +101,10 @@ pub struct MuxConfig {
     /// mux session name that holds all meguri panes
     #[serde(default = "default_session")]
     pub session: String,
-    /// "on-failure" | "always" | "never"
+    /// Pane lifetime policy: "until-issue-closed" (default — the reaper
+    /// reclaims the pane when the issue closes on the forge) | "never"
+    /// (kill the pane as soon as its run ends; high-throughput operation).
+    /// Any other value is treated as "until-issue-closed".
     #[serde(default = "default_keep_pane")]
     pub keep_pane: String,
 }
@@ -123,7 +126,7 @@ fn default_session() -> String {
     "meguri".into()
 }
 fn default_keep_pane() -> String {
-    "on-failure".into()
+    "until-issue-closed".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +151,11 @@ pub struct AgentConfig {
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
+    /// Where the agent keeps its native session transcripts (default:
+    /// `$CLAUDE_CONFIG_DIR` or `~/.claude`). The reaper reads it to save a
+    /// resumable session id before closing a pane.
+    #[serde(default)]
+    pub session_dir: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -157,6 +165,7 @@ impl Default for AgentConfig {
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
             herdr_agent_hint: None,
+            session_dir: None,
         }
     }
 }
@@ -388,6 +397,7 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
         assert_eq!(back.mux.kind, "auto");
+        assert_eq!(back.mux.keep_pane, "until-issue-closed");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
         assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
