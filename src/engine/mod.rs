@@ -65,14 +65,16 @@ pub trait Loop: Send + Sync {
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome>;
 }
 
-/// The loops meguri ships today.
+/// The loops meguri ships today, in dispatch-priority order (the pipeline
+/// reversed = closest to merge first). The scheduler hands out slots from
+/// the head of this list, so ordering alone is the priority mechanism.
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
+        Arc::new(fixer::FixerLoop),
+        Arc::new(spec_worker::SpecWorkerLoop),
+        Arc::new(reviewer::ReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
-        Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(fixer::FixerLoop),
-        Arc::new(reviewer::ReviewerLoop),
     ]
 }
 

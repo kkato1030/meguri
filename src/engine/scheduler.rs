@@ -72,18 +72,22 @@ impl Scheduler {
     }
 
     /// Ask every loop for actionable targets in every project and enqueue
-    /// them, respecting the slot budget.
+    /// them, respecting the slot budget. Loops are visited in priority order
+    /// (loop before project, so priority beats project order); within a loop,
+    /// targets go oldest-first (FIFO by issue/PR number).
     async fn discover(
         &self,
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) -> Result<()> {
-        for deps in &self.projects {
-            for lp in &self.loops {
+        for lp in &self.loops {
+            for deps in &self.projects {
                 if active.len() >= self.max_concurrent {
                     return Ok(());
                 }
-                for target in lp.discover(deps).await? {
+                let mut targets = lp.discover(deps).await?;
+                targets.sort_by_key(|t| t.issue_number);
+                for target in targets {
                     if active.len() >= self.max_concurrent {
                         return Ok(());
                     }
