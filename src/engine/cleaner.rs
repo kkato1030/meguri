@@ -296,6 +296,20 @@ pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
                 }
+                // The cleaner's drive never hands work to the planner; these
+                // are unreachable here but recorded faithfully if they occur.
+                WorkerOutcome::NeedsPlan(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
+                }
+                WorkerOutcome::Decomposed(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::Decomposed, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.decomposed", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -562,7 +576,12 @@ async fn execute(
 
         match result.status {
             TurnStatus::Success => {}
-            TurnStatus::Failure | TurnStatus::NeedsHuman => {
+            // needs_plan is a worker signal and decompose a planner one; on
+            // a read-only sweep they make no sense — give up like failure.
+            TurnStatus::Failure
+            | TurnStatus::NeedsHuman
+            | TurnStatus::NeedsPlan
+            | TurnStatus::Decompose => {
                 return Ok(ExecuteFlow::GiveUp(format!(
                     "agent could not complete the sweep: {}",
                     result.summary
@@ -751,12 +770,13 @@ async fn stale_branches(deps: &Deps, head_sha: &str, stale_days: u64) -> Result<
             continue;
         }
         let age_days = (now.saturating_sub(branch.committer_unix)).max(0) as u64 / 86_400;
+        // Errors (unknown refs, shallow history) count as "not merged".
         let merged = gitops::is_ancestor(
             &deps.project.repo_path,
             &format!("refs/remotes/origin/{}", branch.name),
             head_sha,
         )
-        .await;
+        .unwrap_or(false);
         if merged || age_days > stale_days {
             stale.push(StaleBranch {
                 name: branch.name,

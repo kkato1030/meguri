@@ -18,7 +18,7 @@ use serde_json::json;
 
 use crate::mux::{AgentState, Multiplexer, PaneId};
 use crate::store::{DesiredState, InteractionState};
-pub use prompts::{TurnResultFile, TurnStatus};
+pub use prompts::{ChildIssue, TurnResultFile, TurnStatus};
 
 #[derive(Debug, Clone)]
 pub struct TurnConfig {

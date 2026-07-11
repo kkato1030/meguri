@@ -10,7 +10,7 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_NEEDS_HUMAN, LABEL_READY, LABEL_WORKING};
+use meguri::forge::{Forge, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -514,6 +514,113 @@ async fn worker_needs_human_escalates_on_forge() {
     let comments = env.forge.comments_of(7);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_needs_plan_hands_issue_to_planner() {
+    let env = setup(None).await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // The agent investigates and finds a design decision is needed first.
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_result(wt, turn_id, "needs_plan");
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    let WorkerOutcome::NeedsPlan(reason) = outcome else {
+        panic!("expected NeedsPlan, got {outcome:?}");
+    };
+    assert_eq!(reason, "scripted");
+
+    // Normal ending, not a failure.
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::NeedsPlan);
+
+    // Labels swapped: the claim and the ready trigger are gone, the planner
+    // trigger is on, and nobody called for a human.
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_PLAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_READY.to_string()));
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+
+    // The findings are on the issue for the planner's next poll.
+    let comments = env.forge.comments_of(7);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("scripted"), "comment: {}", comments[0]);
+    assert!(comments[0].contains(LABEL_PLAN));
+
+    // The execute prompt invited the signal.
+    let wt = find_worktree(&env.worktree_root).unwrap();
+    let prompts = prompts_in(&wt);
+    assert!(prompts.iter().any(|p| p.contains("needs_plan")));
+
+    // No PR, nothing pushed.
+    assert!(env.forge.prs().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_needs_plan_with_existing_spec_escalates_to_human() {
+    let env = setup(None).await;
+
+    // The issue already went through planning: its spec is merged on main,
+    // so the worker's worktree contains it.
+    let clone = env.deps.project.repo_path.clone();
+    std::fs::create_dir_all(clone.join("docs/specs")).unwrap();
+    std::fs::write(clone.join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
+    run_git(&clone, &["add", "docs/specs"]).await.unwrap();
+    run_git(&clone, &["commit", "-m", "add spec"])
+        .await
+        .unwrap();
+    run_git(&clone, &["push", "origin", "main"]).await.unwrap();
+
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_result(wt, turn_id, "needs_plan");
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+    agent.abort();
+
+    // The one-shot rule: a second needs-plan is not a plan handoff.
+    assert!(
+        result.is_err(),
+        "needs-plan with an existing spec must fail"
+    );
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_PLAN.to_string()));
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+
+    let comments = env.forge.comments_of(7);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("needs a human"), "{}", comments[0]);
+    assert!(comments[0].contains("docs/specs/issue-7.md"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

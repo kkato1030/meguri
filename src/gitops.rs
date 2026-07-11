@@ -25,6 +25,27 @@ pub async fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Blocking sibling of [`run_git`] for the synchronous verification hooks
+/// (`Flavor::verify_work` runs outside an executor-friendly context).
+pub fn run_git_sync(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("spawning git")?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    } else {
+        bail!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -370,14 +391,6 @@ pub async fn list_remote_branches(repo_path: &Path) -> Result<Vec<RemoteBranch>>
     Ok(branches)
 }
 
-/// Whether `refname`'s tip is an ancestor of `base` (i.e. merged into it).
-/// Errors (unknown refs, shallow history) count as "not merged".
-pub async fn is_ancestor(repo_path: &Path, refname: &str, base: &str) -> bool {
-    run_git(repo_path, &["merge-base", "--is-ancestor", refname, base])
-        .await
-        .is_ok()
-}
-
 /// True when nothing is uncommitted (untracked counts as dirty).
 pub async fn status_clean(worktree: &Path) -> Result<bool> {
     Ok(run_git(worktree, &["status", "--porcelain"])
@@ -405,6 +418,84 @@ pub async fn commits_ahead(worktree: &Path, default_branch: &str) -> Result<u64>
 pub async fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
     run_git(worktree, &["push", "-u", "origin", branch]).await?;
     Ok(())
+}
+
+/// Fetch the base branch and return its tip commit (`origin/<base>` when a
+/// remote exists, the local branch otherwise). The conflict resolver pins
+/// this sha at claim time so the merge target stays fixed even if the base
+/// moves mid-run.
+pub async fn fetch_base_tip(repo_path: &Path, base_branch: &str) -> Result<String> {
+    // Best-effort freshness; offline or remote-less repos still work.
+    let _ = run_git(repo_path, &["fetch", "origin", base_branch]).await;
+    if let Ok(sha) = run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("origin/{base_branch}")],
+    )
+    .await
+    {
+        return Ok(sha);
+    }
+    run_git(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{base_branch}"),
+        ],
+    )
+    .await
+    .with_context(|| format!("base branch {base_branch} exists neither on origin nor locally"))
+}
+
+/// Whether `ancestor` is reachable from `descendant` — how the conflict
+/// resolver proves the base tip was actually merged, not cherry-picked
+/// around. Synchronous: called from `Flavor::verify_work`.
+pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .context("spawning git")?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// A line git would have written as a conflict marker. `=======` alone is
+/// deliberately not matched (legitimate as e.g. a setext heading underline);
+/// a leftover separator without its bracketing markers cannot occur.
+fn is_conflict_marker_line(line: &str) -> bool {
+    ["<<<<<<<", ">>>>>>>", "|||||||"].iter().any(|marker| {
+        line.strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
+}
+
+/// Files changed between `from_ref` and HEAD that still contain conflict
+/// markers — the conflict resolver's proof that a "resolved" merge did not
+/// commit the markers themselves. Synchronous: called from
+/// `Flavor::verify_work`. Unreadable (deleted, binary) files are skipped.
+pub fn conflict_marker_files(worktree: &Path, from_ref: &str) -> Result<Vec<String>> {
+    let changed = run_git_sync(
+        worktree,
+        &["diff", "--name-only", &format!("{from_ref}..HEAD")],
+    )?;
+    let mut hits = Vec::new();
+    for file in changed.lines().filter(|l| !l.is_empty()) {
+        let Ok(content) = std::fs::read_to_string(worktree.join(file)) else {
+            continue;
+        };
+        if content.lines().any(is_conflict_marker_line) {
+            hits.push(file.to_string());
+        }
+    }
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -609,6 +700,95 @@ mod tests {
             run_git(repo.path(), &["rev-parse", "--verify", &branch])
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_base_tip_prefers_origin_and_pins_a_sha() {
+        // Remote-less repo: falls back to the local branch tip.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let local_tip = run_git(repo.path(), &["rev-parse", "main"]).await.unwrap();
+        assert_eq!(
+            fetch_base_tip(repo.path(), "main").await.unwrap(),
+            local_tip
+        );
+        assert!(fetch_base_tip(repo.path(), "nope").await.is_err());
+
+        // With a remote: the origin tip wins even when the local branch lags.
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-b", "main"])
+            .await
+            .unwrap();
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        run_git(repo.path(), &["push", "origin", "main"])
+            .await
+            .unwrap();
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "ahead"])
+            .await
+            .unwrap();
+        let pushed = run_git(repo.path(), &["rev-parse", "origin/main"])
+            .await
+            .unwrap();
+        assert_eq!(fetch_base_tip(repo.path(), "main").await.unwrap(), pushed);
+    }
+
+    #[tokio::test]
+    async fn ancestry_and_marker_scan_verify_a_merge() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("f.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "."]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "base"])
+            .await
+            .unwrap();
+        let base = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+
+        run_git(repo.path(), &["checkout", "-b", "topic"])
+            .await
+            .unwrap();
+        std::fs::write(repo.path().join("f.txt"), "topic\n").unwrap();
+        run_git(repo.path(), &["commit", "-am", "topic"])
+            .await
+            .unwrap();
+
+        assert!(is_ancestor(repo.path(), &base, "HEAD").unwrap());
+        assert!(!is_ancestor(repo.path(), "HEAD", &base).unwrap());
+        assert!(is_ancestor(repo.path(), "no-such-ref", "HEAD").is_err());
+
+        // Committed conflict markers are found; mid-line lookalikes are not.
+        std::fs::write(
+            repo.path().join("f.txt"),
+            "<<<<<<< HEAD\ntopic\n=======\nbase\n>>>>>>> main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("clean.md"),
+            "Heading\n=======\na <<<<<<< b\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "."]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "markers"])
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict_marker_files(repo.path(), &base).unwrap(),
+            vec!["f.txt".to_string()]
+        );
+
+        std::fs::write(repo.path().join("f.txt"), "resolved\n").unwrap();
+        run_git(repo.path(), &["commit", "-am", "resolve"])
+            .await
+            .unwrap();
+        assert!(
+            conflict_marker_files(repo.path(), &base)
+                .unwrap()
+                .is_empty()
         );
     }
 

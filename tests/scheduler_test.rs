@@ -215,6 +215,106 @@ async fn watch_skips_working_and_hold_issues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn watch_gates_on_open_blocker_until_closed_as_completed() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        41,
+        "Blocked work",
+        "Depends on #40.",
+        &[LABEL_READY],
+    ));
+    // GitHub-native dependency: #41 is blocked by the still-open #40.
+    forge.block_issue(41, 40);
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let agent = spawn_scripted_agent(root.path().join("worktrees"));
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    // While the blocker is open, discovery must skip — quietly: no run, no
+    // claim, no escalation label, no comment.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        store.list_runs(false).unwrap().is_empty(),
+        "no runs may start while a blocker is open"
+    );
+    let labels = forge.labels_of(41);
+    assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&meguri::forge::LABEL_NEEDS_HUMAN.to_string()));
+    assert!(forge.comments_of(41).is_empty(), "skips must be silent");
+
+    // Closing the blocker as completed resolves the dependency; the next
+    // discovery pass picks the issue up and drives it to a PR.
+    forge.close_issue(40);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "run never succeeded after the blocker closed; runs: {:?}",
+                store.list_runs(false).unwrap()
+            );
+        }
+        let runs = store.list_runs(false).unwrap();
+        if runs
+            .iter()
+            .any(|r| r.status == RunStatus::Succeeded && r.issue_number == 41)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    watch.abort();
+    agent.abort();
+
+    assert_eq!(forge.prs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        43,
+        "Blocked work",
+        "Depends on #42.",
+        &[LABEL_READY],
+    ));
+    forge.block_issue(43, 42);
+    // not_planned does not resolve the dependency: the plan this issue was
+    // built on never happened, so a human has to re-triage it.
+    forge.close_issue_as(42, "not_planned");
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    watch.abort();
+
+    assert!(
+        store.list_runs(false).unwrap().is_empty(),
+        "a not_planned blocker must keep the issue skipped"
+    );
+    // Still a quiet skip: no escalation, no comment.
+    let labels = forge.labels_of(43);
+    assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&meguri::forge::LABEL_NEEDS_HUMAN.to_string()));
+    assert!(forge.comments_of(43).is_empty(), "skips must be silent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn watch_does_not_refile_issue_with_succeeded_run() {
     let root = tempfile::tempdir().unwrap();
     let forge = Arc::new(FakeForge::with_issue(
@@ -458,6 +558,168 @@ impl Loop for FixedLoop {
             pr_url: "fixed://pr".into(),
         })
     }
+}
+
+/// Shared dispatch log: (loop kind, project id, issue number).
+type DispatchLog = Arc<std::sync::Mutex<Vec<(String, String, i64)>>>;
+
+/// A parameterized fake loop for the priority tests: fixed (project, issue)
+/// targets, each run driven straight to success while the dispatch order is
+/// recorded in a shared log.
+struct StubLoop {
+    kind: &'static str,
+    /// (project id, issue number) pairs this loop discovers.
+    targets: Vec<(&'static str, i64)>,
+    order: DispatchLog,
+}
+
+#[async_trait::async_trait]
+impl Loop for StubLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for (project, n) in &self.targets {
+            if *project == deps.project.id
+                && !deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, self.kind, *n)?
+            {
+                targets.push(Target {
+                    issue_number: *n,
+                    title: format!("stub {n}"),
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        let run = deps.store.get_run(run_id)?.expect("run exists");
+        self.order
+            .lock()
+            .unwrap()
+            .push((run.loop_kind, run.project_id, run.issue_number));
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "stub://pr".into(),
+        })
+    }
+}
+
+/// Wait until `order` has `expected` entries, then return them.
+async fn wait_for_dispatches(order: &DispatchLog, expected: usize) -> Vec<(String, String, i64)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = order.lock().unwrap().clone();
+        if log.len() >= expected {
+            return log;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "only {} of {expected} dispatches happened: {log:?}",
+                log.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Loop-list order is dispatch priority: with one slot, the first loop's
+/// target wins even though the other loop's issue number is smaller.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_prioritizes_loops_in_list_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![
+            Arc::new(StubLoop {
+                kind: "stub-fixer",
+                targets: vec![("proj", 200)],
+                order: order.clone(),
+            }),
+            Arc::new(StubLoop {
+                kind: "stub-worker",
+                targets: vec![("proj", 100)],
+                order: order.clone(),
+            }),
+        ],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 2).await;
+    watch.abort();
+
+    assert_eq!(log[0], ("stub-fixer".into(), "proj".into(), 200));
+    assert_eq!(log[1], ("stub-worker".into(), "proj".into(), 100));
+}
+
+/// Within one loop, targets dispatch oldest-first (FIFO by number) no matter
+/// what order discover returns them in.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(StubLoop {
+            kind: "stub",
+            targets: vec![("proj", 33), ("proj", 11), ("proj", 22)],
+            order: order.clone(),
+        })],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 3).await;
+    watch.abort();
+
+    let issues: Vec<i64> = log.iter().map(|(_, _, n)| *n).collect();
+    assert_eq!(issues, vec![11, 22, 33]);
+}
+
+/// Loop priority beats project order: project B's high-priority loop takes
+/// the slot before project A's low-priority loop (nest inversion).
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_prioritizes_loop_order_over_project_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps_a = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let mut deps_b = deps_a.clone();
+    deps_b.project.id = "proj-b".into();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps_a, deps_b],
+        loops: vec![
+            Arc::new(StubLoop {
+                kind: "stub-fixer",
+                targets: vec![("proj-b", 300)],
+                order: order.clone(),
+            }),
+            Arc::new(StubLoop {
+                kind: "stub-planner",
+                targets: vec![("proj", 1)],
+                order: order.clone(),
+            }),
+        ],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 2).await;
+    watch.abort();
+
+    assert_eq!(log[0], ("stub-fixer".into(), "proj-b".into(), 300));
+    assert_eq!(log[1], ("stub-planner".into(), "proj".into(), 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]

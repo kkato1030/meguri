@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod engine;
 pub mod events;
 pub mod forge;
