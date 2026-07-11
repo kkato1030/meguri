@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
-    ReviewThread,
+    Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
+    MergeableState, PullRequest, ReviewComment, ReviewThread,
 };
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,11 @@ pub struct FakeForge {
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
     /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
     pub pr_for_branch_errors: Mutex<HashSet<String>>,
+    /// CI checks per PR number (ci-fixer tests); unset PRs report an empty
+    /// rollup (Success — no CI configured).
+    pub checks: Mutex<HashMap<i64, Vec<CheckRun>>>,
+    /// What pr_failed_check_logs returns, per PR number.
+    pub failed_check_logs: Mutex<HashMap<i64, String>>,
 }
 
 impl FakeForge {
@@ -126,6 +131,35 @@ impl FakeForge {
     /// Simulate the forge's mergeability verdict (conflict-resolver tests).
     pub fn set_pr_mergeable(&self, number: i64, state: MergeableState) {
         self.mergeable.lock().unwrap().insert(number, state);
+    }
+
+    /// Record one CI check's verdict on a PR head (ci-fixer tests). Calls
+    /// accumulate, like checks on a real head.
+    pub fn set_pr_check(&self, number: i64, name: &str, state: CheckState) {
+        self.checks
+            .lock()
+            .unwrap()
+            .entry(number)
+            .or_default()
+            .push(CheckRun {
+                name: name.into(),
+                state,
+                url: format!("https://fake.example/actions/runs/{number}/job/1"),
+            });
+    }
+
+    /// Simulate CI resetting on a new head (a fresh push clears the old
+    /// head's checks).
+    pub fn clear_pr_checks(&self, number: i64) {
+        self.checks.lock().unwrap().remove(&number);
+    }
+
+    /// What the fake returns as the PR's failed-job logs.
+    pub fn set_pr_failed_check_logs(&self, number: i64, logs: &str) {
+        self.failed_check_logs
+            .lock()
+            .unwrap()
+            .insert(number, logs.into());
     }
 
     /// Simulate a new push to the PR branch (head moves, review marker for
@@ -481,6 +515,28 @@ impl Forge for FakeForge {
             .get(&number)
             .copied()
             .unwrap_or(MergeableState::Unknown))
+    }
+
+    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup> {
+        Ok(CheckRollup {
+            checks: self
+                .checks
+                .lock()
+                .unwrap()
+                .get(&number)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn pr_failed_check_logs(&self, number: i64) -> Result<String> {
+        Ok(self
+            .failed_check_logs
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {

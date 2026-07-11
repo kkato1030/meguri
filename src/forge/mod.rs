@@ -50,6 +50,58 @@ pub enum MergeableState {
     Unknown,
 }
 
+/// Verdict of one CI check on a PR head, reduced to the axis the ci-fixer
+/// cares about: done-and-green, done-and-red, or still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Success,
+    Failure,
+    Pending,
+}
+
+/// One CI check on the PR's head commit (a GitHub Actions check run or a
+/// classic commit status).
+#[derive(Debug, Clone)]
+pub struct CheckRun {
+    pub name: String,
+    pub state: CheckState,
+    /// Detail page of the check; on GitHub Actions this carries the workflow
+    /// run id the failed-log fetch needs. Empty when the forge has none.
+    pub url: String,
+}
+
+/// The check/status rollup of a PR's head commit — the trigger for the
+/// ci-fixer loop.
+#[derive(Debug, Clone, Default)]
+pub struct CheckRollup {
+    pub checks: Vec<CheckRun>,
+}
+
+impl CheckRollup {
+    /// Aggregate verdict. Pending wins over Failure: while anything is still
+    /// running the picture is incomplete — the ci-fixer must not start on a
+    /// head whose CI could still change under it (and whose failed logs may
+    /// not exist yet). No checks at all is Success: a project without CI has
+    /// nothing to fix.
+    pub fn state(&self) -> CheckState {
+        if self.checks.iter().any(|c| c.state == CheckState::Pending) {
+            CheckState::Pending
+        } else if self.checks.iter().any(|c| c.state == CheckState::Failure) {
+            CheckState::Failure
+        } else {
+            CheckState::Success
+        }
+    }
+
+    /// The failing checks (prompt rendering, failed-log fetching).
+    pub fn failed(&self) -> Vec<&CheckRun> {
+        self.checks
+            .iter()
+            .filter(|c| c.state == CheckState::Failure)
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub number: i64,
@@ -184,6 +236,12 @@ pub trait Forge: Send + Sync {
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
+    /// The check/status rollup of the PR's head commit (ci-fixer discovery).
+    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup>;
+    /// Failed-job logs of the PR's failing checks, pre-trimmed for a prompt.
+    /// Best-effort per check: a check whose logs cannot be fetched
+    /// contributes a note instead of failing the whole call.
+    async fn pr_failed_check_logs(&self, number: i64) -> Result<String>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
     /// All review threads on a PR, resolved or not.
@@ -202,6 +260,50 @@ mod tests {
             state: state.into(),
             state_reason: state_reason.map(str::to_string),
         }
+    }
+
+    fn check(state: CheckState) -> CheckRun {
+        CheckRun {
+            name: "ci".into(),
+            state,
+            url: String::new(),
+        }
+    }
+
+    #[test]
+    fn rollup_state_is_pending_over_failure_over_success() {
+        // No checks: nothing to fix, never a trigger.
+        assert_eq!(CheckRollup::default().state(), CheckState::Success);
+
+        let green = CheckRollup {
+            checks: vec![check(CheckState::Success), check(CheckState::Success)],
+        };
+        assert_eq!(green.state(), CheckState::Success);
+
+        let red = CheckRollup {
+            checks: vec![check(CheckState::Success), check(CheckState::Failure)],
+        };
+        assert_eq!(red.state(), CheckState::Failure);
+
+        // A failure with anything still running stays Pending: the picture
+        // is incomplete until CI settles.
+        let mixed = CheckRollup {
+            checks: vec![check(CheckState::Failure), check(CheckState::Pending)],
+        };
+        assert_eq!(mixed.state(), CheckState::Pending);
+    }
+
+    #[test]
+    fn rollup_failed_lists_only_failing_checks() {
+        let rollup = CheckRollup {
+            checks: vec![
+                check(CheckState::Success),
+                check(CheckState::Failure),
+                check(CheckState::Pending),
+            ],
+        };
+        assert_eq!(rollup.failed().len(), 1);
+        assert_eq!(rollup.failed()[0].state, CheckState::Failure);
     }
 
     #[test]
