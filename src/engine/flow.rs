@@ -95,6 +95,27 @@ pub trait Flavor: Send + Sync {
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         escalate_on_forge(deps, run.issue_number, reason).await;
     }
+
+    /// The agent ended its execute turn with `needs_plan`: a design decision
+    /// must precede implementation (issue #22). Returns the run's terminal
+    /// outcome. Default: no plan handoff exists for this loop — a human must
+    /// look (only the worker overrides this to demote the issue to
+    /// `meguri:plan`).
+    async fn on_needs_plan(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        worktree: &Path,
+        reason: &str,
+    ) -> Result<WorkerOutcome> {
+        let _ = (deps, worktree);
+        Err(NeedsHuman(format!(
+            "agent asked for a plan on issue #{} but this loop has no plan \
+             handoff: {reason}",
+            run.issue_number
+        ))
+        .into())
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -213,6 +234,12 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
                 }
+                WorkerOutcome::NeedsPlan(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -261,6 +288,11 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+            StepFlow::NeedsPlan(reason) => {
+                let outcome = flavor.on_needs_plan(deps, &run, &worktree, &reason).await?;
+                cleanup_pane(deps, &run, true).await;
+                return Ok(outcome);
+            }
         }
         step = save_step(deps, &run, STEP_VALIDATE, &checkpoint)?;
     }
@@ -270,6 +302,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+            StepFlow::NeedsPlan(reason) => {
+                // Unreachable: validate() escalates a needs_plan fix turn
+                // (the work is already committed by then).
+                return Err(NeedsHuman(format!(
+                    "agent asked for a plan during validation on issue #{}: {reason}",
+                    run.issue_number
+                ))
+                .into());
+            }
         }
         step = save_step(deps, &run, STEP_OPEN_PR, &checkpoint)?;
     }
@@ -287,6 +328,9 @@ pub(crate) enum StepFlow {
     Continue,
     Stopped,
     Interrupted(String),
+    /// The agent's execute turn ended with `needs_plan` (+ the reason); the
+    /// flavor's [`Flavor::on_needs_plan`] decides the terminal outcome.
+    NeedsPlan(String),
 }
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
@@ -739,6 +783,9 @@ async fn execute(
                 ))
                 .into());
             }
+            TurnStatus::NeedsPlan => {
+                return Ok(StepFlow::NeedsPlan(result.summary));
+            }
         }
 
         // Trust but verify: success means commits exist, nothing dangles,
@@ -861,7 +908,9 @@ async fn validate(
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
                 TurnStatus::Success => continue,
-                TurnStatus::Failure | TurnStatus::NeedsHuman => {
+                // needs_plan makes no sense once work is committed and
+                // failing validation — escalate like the other two.
+                TurnStatus::Failure | TurnStatus::NeedsHuman | TurnStatus::NeedsPlan => {
                     return Err(NeedsHuman(format!(
                         "agent could not fix validation: {}",
                         r.summary

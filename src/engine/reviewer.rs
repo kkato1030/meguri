@@ -163,6 +163,13 @@ pub async fn run_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
                 }
+                WorkerOutcome::NeedsPlan(reason) => {
+                    // Unreachable: review turns escalate needs_plan instead.
+                    deps.store
+                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -216,6 +223,14 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
             flow::StepFlow::Continue => {}
             flow::StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             flow::StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+            flow::StepFlow::NeedsPlan(reason) => {
+                // Unreachable: the review turn escalates needs_plan below.
+                return Err(NeedsHuman(format!(
+                    "agent asked for a plan reviewing PR #{}: {reason}",
+                    run.issue_number
+                ))
+                .into());
+            }
         }
         step = save_step(deps, &run, STEP_SETTLE, &cp)?;
     }
@@ -427,7 +442,8 @@ async fn execute(
                 ))
                 .into());
             }
-            TurnStatus::NeedsHuman => {
+            // needs_plan is a worker signal; on a review turn a human looks.
+            TurnStatus::NeedsHuman | TurnStatus::NeedsPlan => {
                 return Err(NeedsHuman(format!(
                     "agent needs a human reviewing PR #{}: {}",
                     run.issue_number, result.summary
