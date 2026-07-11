@@ -106,7 +106,11 @@ keep_pane = "on-failure"  # also: always | never
 
 [agent]
 command = "claude"
-args = []              # e.g. ["--permission-mode", "acceptEdits"]
+# Default is yolo: the agent runs in an isolated worktree, and an autonomous
+# loop stalls if it asks permission for every git/cargo command. To gate each
+# command instead, set args = ["--permission-mode", "acceptEdits"] and answer
+# dialogs by attaching to the pane.
+args = ["--dangerously-skip-permissions"]
 
 [limits]
 idle_grace_secs = 90        # silence before a nudge

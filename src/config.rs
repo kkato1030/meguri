@@ -78,7 +78,13 @@ pub struct AgentConfig {
     #[serde(default = "default_agent_command")]
     pub command: String,
     /// Extra args placed before the initial prompt argument.
-    #[serde(default)]
+    ///
+    /// Defaults to yolo mode (`--dangerously-skip-permissions`): each run
+    /// works in an isolated git worktree, and an autonomous loop stalls if the
+    /// agent stops to ask permission for every `git`/`cargo` command. Users who
+    /// want a per-command gate can set `args = ["--permission-mode",
+    /// "acceptEdits"]` and answer dialogs by attaching to the pane.
+    #[serde(default = "default_agent_args")]
     pub args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
@@ -89,7 +95,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             command: default_agent_command(),
-            args: Vec::new(),
+            args: default_agent_args(),
             herdr_agent_hint: None,
         }
     }
@@ -97,6 +103,11 @@ impl Default for AgentConfig {
 
 fn default_agent_command() -> String {
     "claude".into()
+}
+
+fn default_agent_args() -> Vec<String> {
+    // Yolo by default; see AgentConfig::args for the rationale and opt-out.
+    vec!["--dangerously-skip-permissions".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +245,27 @@ mod tests {
         assert_eq!(back.mux.kind, "auto");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
+    }
+
+    #[test]
+    fn default_agent_is_yolo() {
+        // Autonomous loops must not stall on per-command permission prompts;
+        // the agent runs in an isolated worktree, so yolo is the default.
+        assert_eq!(
+            Config::default().agent.args,
+            vec!["--dangerously-skip-permissions".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_args_can_be_overridden_to_gated() {
+        let raw = r#"
+[agent]
+command = "claude"
+args = ["--permission-mode", "acceptEdits"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.agent.args, vec!["--permission-mode", "acceptEdits"]);
     }
 
     #[test]
