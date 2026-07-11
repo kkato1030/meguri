@@ -55,16 +55,18 @@ meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
 
-Register a project in `~/.meguri/config.toml`:
+`meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
 
 ```toml
 [[projects]]
 id = "myproj"
 repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
-default_branch = "main"
-check_command = "cargo test"   # optional but recommended: meguri runs this itself
+# default_branch = "main"
+# check_command = "cargo test"   # recommended: meguri runs this itself
 ```
+
+Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
 ## Use
 
@@ -106,7 +108,7 @@ Labels and comments on GitHub are the durable workflow state (looper's "Authorit
 
 ## Configuration
 
-See `meguri init` output for the full default `config.toml`. Highlights:
+Every key has a built-in default, so `config.toml` only needs `[[projects]]` plus whatever you want to override — `meguri init` writes a minimal template on exactly that premise. The defaults:
 
 ```toml
 # Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
