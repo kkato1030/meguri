@@ -102,9 +102,10 @@ pub async fn cmd_watch() -> Result<()> {
         projects.push(build_deps(&cfg, project, None)?);
     }
     println!(
-        "watching {} project(s) for {} issues (poll {}s, slots {})",
+        "watching {} project(s) for {}/{} issues (poll {}s, slots {})",
         projects.len(),
         crate::forge::LABEL_READY,
+        crate::forge::LABEL_PLAN,
         cfg.scheduler.poll_interval_secs,
         cfg.scheduler.max_concurrent_runs,
     );

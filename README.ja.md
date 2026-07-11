@@ -90,9 +90,15 @@ meguri stop <run>         # kill pane, release the claim, cancel
 | ラベル | 意味 |
 |---|---|
 | `meguri:ready` | worker ループに issue をキューイングする（あなたが付ける） |
+| `meguri:plan` | planner ループに issue をキューイングする（オプトインの spec 先行フロー） |
+| `meguri:spec-reviewing` | spec PR に付く: 人間の spec レビュー待ち |
 | `meguri:working` | meguri がクレーム済み（PR が開くと外れる） |
 | `meguri:hold` | discovery がこの issue をスキップする |
 | `meguri:needs-human` | meguri が断念。理由はコメントで説明される |
+
+### spec 先行フロー（オプトイン）
+
+`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。spec をレビューしてラベルを `meguri:spec-ready` に貼り替える（当面は手動）と、worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。
 
 GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。
 
@@ -140,7 +146,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-MVP は GitHub 上の **worker** ループ（issue → PR）です。アーキテクチャは looper のロールモデルを踏襲しているため、planner / reviewer / fixer の各ループは、同じターンエンジンを共有する追加の `Loop` 実装として計画されています。ラベルは `meguri:plan` → `meguri:spec-reviewing` → `meguri:spec-ready` へ拡張されます。
+GitHub 上で **worker** ループ（issue → PR）と **planner** ループ（`meguri:plan` issue → spec PR）が動きます。アーキテクチャは looper のロールモデルを踏襲しているため、reviewer / fixer の各ループ — そして worker が `meguri:spec-ready` の spec PR を拾って同じブランチで実装を続ける後段 — は、同じターンエンジンを共有する追加の `Loop` 実装として計画されています。
 
 ## ライセンス
 
