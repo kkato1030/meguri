@@ -4,9 +4,9 @@
 //! test workspace), so they are gated behind MEGURI_TEST_HERDR=1.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use meguri::mux::{AgentState, Multiplexer, PaneSpec, herdr::HerdrMux};
+use meguri::mux::{AgentState, Multiplexer, MuxError, PaneId, PaneSpec, herdr::HerdrMux};
 
 fn herdr_enabled() -> bool {
     std::env::var("MEGURI_TEST_HERDR").as_deref() == Ok("1") && HerdrMux::socket_live()
@@ -108,4 +108,110 @@ async fn herdr_spawn_send_read_kill() {
     assert!(!mux.pane_alive(&pane).await.unwrap());
 
     cleanup_workspace(&label).await;
+}
+
+/// Acceptance: a state transition must be seen in well under the old 2s poll
+/// interval. The transition is driven via `pane report-agent` (the same
+/// reporting API real agent integrations use) 600ms into the wait.
+#[tokio::test]
+async fn herdr_wait_state_detects_transition_faster_than_poll_interval() {
+    if !herdr_enabled() {
+        eprintln!("skipping: set MEGURI_TEST_HERDR=1 with a live herdr server");
+        return;
+    }
+    let label = format!("meguri-test-wait-{}", std::process::id());
+    let mux = HerdrMux::new(&label);
+    let dir = tempfile::tempdir().unwrap();
+
+    let pane = mux
+        .spawn_pane(&PaneSpec {
+            title: "wait".into(),
+            cwd: dir.path().to_path_buf(),
+            command: vec![
+                "bash".into(),
+                fake_agent_path().to_string_lossy().to_string(),
+            ],
+            env: vec![],
+        })
+        .await
+        .expect("spawn pane");
+
+    const REPORT_AFTER: Duration = Duration::from_millis(600);
+    let pane_id = pane.0.clone();
+    let reporter = tokio::spawn(async move {
+        tokio::time::sleep(REPORT_AFTER).await;
+        let out = tokio::process::Command::new("herdr")
+            .args([
+                "pane",
+                "report-agent",
+                &pane_id,
+                "--source",
+                "meguri-test",
+                "--agent",
+                "fake",
+                "--state",
+                "working",
+                "--seq",
+                "1",
+            ])
+            .output()
+            .await
+            .expect("report-agent runs");
+        assert!(
+            out.status.success(),
+            "report-agent failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+
+    let started = Instant::now();
+    let state = mux
+        .wait_state(&pane, &[AgentState::Working], Duration::from_secs(10))
+        .await
+        .expect("wait_state");
+    let elapsed = started.elapsed();
+    reporter.await.unwrap();
+
+    assert_eq!(state, AgentState::Working);
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "returned before the transition was reported: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1800),
+        "detection latency {elapsed:?} is not below the 2s poll interval \
+         (transition reported at {REPORT_AFTER:?})"
+    );
+
+    // The event-fed cache now serves agent_state without a round trip.
+    assert_eq!(mux.agent_state(&pane).await.unwrap(), AgentState::Working);
+
+    mux.kill_pane(&pane).await.unwrap();
+    cleanup_workspace(&label).await;
+}
+
+/// Acceptance: with herdr dead (socket gone), wait_state must degrade to a
+/// clean WaitTimeout after the full timeout instead of erroring immediately.
+/// Needs no live herdr, so it always runs.
+#[tokio::test]
+async fn herdr_wait_state_survives_dead_herdr() {
+    let dir = tempfile::tempdir().unwrap();
+    let mux = HerdrMux::with_socket("meguri-test-dead", dir.path().join("no-such.sock"));
+    let pane = PaneId("wZZ:p99".into());
+
+    let started = Instant::now();
+    let err = mux
+        .wait_state(&pane, &[AgentState::Working], Duration::from_millis(1500))
+        .await
+        .expect_err("nothing can reach Working");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(err, MuxError::WaitTimeout(_)),
+        "expected WaitTimeout, got: {err:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1400),
+        "gave up before the timeout: {elapsed:?}"
+    );
 }

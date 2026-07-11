@@ -88,6 +88,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         default_branch: "main".into(),
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
+        language: None,
         pr: None,
     };
 

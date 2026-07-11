@@ -1,5 +1,6 @@
 //! In-memory Forge for tests: records every mutation for assertions.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
@@ -9,12 +10,14 @@ use super::{CreatedPr, Forge, Issue, PullRequest, ReviewComment, ReviewThread};
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
+    pub number: i64,
     pub head: String,
     pub base: String,
     pub title: String,
     pub body: String,
     pub draft: bool,
     pub labels: Vec<String>,
+    pub head_sha: String,
     /// "open", "merged" or "closed".
     pub state: String,
 }
@@ -26,6 +29,8 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
+    pub pr_comments: Mutex<Vec<(i64, String)>>,
+    pub pr_diffs: Mutex<HashMap<i64, String>>,
 }
 
 impl FakeForge {
@@ -40,6 +45,43 @@ impl FakeForge {
         forge
     }
 
+    /// Seed a pull request as if it already existed on the forge (reviewer
+    /// tests; `create_pr` records worker/planner-created ones).
+    pub fn add_pr(
+        &self,
+        number: i64,
+        title: &str,
+        body: &str,
+        labels: &[&str],
+        head_branch: &str,
+        head_sha: &str,
+    ) {
+        self.prs.lock().unwrap().push(RecordedPr {
+            number,
+            head: head_branch.into(),
+            base: "main".into(),
+            title: title.into(),
+            body: body.into(),
+            draft: false,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            head_sha: head_sha.into(),
+            state: "open".into(),
+        });
+    }
+
+    pub fn set_pr_diff(&self, number: i64, diff: &str) {
+        self.pr_diffs.lock().unwrap().insert(number, diff.into());
+    }
+
+    /// Simulate a new push to the PR branch (head moves, review marker for
+    /// the old head no longer matches).
+    pub fn set_pr_head(&self, number: i64, head_sha: &str) {
+        let mut prs = self.prs.lock().unwrap();
+        if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
+            pr.head_sha = head_sha.into();
+        }
+    }
+
     pub fn labels_of(&self, number: i64) -> Vec<String> {
         self.issues
             .lock()
@@ -47,6 +89,16 @@ impl FakeForge {
             .iter()
             .find(|i| i.number == number)
             .map(|i| i.labels.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn pr_labels_of(&self, number: i64) -> Vec<String> {
+        self.prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == number)
+            .map(|p| p.labels.clone())
             .unwrap_or_default()
     }
 
@@ -64,35 +116,44 @@ impl FakeForge {
             .collect()
     }
 
+    pub fn pr_comments_of(&self, number: i64) -> Vec<String> {
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
     /// Seed an already-open PR (as if a worker run shipped it earlier);
     /// returns its number.
     pub fn push_pr(&self, head: &str, title: &str, labels: &[&str]) -> i64 {
         let mut prs = self.prs.lock().unwrap();
+        let number = prs.len() as i64 + 1;
         prs.push(RecordedPr {
+            number,
             head: head.into(),
             base: "main".into(),
             title: title.into(),
             body: String::new(),
             draft: true,
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            head_sha: String::new(),
             state: "open".into(),
         });
-        prs.len() as i64
+        number
     }
 
     pub fn set_pr_state(&self, pr: i64, state: &str) {
         let mut prs = self.prs.lock().unwrap();
-        if let Some(rec) = pr_index(pr).and_then(|i| prs.get_mut(i)) {
+        if let Some(rec) = prs.iter_mut().find(|p| p.number == pr) {
             rec.state = state.to_string();
         }
     }
 
     pub fn pr_labels(&self, pr: i64) -> Vec<String> {
-        let prs = self.prs.lock().unwrap();
-        pr_index(pr)
-            .and_then(|i| prs.get(i))
-            .map(|rec| rec.labels.clone())
-            .unwrap_or_default()
+        self.pr_labels_of(pr)
     }
 
     /// The reviewer side of the ping-pong: open an unresolved thread.
@@ -146,21 +207,18 @@ impl FakeForge {
             .map(|(_, t)| t.clone())
             .collect()
     }
-}
 
-/// PR numbers are 1-based indices into the recorded list.
-fn pr_index(pr: i64) -> Option<usize> {
-    usize::try_from(pr).ok().and_then(|n| n.checked_sub(1))
-}
-
-fn pull_request(number: i64, rec: &RecordedPr) -> PullRequest {
-    PullRequest {
-        number,
-        title: rec.title.clone(),
-        url: format!("https://fake.example/pr/{number}"),
-        head_branch: rec.head.clone(),
-        state: rec.state.clone(),
-        labels: rec.labels.clone(),
+    fn pr_to_public(pr: &RecordedPr) -> PullRequest {
+        PullRequest {
+            number: pr.number,
+            title: pr.title.clone(),
+            body: pr.body.clone(),
+            url: format!("https://fake.example/pr/{}", pr.number),
+            head_branch: pr.head.clone(),
+            head_sha: pr.head_sha.clone(),
+            state: pr.state.clone(),
+            labels: pr.labels.clone(),
+        }
     }
 }
 
@@ -209,7 +267,7 @@ impl Forge for FakeForge {
 
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
         let mut prs = self.prs.lock().unwrap();
-        let Some(rec) = pr_index(pr).and_then(|i| prs.get_mut(i)) else {
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
             bail!("PR #{pr} not found");
         };
         if !rec.labels.iter().any(|l| l == label) {
@@ -220,10 +278,50 @@ impl Forge for FakeForge {
 
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()> {
         let mut prs = self.prs.lock().unwrap();
-        let Some(rec) = pr_index(pr).and_then(|i| prs.get_mut(i)) else {
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
             bail!("PR #{pr} not found");
         };
         rec.labels.retain(|l| l != label);
+        Ok(())
+    }
+
+    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
+        self.prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == number)
+            .map(Self::pr_to_public)
+            .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
+    }
+
+    async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
+        Ok(self
+            .prs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.labels.iter().any(|l| l == label))
+            .map(Self::pr_to_public)
+            .collect())
+    }
+
+    async fn pr_diff(&self, number: i64) -> Result<String> {
+        Ok(self
+            .pr_diffs
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn pr_comments(&self, number: i64) -> Result<Vec<String>> {
+        Ok(self.pr_comments_of(number))
+    }
+
+    async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
+        self.pr_comments.lock().unwrap().push((pr, body.into()));
         Ok(())
     }
 
@@ -246,27 +344,22 @@ impl Forge for FakeForge {
         draft: bool,
     ) -> Result<CreatedPr> {
         let mut prs = self.prs.lock().unwrap();
+        let number = prs.len() as i64 + 1;
         prs.push(RecordedPr {
+            number,
             head: head.into(),
             base: base.into(),
             title: title.into(),
             body: body.into(),
             draft,
             labels: Vec::new(),
+            head_sha: String::new(),
             state: "open".into(),
         });
         Ok(CreatedPr {
-            number: prs.len() as i64,
-            url: format!("https://fake.example/pr/{}", prs.len()),
+            number,
+            url: format!("https://fake.example/pr/{number}"),
         })
-    }
-
-    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
-        let prs = self.prs.lock().unwrap();
-        pr_index(number)
-            .and_then(|i| prs.get(i))
-            .map(|rec| pull_request(number, rec))
-            .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
     }
 
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>> {
@@ -275,9 +368,8 @@ impl Forge for FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .enumerate()
-            .filter(|(_, rec)| rec.state == "open")
-            .map(|(i, rec)| pull_request(i as i64 + 1, rec))
+            .filter(|rec| rec.state == "open")
+            .map(Self::pr_to_public)
             .collect())
     }
 

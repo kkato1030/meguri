@@ -163,6 +163,36 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
     exclude_meguri(worktree).await
 }
 
+/// Create (or reuse) a review worktree detached at `head_sha` (a PR head).
+/// Detached HEAD avoids colliding with whichever worktree still has the PR
+/// branch checked out (e.g. the planner's on the same host).
+pub async fn create_review_worktree(
+    repo_path: &Path,
+    worktree: &Path,
+    head_branch: &str,
+    head_sha: &str,
+) -> Result<()> {
+    if worktree.join(".git").exists() {
+        return Ok(()); // resuming an interrupted run
+    }
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Best-effort: the head may already be local (pushed from this host).
+    let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
+
+    let wt = worktree.to_string_lossy().to_string();
+    run_git(
+        repo_path,
+        &["worktree", "add", "--force", "--detach", &wt, head_sha],
+    )
+    .await
+    .context("git worktree add (review)")?;
+
+    exclude_meguri(worktree).await
+}
+
 /// Detach `branch` from every worktree that has it checked out so another
 /// worktree can take it over.
 pub async fn detach_branch(repo_path: &Path, branch: &str) -> Result<()> {
@@ -366,5 +396,40 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn review_worktree_is_detached_at_the_head_sha() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        // A "PR branch" with one commit; main stays behind.
+        run_git(repo.path(), &["checkout", "-b", "pr-branch"])
+            .await
+            .unwrap();
+        std::fs::write(repo.path().join("spec.md"), "spec\n").unwrap();
+        run_git(repo.path(), &["add", "spec.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "spec"])
+            .await
+            .unwrap();
+        let sha = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        run_git(repo.path(), &["checkout", "main"]).await.unwrap();
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = worktree_path(wt_root.path(), "proj", "review-1-run-x");
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha)
+            .await
+            .unwrap();
+        assert!(wt.join("spec.md").exists());
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(), sha);
+        // Detached: rev-parse a symbolic ref fails.
+        assert!(
+            run_git(&wt, &["symbolic-ref", "HEAD"]).await.is_err(),
+            "review worktree must be detached"
+        );
+        // Idempotent for resume.
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha)
+            .await
+            .unwrap();
     }
 }

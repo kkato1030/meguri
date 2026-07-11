@@ -91,14 +91,15 @@ meguri stop <run>         # kill pane, release the claim, cancel
 |---|---|
 | `meguri:ready` | you queue an issue for the worker loop |
 | `meguri:plan` | you queue an issue for the planner loop (opt-in spec-first flow) |
-| `meguri:spec-reviewing` | on the spec PR: awaiting human spec review |
+| `meguri:spec-reviewing` | on the spec PR: awaiting review by the reviewer loop (or a human) |
+| `meguri:spec-ready` | on the spec PR: review passed; the worker continues implementation |
 | `meguri:working` | meguri claimed it (removed when the PR opens) |
 | `meguri:hold` | discovery skips this issue |
 | `meguri:needs-human` | meguri gave up; a comment explains why |
 
 ### Spec-first flow (opt-in)
 
-Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. Review the spec and flip the label to `meguri:spec-ready` (manual for now); the worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
+Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
 
 Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step.
 
@@ -107,6 +108,11 @@ Labels and comments on GitHub are the durable workflow state (looper's "Authorit
 See `meguri init` output for the full default `config.toml`. Highlights:
 
 ```toml
+# Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
+# Free-form text, e.g. "日本語" or "Japanese"; omit to leave the agent to its
+# default (usually English). Override per project with `language` in [[projects]].
+language = "日本語"
+
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
@@ -146,7 +152,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-The **worker** loop (issue → PR) and the **planner** loop (`meguri:plan` issue → spec PR) run on GitHub today. The architecture mirrors looper's role model, so reviewer / fixer loops — and the worker picking up `meguri:spec-ready` spec PRs to continue implementation on the same branch — are planned as additional `Loop` implementations sharing the same turn engine.
+The **worker** loop (issue → PR), the **planner** loop (`meguri:plan` issue → spec PR), and the **reviewer** loop (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`) run on GitHub today. The architecture mirrors looper's role model, so a fixer loop — and the worker picking up `meguri:spec-ready` spec PRs to continue implementation on the same branch — are planned as additional `Loop` implementations sharing the same turn engine.
 
 ## License
 

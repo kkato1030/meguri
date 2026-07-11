@@ -366,8 +366,10 @@ mod tests {
         let pr = PullRequest {
             number: 3,
             title: "Add feature (#9)".into(),
+            body: String::new(),
             url: "https://fake.example/pr/3".into(),
             head_branch: "meguri/9-add-feature-abc123".into(),
+            head_sha: String::new(),
             state: "open".into(),
             labels: vec![],
         };
@@ -445,6 +447,7 @@ mod tests {
                 default_branch: "main".into(),
                 check_command: None,
                 worktree_root: None,
+                language: None,
                 pr: None,
             },
         }

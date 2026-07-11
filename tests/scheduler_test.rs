@@ -53,6 +53,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             repo_path: clone,
             repo_slug: "me/proj".into(),
             default_branch: "main".into(),
+            language: None,
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
             pr: None,
@@ -295,6 +296,60 @@ async fn recovery_resumes_interrupted_run_to_success() {
     let events = store.events_for_run(&run.id, 200).unwrap();
     assert!(events.iter().any(|e| e.kind == "run.recovered"));
     assert_eq!(forge.prs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_dispatches_multiple_ready_issues_concurrently() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        21,
+        "First ready issue",
+        "Do it.",
+        &[LABEL_READY],
+    ));
+    forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 22,
+        title: "Second ready issue".into(),
+        body: "Do it too.".into(),
+        labels: vec![LABEL_READY.into()],
+    });
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let agent = spawn_scripted_agent(root.path().join("worktrees"));
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(300),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "both runs never succeeded; runs: {:?}",
+                store.list_runs(false).unwrap()
+            );
+        }
+        let runs = store.list_runs(false).unwrap();
+        let done = [21, 22]
+            .iter()
+            .filter(|n| {
+                runs.iter()
+                    .any(|r| r.status == RunStatus::Succeeded && r.issue_number == **n)
+            })
+            .count();
+        if done == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    watch.abort();
+    agent.abort();
+
+    assert_eq!(forge.prs().len(), 2);
 }
 
 /// A minimal non-worker loop: discovers one fixed target and drives its run

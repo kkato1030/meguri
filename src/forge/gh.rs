@@ -59,32 +59,49 @@ impl GhForge {
         })
     }
 
+    fn labels_from_json(v: &Value) -> Vec<String> {
+        v.get("labels")
+            .and_then(Value::as_array)
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|l| l.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn pr_from_json(v: &Value) -> Option<PullRequest> {
         Some(PullRequest {
             number: v.get("number")?.as_i64()?,
             title: v.get("title")?.as_str()?.to_string(),
+            body: v
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             url: v
                 .get("url")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            head_branch: v.get("headRefName")?.as_str()?.to_string(),
+            head_branch: v
+                .get("headRefName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            head_sha: v
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             state: v
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or("open")
                 .to_lowercase(),
-            labels: v
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(|labels| {
-                    labels
-                        .iter()
-                        .filter_map(|l| l.get("name").and_then(Value::as_str))
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            labels: Self::labels_from_json(v),
         })
     }
 
@@ -206,6 +223,89 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,body,labels,headRefName,headRefOid,state,url",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
+        Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "list",
+                "--repo",
+                &self.repo,
+                "--state",
+                "open",
+                "--label",
+                label,
+                "--limit",
+                "50",
+                "--json",
+                "number,title,body,labels,headRefName,headRefOid,state,url",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr list output")?;
+        Ok(v.as_array()
+            .map(|items| items.iter().filter_map(Self::pr_from_json).collect())
+            .unwrap_or_default())
+    }
+
+    async fn pr_diff(&self, number: i64) -> Result<String> {
+        self.gh(&["pr", "diff", &number.to_string(), "--repo", &self.repo])
+            .await
+    }
+
+    async fn pr_comments(&self, number: i64) -> Result<Vec<String>> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "comments",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view comments")?;
+        Ok(v.get("comments")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|c| c.get("body").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "comment",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
         self.gh(&[
             "issue",
@@ -265,22 +365,6 @@ impl Forge for GhForge {
         Ok(CreatedPr { number, url })
     }
 
-    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
-        let raw = self
-            .gh(&[
-                "pr",
-                "view",
-                &number.to_string(),
-                "--repo",
-                &self.repo,
-                "--json",
-                "number,title,url,headRefName,state,labels",
-            ])
-            .await?;
-        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
-        Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
-    }
-
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>> {
         let raw = self
             .gh(&[
@@ -293,7 +377,7 @@ impl Forge for GhForge {
                 "--limit",
                 "50",
                 "--json",
-                "number,title,url,headRefName,state,labels",
+                "number,title,body,url,headRefName,headRefOid,state,labels",
             ])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr list output")?;

@@ -13,11 +13,12 @@ pub const LABEL_READY: &str = "meguri:ready";
 /// Issue is queued for the planner loop (applied by a human; opt-in
 /// spec-first flow — the default stays `meguri:ready` straight to a PR).
 pub const LABEL_PLAN: &str = "meguri:plan";
-/// The planner's spec PR awaits (human) spec review; flipping it to
-/// `meguri:spec-ready` is manual until the reviewer loop exists.
+/// The planner's spec PR awaits review; the reviewer loop picks it up,
+/// posts a summary review, and flips it to `meguri:spec-ready` when clean.
 pub const LABEL_SPEC_REVIEWING: &str = "meguri:spec-reviewing";
-/// Spec review approved the approach; the worker owns the branch from here
-/// on and the fixer must keep its hands off the PR.
+/// Spec review approved the approach; the worker continues implementation on
+/// the same branch (issue #21) and owns it from here on — the fixer must keep
+/// its hands off the PR. A human can also apply this label directly.
 pub const LABEL_SPEC_READY: &str = "meguri:spec-ready";
 /// meguri claimed the issue (dedup across restarts and hosts).
 pub const LABEL_WORKING: &str = "meguri:working";
@@ -46,15 +47,18 @@ pub struct CreatedPr {
     pub url: String,
 }
 
-/// A pull request as discovery sees it (state and labels drive whether the
-/// fixer may touch it).
+/// A pull request as discovery sees it: state and labels drive whether the
+/// fixer may touch it, and the head sha lets the reviewer loop check what was
+/// already reviewed and check out its head.
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: i64,
     pub title: String,
+    pub body: String,
     pub url: String,
     /// Head branch name (meguri's own PRs follow `meguri/...`).
     pub head_branch: String,
+    pub head_sha: String,
     /// Lowercase state: "open", "merged" or "closed".
     pub state: String,
     pub labels: Vec<String>,
@@ -97,6 +101,14 @@ pub trait Forge: Send + Sync {
     /// space but need different edit commands).
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()>;
+    /// Open pull requests carrying `label` (candidates for review discovery).
+    async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>>;
+    /// The PR's full unified diff against its base.
+    async fn pr_diff(&self, number: i64) -> Result<String>;
+    /// Bodies of the PR's conversation comments (review-marker lookups).
+    async fn pr_comments(&self, number: i64) -> Result<Vec<String>>;
+    /// Post a conversation comment on a pull request.
+    async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
     /// Comment on a pull request (same number space, different command).
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()>;

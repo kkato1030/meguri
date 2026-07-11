@@ -1,6 +1,7 @@
 pub mod fixer;
 pub mod flow;
 pub mod planner;
+pub mod reviewer;
 pub mod scheduler;
 pub mod worker;
 
@@ -68,6 +69,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(fixer::FixerLoop),
+        Arc::new(reviewer::ReviewerLoop),
     ]
 }
 
