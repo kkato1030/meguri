@@ -69,6 +69,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         default_branch: "main".into(),
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
+        pr: None,
     };
 
     let deps = Deps {
@@ -129,11 +130,30 @@ fn pending_turn(worktree: &Path) -> Option<String> {
 }
 
 fn write_result(worktree: &Path, turn_id: &str, status: &str) {
-    std::fs::write(
-        worktree.join(".meguri/result.json"),
-        format!(r#"{{"turn_id":"{turn_id}","status":"{status}","summary":"scripted"}}"#),
-    )
-    .unwrap();
+    write_result_with(worktree, turn_id, status, None);
+}
+
+fn write_result_with(worktree: &Path, turn_id: &str, status: &str, pr_body: Option<&str>) {
+    let mut result = serde_json::json!({
+        "turn_id": turn_id, "status": status, "summary": "scripted",
+    });
+    if let Some(body) = pr_body {
+        result["pr_body"] = serde_json::Value::String(body.into());
+    }
+    std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
+}
+
+/// Contents of the prompt files delivered to the (scripted) agent.
+fn prompts_in(worktree: &Path) -> Vec<String> {
+    std::fs::read_dir(worktree.join(".meguri"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("prompt-") && name.ends_with(".md")
+        })
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect()
 }
 
 /// Scripted pane-side agent: for each new prompt turn, run `action`.
@@ -211,12 +231,30 @@ async fn worker_happy_path_issue_to_pr() {
     assert_eq!(record.status, RunStatus::Succeeded);
     assert_eq!(record.step, "open-pr");
 
-    // PR recorded with the right shape.
+    // PR recorded with the right shape: draft by default, agent summary as
+    // the fallback body (no pr_body written), no raw issue-body excerpt.
     let prs = env.forge.prs();
     assert_eq!(prs.len(), 1);
     assert_eq!(prs[0].base, "main");
     assert!(prs[0].head.starts_with("meguri/7-add-greeting-file-"));
     assert!(prs[0].body.contains("Closes #7"));
+    assert!(prs[0].draft, "pr.draft defaults to true");
+    assert!(prs[0].body.contains("scripted"), "body: {}", prs[0].body);
+    assert!(
+        !prs[0].body.contains("Create `greeting.txt`"),
+        "issue body must no longer be embedded: {}",
+        prs[0].body
+    );
+
+    // Without a repo PR template, the execute prompt carries the default one.
+    let wt = find_worktree(&env.worktree_root).unwrap();
+    let prompts = prompts_in(&wt);
+    let execute_prompt = prompts
+        .iter()
+        .find(|p| p.contains("# Issue:"))
+        .expect("execute prompt exists");
+    assert!(execute_prompt.contains("# Pull request description"));
+    assert!(execute_prompt.contains("## Summary"));
 
     // Labels settled: claim + trigger removed, no escalation.
     let labels = env.forge.labels_of(7);
@@ -236,6 +274,133 @@ async fn worker_happy_path_issue_to_pr() {
         branches.contains("meguri/7-add-greeting-file-"),
         "{branches}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_uses_agent_pr_body_in_pr() {
+    let env = setup(None).await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result_with(
+                &wt,
+                &turn_id,
+                "success",
+                Some("## Summary\nAdded greeting.txt so newcomers get a hello."),
+            );
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(prs[0].body.contains("Closes #7"));
+    assert!(
+        prs[0]
+            .body
+            .contains("## Summary\nAdded greeting.txt so newcomers get a hello."),
+        "body: {}",
+        prs[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_pr_draft_false_opens_normal_pr() {
+    let mut env = setup(None).await;
+    env.deps.config.pr.draft = false;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(!prs[0].draft, "pr.draft = false must open a normal PR");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_prompt_carries_repo_pr_template() {
+    let env = setup(None).await;
+
+    // Ship a PR template in the repo so the worktree (cut from origin/main)
+    // contains it.
+    let clone = env.deps.project.repo_path.clone();
+    std::fs::create_dir_all(clone.join(".github")).unwrap();
+    std::fs::write(
+        clone.join(".github/pull_request_template.md"),
+        "## Repo Template\n- custom section\n",
+    )
+    .unwrap();
+    run_git(&clone, &["add", ".github"]).await.unwrap();
+    run_git(&clone, &["commit", "-m", "add PR template"])
+        .await
+        .unwrap();
+    run_git(&clone, &["push", "origin", "main"]).await.unwrap();
+
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let wt = find_worktree(&env.worktree_root).unwrap();
+    let prompts = prompts_in(&wt);
+    let execute_prompt = prompts
+        .iter()
+        .find(|p| p.contains("# Issue:"))
+        .expect("execute prompt exists");
+    assert!(
+        execute_prompt.contains("## Repo Template"),
+        "repo template must win over the default"
+    );
+    assert!(!execute_prompt.contains("<what & why>"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -31,6 +31,13 @@ pub struct WorkerCheckpoint {
     pub fix_turns_used: u32,
     #[serde(default)]
     pub pr_url: Option<String>,
+    /// Agent's one-paragraph summary from the verified execute turn
+    /// (fallback PR body).
+    #[serde(default)]
+    pub summary: String,
+    /// Agent-authored PR description (Markdown) from the verified execute turn.
+    #[serde(default)]
+    pub pr_body: Option<String>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -140,7 +147,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
     );
 
     if step == STEP_EXECUTE {
-        match execute(deps, &run, &checkpoint, &worktree).await? {
+        match execute(deps, &run, &mut checkpoint, &worktree).await? {
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
@@ -400,10 +407,10 @@ async fn run_turn(
 async fn execute(
     deps: &Deps,
     run: &RunRecord,
-    cp: &WorkerCheckpoint,
+    cp: &mut WorkerCheckpoint,
     worktree: &Path,
 ) -> Result<StepFlow> {
-    let mut prompt = execute_prompt(deps, run, cp);
+    let mut prompt = execute_prompt(deps, run, cp, worktree);
     let mut corrective_turns = 0u32;
 
     loop {
@@ -438,6 +445,10 @@ async fn execute(
         let clean = gitops::status_clean(worktree).await?;
         let ahead = gitops::commits_ahead(worktree, &deps.project.default_branch).await?;
         if clean && ahead > 0 {
+            // Keep what the agent said for the PR body (persisted by the
+            // caller's step save).
+            cp.summary = result.summary;
+            cp.pr_body = result.pr_body;
             deps.store.emit(
                 Some(&run.id),
                 "execute.verified",
@@ -574,16 +585,21 @@ async fn open_pr(
         url.clone() // resumed after PR creation
     } else {
         let title = format!("{} (#{})", cp.issue_title, run.issue_number);
+        let description = cp
+            .pr_body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cp.summary.trim());
         let body = format!(
             "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
              from an interactive agent session (run `{}`).",
-            run.issue_number,
-            cp.issue_body_excerpt(),
-            run.id
+            run.issue_number, description, run.id
         );
+        let draft = deps.config.pr_for(&deps.project).draft;
         let pr = deps
             .forge
-            .create_pr(&branch, &deps.project.default_branch, &title, &body)
+            .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
             .await?;
         cp.pr_url = Some(pr.url.clone());
         save_step(deps, run, STEP_OPEN_PR, cp)?;
@@ -603,17 +619,43 @@ async fn open_pr(
     Ok(pr_url)
 }
 
-impl WorkerCheckpoint {
-    fn issue_body_excerpt(&self) -> String {
-        let mut excerpt: String = self.issue_body.chars().take(400).collect();
-        if excerpt.len() < self.issue_body.len() {
-            excerpt.push('…');
-        }
-        excerpt
-    }
+/// Where repositories keep their PR template, in priority order.
+const PR_TEMPLATE_PATHS: &[&str] = &[
+    ".github/pull_request_template.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "docs/pull_request_template.md",
+    "pull_request_template.md",
+];
+
+/// Fallback PR template when the repository doesn't ship one.
+const DEFAULT_PR_TEMPLATE: &str = "## Summary\n<what & why>\n\n\
+     ## Changes\n- <key changes>\n\n\
+     ## Testing\n- <verification / tests you ran>";
+
+/// The repository's own PR template, read from the worktree (never delegated
+/// to the agent).
+fn find_pr_template(worktree: &Path) -> Option<String> {
+    PR_TEMPLATE_PATHS
+        .iter()
+        .map(|rel| worktree.join(rel))
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-fn execute_prompt(_deps: &Deps, run: &RunRecord, cp: &WorkerCheckpoint) -> String {
+/// Prompt section asking the agent to author the PR description (`pr_body`).
+fn pr_body_instruction(worktree: &Path) -> String {
+    let template = find_pr_template(worktree).unwrap_or_else(|| DEFAULT_PR_TEMPLATE.to_string());
+    format!(
+        "# Pull request description\n\
+         meguri opens the pull request; you write its description. In the completion \
+         result file, set `pr_body` to a Markdown description that fills in every \
+         section of the template below with what you actually did (do not paste the \
+         issue text):\n\n{template}"
+    )
+}
+
+fn execute_prompt(_deps: &Deps, run: &RunRecord, cp: &WorkerCheckpoint, worktree: &Path) -> String {
     format!(
         "You are implementing GitHub issue #{number} in this repository \
          (branch `{branch}`, a dedicated worktree).\n\n\
@@ -625,11 +667,67 @@ fn execute_prompt(_deps: &Deps, run: &RunRecord, cp: &WorkerCheckpoint) -> Strin
          - COMMIT all your work to the current branch with clear messages. \
            Leave the working tree clean.\n\
          - Do NOT push and do NOT create a pull request; meguri handles both.\n\
-         - Do NOT switch branches or touch other worktrees.",
+         - Do NOT switch branches or touch other worktrees.\n\n\
+         {pr_section}",
         number = run.issue_number,
         branch = run.branch.as_deref().unwrap_or("?"),
         title = cp.issue_title,
         body = cp.issue_body,
+        pr_section = pr_body_instruction(worktree),
     )
     // The completion contract is appended by prepare_turn.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_template_discovery_prefers_repo_locations_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_pr_template(dir.path()), None);
+
+        std::fs::write(dir.path().join("pull_request_template.md"), "root tpl\n").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root tpl"));
+
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/pull_request_template.md"), "docs tpl").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("docs tpl"));
+
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        std::fs::write(
+            dir.path().join(".github/pull_request_template.md"),
+            "gh tpl",
+        )
+        .unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("gh tpl"));
+    }
+
+    #[test]
+    fn blank_repo_template_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pull_request_template.md"), "  \n\n").unwrap();
+        assert_eq!(find_pr_template(dir.path()), None);
+    }
+
+    #[test]
+    fn pr_body_instruction_uses_repo_template_or_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = pr_body_instruction(dir.path());
+        assert!(section.contains("pr_body"));
+        assert!(
+            section.contains("## Summary"),
+            "default template: {section}"
+        );
+
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        std::fs::write(
+            dir.path().join(".github/pull_request_template.md"),
+            "## Repo Sections\n- fill me\n",
+        )
+        .unwrap();
+        let section = pr_body_instruction(dir.path());
+        assert!(section.contains("## Repo Sections"));
+        assert!(!section.contains("<what & why>"));
+    }
 }

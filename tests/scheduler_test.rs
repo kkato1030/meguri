@@ -55,6 +55,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             default_branch: "main".into(),
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
+            pr: None,
         },
     }
 }

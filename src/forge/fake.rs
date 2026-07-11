@@ -13,6 +13,7 @@ pub struct RecordedPr {
     pub base: String,
     pub title: String,
     pub body: String,
+    pub draft: bool,
 }
 
 #[derive(Default)]
@@ -113,6 +114,7 @@ impl Forge for FakeForge {
         base: &str,
         title: &str,
         body: &str,
+        draft: bool,
     ) -> Result<CreatedPr> {
         let mut prs = self.prs.lock().unwrap();
         prs.push(RecordedPr {
@@ -120,6 +122,7 @@ impl Forge for FakeForge {
             base: base.into(),
             title: title.into(),
             body: body.into(),
+            draft,
         });
         Ok(CreatedPr {
             number: prs.len() as i64,

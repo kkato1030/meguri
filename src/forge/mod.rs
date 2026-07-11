@@ -45,6 +45,12 @@ pub trait Forge: Send + Sync {
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
-    async fn create_pr(&self, head: &str, base: &str, title: &str, body: &str)
-    -> Result<CreatedPr>;
+    async fn create_pr(
+        &self,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<CreatedPr>;
 }

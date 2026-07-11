@@ -124,6 +124,9 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[pr]
+draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き
 ```
 
 ## 開発
