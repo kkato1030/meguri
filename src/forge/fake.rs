@@ -290,9 +290,23 @@ impl Forge for FakeForge {
             .iter()
             .any(|i| i.number == number)
         {
-            Ok(IssueState::Open)
-        } else {
-            bail!("issue #{number} not found")
+            return Ok(IssueState::Open);
+        }
+        // Issues and PRs share the number space (as on GitHub, where
+        // `gh issue view <PR#>` resolves the PR): merged counts as closed,
+        // anything unrecognized is an error, never a silent Open.
+        let pr_state = self
+            .prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == number)
+            .map(|p| p.state.clone());
+        match pr_state.as_deref() {
+            Some("merged") | Some("closed") => Ok(IssueState::Closed),
+            Some("open") => Ok(IssueState::Open),
+            Some(other) => bail!("unrecognized state `{other}` of PR #{number}"),
+            None => bail!("issue #{number} not found"),
         }
     }
 
