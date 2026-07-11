@@ -141,6 +141,12 @@ pub trait Forge: Send + Sync {
     /// Issues blocking `issue` via the forge-native dependency graph
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
+    /// File a new issue; returns its number (planner decomposition,
+    /// issue #24).
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
+    /// Record `issue` as blocked by `blocker` in the forge-native dependency
+    /// graph (the same graph [`Forge::blocked_by`] reads).
+    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number

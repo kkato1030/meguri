@@ -236,6 +236,54 @@ impl Forge for GhForge {
             .unwrap_or_default())
     }
 
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        for label in labels {
+            self.ensure_label(label).await;
+        }
+        let mut args = vec![
+            "issue", "create", "--repo", &self.repo, "--title", title, "--body", body,
+        ];
+        for label in labels {
+            args.push("--label");
+            args.push(label);
+        }
+        let out = self.gh(&args).await?;
+        // gh prints the created issue's URL (possibly after other lines).
+        let url = out
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("https://"))
+            .unwrap_or(&out)
+            .trim();
+        url.rsplit('/')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .with_context(|| format!("no issue number in gh issue create output: {out}"))
+    }
+
+    /// The dependencies endpoint wants the blocking issue's database id, not
+    /// its number — resolve it first.
+    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        let raw = self
+            .gh(&["api", &format!("repos/{}/issues/{blocker}", self.repo)])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue output")?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_i64)
+            .with_context(|| format!("issue #{blocker} has no id: {raw}"))?;
+        self.gh(&[
+            "api",
+            "-X",
+            "POST",
+            &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
+            "-F",
+            &format!("issue_id={id}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         self.ensure_label(label).await;
         self.gh(&[
