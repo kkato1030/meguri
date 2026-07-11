@@ -207,7 +207,12 @@ impl Flavor for SpecWorkerFlavor {
         // section: the PR already exists, nothing consumes `pr_body` here.
     }
 
-    fn verify_work(&self, _run: &RunRecord, _worktree: &Path) -> std::result::Result<(), String> {
+    fn verify_work(
+        &self,
+        _run: &RunRecord,
+        _cp: &Checkpoint,
+        _worktree: &Path,
+    ) -> std::result::Result<(), String> {
         Ok(()) // committed implementation work is all the takeover requires
     }
 

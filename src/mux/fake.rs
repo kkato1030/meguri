@@ -14,16 +14,23 @@ use super::{
 #[derive(Debug)]
 pub struct FakePane {
     pub spec_title: String,
+    pub spec_command: Vec<String>,
     pub sent_lines: Vec<String>,
     pub state: AgentState,
     pub alive: bool,
     pub tail: Vec<String>,
+    pub agent_session: Option<String>,
 }
 
 pub struct FakeMux {
     pub native_agent_state: bool,
     next_id: AtomicUsize,
     panes: Mutex<HashMap<PaneId, FakePane>>,
+    /// Spawned commands in spawn order (the pane map loses ordering).
+    spawn_log: Mutex<Vec<Vec<String>>>,
+    /// Spawns whose command contains this string come up already dead
+    /// (emulates e.g. `claude --resume <unknown-id>` exiting immediately).
+    dead_spawn_matching: Mutex<Option<String>>,
 }
 
 impl FakeMux {
@@ -32,6 +39,8 @@ impl FakeMux {
             native_agent_state,
             next_id: AtomicUsize::new(1),
             panes: Mutex::new(HashMap::new()),
+            spawn_log: Mutex::new(Vec::new()),
+            dead_spawn_matching: Mutex::new(None),
         }
     }
 
@@ -68,6 +77,24 @@ impl FakeMux {
     pub fn pane_count(&self) -> usize {
         self.panes.lock().unwrap().len()
     }
+
+    /// What the mux itself reports for `agent_session_id` (the herdr path).
+    pub fn set_agent_session(&self, pane: &PaneId, session: Option<String>) {
+        let mut panes = self.panes.lock().unwrap();
+        if let Some(p) = panes.get_mut(pane) {
+            p.agent_session = session;
+        }
+    }
+
+    /// Make future spawns whose command contains `needle` come up dead.
+    pub fn fail_spawns_matching(&self, needle: &str) {
+        *self.dead_spawn_matching.lock().unwrap() = Some(needle.to_string());
+    }
+
+    /// Every spawned command, in spawn order.
+    pub fn spawned_commands(&self) -> Vec<Vec<String>> {
+        self.spawn_log.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -91,14 +118,21 @@ impl Multiplexer for FakeMux {
             "fake:{}",
             self.next_id.fetch_add(1, Ordering::SeqCst)
         ));
+        self.spawn_log.lock().unwrap().push(spec.command.clone());
+        let alive = match &*self.dead_spawn_matching.lock().unwrap() {
+            Some(needle) => !spec.command.iter().any(|arg| arg.contains(needle)),
+            None => true,
+        };
         self.panes.lock().unwrap().insert(
             id.clone(),
             FakePane {
                 spec_title: spec.title.clone(),
+                spec_command: spec.command.clone(),
                 sent_lines: Vec::new(),
                 state: AgentState::Working,
-                alive: true,
+                alive,
                 tail: Vec::new(),
+                agent_session: None,
             },
         );
         Ok(id)
@@ -149,6 +183,15 @@ impl Multiplexer for FakeMux {
                 }
             })
             .unwrap_or(AgentState::Unknown))
+    }
+
+    async fn agent_session_id(&self, pane: &PaneId) -> MuxResult<Option<String>> {
+        Ok(self
+            .panes
+            .lock()
+            .unwrap()
+            .get(pane)
+            .and_then(|p| p.agent_session.clone()))
     }
 
     async fn kill_pane(&self, pane: &PaneId) -> MuxResult<()> {

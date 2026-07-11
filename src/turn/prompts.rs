@@ -14,6 +14,31 @@ pub enum TurnStatus {
     Success,
     Failure,
     NeedsHuman,
+    /// The agent found that a design decision must precede implementation
+    /// (issue #22). Only the worker's execute prompt invites this status;
+    /// everywhere else it escalates like `NeedsHuman`.
+    NeedsPlan,
+    /// The agent found the issue too big for one spec and proposes to split
+    /// it into sub-issues (issue #24), described in
+    /// [`TurnResultFile::children`]. Only the planner's execute prompt
+    /// invites this status; everywhere else it escalates like `NeedsHuman`.
+    Decompose,
+}
+
+/// One sub-issue proposed by a `decompose` turn (issue #24). meguri files
+/// the issue itself — the agent only describes it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChildIssue {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// How the child enters the loops: "ready" (small enough to implement
+    /// directly) or "plan" (needs its own design pass first).
+    pub kind: String,
+    /// Zero-based indices of *earlier* `children` entries this one depends
+    /// on; meguri wires them as GitHub-native `blocked_by`.
+    #[serde(default)]
+    pub blocked_by: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +51,14 @@ pub struct TurnResultFile {
     /// body when present; `summary` is the fallback.
     #[serde(default)]
     pub pr_body: Option<String>,
+    /// The agent CLI's own session id (e.g. a Claude Code session UUID),
+    /// letting recovery `--resume` the conversation after the pane dies.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+    /// Sub-issues proposed by a `decompose` turn, in dependency order
+    /// (issue #24). Empty for every other status.
+    #[serde(default)]
+    pub children: Vec<ChildIssue>,
 }
 
 pub fn meguri_dir(worktree: &Path) -> PathBuf {
@@ -63,6 +96,10 @@ When you have FULLY completed the task above, write a JSON file at
 - `pr_body` (on success): a Markdown pull-request description of what you
   actually changed. If the prompt includes a PR template, fill in each of its
   sections; escape newlines as \n inside the JSON string.
+- `agent_session_id` (optional): if you know your own CLI session id (e.g.
+  your Claude Code session UUID), include it so this conversation can be
+  resumed if the terminal dies. Omit the field entirely if you are not sure —
+  never invent one.
 - WRITE THE FILE; do not merely print the JSON to the terminal.
 - Do not commit or stage anything under `{MEGURI_DIR}/`.
 - If you are unsure whether you are done, prefer "needs_human" over guessing."#
@@ -125,6 +162,7 @@ mod tests {
         assert!(content.contains(r#""turn_id": "abc-123""#));
         assert!(content.contains("needs_human"));
         assert!(content.contains("pr_body"));
+        assert!(content.contains("agent_session_id"));
     }
 
     #[test]
@@ -141,6 +179,55 @@ mod tests {
 
         std::fs::write(result_path(dir.path()), "not json").unwrap();
         assert!(read_result(dir.path(), "t1").is_none());
+    }
+
+    #[test]
+    fn result_status_needs_plan_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"needs_plan","summary":"design first"}"#,
+        )
+        .unwrap();
+        let result = read_result(dir.path(), "t1").unwrap();
+        assert_eq!(result.status, TurnStatus::NeedsPlan);
+        assert_eq!(result.summary, "design first");
+    }
+
+    #[test]
+    fn result_status_decompose_parses_with_children() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"decompose","summary":"too big",
+                "children":[
+                  {"title":"part 1","body":"do A","kind":"ready"},
+                  {"title":"part 2","kind":"plan","blocked_by":[0]}
+                ]}"#,
+        )
+        .unwrap();
+        let result = read_result(dir.path(), "t1").unwrap();
+        assert_eq!(result.status, TurnStatus::Decompose);
+        assert_eq!(result.children.len(), 2);
+        assert_eq!(result.children[0].title, "part 1");
+        assert_eq!(result.children[0].kind, "ready");
+        assert!(result.children[0].blocked_by.is_empty());
+        assert_eq!(result.children[1].body, "");
+        assert_eq!(result.children[1].blocked_by, vec![0]);
+    }
+
+    #[test]
+    fn result_children_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert!(read_result(dir.path(), "t1").unwrap().children.is_empty());
     }
 
     #[test]
@@ -162,6 +249,34 @@ mod tests {
         assert_eq!(
             read_result(dir.path(), "t1").unwrap().pr_body.as_deref(),
             Some("## Summary\nDid it.")
+        );
+    }
+
+    #[test]
+    fn result_agent_session_id_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1").unwrap().agent_session_id,
+            None
+        );
+
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done","agent_session_id":"sess-42"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1")
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("sess-42")
         );
     }
 

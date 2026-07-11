@@ -616,6 +616,7 @@ dependencies = [
  "clap",
  "dirs",
  "http-body-util",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

@@ -77,9 +77,9 @@ impl Scheduler {
     }
 
     /// Ask every loop for actionable targets in every project and enqueue
-    /// them, respecting the slot budget. Loops are visited in `self.loops`
-    /// order across all projects, so slots fill by loop priority before
-    /// project order; within a loop, targets go oldest-first (FIFO).
+    /// them, respecting the slot budget. Loops are visited in priority order
+    /// (loop before project, so priority beats project order); within a loop,
+    /// targets go oldest-first (FIFO by issue/PR number).
     async fn discover(
         &self,
         running: &mut JoinSet<String>,

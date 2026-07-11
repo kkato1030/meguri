@@ -1,3 +1,4 @@
+pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
 pub mod planner;
@@ -46,6 +47,14 @@ pub enum WorkerOutcome {
     /// Benign race: the issue was held or de-labeled between discovery and
     /// claim (e.g. another run already shipped it). No escalation.
     Skipped(String),
+    /// The agent found a design decision must precede implementation; the
+    /// issue was handed to the planner (issue #22). A normal ending, not a
+    /// failure — the reason (agent's summary) is left as an issue comment.
+    NeedsPlan(String),
+    /// The planner split the issue into sub-issues instead of writing a spec
+    /// (issue #24). The second normal planner ending — the rationale
+    /// (agent's summary) is left as an issue comment.
+    Decomposed(String),
 }
 
 /// A schedulable loop: discovers actionable targets for a project and drives
@@ -66,10 +75,11 @@ pub trait Loop: Send + Sync {
 }
 
 /// The loops meguri ships today, in dispatch-priority order (the pipeline
-/// reversed = closest to merge first). The scheduler hands out slots from the
-/// head, so free slots always go to the most-downstream work available.
+/// reversed = closest to merge first). The scheduler hands out slots from
+/// the head of this list, so ordering alone is the priority mechanism.
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
+        Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(reviewer::ReviewerLoop),
