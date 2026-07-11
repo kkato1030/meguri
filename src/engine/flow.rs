@@ -133,7 +133,8 @@ pub struct NeedsHuman(pub String);
 /// Shared discovery: open issues carrying `label` that are actionable — not
 /// held, not claimed by another host, not already shipped by a succeeded run
 /// of this loop (avoids duplicate PRs when the trigger label lingers or
-/// reappears; humans can force a rerun with `meguri run --issue N`).
+/// reappears; humans can force a rerun with `meguri run --issue N`), and not
+/// gated by an unresolved `blocked_by` dependency.
 pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Result<Vec<Target>> {
     let issues = deps.forge.list_issues_with_label(label).await?;
     let mut targets = Vec::new();
@@ -147,12 +148,27 @@ pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Res
         {
             continue;
         }
+        if has_unresolved_blockers(deps, issue.number).await {
+            continue;
+        }
         targets.push(Target {
             issue_number: issue.number,
             title: issue.title,
         });
     }
     Ok(targets)
+}
+
+/// Dependency gate (looper ADR-0004): GitHub-native `blocked_by` is the
+/// authority. Only a blocker closed as completed resolves; open blockers,
+/// not_planned/duplicate closes, and blockers we cannot read all keep the
+/// issue out of discovery. The skip is silent — no label, no comment: the
+/// dependency graph on the forge already tells a human why nothing starts.
+async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
+    match deps.forge.blocked_by(issue).await {
+        Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
+        Err(_) => true,
+    }
 }
 
 pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<WorkerOutcome> {
