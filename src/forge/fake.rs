@@ -6,7 +6,9 @@ use std::sync::Mutex;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::{CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread};
+use super::{
+    Blocker, CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread,
+};
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
@@ -25,7 +27,12 @@ pub struct RecordedPr {
 #[derive(Default)]
 pub struct FakeForge {
     pub issues: Mutex<Vec<Issue>>,
-    pub closed: Mutex<HashSet<i64>>,
+    /// Closed issues: number → state_reason ("completed", "not_planned", ...).
+    pub closed: Mutex<HashMap<i64, String>>,
+    /// Dependency graph: issue → numbers of the issues blocking it.
+    pub blocked_by: Mutex<HashMap<i64, Vec<i64>>>,
+    /// Issues whose blocked_by lookup fails (unreadable-blocker scenarios).
+    pub blocked_by_errors: Mutex<HashSet<i64>>,
     pub comments: Mutex<Vec<(i64, String)>>,
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
@@ -47,7 +54,31 @@ impl FakeForge {
     }
 
     pub fn close_issue(&self, number: i64) {
-        self.closed.lock().unwrap().insert(number);
+        self.close_issue_as(number, "completed");
+    }
+
+    /// Close with an explicit state_reason ("not_planned", "duplicate", ...).
+    pub fn close_issue_as(&self, number: i64, state_reason: &str) {
+        self.closed
+            .lock()
+            .unwrap()
+            .insert(number, state_reason.to_string());
+    }
+
+    /// Record that `issue` is blocked by `blocker` (GitHub-native
+    /// dependency); the blocker's state comes from the closed map.
+    pub fn block_issue(&self, issue: i64, blocker: i64) {
+        self.blocked_by
+            .lock()
+            .unwrap()
+            .entry(issue)
+            .or_default()
+            .push(blocker);
+    }
+
+    /// Make blocked_by lookups for `issue` fail (unreadable blockers).
+    pub fn fail_blocked_by(&self, issue: i64) {
+        self.blocked_by_errors.lock().unwrap().insert(issue);
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
@@ -240,7 +271,7 @@ impl Forge for FakeForge {
     }
 
     async fn issue_state(&self, number: i64) -> Result<IssueState> {
-        if self.closed.lock().unwrap().contains(&number) {
+        if self.closed.lock().unwrap().contains_key(&number) {
             return Ok(IssueState::Closed);
         }
         if self
@@ -263,9 +294,37 @@ impl Forge for FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|i| i.has_label(label) && !closed.contains(&i.number))
+            .filter(|i| i.has_label(label) && !closed.contains_key(&i.number))
             .cloned()
             .collect())
+    }
+
+    async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>> {
+        if self.blocked_by_errors.lock().unwrap().contains(&issue) {
+            bail!("blocked_by of issue #{issue} is unreadable");
+        }
+        let closed = self.closed.lock().unwrap();
+        Ok(self
+            .blocked_by
+            .lock()
+            .unwrap()
+            .get(&issue)
+            .map(|blockers| {
+                blockers
+                    .iter()
+                    .map(|n| Blocker {
+                        number: *n,
+                        state: if closed.contains_key(n) {
+                            "closed"
+                        } else {
+                            "open"
+                        }
+                        .into(),
+                        state_reason: closed.get(n).cloned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
