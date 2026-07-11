@@ -163,7 +163,7 @@ pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
     crate::server::serve(store, cfg, listener).await
 }
 
-pub async fn cmd_clean(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {
+pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {
     let cfg = Config::load()?;
     let projects: Vec<&ProjectConfig> = match project {
         Some(id) => vec![pick_project(&cfg, Some(id))?],

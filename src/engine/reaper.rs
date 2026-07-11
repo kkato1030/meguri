@@ -1,6 +1,6 @@
 //! Worktree reaper: reclaim worktrees whose issue is closed on the forge
 //! ("Authority": the issue's lifecycle, not local state, decides when a
-//! worktree may go). Shared by `meguri clean` and the watch-loop sweep;
+//! worktree may go). Shared by `meguri prune` and the watch-loop sweep;
 //! pane lifecycle stays with #13.
 
 use std::path::{Path, PathBuf};
@@ -229,13 +229,13 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
 }
 
 /// Watch-poll sweep: reclaim closed-issue worktrees, never forcing. Dirty
-/// worktrees are left for `meguri clean --force`.
+/// worktrees are left for `meguri prune --force`.
 pub async fn sweep(deps: &Deps) -> Result<()> {
     let candidates = plan(deps).await?;
     for c in candidates.iter().filter(|c| c.verdict == Verdict::Dirty) {
         tracing::warn!(
             "worktree {} has uncommitted changes for closed issue #{} — \
-             skipped (reclaim with `meguri clean --force`)",
+             skipped (reclaim with `meguri prune --force`)",
             c.path.display(),
             c.issue.unwrap_or(0),
         );
