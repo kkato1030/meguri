@@ -2,7 +2,7 @@
 //! resumes runs orphaned by a dead orchestrator.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
@@ -730,6 +730,182 @@ async fn watch_ticks_write_a_heartbeat() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     watch.abort();
+}
+
+/// A scripted loop for dispatch-priority tests: discovers fixed
+/// (project, issue) targets and records drive order in a shared log.
+struct RecordingLoop {
+    kind: &'static str,
+    /// (project_id, issue_number) pairs this loop discovers.
+    targets: Vec<(&'static str, i64)>,
+    /// (loop kind, project_id, issue_number) in drive order.
+    log: Arc<Mutex<Vec<(String, String, i64)>>>,
+}
+
+#[async_trait::async_trait]
+impl Loop for RecordingLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for (project, issue) in &self.targets {
+            if *project != deps.project.id
+                || deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, self.kind, *issue)?
+            {
+                continue;
+            }
+            targets.push(Target {
+                issue_number: *issue,
+                title: format!("target {issue}"),
+            });
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        let run = deps.store.get_run(run_id)?.expect("run exists");
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.kind.into(), run.project_id, run.issue_number));
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "fake://pr".into(),
+        })
+    }
+}
+
+/// Run a single-slot scheduler with `loops` over `projects` until `expected`
+/// drives are logged, then return the log in drive order.
+async fn drive_order(
+    projects: Vec<Deps>,
+    loops: Vec<Arc<dyn Loop>>,
+    log: Arc<Mutex<Vec<(String, String, i64)>>>,
+    expected: usize,
+) -> Vec<(String, String, i64)> {
+    let scheduler = Scheduler {
+        projects,
+        loops,
+        poll_interval: Duration::from_millis(100),
+        // One slot at a time so drive order mirrors dispatch priority.
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if log.lock().unwrap().len() >= expected {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("only {:?} of {expected} drives ran", log.lock().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+    log.lock().unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_dispatches_loops_in_priority_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // The worker target has the smaller issue number; only loop priority
+    // (fixer listed first) can put the fixer target ahead of it.
+    let order = drive_order(
+        vec![deps],
+        vec![
+            Arc::new(RecordingLoop {
+                kind: "fixer",
+                targets: vec![("proj", 201)],
+                log: log.clone(),
+            }),
+            Arc::new(RecordingLoop {
+                kind: "worker",
+                targets: vec![("proj", 101)],
+                log: log.clone(),
+            }),
+        ],
+        log,
+        2,
+    )
+    .await;
+
+    assert_eq!(
+        order,
+        vec![
+            ("fixer".into(), "proj".into(), 201),
+            ("worker".into(), "proj".into(), 101),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_orders_targets_within_a_loop_by_issue_number() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // discover() returns the targets unsorted; the scheduler normalizes
+    // to oldest-first (FIFO).
+    let order = drive_order(
+        vec![deps],
+        vec![Arc::new(RecordingLoop {
+            kind: "fixer",
+            targets: vec![("proj", 305), ("proj", 301), ("proj", 303)],
+            log: log.clone(),
+        })],
+        log,
+        3,
+    )
+    .await;
+
+    let issues: Vec<i64> = order.iter().map(|(_, _, n)| *n).collect();
+    assert_eq!(issues, vec![301, 303, 305]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_prefers_loop_priority_over_project_order() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    // Two projects sharing one store; "alpha" is listed first.
+    let mut deps_a = setup(&root.path().join("alpha"), forge.clone()).await;
+    deps_a.project.id = "alpha".into();
+    let mut deps_b = setup(&root.path().join("beta"), forge).await;
+    deps_b.store = deps_a.store.clone();
+    deps_b.project.id = "beta".into();
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // Project beta only has fixer work, project alpha only planner work;
+    // the fixer loop must win even though alpha comes first.
+    let order = drive_order(
+        vec![deps_a, deps_b],
+        vec![
+            Arc::new(RecordingLoop {
+                kind: "fixer",
+                targets: vec![("beta", 501)],
+                log: log.clone(),
+            }),
+            Arc::new(RecordingLoop {
+                kind: "planner",
+                targets: vec![("alpha", 401)],
+                log: log.clone(),
+            }),
+        ],
+        log,
+        2,
+    )
+    .await;
+
+    assert_eq!(order[0], ("fixer".into(), "beta".into(), 501));
+    assert_eq!(order[1], ("planner".into(), "alpha".into(), 401));
 }
 
 #[tokio::test(flavor = "multi_thread")]

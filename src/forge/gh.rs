@@ -236,6 +236,54 @@ impl Forge for GhForge {
             .unwrap_or_default())
     }
 
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        for label in labels {
+            self.ensure_label(label).await;
+        }
+        let mut args = vec![
+            "issue", "create", "--repo", &self.repo, "--title", title, "--body", body,
+        ];
+        for label in labels {
+            args.push("--label");
+            args.push(label);
+        }
+        let out = self.gh(&args).await?;
+        // gh prints the created issue's URL (possibly after other lines).
+        let url = out
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("https://"))
+            .unwrap_or(&out)
+            .trim();
+        url.rsplit('/')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .with_context(|| format!("no issue number in gh issue create output: {out}"))
+    }
+
+    /// The dependencies endpoint wants the blocking issue's database id, not
+    /// its number — resolve it first.
+    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        let raw = self
+            .gh(&["api", &format!("repos/{}/issues/{blocker}", self.repo)])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue output")?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_i64)
+            .with_context(|| format!("issue #{blocker} has no id: {raw}"))?;
+        self.gh(&[
+            "api",
+            "-X",
+            "POST",
+            &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
+            "-F",
+            &format!("issue_id={id}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         self.ensure_label(label).await;
         self.gh(&[
@@ -308,6 +356,33 @@ impl Forge for GhForge {
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
         Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
+    }
+
+    /// `gh pr view` resolves a branch name to its PR (preferring an open one
+    /// when several exist, which is the safe direction: open means keep).
+    /// "No PR" is a normal answer, not an error — only real lookup failures
+    /// (network, auth) propagate so the caller can fall back to keeping.
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        let raw = match self
+            .gh(&[
+                "pr",
+                "view",
+                branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,body,labels,headRefName,headRefOid,state,url",
+            ])
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) if e.to_string().contains("no pull requests found") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
+        Ok(Some(
+            Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))?,
+        ))
     }
 
     /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",

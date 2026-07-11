@@ -43,6 +43,8 @@ pub struct FakeForge {
     /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
     /// before it finished computing).
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
+    /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
+    pub pr_for_branch_errors: Mutex<HashSet<String>>,
 }
 
 impl FakeForge {
@@ -85,6 +87,14 @@ impl FakeForge {
         self.blocked_by_errors.lock().unwrap().insert(issue);
     }
 
+    /// Make pr_for_branch lookups for `branch` fail (forge outage).
+    pub fn fail_pr_for_branch(&self, branch: &str) {
+        self.pr_for_branch_errors
+            .lock()
+            .unwrap()
+            .insert(branch.to_string());
+    }
+
     /// Seed a pull request as if it already existed on the forge (reviewer
     /// tests; `create_pr` records worker/planner-created ones).
     pub fn add_pr(
@@ -125,6 +135,21 @@ impl FakeForge {
         if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
             pr.head_sha = head_sha.into();
         }
+    }
+
+    /// Numbers of the issues recorded as blocking `number`.
+    pub fn blockers_of(&self, number: i64) -> Vec<i64> {
+        self.blocked_by
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of every issue on the fake forge (creation-order).
+    pub fn all_issues(&self) -> Vec<Issue> {
+        self.issues.lock().unwrap().clone()
     }
 
     pub fn labels_of(&self, number: i64) -> Vec<String> {
@@ -350,6 +375,31 @@ impl Forge for FakeForge {
             .unwrap_or_default())
     }
 
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        let mut issues = self.issues.lock().unwrap();
+        let number = issues.iter().map(|i| i.number).max().unwrap_or(0) + 1;
+        issues.push(Issue {
+            number,
+            title: title.into(),
+            body: body.into(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        });
+        Ok(number)
+    }
+
+    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        {
+            let issues = self.issues.lock().unwrap();
+            for number in [issue, blocker] {
+                if !issues.iter().any(|i| i.number == number) {
+                    bail!("issue #{number} not found");
+                }
+            }
+        }
+        self.block_issue(issue, blocker);
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         let mut issues = self.issues.lock().unwrap();
         let Some(i) = issues.iter_mut().find(|i| i.number == issue) else {
@@ -398,6 +448,20 @@ impl Forge for FakeForge {
             .find(|p| p.number == number)
             .map(Self::pr_to_public)
             .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
+    }
+
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        if self.pr_for_branch_errors.lock().unwrap().contains(branch) {
+            bail!("forge lookup of branch {branch} is unavailable");
+        }
+        let prs = self.prs.lock().unwrap();
+        let matching: Vec<&RecordedPr> = prs.iter().filter(|p| p.head == branch).collect();
+        // Like `gh pr view <branch>`: an open PR wins over closed/merged ones.
+        Ok(matching
+            .iter()
+            .find(|p| p.state == "open")
+            .or(matching.last())
+            .map(|p| Self::pr_to_public(p)))
     }
 
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {

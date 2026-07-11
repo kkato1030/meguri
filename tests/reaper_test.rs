@@ -236,6 +236,99 @@ async fn unmerged_branch_is_kept_without_force() {
         .expect("unmerged branch survives without --force");
 }
 
+/// Simulate a squash merge of `branch`: main gains an equivalent commit with
+/// a different sha, so the branch tip is *not* an ancestor of origin/main.
+async fn squash_merge_onto_main(deps: &Deps, issue: i64) {
+    let repo = &deps.project.repo_path;
+    std::fs::write(repo.join("work.txt"), format!("issue {issue}\n")).unwrap();
+    run_git(repo, &["add", "work.txt"]).await.unwrap();
+    run_git(
+        repo,
+        &[
+            "-c",
+            "user.email=a@a",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            "squashed",
+        ],
+    )
+    .await
+    .unwrap();
+    run_git(repo, &["push", "origin", "main"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn squash_merged_branch_is_deleted_via_forge_pr_state() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(11, "Squashed", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 11, "Squashed").await;
+    squash_merge_onto_main(&deps, 11).await;
+    forge.add_pr(41, "Squashed", "", &[], &branch, "sha41");
+    forge.set_pr_state(41, "merged");
+    forge.close_issue(11);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists());
+    assert!(
+        reclaimed[0].branch_deleted,
+        "merged PR state deletes the squash-merged branch"
+    );
+    assert!(
+        run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+            .await
+            .is_err(),
+        "squash-merged local branch is deleted"
+    );
+}
+
+#[tokio::test]
+async fn open_pr_branch_is_kept_without_force() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(12, "Still open PR", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 12, "Still open PR").await;
+    forge.add_pr(42, "Still open PR", "", &[], &branch, "sha42");
+    forge.close_issue(12); // issue closed, but the PR never merged
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists());
+    assert!(!reclaimed[0].branch_deleted);
+    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+        .await
+        .expect("branch with an open PR survives without --force");
+}
+
+#[tokio::test]
+async fn forge_lookup_failure_keeps_branch_but_reclaims_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(13, "Forge down", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 13, "Forge down").await;
+    forge.add_pr(43, "Forge down", "", &[], &branch, "sha43");
+    forge.set_pr_state(43, "merged"); // merged, but the lookup will fail
+    forge.fail_pr_for_branch(&branch);
+    forge.close_issue(13);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1, "worktree reclamation still succeeds");
+    assert!(!wt.exists());
+    assert!(!reclaimed[0].branch_deleted);
+    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+        .await
+        .expect("branch survives when the forge cannot answer");
+}
+
 #[tokio::test]
 async fn dirty_worktree_needs_force() {
     let root = tempfile::tempdir().unwrap();

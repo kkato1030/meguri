@@ -169,6 +169,13 @@ pub async fn run_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                     deps.store
                         .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
                 }
+                WorkerOutcome::Decomposed(reason) => {
+                    // Unreachable: review turns escalate decompose instead.
+                    deps.store
+                        .update_run_status(run_id, RunStatus::Decomposed, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.decomposed", json!({ "reason": reason }))?;
+                }
             }
             Ok(outcome)
         }
@@ -227,6 +234,14 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 return Err(NeedsHuman(format!(
                     "agent asked for a plan reviewing PR #{}: {reason}",
                     run.issue_number
+                ))
+                .into());
+            }
+            flow::StepFlow::Decompose(result) => {
+                // Unreachable: the review turn escalates decompose below.
+                return Err(NeedsHuman(format!(
+                    "agent asked to decompose reviewing PR #{}: {}",
+                    run.issue_number, result.summary
                 ))
                 .into());
             }
@@ -440,8 +455,9 @@ async fn execute(
                 ))
                 .into());
             }
-            // needs_plan is a worker signal; on a review turn a human looks.
-            TurnStatus::NeedsHuman | TurnStatus::NeedsPlan => {
+            // needs_plan is a worker signal and decompose a planner one; on
+            // a review turn a human looks.
+            TurnStatus::NeedsHuman | TurnStatus::NeedsPlan | TurnStatus::Decompose => {
                 return Err(NeedsHuman(format!(
                     "agent needs a human reviewing PR #{}: {}",
                     run.issue_number, result.summary

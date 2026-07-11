@@ -243,22 +243,7 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
             continue;
         }
         let branch_deleted = match &c.branch {
-            Some(branch) => {
-                match gitops::delete_branch(
-                    &deps.project.repo_path,
-                    branch,
-                    &deps.project.default_branch,
-                    force,
-                )
-                .await
-                {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!("keeping branch {branch} (not merged?): {e:#}");
-                        false
-                    }
-                }
-            }
+            Some(branch) => delete_branch_if_merged(deps, branch, force).await,
             None => false,
         };
         deps.store.emit(
@@ -283,6 +268,66 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
         gitops::prune_worktrees(&deps.project.repo_path).await.ok();
     }
     Ok(reclaimed)
+}
+
+/// Delete a reclaimed candidate's branch; true when it was deleted. Two
+/// merged-ness checks complement each other: the offline `--is-ancestor`
+/// check inside [`gitops::delete_branch`] first, and when that says
+/// unmerged, the forge's PR state — a squash or rebase merge rewrites the
+/// commits, so the branch tip never becomes an ancestor of the base, but
+/// the PR still reads `merged`. Either verdict deletes; no PR, an open PR,
+/// or a failed forge lookup keeps the branch, as before.
+async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool {
+    let ancestor_err = match gitops::delete_branch(
+        &deps.project.repo_path,
+        branch,
+        &deps.project.default_branch,
+        force,
+    )
+    .await
+    {
+        Ok(()) => return true,
+        Err(e) if force => {
+            // force already skips the merged check; nothing left to try.
+            tracing::warn!("keeping branch {branch}: {e:#}");
+            return false;
+        }
+        Err(e) => e,
+    };
+    match deps.forge.pr_for_branch(branch).await {
+        Ok(Some(pr)) if pr.state == "merged" => {
+            match gitops::delete_branch(
+                &deps.project.repo_path,
+                branch,
+                &deps.project.default_branch,
+                true,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "deleted branch {branch} (PR #{} merged on the forge)",
+                        pr.number
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("keeping branch {branch}: {e:#}");
+                    false
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::warn!("keeping branch {branch} (not merged?): {ancestor_err:#}");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                "keeping branch {branch} (not merged locally, forge lookup failed: {e:#})"
+            );
+            false
+        }
+    }
 }
 
 /// One issue↔pane mapping and what the reaper decided about it.

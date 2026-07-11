@@ -95,6 +95,10 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
             );
             Ok(())
         }
+        WorkerOutcome::Decomposed(reason) => {
+            println!("🧩 decomposed into sub-issues: {reason}");
+            Ok(())
+        }
     }
 }
 
