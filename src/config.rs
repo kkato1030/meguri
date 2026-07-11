@@ -25,6 +25,30 @@ pub fn worktrees_root() -> PathBuf {
     meguri_home().join("worktrees")
 }
 
+/// Minimal `config.toml` written by `meguri init`. Loading fills every
+/// omitted section/key from the serde defaults, so the template only carries
+/// the projects stub plus commented override examples.
+pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目だけ書けば、残りは既定値が使われます。
+# 既定値一覧は README を参照。
+
+[[projects]]
+id = "myproj"
+repo_path = "/abs/path/to/clone"
+repo_slug = "owner/repo"
+# default_branch = "main"
+# check_command = "cargo test"
+
+# 既定を上書きしたい時だけ、必要なセクション/キーを書く:
+# [scheduler]
+# max_concurrent_runs = 3
+#
+# [limits]
+# idle_grace_secs = 120
+#
+# [agent]
+# args = ["--permission-mode", "acceptEdits"]  # yolo をやめて確認ダイアログ運用にする例
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Language for agent-authored deliverables (PR descriptions, summaries,
@@ -40,6 +64,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
     #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
@@ -218,6 +244,33 @@ fn default_max_concurrent() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// `meguri serve` listen port.
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    /// Bind address. Loopback by default — the dashboard has no auth; serve
+    /// warns (but proceeds) on anything else.
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: default_server_port(),
+            bind: default_server_bind(),
+        }
+    }
+}
+
+fn default_server_port() -> u16 {
+    8607
+}
+fn default_server_bind() -> String {
+    "127.0.0.1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
     /// Absolute path to the primary clone.
@@ -261,15 +314,6 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let raw = toml::to_string_pretty(self)?;
-        std::fs::write(path, raw)?;
-        Ok(())
-    }
-
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
         self.projects.iter().find(|p| p.id == id)
     }
@@ -298,6 +342,22 @@ mod tests {
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
         assert!(back.pr.draft);
+        assert_eq!(back.server.port, 8607);
+        assert_eq!(back.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.server.port, 8607);
+        assert_eq!(cfg.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_section_overrides_defaults() {
+        let cfg: Config = toml::from_str("[server]\nport = 9000\nbind = \"0.0.0.0\"\n").unwrap();
+        assert_eq!(cfg.server.port, 9000);
+        assert_eq!(cfg.server.bind, "0.0.0.0");
     }
 
     #[test]
@@ -390,6 +450,34 @@ language = "English"
         assert_eq!(cfg.language_for(demo), Some("日本語"));
         let en = cfg.project("en").unwrap();
         assert_eq!(cfg.language_for(en), Some("English"));
+    }
+
+    #[test]
+    fn init_template_is_minimal_and_loads_with_defaults() {
+        // Only the projects stub is active; every other section stays commented.
+        let active_tables: Vec<&str> = INIT_TEMPLATE
+            .lines()
+            .filter(|l| l.trim_start().starts_with('['))
+            .collect();
+        assert_eq!(active_tables, vec!["[[projects]]"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, INIT_TEMPLATE).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+
+        let p = cfg.project("myproj").unwrap();
+        assert_eq!(p.repo_slug, "owner/repo");
+        assert_eq!(p.default_branch, "main");
+        assert_eq!(p.check_command, None);
+
+        // Omitted sections/keys fall back to the serde defaults.
+        assert_eq!(cfg.language, None);
+        assert_eq!(cfg.mux.kind, "auto");
+        assert_eq!(cfg.agent.args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(cfg.limits.idle_grace_secs, 90);
+        assert_eq!(cfg.scheduler.max_concurrent_runs, 2);
+        assert!(cfg.pr.draft);
     }
 
     #[test]

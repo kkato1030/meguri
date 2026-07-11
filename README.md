@@ -55,16 +55,18 @@ meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
 
-Register a project in `~/.meguri/config.toml`:
+`meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
 
 ```toml
 [[projects]]
 id = "myproj"
 repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
-default_branch = "main"
-check_command = "cargo test"   # optional but recommended: meguri runs this itself
+# default_branch = "main"
+# check_command = "cargo test"   # recommended: meguri runs this itself
 ```
+
+Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
 ## Use
 
@@ -77,6 +79,7 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
+meguri serve              # read-only web dashboard on http://127.0.0.1:8607
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -85,6 +88,10 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
+
+### Web dashboard
+
+`meguri serve` starts a read-only dashboard at `http://127.0.0.1:8607` (override with `--port` / `--bind` or the `[server]` config section): a runs table like `meguri ps` with `awaiting_human` runs highlighted front and center, plus a per-run page with the event trail, a terminal-style pane tail, turn history, and the attach command ready to copy. It is an independent process that reads the same sqlite database — it works even when `meguri watch` is not running, and shows watch liveness from the heartbeat the scheduler writes each tick. There is no authentication, so it binds loopback by default; binding anything else prints a warning.
 
 ### Labels
 
@@ -106,7 +113,7 @@ Labels and comments on GitHub are the durable workflow state (looper's "Authorit
 
 ## Configuration
 
-See `meguri init` output for the full default `config.toml`. Highlights:
+Every key has a built-in default, so `config.toml` only needs `[[projects]]` plus whatever you want to override — `meguri init` writes a minimal template on exactly that premise. The defaults:
 
 ```toml
 # Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
@@ -137,6 +144,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[server]
+port = 8607            # meguri serve listen port
+bind = "127.0.0.1"     # no auth — keep it loopback unless you know your network
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]
