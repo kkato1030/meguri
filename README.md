@@ -186,6 +186,11 @@ throttle_secs = 10             # launchd ThrottleInterval (secs between restarts
 port = 8607            # meguri serve listen port
 bind = "127.0.0.1"     # no auth — keep it loopback unless you know your network
 
+[notifications]
+macos = true           # page awaiting_human via a macOS notification (osascript)
+# webhook_url = "https://example.com/hook"  # JSON POST: run id / issue / reason / attach
+throttle_secs = 60     # min seconds between notifications for the same run
+
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]
 ```

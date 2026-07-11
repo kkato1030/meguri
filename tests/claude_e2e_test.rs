@@ -147,6 +147,7 @@ async fn real_claude_implements_issue_in_tmux() {
 
     let deps = Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: mux.clone(),
         forge: forge.clone(),
         config,

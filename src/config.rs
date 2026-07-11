@@ -47,6 +47,11 @@ repo_slug = "owner/repo"
 #
 # [agent]
 # args = ["--permission-mode", "acceptEdits"]  # yolo をやめて確認ダイアログ運用にする例
+#
+# [notifications]
+# macos = true                       # awaiting_human を macOS 通知で知らせる
+# webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
+# throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -68,6 +73,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
@@ -319,6 +326,38 @@ fn default_server_bind() -> String {
     "127.0.0.1".into()
 }
 
+/// awaiting_human escalations paged to a human (issue #7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// macOS notification via `osascript` (no-op on other platforms).
+    #[serde(default = "default_notifications_macos")]
+    pub macos: bool,
+    /// URL POSTed a JSON payload (run id / issue / reason / attach command).
+    /// None disables the webhook.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Minimum seconds between notifications for the same run.
+    #[serde(default = "default_notifications_throttle")]
+    pub throttle_secs: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            macos: default_notifications_macos(),
+            webhook_url: None,
+            throttle_secs: default_notifications_throttle(),
+        }
+    }
+}
+
+fn default_notifications_macos() -> bool {
+    true
+}
+fn default_notifications_throttle() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -395,6 +434,34 @@ mod tests {
         assert!(back.pr.draft);
         assert_eq!(back.server.port, 8607);
         assert_eq!(back.server.bind, "127.0.0.1");
+        assert!(back.notifications.macos);
+        assert_eq!(back.notifications.webhook_url, None);
+        assert_eq!(back.notifications.throttle_secs, 60);
+    }
+
+    #[test]
+    fn notifications_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.notifications.macos);
+        assert_eq!(cfg.notifications.webhook_url, None);
+        assert_eq!(cfg.notifications.throttle_secs, 60);
+    }
+
+    #[test]
+    fn notifications_section_overrides_defaults() {
+        let raw = r#"
+[notifications]
+macos = false
+webhook_url = "https://example.com/hook"
+throttle_secs = 10
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.notifications.macos);
+        assert_eq!(
+            cfg.notifications.webhook_url.as_deref(),
+            Some("https://example.com/hook")
+        );
+        assert_eq!(cfg.notifications.throttle_secs, 10);
     }
 
     #[test]

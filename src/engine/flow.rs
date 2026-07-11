@@ -739,6 +739,7 @@ pub(crate) async fn run_turn(
     let control = StoreControl {
         store: deps.store.clone(),
         run_id: run.id.clone(),
+        notifier: deps.notifier.clone(),
     };
     let engine = turn_engine(deps);
     let outcome = engine
