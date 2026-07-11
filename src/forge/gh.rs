@@ -237,6 +237,7 @@ impl Forge for GhForge {
     }
 
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        // `gh issue create --label` fails on labels that don't exist yet.
         for label in labels {
             self.ensure_label(label).await;
         }
@@ -279,6 +280,20 @@ impl Forge for GhForge {
             &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
             "-F",
             &format!("issue_id={id}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
         ])
         .await?;
         Ok(())

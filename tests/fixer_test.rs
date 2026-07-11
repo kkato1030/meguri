@@ -90,6 +90,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
+        clean: None,
     };
 
     let deps = Deps {

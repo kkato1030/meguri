@@ -26,6 +26,9 @@ pub const LABEL_WORKING: &str = "meguri:working";
 pub const LABEL_HOLD: &str = "meguri:hold";
 /// meguri gave up and a human needs to look (a comment explains why).
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
+/// The cleaner loop's per-project report issue (one per project; its body is
+/// a snapshot of the current divergence, rewritten on every sweep).
+pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
 
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
@@ -142,11 +145,13 @@ pub trait Forge: Send + Sync {
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
     /// File a new issue; returns its number (planner decomposition,
-    /// issue #24).
+    /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
     /// Record `issue` as blocked by `blocker` in the forge-native dependency
     /// graph (the same graph [`Forge::blocked_by`] reads).
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
+    /// Overwrite an issue's body wholesale (snapshot-style report updates).
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number

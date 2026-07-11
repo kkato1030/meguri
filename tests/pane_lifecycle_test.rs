@@ -78,6 +78,7 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -87,6 +88,7 @@ async fn setup() -> TestEnv {
         forge,
         config,
         project,
+        notifier: meguri::notify::fake::recording_notifier().0,
     };
     TestEnv {
         deps,

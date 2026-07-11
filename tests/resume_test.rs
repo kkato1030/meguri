@@ -74,6 +74,7 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let deps = Deps {

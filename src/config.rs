@@ -78,7 +78,43 @@ pub struct Config {
     #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
+    pub clean: CleanConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+/// Settings for the cleaner loop (read-only repository sweeps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanConfig {
+    /// Minimum hours between sweeps; a moved head alone does not trigger one.
+    #[serde(default = "default_clean_interval_hours")]
+    pub interval_hours: u64,
+    /// Remote branches whose last commit is older than this many days are
+    /// reported as stale (merged branches are reported regardless of age).
+    #[serde(default = "default_stale_branch_days")]
+    pub stale_branch_days: u64,
+    /// False-positive silencer: findings whose file/note (or branch name /
+    /// `#N` reference) contains any of these substrings are dropped from the
+    /// report at render time.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl Default for CleanConfig {
+    fn default() -> Self {
+        Self {
+            interval_hours: default_clean_interval_hours(),
+            stale_branch_days: default_stale_branch_days(),
+            ignore: Vec::new(),
+        }
+    }
+}
+
+fn default_clean_interval_hours() -> u64 {
+    24
+}
+fn default_stale_branch_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +424,10 @@ pub struct ProjectConfig {
     /// Per-project PR settings; overrides the global `[pr]` section.
     #[serde(default)]
     pub pr: Option<PrConfig>,
+    /// Per-project cleaner settings; overrides the global `[clean]` section
+    /// (the ignore list in particular is inherently project-specific).
+    #[serde(default)]
+    pub clean: Option<CleanConfig>,
 }
 
 fn default_branch() -> String {
@@ -423,6 +463,11 @@ impl Config {
     /// Effective deliverable language for a project (project override wins).
     pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
         project.language.as_deref().or(self.language.as_deref())
+    }
+
+    /// Effective cleaner settings for a project (project override wins).
+    pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
+        project.clean.as_ref().unwrap_or(&self.clean)
     }
 }
 
@@ -620,6 +665,47 @@ language = "English"
         assert_eq!(cfg.limits.idle_grace_secs, 90);
         assert_eq!(cfg.scheduler.max_concurrent_runs, 2);
         assert!(cfg.pr.draft);
+    }
+
+    #[test]
+    fn clean_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.clean.interval_hours, 24);
+        assert_eq!(cfg.clean.stale_branch_days, 30);
+        assert!(cfg.clean.ignore.is_empty());
+    }
+
+    #[test]
+    fn clean_project_override_wins() {
+        let raw = r#"
+[clean]
+interval_hours = 12
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "quiet"
+repo_path = "/tmp/quiet"
+repo_slug = "me/quiet"
+
+[projects.clean]
+interval_hours = 48
+ignore = ["docs/legacy"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.clean_for(demo).interval_hours, 12);
+        assert_eq!(cfg.clean_for(demo).stale_branch_days, 30);
+
+        let quiet = cfg.project("quiet").unwrap();
+        assert_eq!(cfg.clean_for(quiet).interval_hours, 48);
+        // The override replaces the whole section; omitted keys fall back to
+        // the built-in defaults, not the global section.
+        assert_eq!(cfg.clean_for(quiet).stale_branch_days, 30);
+        assert_eq!(cfg.clean_for(quiet).ignore, vec!["docs/legacy"]);
     }
 
     #[test]

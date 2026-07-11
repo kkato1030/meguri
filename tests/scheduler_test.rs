@@ -40,6 +40,24 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 
 async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
+
+    // Quiesce the cleaner loop: a report issue whose marker already covers
+    // the current head keeps these tests about worker discovery
+    // (cleaner_test drives the cleaner itself).
+    let head = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
+    let scanned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    forge
+        .create_issue(
+            meguri::engine::cleaner::REPORT_TITLE,
+            &meguri::engine::cleaner::clean_marker(&head, scanned),
+            &[meguri::forge::LABEL_CLEAN_REPORT],
+        )
+        .await
+        .unwrap();
+
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
@@ -58,6 +76,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
             pr: None,
+            clean: None,
         },
     }
 }

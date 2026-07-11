@@ -361,6 +361,7 @@ mod tests {
                 check_command: None,
                 worktree_root: None,
                 pr: None,
+                clean: None,
             },
         }
     }

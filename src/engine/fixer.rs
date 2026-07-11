@@ -435,6 +435,7 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
+                clean: None,
             },
         }
     }
