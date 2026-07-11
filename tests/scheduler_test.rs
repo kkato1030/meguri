@@ -308,7 +308,10 @@ impl Loop for FixedLoop {
     }
 
     async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        if deps.store.issue_has_succeeded_run(&deps.project.id, 99)? {
+        if deps
+            .store
+            .issue_has_succeeded_run(&deps.project.id, "fixed", 99)?
+        {
             return Ok(vec![]);
         }
         Ok(vec![Target {

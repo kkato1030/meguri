@@ -10,6 +10,12 @@ pub mod gh;
 
 /// Issue is queued for the worker loop (applied by a human).
 pub const LABEL_READY: &str = "meguri:ready";
+/// Issue is queued for the planner loop (applied by a human; opt-in
+/// spec-first flow — the default stays `meguri:ready` straight to a PR).
+pub const LABEL_PLAN: &str = "meguri:plan";
+/// The planner's spec PR awaits (human) spec review; flipping it to
+/// `meguri:spec-ready` is manual until the reviewer loop exists.
+pub const LABEL_SPEC_REVIEWING: &str = "meguri:spec-reviewing";
 /// meguri claimed the issue (dedup across restarts and hosts).
 pub const LABEL_WORKING: &str = "meguri:working";
 /// Discovery must skip this issue.
@@ -44,6 +50,9 @@ pub trait Forge: Send + Sync {
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
+    /// Add a label to a pull request (issues and PRs share GitHub's number
+    /// space but need different edit commands).
+    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
     async fn create_pr(
         &self,
