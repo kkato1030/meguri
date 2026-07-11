@@ -220,7 +220,12 @@ impl Flavor for SpecWorkerFlavor {
     /// The planner's "spec must exist" check, inverted: the spec is
     /// disposable scaffolding, so a spec that survived implementation gets a
     /// corrective turn asking for its deletion.
-    fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String> {
+    fn verify_work(
+        &self,
+        run: &RunRecord,
+        _cp: &Checkpoint,
+        worktree: &Path,
+    ) -> std::result::Result<(), String> {
         let spec = super::planner::spec_rel_path(run.issue_number);
         if worktree.join(&spec).is_file() {
             Err(format!(
@@ -333,11 +338,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let run = fake_run(7);
 
-        assert!(SpecWorkerFlavor.verify_work(&run, dir.path()).is_ok());
+        assert!(
+            SpecWorkerFlavor
+                .verify_work(&run, &Checkpoint::default(), dir.path())
+                .is_ok()
+        );
 
         std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
         std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
-        let err = SpecWorkerFlavor.verify_work(&run, dir.path()).unwrap_err();
+        let err = SpecWorkerFlavor
+            .verify_work(&run, &Checkpoint::default(), dir.path())
+            .unwrap_err();
         assert!(err.contains("docs/specs/issue-7.md"), "{err}");
         assert!(err.contains("delete it"), "{err}");
     }

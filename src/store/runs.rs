@@ -16,6 +16,9 @@ pub enum RunStatus {
     /// The run turned out to have nothing to do (e.g. the issue was
     /// de-labeled between discovery and claim) — terminal, no escalation.
     Skipped,
+    /// The agent found a design decision must precede implementation and the
+    /// issue was routed to the planner (issue #22) — terminal, not a failure.
+    NeedsPlan,
 }
 
 impl RunStatus {
@@ -28,6 +31,7 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::NeedsPlan => "needs_plan",
         }
     }
 
@@ -40,6 +44,7 @@ impl RunStatus {
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
             "skipped" => Some(Self::Skipped),
+            "needs_plan" => Some(Self::NeedsPlan),
             _ => None,
         }
     }
@@ -128,6 +133,10 @@ pub struct RunRecord {
     pub mux_pane_id: Option<String>,
     pub turn_no: i64,
     pub current_turn_id: Option<String>,
+    /// Native session id of the agent CLI last seen in the run's pane
+    /// (reported via the turn contract or the mux); used to `--resume`
+    /// the conversation when the pane dies.
+    pub agent_session_id: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -156,6 +165,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         mux_pane_id: row.get("mux_pane_id")?,
         turn_no: row.get("turn_no")?,
         current_turn_id: row.get("current_turn_id")?,
+        agent_session_id: row.get("agent_session_id")?,
         error: row.get("error")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
@@ -274,6 +284,28 @@ impl Store {
         })
     }
 
+    /// Number of succeeded runs of a loop for one issue/PR — the conflict
+    /// resolver's resolve budget: a PR that keeps re-conflicting after this
+    /// many successful resolves stops being rediscovered instead of looping
+    /// forever. Skipped/failed runs don't consume the budget (benign races
+    /// and escalations have their own convergence).
+    pub fn succeeded_run_count(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            let count = c.query_row(
+                "SELECT COUNT(*) FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                   AND issue_number = ?3 AND status = 'succeeded'",
+                params![project_id, loop_kind, issue_number],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+    }
+
     /// Runs that own a worktree, matched by branch name or recorded path
     /// (newest first). Both keys are tried because the reaper resolves
     /// worktrees from `git worktree list`, whose paths may be canonicalized
@@ -325,7 +357,8 @@ impl Store {
                 RunStatus::Succeeded
                 | RunStatus::Failed
                 | RunStatus::Cancelled
-                | RunStatus::Skipped => (None, Some(now())),
+                | RunStatus::Skipped
+                | RunStatus::NeedsPlan => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(
@@ -364,6 +397,17 @@ impl Store {
             c.execute(
                 "UPDATE runs SET mux_kind = ?2, mux_session = ?3, mux_pane_id = ?4 WHERE id = ?1",
                 params![id, kind, session, pane],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record (or clear, with None) the run's native agent session id.
+    pub fn update_run_agent_session(&self, id: &str, session: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET agent_session_id = ?2 WHERE id = ?1",
+                params![id, session],
             )?;
             Ok(())
         })
@@ -561,6 +605,32 @@ mod tests {
     }
 
     #[test]
+    fn succeeded_run_count_counts_only_terminal_successes() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        // Terminal statuses only: an active run would trip the unique
+        // (project, loop, issue) index on the next create.
+        for status in [RunStatus::Skipped, RunStatus::Failed, RunStatus::Cancelled] {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store.update_run_status(&run.id, status, None).unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
+
+        for _ in 0..2 {
+            let run = store.create_run("demo", 9, "t").unwrap();
+            store
+                .update_run_status(&run.id, RunStatus::Succeeded, None)
+                .unwrap();
+        }
+        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 2);
+        // Scoped by loop, project, and issue.
+        assert_eq!(store.succeeded_run_count("demo", "planner", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("other", "worker", 9).unwrap(), 0);
+        assert_eq!(store.succeeded_run_count("demo", "worker", 10).unwrap(), 0);
+    }
+
+    #[test]
     fn runs_for_worktree_matches_branch_or_path() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 5, "t").unwrap();
@@ -611,6 +681,23 @@ mod tests {
         );
         store.set_desired_state(&run.id, None).unwrap();
         assert_eq!(store.read_desired_state(&run.id).unwrap(), None);
+    }
+
+    #[test]
+    fn agent_session_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert_eq!(run.agent_session_id, None);
+
+        store
+            .update_run_agent_session(&run.id, Some("sess-abc"))
+            .unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id.as_deref(), Some("sess-abc"));
+
+        store.update_run_agent_session(&run.id, None).unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id, None);
     }
 
     #[test]

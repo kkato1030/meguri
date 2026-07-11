@@ -36,12 +36,44 @@ pub enum IssueState {
     Closed,
 }
 
+/// Whether a PR can merge into its base, as computed by the forge — the
+/// trigger for the conflict-resolver loop. `Unknown` is GitHub's transient
+/// "still computing" state; discovery treats it as not actionable and simply
+/// retries on the next poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeableState {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub number: i64,
     pub title: String,
     pub body: String,
     pub labels: Vec<String>,
+}
+
+/// One blocking issue from the forge-native dependency graph (GitHub's
+/// `blocked_by`) — the dependency gate's single source of truth (looper
+/// ADR-0004). No label conventions, no issue-body parsing.
+#[derive(Debug, Clone)]
+pub struct Blocker {
+    pub number: i64,
+    /// Lowercase state: "open" or "closed".
+    pub state: String,
+    /// Why it closed ("completed", "not_planned", "duplicate"), if closed.
+    pub state_reason: Option<String>,
+}
+
+impl Blocker {
+    /// Only closed-as-completed resolves a dependency. A blocker closed as
+    /// not_planned/duplicate keeps blocking: the dependent issue was planned
+    /// against work that never happened, so a human must re-triage it.
+    pub fn resolved(&self) -> bool {
+        self.state == "closed" && self.state_reason.as_deref() == Some("completed")
+    }
 }
 
 impl Issue {
@@ -106,6 +138,9 @@ pub trait Forge: Send + Sync {
     async fn issue_state(&self, number: i64) -> Result<IssueState>;
     /// Open issues carrying `label` (candidates for discovery).
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
+    /// Issues blocking `issue` via the forge-native dependency graph
+    /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
+    async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number
@@ -132,10 +167,36 @@ pub trait Forge: Send + Sync {
         draft: bool,
     ) -> Result<CreatedPr>;
     async fn get_pr(&self, number: i64) -> Result<PullRequest>;
+    /// Whether the PR can merge into its base (conflict-resolver discovery).
+    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
     /// All review threads on a PR, resolved or not.
     async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>>;
     /// Reply inside an existing review thread.
     async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocker(state: &str, state_reason: Option<&str>) -> Blocker {
+        Blocker {
+            number: 1,
+            state: state.into(),
+            state_reason: state_reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_closed_as_completed_resolves_a_blocker() {
+        assert!(blocker("closed", Some("completed")).resolved());
+        assert!(!blocker("open", None).resolved());
+        assert!(!blocker("closed", Some("not_planned")).resolved());
+        assert!(!blocker("closed", Some("duplicate")).resolved());
+        assert!(!blocker("closed", None).resolved());
+        // Unreadable state degrades to unresolved, never to resolved.
+        assert!(!blocker("", None).resolved());
+    }
 }

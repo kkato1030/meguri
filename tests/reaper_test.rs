@@ -1,4 +1,4 @@
-//! Reaper tests: `meguri clean` classification and reclamation of worktrees
+//! Reaper tests: `meguri prune` classification and reclamation of worktrees
 //! whose issue closed on the forge.
 
 use std::path::{Path, PathBuf};
@@ -83,6 +83,34 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
     .await
     .unwrap();
     (branch, wt)
+}
+
+/// Create a reviewer-style worktree for PR `pr`: a detached checkout named
+/// `review-<PR#>-<run id>` whose finished run carries the PR number as
+/// issue_number (that's all the reaper has to resolve the forge state from).
+async fn add_review_worktree(deps: &Deps, pr: i64) -> PathBuf {
+    let run = deps
+        .store
+        .create_run_for_loop("proj", "reviewer", pr, &format!("Review PR #{pr}"))
+        .unwrap();
+    let root = deps.project.worktree_root.clone().unwrap();
+    let wt = gitops::worktree_path(&root, &deps.project.id, &format!("review-{pr}-{}", run.id));
+    let head = run_git(&deps.project.repo_path, &["rev-parse", "HEAD"])
+        .await
+        .unwrap();
+    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim())
+        .await
+        .unwrap();
+    // A detached checkout reports no branch, so the run lookup goes by path;
+    // store it canonicalized the way the reaper compares it.
+    let wt = std::fs::canonicalize(&wt).unwrap();
+    deps.store
+        .update_run_worktree(&run.id, "pr-head", &wt.to_string_lossy())
+        .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Succeeded, None)
+        .unwrap();
+    wt
 }
 
 fn verdict_of(candidates: &[reaper::Candidate], issue: i64) -> &reaper::Candidate {
@@ -275,6 +303,41 @@ async fn live_pane_protects_closed_issue_worktree() {
     assert_eq!(verdict_of(&candidates, 8).verdict, Verdict::Reclaim);
     reaper::reclaim(&deps, &candidates, false).await.unwrap();
     assert!(!wt.exists());
+}
+
+#[tokio::test]
+async fn merged_pr_review_worktree_is_reclaimed() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    // No issue #32 exists — the number belongs to a PR, and it merged.
+    forge.add_pr(32, "Shipped", "", &[], "pr-head", "sha32");
+    forge.set_pr_state(32, "merged");
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let wt = add_review_worktree(&deps, 32).await;
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 32).verdict, Verdict::Reclaim);
+
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists(), "merged PR's review worktree reclaimed");
+}
+
+#[tokio::test]
+async fn open_pr_review_worktree_is_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    forge.add_pr(33, "Under review", "", &[], "pr-head", "sha33");
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let wt = add_review_worktree(&deps, 33).await;
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 33).verdict, Verdict::Open);
+
+    reaper::sweep(&deps).await.unwrap();
+    assert!(wt.exists(), "open PR's review worktree untouched");
 }
 
 #[tokio::test]

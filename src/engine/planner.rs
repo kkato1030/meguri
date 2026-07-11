@@ -114,7 +114,12 @@ impl Flavor for PlannerFlavor {
 
     /// The planner's deliverable is the spec file; committed-but-specless
     /// work gets a corrective turn.
-    fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String> {
+    fn verify_work(
+        &self,
+        run: &RunRecord,
+        _cp: &Checkpoint,
+        worktree: &Path,
+    ) -> std::result::Result<(), String> {
         let spec = spec_rel_path(run.issue_number);
         if worktree.join(&spec).is_file() {
             Ok(())
@@ -166,12 +171,15 @@ mod tests {
         let mut run = fake_run(7);
         run.worktree_path = Some(dir.path().to_string_lossy().into_owned());
 
-        let err = PlannerFlavor.verify_work(&run, dir.path()).unwrap_err();
+        let cp = Checkpoint::default();
+        let err = PlannerFlavor
+            .verify_work(&run, &cp, dir.path())
+            .unwrap_err();
         assert!(err.contains("docs/specs/issue-7.md"), "{err}");
 
         std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
         std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
-        assert!(PlannerFlavor.verify_work(&run, dir.path()).is_ok());
+        assert!(PlannerFlavor.verify_work(&run, &cp, dir.path()).is_ok());
     }
 
     #[test]
