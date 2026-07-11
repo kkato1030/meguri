@@ -36,7 +36,28 @@ pub struct Config {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
+    pub pr: PrConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrConfig {
+    /// Open pull requests as drafts (a human promotes them when ready).
+    #[serde(default = "default_pr_draft")]
+    pub draft: bool,
+}
+
+impl Default for PrConfig {
+    fn default() -> Self {
+        Self {
+            draft: default_pr_draft(),
+        }
+    }
+}
+
+fn default_pr_draft() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +217,9 @@ pub struct ProjectConfig {
     /// Override for the worktree parent directory (default: ~/.meguri/worktrees).
     #[serde(default)]
     pub worktree_root: Option<PathBuf>,
+    /// Per-project PR settings; overrides the global `[pr]` section.
+    #[serde(default)]
+    pub pr: Option<PrConfig>,
 }
 
 fn default_branch() -> String {
@@ -231,6 +255,11 @@ impl Config {
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
         self.projects.iter().find(|p| p.id == id)
     }
+
+    /// Effective PR settings for a project (project override wins).
+    pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
+        project.pr.as_ref().unwrap_or(&self.pr)
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +274,7 @@ mod tests {
         assert_eq!(back.mux.kind, "auto");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
+        assert!(back.pr.draft);
     }
 
     #[test]
@@ -266,6 +296,36 @@ args = ["--permission-mode", "acceptEdits"]
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.agent.args, vec!["--permission-mode", "acceptEdits"]);
+    }
+
+    #[test]
+    fn pr_draft_defaults_true() {
+        assert!(Config::default().pr.draft);
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.pr.draft);
+    }
+
+    #[test]
+    fn pr_draft_can_be_disabled_globally() {
+        let cfg: Config = toml::from_str("[pr]\ndraft = false\n").unwrap();
+        assert!(!cfg.pr.draft);
+    }
+
+    #[test]
+    fn pr_draft_project_override_wins() {
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[projects.pr]
+draft = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.pr.draft, "global default stays true");
+        let p = cfg.project("demo").unwrap();
+        assert!(!cfg.pr_for(p).draft);
     }
 
     #[test]

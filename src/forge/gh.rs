@@ -164,13 +164,16 @@ impl Forge for GhForge {
         base: &str,
         title: &str,
         body: &str,
+        draft: bool,
     ) -> Result<CreatedPr> {
-        let url = self
-            .gh(&[
-                "pr", "create", "--repo", &self.repo, "--head", head, "--base", base, "--title",
-                title, "--body", body,
-            ])
-            .await?;
+        let mut args = vec![
+            "pr", "create", "--repo", &self.repo, "--head", head, "--base", base, "--title", title,
+            "--body", body,
+        ];
+        if draft {
+            args.push("--draft");
+        }
+        let url = self.gh(&args).await?;
         let url = url
             .lines()
             .rev()

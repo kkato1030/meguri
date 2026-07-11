@@ -22,6 +22,10 @@ pub struct TurnResultFile {
     pub status: TurnStatus,
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored pull-request description (Markdown), used as the PR
+    /// body when present; `summary` is the fallback.
+    #[serde(default)]
+    pub pr_body: Option<String>,
 }
 
 pub fn meguri_dir(worktree: &Path) -> PathBuf {
@@ -51,11 +55,14 @@ fn completion_contract(turn_id: &str) -> String {
 When you have FULLY completed the task above, write a JSON file at
 `{MEGURI_DIR}/{RESULT_FILE}` (relative to the repository root) containing exactly:
 
-    {{"turn_id": "{turn_id}", "status": "success", "summary": "<one concise paragraph of what you did>"}}
+    {{"turn_id": "{turn_id}", "status": "success", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
 
 - `status` must be one of: "success" (task done), "failure" (you tried and
   cannot complete it), "needs_human" (a human decision or missing information
   blocks you — explain what you need in the summary).
+- `pr_body` (on success): a Markdown pull-request description of what you
+  actually changed. If the prompt includes a PR template, fill in each of its
+  sections; escape newlines as \n inside the JSON string.
 - WRITE THE FILE; do not merely print the JSON to the terminal.
 - Do not commit or stage anything under `{MEGURI_DIR}/`.
 - If you are unsure whether you are done, prefer "needs_human" over guessing."#
@@ -117,6 +124,7 @@ mod tests {
         assert!(content.contains("Implement the thing."));
         assert!(content.contains(r#""turn_id": "abc-123""#));
         assert!(content.contains("needs_human"));
+        assert!(content.contains("pr_body"));
     }
 
     #[test]
@@ -133,6 +141,28 @@ mod tests {
 
         std::fs::write(result_path(dir.path()), "not json").unwrap();
         assert!(read_result(dir.path(), "t1").is_none());
+    }
+
+    #[test]
+    fn result_pr_body_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_result(dir.path(), "t1").unwrap().pr_body, None);
+
+        std::fs::write(
+            result_path(dir.path()),
+            r###"{"turn_id":"t1","status":"success","summary":"done","pr_body":"## Summary\nDid it."}"###,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1").unwrap().pr_body.as_deref(),
+            Some("## Summary\nDid it.")
+        );
     }
 
     #[test]
