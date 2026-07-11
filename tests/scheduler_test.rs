@@ -541,6 +541,168 @@ impl Loop for FixedLoop {
     }
 }
 
+/// Shared dispatch log: (loop kind, project id, issue number).
+type DispatchLog = Arc<std::sync::Mutex<Vec<(String, String, i64)>>>;
+
+/// A parameterized fake loop for the priority tests: fixed (project, issue)
+/// targets, each run driven straight to success while the dispatch order is
+/// recorded in a shared log.
+struct StubLoop {
+    kind: &'static str,
+    /// (project id, issue number) pairs this loop discovers.
+    targets: Vec<(&'static str, i64)>,
+    order: DispatchLog,
+}
+
+#[async_trait::async_trait]
+impl Loop for StubLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for (project, n) in &self.targets {
+            if *project == deps.project.id
+                && !deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, self.kind, *n)?
+            {
+                targets.push(Target {
+                    issue_number: *n,
+                    title: format!("stub {n}"),
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        let run = deps.store.get_run(run_id)?.expect("run exists");
+        self.order
+            .lock()
+            .unwrap()
+            .push((run.loop_kind, run.project_id, run.issue_number));
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "stub://pr".into(),
+        })
+    }
+}
+
+/// Wait until `order` has `expected` entries, then return them.
+async fn wait_for_dispatches(order: &DispatchLog, expected: usize) -> Vec<(String, String, i64)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = order.lock().unwrap().clone();
+        if log.len() >= expected {
+            return log;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "only {} of {expected} dispatches happened: {log:?}",
+                log.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Loop-list order is dispatch priority: with one slot, the first loop's
+/// target wins even though the other loop's issue number is smaller.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_prioritizes_loops_in_list_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![
+            Arc::new(StubLoop {
+                kind: "stub-fixer",
+                targets: vec![("proj", 200)],
+                order: order.clone(),
+            }),
+            Arc::new(StubLoop {
+                kind: "stub-worker",
+                targets: vec![("proj", 100)],
+                order: order.clone(),
+            }),
+        ],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 2).await;
+    watch.abort();
+
+    assert_eq!(log[0], ("stub-fixer".into(), "proj".into(), 200));
+    assert_eq!(log[1], ("stub-worker".into(), "proj".into(), 100));
+}
+
+/// Within one loop, targets dispatch oldest-first (FIFO by number) no matter
+/// what order discover returns them in.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(StubLoop {
+            kind: "stub",
+            targets: vec![("proj", 33), ("proj", 11), ("proj", 22)],
+            order: order.clone(),
+        })],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 3).await;
+    watch.abort();
+
+    let issues: Vec<i64> = log.iter().map(|(_, _, n)| *n).collect();
+    assert_eq!(issues, vec![11, 22, 33]);
+}
+
+/// Loop priority beats project order: project B's high-priority loop takes
+/// the slot before project A's low-priority loop (nest inversion).
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_prioritizes_loop_order_over_project_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps_a = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let mut deps_b = deps_a.clone();
+    deps_b.project.id = "proj-b".into();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps_a, deps_b],
+        loops: vec![
+            Arc::new(StubLoop {
+                kind: "stub-fixer",
+                targets: vec![("proj-b", 300)],
+                order: order.clone(),
+            }),
+            Arc::new(StubLoop {
+                kind: "stub-planner",
+                targets: vec![("proj", 1)],
+                order: order.clone(),
+            }),
+        ],
+        poll_interval: Duration::from_millis(100),
+        max_concurrent: 1,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    let log = wait_for_dispatches(&order, 2).await;
+    watch.abort();
+
+    assert_eq!(log[0], ("stub-fixer".into(), "proj-b".into(), 300));
+    assert_eq!(log[1], ("stub-planner".into(), "proj".into(), 1));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_ticks_write_a_heartbeat() {
     let root = tempfile::tempdir().unwrap();
