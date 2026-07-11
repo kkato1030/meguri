@@ -85,6 +85,37 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 ```
 
+### Keep it running (daemon)
+
+`meguri watch` stays in the foreground; to survive closing the shell, detach it:
+
+```bash
+meguri daemon start       # spawn watch detached (log: ~/.meguri/logs/watch.log)
+meguri daemon status      # pid / mode / liveness / log location / active runs
+meguri daemon logs -f     # tail the daemon log
+meguri daemon restart
+meguri daemon stop        # SIGTERM; kill-safe, recovery resumes on next start
+```
+
+On macOS, hand supervision to launchd so the watch also survives logout,
+reboot, and crashes:
+
+```bash
+meguri daemon install --mode launchd   # generate + bootstrap a user LaunchAgent
+meguri daemon uninstall                # bootout + remove the plist
+```
+
+The LaunchAgent bakes in your current `PATH` (and `HERDR_SOCKET_PATH` /
+`MEGURI_HOME` if set), so `gh`, `tmux`/`herdr`, and the agent CLI resolve under
+launchd; its log goes to `~/.meguri/logs/launchd.log`. Restart policy and
+throttle come from the `[daemon]` config section — after changing them, re-run
+`meguri daemon install`. Other platforms get an explicit error (no silent
+fallback); systemd user units are planned.
+
+Whatever the mode, the watch process holds an exclusive lock
+(`~/.meguri/daemon/watch.lock`), so a second scheduler — foreground or
+detached — fails loudly instead of double-driving runs.
+
 ### Labels
 
 | label | meaning |
@@ -131,6 +162,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[daemon]
+restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
+throttle_secs = 10             # launchd ThrottleInterval (secs between restarts)
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]

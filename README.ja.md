@@ -85,6 +85,36 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 ```
 
+### 常駐させる（daemon）
+
+`meguri watch` はフォアグラウンドに留まります。シェルを閉じても回り続けさせるには detach します:
+
+```bash
+meguri daemon start       # watch を detach 起動（ログ: ~/.meguri/logs/watch.log）
+meguri daemon status      # pid / モード / 稼働状態 / ログ位置 / アクティブ run 数
+meguri daemon logs -f     # daemon ログを follow
+meguri daemon restart
+meguri daemon stop        # SIGTERM。kill-safe なので次回起動時の recovery が再開する
+```
+
+macOS では監視を launchd に委ねると、ログアウト・再起動・クラッシュ後も自動復帰します:
+
+```bash
+meguri daemon install --mode launchd   # user LaunchAgent を生成して bootstrap
+meguri daemon uninstall                # bootout + plist 削除
+```
+
+LaunchAgent には install 時の `PATH`（および設定されていれば `HERDR_SOCKET_PATH` /
+`MEGURI_HOME`）が焼き込まれるため、launchd 配下でも `gh`・`tmux`/`herdr`・エージェント
+CLI が解決できます。ログは `~/.meguri/logs/launchd.log` へ。restart policy と throttle は
+config の `[daemon]` セクションから来ます — 変更したら `meguri daemon install` を再実行して
+反映します。非対応プラットフォームでは明示エラーになります（silent fallback しません）。
+systemd user unit は後続予定です。
+
+どのモードでも watch プロセスは排他ロック（`~/.meguri/daemon/watch.lock`）を保持するので、
+2 つ目のスケジューラ — フォアグラウンドでも detached でも — は二重駆動せず明示エラーで
+落ちます。
+
 ### ラベル
 
 | ラベル | 意味 |
@@ -131,6 +161,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[daemon]
+restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
+throttle_secs = 10             # launchd ThrottleInterval（再起動の最短間隔・秒）
 
 [pr]
 draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き

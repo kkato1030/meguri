@@ -452,6 +452,7 @@ dependencies = [
  "async-trait",
  "clap",
  "dirs",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
