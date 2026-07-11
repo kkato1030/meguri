@@ -105,6 +105,7 @@ async fn setup() -> TestEnv {
         repo_path: clone,
         repo_slug: "me/proj".into(),
         default_branch: "main".into(),
+        language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,

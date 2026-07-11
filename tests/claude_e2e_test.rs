@@ -155,6 +155,7 @@ async fn real_claude_implements_issue_in_tmux() {
             repo_path: clone.clone(),
             repo_slug: "local/sandbox".into(),
             default_branch: "main".into(),
+            language: None,
             check_command: Some("python3 -m unittest discover -q".into()),
             worktree_root: Some(root.path().join("worktrees")),
             pr: None,

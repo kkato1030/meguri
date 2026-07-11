@@ -332,7 +332,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -
     Ok(())
 }
 
-fn execute_prompt(run: &RunRecord, cp: &ReviewCheckpoint) -> String {
+fn execute_prompt(run: &RunRecord, cp: &ReviewCheckpoint, language: Option<&str>) -> String {
     format!(
         "You are reviewing pull request #{number} in this repository. The \
          worktree is checked out read-only at the PR head (commit \
@@ -353,7 +353,8 @@ fn execute_prompt(run: &RunRecord, cp: &ReviewCheckpoint) -> String {
            - \"findings\": something must change; list every finding in \
              `review` so the author can fix and push.\n\
          - A completed review is a success regardless of verdict; report \
-           \"failure\"/\"needs_human\" only when you cannot review at all.",
+           \"failure\"/\"needs_human\" only when you cannot review at all.\
+         {lang_section}",
         number = run.issue_number,
         sha = cp.head_sha,
         branch = cp.head_branch,
@@ -361,6 +362,7 @@ fn execute_prompt(run: &RunRecord, cp: &ReviewCheckpoint) -> String {
         body = cp.pr_body,
         diff = DIFF_FILE,
         review = REVIEW_FILE,
+        lang_section = flow::language_instruction(language),
     )
     // The completion contract is appended by prepare_turn.
 }
@@ -401,7 +403,7 @@ async fn execute(
     std::fs::create_dir_all(worktree.join(crate::turn::prompts::MEGURI_DIR))?;
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
 
-    let mut prompt = execute_prompt(run, cp);
+    let mut prompt = execute_prompt(run, cp, deps.config.language_for(&deps.project));
     let mut corrective_turns = 0u32;
 
     loop {
@@ -596,12 +598,22 @@ mod tests {
             head_sha: "deadbeef".into(),
             ..Default::default()
         };
-        let prompt = execute_prompt(&run, &cp);
+        let prompt = execute_prompt(&run, &cp, None);
         assert!(prompt.contains("# PR: Spec: Add caching (#5)"));
         assert!(prompt.contains(DIFF_FILE));
         assert!(prompt.contains(REVIEW_FILE));
         assert!(prompt.contains("Do NOT modify"));
         assert!(prompt.contains("deadbeef"));
+        assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_pins_output_language_when_configured() {
+        let run = fake_run(12);
+        let cp = ReviewCheckpoint::default();
+        let prompt = execute_prompt(&run, &cp, Some("日本語"));
+        assert!(prompt.contains("# Output language"));
+        assert!(prompt.contains("日本語"));
     }
 
     #[test]

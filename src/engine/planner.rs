@@ -61,7 +61,7 @@ impl Flavor for PlannerFlavor {
 
     fn execute_prompt(
         &self,
-        _deps: &Deps,
+        deps: &Deps,
         run: &RunRecord,
         cp: &Checkpoint,
         worktree: &Path,
@@ -86,13 +86,14 @@ impl Flavor for PlannerFlavor {
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; meguri handles both.\n\
              - Do NOT switch branches or touch other worktrees.\n\n\
-             {pr_section}",
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
             spec = spec_rel_path(run.issue_number),
             pr_section = flow::pr_body_instruction(worktree),
+            lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
         // The completion contract is appended by prepare_turn.
     }
@@ -178,6 +179,19 @@ mod tests {
         assert!(prompt.contains("do NOT implement"));
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Pull request description"));
+        assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_pins_output_language_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let cp = Checkpoint::default();
+        let mut deps = fake_deps();
+        deps.config.language = Some("日本語".into());
+        let prompt = PlannerFlavor.execute_prompt(&deps, &run, &cp, dir.path());
+        assert!(prompt.contains("# Output language"));
+        assert!(prompt.contains("日本語"));
     }
 
     #[test]
@@ -211,6 +225,7 @@ mod tests {
                 repo_path: "/tmp/unused".into(),
                 repo_slug: "me/proj".into(),
                 default_branch: "main".into(),
+                language: None,
                 check_command: None,
                 worktree_root: None,
                 pr: None,

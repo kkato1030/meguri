@@ -71,6 +71,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         repo_path: clone,
         repo_slug: "me/proj".into(),
         default_branch: "main".into(),
+        language: None,
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
