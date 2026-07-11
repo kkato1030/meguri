@@ -366,6 +366,13 @@ async fn claim_issue(
     deps.forge
         .add_label(issue.number, forge::LABEL_WORKING)
         .await?;
+    // A fresh claim supersedes a previous run's escalation: the human is no
+    // longer needed while this run is in flight (and a new failure re-adds
+    // the label). No-op if absent; best-effort like the escalation side.
+    let _ = deps
+        .forge
+        .remove_label(issue.number, forge::LABEL_NEEDS_HUMAN)
+        .await;
     deps.store.emit(
         Some(&run.id),
         "issue.claimed",
