@@ -120,6 +120,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         forge: forge.clone(),
         config,
         project,
+        notifier: meguri::notify::fake::recording_notifier().0,
     };
     TestEnv {
         deps,

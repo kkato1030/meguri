@@ -79,6 +79,7 @@ async fn setup() -> TestEnv {
 
     let deps = Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: mux.clone(),
         forge,
         config,

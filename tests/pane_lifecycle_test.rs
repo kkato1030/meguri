@@ -88,6 +88,7 @@ async fn setup() -> TestEnv {
         forge,
         config,
         project,
+        notifier: meguri::notify::fake::recording_notifier().0,
     };
     TestEnv {
         deps,
