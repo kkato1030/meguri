@@ -111,7 +111,81 @@ pub async fn create_worktree(
     .await
     .context("git worktree add")?;
 
-    // Keep .meguri/ (prompts, result contract) out of the agent's diffs.
+    exclude_meguri(worktree).await
+}
+
+/// Attach a worktree to an *existing* branch (a PR's head): detach the
+/// branch from whichever worktree still holds it (git refuses two checkouts
+/// of one branch), reset it to the pushed tip, and check it out here.
+pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) -> Result<()> {
+    if worktree.join(".git").exists() {
+        // Resuming, or reusing the worktree that already owns the branch
+        // (attach and create share the same path scheme). Best-effort sync
+        // to the pushed tip; a diverged or offline worktree keeps working.
+        let _ = run_git(worktree, &["fetch", "origin", branch]).await;
+        let _ = run_git(
+            worktree,
+            &["merge", "--ff-only", &format!("origin/{branch}")],
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Best-effort freshness; offline or remote-less repos still work.
+    let _ = run_git(repo_path, &["fetch", "origin", branch]).await;
+    detach_branch(repo_path, branch).await?;
+
+    let origin_ref = format!("origin/{branch}");
+    if run_git(repo_path, &["rev-parse", "--verify", &origin_ref])
+        .await
+        .is_ok()
+    {
+        // Create or reset the local branch to the pushed tip (safe: nothing
+        // has it checked out after the detach).
+        run_git(repo_path, &["branch", "--force", branch, &origin_ref]).await?;
+    } else {
+        run_git(
+            repo_path,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .await
+        .with_context(|| format!("branch {branch} exists neither on origin nor locally"))?;
+    }
+
+    let wt = worktree.to_string_lossy().to_string();
+    run_git(repo_path, &["worktree", "add", "--force", &wt, branch])
+        .await
+        .context("git worktree add (attach)")?;
+
+    exclude_meguri(worktree).await
+}
+
+/// Detach `branch` from every worktree that has it checked out so another
+/// worktree can take it over.
+pub async fn detach_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let _ = run_git(repo_path, &["worktree", "prune"]).await;
+    let list = run_git(repo_path, &["worktree", "list", "--porcelain"]).await?;
+    let want = format!("branch refs/heads/{branch}");
+    let mut current: Option<PathBuf> = None;
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+        } else if line == want
+            && let Some(path) = current.take()
+        {
+            run_git(&path, &["checkout", "--detach"])
+                .await
+                .with_context(|| format!("detaching {branch} from worktree {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Keep .meguri/ (prompts, result contract) out of the agent's diffs.
+async fn exclude_meguri(worktree: &Path) -> Result<()> {
     let exclude = run_git(worktree, &["rev-parse", "--git-path", "info/exclude"]).await?;
     let exclude_path = if Path::new(&exclude).is_absolute() {
         PathBuf::from(exclude)
@@ -234,5 +308,63 @@ mod tests {
 
         remove_worktree(repo.path(), &wt).await.unwrap();
         assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn attach_takes_over_a_branch_checked_out_elsewhere() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        // The "worker's" worktree owns the branch and committed on it.
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = "meguri/1-feature-abc";
+        let old_wt = worktree_path(wt_root.path(), "proj", branch);
+        create_worktree(repo.path(), &old_wt, branch, "main")
+            .await
+            .unwrap();
+        std::fs::write(old_wt.join("f.txt"), "v1").unwrap();
+        run_git(&old_wt, &["add", "."]).await.unwrap();
+        run_git(&old_wt, &["commit", "-m", "feature"])
+            .await
+            .unwrap();
+        let tip = run_git(&old_wt, &["rev-parse", "HEAD"]).await.unwrap();
+
+        // The fixer attaches the same branch at a different path: the old
+        // worktree gets detached, the new one sits on the branch tip.
+        let new_root = tempfile::tempdir().unwrap();
+        let new_wt = worktree_path(new_root.path(), "proj", branch);
+        attach_worktree(repo.path(), &new_wt, branch).await.unwrap();
+
+        assert_eq!(run_git(&new_wt, &["rev-parse", "HEAD"]).await.unwrap(), tip);
+        assert_eq!(
+            run_git(&new_wt, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .await
+                .unwrap(),
+            branch
+        );
+        assert_eq!(
+            run_git(&old_wt, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .await
+                .unwrap(),
+            "HEAD",
+            "old worktree must be detached"
+        );
+
+        // New commits land on the branch; .meguri/ stays excluded.
+        std::fs::create_dir_all(new_wt.join(".meguri")).unwrap();
+        std::fs::write(new_wt.join(".meguri/result.json"), "{}").unwrap();
+        assert!(status_clean(&new_wt).await.unwrap());
+        assert_eq!(commits_ahead(&new_wt, "main").await.unwrap(), 1);
+
+        // Attaching again (resume) is idempotent.
+        attach_worktree(repo.path(), &new_wt, branch).await.unwrap();
+
+        // A branch that exists nowhere fails loudly.
+        let missing = worktree_path(new_root.path(), "proj", "meguri/none");
+        assert!(
+            attach_worktree(repo.path(), &missing, "meguri/none")
+                .await
+                .is_err()
+        );
     }
 }
