@@ -51,4 +51,16 @@ pub enum Command {
     Handback { run: String },
     /// Kill the pane and cancel the run
     Stop { run: String },
+    /// Reclaim worktrees (and merged local branches) of closed issues
+    Clean {
+        /// Only clean this project (default: all configured projects)
+        #[arg(long)]
+        project: Option<String>,
+        /// List what would be reclaimed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also reclaim dirty worktrees and force-delete unmerged branches
+        #[arg(long)]
+        force: bool,
+    },
 }

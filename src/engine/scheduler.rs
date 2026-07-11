@@ -52,6 +52,14 @@ impl Scheduler {
                 tracing::warn!("discovery failed: {e:#}");
             }
 
+            // Ride the poll: reclaim worktrees whose issue closed (#13's
+            // worktree half; pane lifecycle stays with the runs above).
+            for deps in &self.projects {
+                if let Err(e) = super::reaper::sweep(deps).await {
+                    tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
+                }
+            }
+
             tokio::select! {
                 _ = tokio::time::sleep(self.poll_interval) => {}
                 Some(res) = running.join_next(), if !running.is_empty() => {

@@ -1,0 +1,298 @@
+//! Reaper tests: `meguri clean` classification and reclamation of worktrees
+//! whose issue closed on the forge.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use meguri::config::{Config, ProjectConfig};
+use meguri::engine::Deps;
+use meguri::engine::reaper::{self, Verdict};
+use meguri::forge::fake::FakeForge;
+use meguri::gitops::{self, run_git};
+use meguri::mux::PaneSpec;
+use meguri::mux::fake::FakeMux;
+use meguri::store::{RunStatus, Store};
+
+async fn init_origin_and_clone(root: &Path) -> PathBuf {
+    let origin = root.join("origin.git");
+    let clone = root.join("clone");
+    std::fs::create_dir_all(&origin).unwrap();
+    run_git(&origin, &["init", "--bare", "-b", "main"])
+        .await
+        .unwrap();
+    run_git(
+        root,
+        &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+    )
+    .await
+    .unwrap();
+    for args in [
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "meguri-test"],
+        vec!["commit", "--allow-empty", "-m", "init"],
+        vec!["push", "-u", "origin", "main"],
+    ] {
+        run_git(&clone, &args).await.unwrap();
+    }
+    clone
+}
+
+async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
+    let clone = init_origin_and_clone(root).await;
+    Deps {
+        store: Store::open_in_memory().unwrap(),
+        mux: Arc::new(FakeMux::new(false)),
+        forge,
+        config: Config::default(),
+        project: ProjectConfig {
+            id: "proj".into(),
+            repo_path: clone,
+            repo_slug: "me/proj".into(),
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: Some(root.join("worktrees")),
+            pr: None,
+        },
+    }
+}
+
+/// Create a meguri worktree for `issue` with one committed file; returns
+/// (branch, worktree path).
+async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf) {
+    let branch = gitops::branch_name(issue, title, &format!("run-{issue}"));
+    let root = deps.project.worktree_root.clone().unwrap();
+    let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
+    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main")
+        .await
+        .unwrap();
+    std::fs::write(wt.join("work.txt"), format!("issue {issue}\n")).unwrap();
+    run_git(&wt, &["add", "work.txt"]).await.unwrap();
+    run_git(
+        &wt,
+        &[
+            "-c",
+            "user.email=a@a",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            "work",
+        ],
+    )
+    .await
+    .unwrap();
+    (branch, wt)
+}
+
+fn verdict_of(candidates: &[reaper::Candidate], issue: i64) -> &reaper::Candidate {
+    candidates
+        .iter()
+        .find(|c| c.issue == Some(issue))
+        .unwrap_or_else(|| panic!("no candidate for issue #{issue}: {candidates:?}"))
+}
+
+#[tokio::test]
+async fn plan_classifies_closed_open_dirty_active_and_orphan() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(1, "Closed clean", "", &[]));
+    for (n, t) in [(2, "Still open"), (3, "Closed dirty"), (4, "Active run")] {
+        forge.issues.lock().unwrap().push(meguri::forge::Issue {
+            number: n,
+            title: t.into(),
+            body: String::new(),
+            labels: vec![],
+        });
+    }
+    let deps = setup(root.path(), forge.clone()).await;
+
+    add_worktree(&deps, 1, "Closed clean").await;
+    add_worktree(&deps, 2, "Still open").await;
+    let (_, dirty_wt) = add_worktree(&deps, 3, "Closed dirty").await;
+    std::fs::write(dirty_wt.join("uncommitted.txt"), "wip").unwrap();
+    let (active_branch, active_wt) = add_worktree(&deps, 4, "Active run").await;
+
+    // Issue #4's worktree belongs to a run that is still active.
+    let run = deps.store.create_run("proj", 4, "Active run").unwrap();
+    deps.store
+        .update_run_worktree(&run.id, &active_branch, &active_wt.to_string_lossy())
+        .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Running, None)
+        .unwrap();
+
+    // An orphan worktree under meguri's root with a non-meguri branch.
+    let orphan_wt = root.path().join("worktrees/proj/manual-experiment");
+    run_git(
+        &deps.project.repo_path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "manual-experiment",
+            orphan_wt.to_str().unwrap(),
+            "main",
+        ],
+    )
+    .await
+    .unwrap();
+
+    forge.close_issue(1);
+    forge.close_issue(3);
+    forge.close_issue(4); // even closed, the active run protects it
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(candidates.len(), 5, "{candidates:?}");
+    assert_eq!(verdict_of(&candidates, 1).verdict, Verdict::Reclaim);
+    assert_eq!(verdict_of(&candidates, 2).verdict, Verdict::Open);
+    assert_eq!(verdict_of(&candidates, 3).verdict, Verdict::Dirty);
+    assert_eq!(verdict_of(&candidates, 4).verdict, Verdict::ActiveRun);
+    let orphan = candidates
+        .iter()
+        .find(|c| c.issue.is_none())
+        .expect("orphan candidate listed");
+    assert_eq!(orphan.verdict, Verdict::Orphan);
+}
+
+#[tokio::test]
+async fn reclaim_removes_worktree_and_merged_branch() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(5, "Shipped", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 5, "Shipped").await;
+    // The PR merged: the branch's commits landed on origin/main.
+    run_git(&deps.project.repo_path, &["merge", &branch])
+        .await
+        .unwrap();
+    run_git(&deps.project.repo_path, &["push", "origin", "main"])
+        .await
+        .unwrap();
+    forge.close_issue(5);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(reclaimed[0].branch_deleted);
+    assert!(!wt.exists());
+
+    // git worktree list is clean: only the primary checkout remains.
+    let listed = gitops::list_worktrees(&deps.project.repo_path)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+            .await
+            .is_err(),
+        "merged local branch is deleted"
+    );
+}
+
+#[tokio::test]
+async fn unmerged_branch_is_kept_without_force() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(6, "Squash merged", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 6, "Squash merged").await;
+    forge.close_issue(6); // closed on the forge, but not merged in git terms
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists(), "worktree goes even when the branch stays");
+    assert!(!reclaimed[0].branch_deleted);
+    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+        .await
+        .expect("unmerged branch survives without --force");
+}
+
+#[tokio::test]
+async fn dirty_worktree_needs_force() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(7, "Dirty", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (_, wt) = add_worktree(&deps, 7, "Dirty").await;
+    std::fs::write(wt.join("uncommitted.txt"), "precious wip").unwrap();
+    forge.close_issue(7);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 7).verdict, Verdict::Dirty);
+
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert!(reclaimed.is_empty());
+    assert!(wt.exists(), "dirty worktree survives without --force");
+
+    let reclaimed = reaper::reclaim(&deps, &candidates, true).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists(), "--force reclaims the dirty worktree");
+}
+
+#[tokio::test]
+async fn live_pane_protects_closed_issue_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(8, "Pane alive", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 8, "Pane alive").await;
+    let pane = deps
+        .mux
+        .spawn_pane(&PaneSpec {
+            title: "meguri#8".into(),
+            cwd: wt.clone(),
+            command: vec!["agent".into()],
+            env: vec![],
+        })
+        .await
+        .unwrap();
+    let run = deps.store.create_run("proj", 8, "Pane alive").unwrap();
+    deps.store
+        .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())
+        .unwrap();
+    deps.store
+        .update_run_mux(&run.id, deps.mux.kind().as_str(), "meguri", &pane.0)
+        .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Succeeded, None)
+        .unwrap();
+    forge.close_issue(8);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 8).verdict, Verdict::PaneAlive);
+    assert!(
+        reaper::reclaim(&deps, &candidates, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(wt.exists());
+
+    // Once the pane dies the worktree becomes reclaimable.
+    deps.mux.kill_pane(&pane).await.unwrap();
+    let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 8).verdict, Verdict::Reclaim);
+    reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert!(!wt.exists());
+}
+
+#[tokio::test]
+async fn sweep_reclaims_only_closed_clean_worktrees() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(9, "Closed", "", &[]));
+    forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 10,
+        title: "Open".into(),
+        body: String::new(),
+        labels: vec![],
+    });
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (_, closed_wt) = add_worktree(&deps, 9, "Closed").await;
+    let (_, open_wt) = add_worktree(&deps, 10, "Open").await;
+    forge.close_issue(9);
+
+    reaper::sweep(&deps).await.unwrap();
+    assert!(!closed_wt.exists(), "closed issue's worktree reclaimed");
+    assert!(open_wt.exists(), "open issue's worktree untouched");
+}

@@ -83,6 +83,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
+meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
 
 ### Labels
@@ -100,7 +101,7 @@ meguri stop <run>         # kill pane, release the claim, cancel
 
 Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. Review the spec and flip the label to `meguri:spec-ready` (manual for now); the worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. While watching, meguri also reclaims the worktree (and merged local branch) of every issue that closes; `meguri clean` does the same on demand for one-shot usage.
 
 ## Configuration
 

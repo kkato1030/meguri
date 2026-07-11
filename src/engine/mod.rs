@@ -1,5 +1,6 @@
 pub mod flow;
 pub mod planner;
+pub mod reaper;
 pub mod scheduler;
 pub mod worker;
 
