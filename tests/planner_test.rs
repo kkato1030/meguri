@@ -75,6 +75,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let deps = Deps {

@@ -104,10 +104,15 @@ meguri clean              # reclaim worktrees of closed issues (--dry-run / --fo
 | `meguri:working` | meguri claimed it (removed when the PR opens) |
 | `meguri:hold` | discovery skips this issue |
 | `meguri:needs-human` | meguri gave up; a comment explains why |
+| `meguri:clean-report` | the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep) |
 
 ### Spec-first flow (opt-in)
 
 Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
+
+### Cleaner (read-only repository sweeps)
+
+The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
 Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. While watching, meguri also reclaims the worktree (and merged local branch) of every issue that closes; `meguri clean` does the same on demand for one-shot usage.
 
@@ -151,6 +156,11 @@ bind = "127.0.0.1"     # no auth — keep it loopback unless you know your netwo
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]
+
+[clean]
+interval_hours = 24     # min hours between cleaner sweeps (a moved head alone doesn't trigger one)
+stale_branch_days = 30  # remote branches older than this are reported as stale
+ignore = []             # substrings that silence false positives; override per project with [projects.clean]
 ```
 
 ## Development
@@ -164,7 +174,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-Five loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), and the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it).
+Six loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue).
 
 ## License
 

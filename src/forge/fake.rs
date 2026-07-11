@@ -268,6 +268,27 @@ impl Forge for FakeForge {
             .collect())
     }
 
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        let mut issues = self.issues.lock().unwrap();
+        let number = issues.iter().map(|i| i.number).max().unwrap_or(0) + 1;
+        issues.push(Issue {
+            number,
+            title: title.into(),
+            body: body.into(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        });
+        Ok(number)
+    }
+
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        let mut issues = self.issues.lock().unwrap();
+        let Some(i) = issues.iter_mut().find(|i| i.number == number) else {
+            bail!("issue #{number} not found");
+        };
+        i.body = body.to_string();
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         let mut issues = self.issues.lock().unwrap();
         let Some(i) = issues.iter_mut().find(|i| i.number == issue) else {

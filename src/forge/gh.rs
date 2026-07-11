@@ -189,6 +189,46 @@ impl Forge for GhForge {
             .unwrap_or_default())
     }
 
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64> {
+        // `gh issue create --label` fails on labels that don't exist yet.
+        for label in labels {
+            self.ensure_label(label).await;
+        }
+        let mut args = vec![
+            "issue", "create", "--repo", &self.repo, "--title", title, "--body", body,
+        ];
+        for label in labels {
+            args.push("--label");
+            args.push(label);
+        }
+        let url = self.gh(&args).await?;
+        // gh prints the issue URL (possibly after progress lines).
+        let url = url
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("https://"))
+            .unwrap_or(&url)
+            .trim();
+        url.rsplit('/')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .with_context(|| format!("cannot parse issue number from gh output: {url}"))
+    }
+
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         self.ensure_label(label).await;
         self.gh(&[
