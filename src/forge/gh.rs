@@ -310,6 +310,33 @@ impl Forge for GhForge {
         Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))
     }
 
+    /// `gh pr view` resolves a branch name to its PR (preferring an open one
+    /// when several exist, which is the safe direction: open means keep).
+    /// "No PR" is a normal answer, not an error — only real lookup failures
+    /// (network, auth) propagate so the caller can fall back to keeping.
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        let raw = match self
+            .gh(&[
+                "pr",
+                "view",
+                branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,body,labels,headRefName,headRefOid,state,url",
+            ])
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) if e.to_string().contains("no pull requests found") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
+        Ok(Some(
+            Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))?,
+        ))
+    }
+
     /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",
     /// "CONFLICTING" or "UNKNOWN" (still computing). `mergeStateStatus` is
     /// requested too so a future caller can distinguish e.g. blocked-but-

@@ -167,6 +167,10 @@ pub trait Forge: Send + Sync {
         draft: bool,
     ) -> Result<CreatedPr>;
     async fn get_pr(&self, number: i64) -> Result<PullRequest>;
+    /// The PR whose head is `branch`, if any — open PRs win over closed or
+    /// merged ones. The reaper uses the merged state to recognize squash and
+    /// rebase merges, whose branch tips never become ancestors of the base.
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
     /// Open PRs (candidates for fixer discovery).
