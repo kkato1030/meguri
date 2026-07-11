@@ -7,7 +7,17 @@ use rusqlite::Connection;
 mod runs;
 pub use runs::*;
 
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("migrations/0001_init.sql")),
+    (
+        "0002_heartbeats",
+        include_str!("migrations/0002_heartbeats.sql"),
+    ),
+    (
+        "0003_agent_session",
+        include_str!("migrations/0003_agent_session.sql"),
+    ),
+];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).
 ///
@@ -73,6 +83,55 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         f(&conn)
     }
+
+    /// Record that `name` (e.g. "watch") is alive right now.
+    pub fn heartbeat(&self, name: &str) -> Result<()> {
+        self.heartbeat_at(name, &now())
+    }
+
+    /// UPSERT a heartbeat with an explicit timestamp (tests fabricate stale ones).
+    pub fn heartbeat_at(&self, name: &str, ts: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO heartbeats (name, ts) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET ts = excluded.ts",
+                rusqlite::params![name, ts],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn latest_heartbeat(&self, name: &str) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT ts FROM heartbeats WHERE name = ?1")?;
+            let mut rows = stmt.query([name])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(row.get(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+/// Inverse of [`now`]: parse our RFC3339 UTC shape back to epoch seconds.
+/// Returns None on anything that doesn't match `YYYY-MM-DDThh:mm:ssZ`.
+pub fn parse_ts(ts: &str) -> Option<u64> {
+    let b = ts.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    let num = |s: &str| s.parse::<i64>().ok();
+    let (year, month, day) = (num(&ts[0..4])?, num(&ts[5..7])?, num(&ts[8..10])?);
+    let (h, m, s) = (num(&ts[11..13])?, num(&ts[14..16])?, num(&ts[17..19])?);
+    // Days-from-civil (Howard Hinnant), the inverse of the algorithm in now().
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + m * 60 + s).ok()
 }
 
 /// RFC3339 UTC timestamp without external chrono dependency.
@@ -110,7 +169,7 @@ mod tests {
             .with_conn(|c| {
                 let n: i64 =
                     c.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))?;
-                assert_eq!(n, 1);
+                assert_eq!(n, MIGRATIONS.len() as i64);
                 Ok(())
             })
             .unwrap();
@@ -122,5 +181,42 @@ mod tests {
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert!(ts.starts_with("20"));
+    }
+
+    #[test]
+    fn parse_ts_inverts_now() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let parsed = parse_ts(&now()).unwrap();
+        assert!(parsed.abs_diff(before) <= 1);
+        assert_eq!(parse_ts("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(parse_ts("not a timestamp"), None);
+        assert_eq!(parse_ts("2000-03-01 00:00:00Z"), None);
+    }
+
+    #[test]
+    fn heartbeat_upsert_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.latest_heartbeat("watch").unwrap(), None);
+
+        store.heartbeat_at("watch", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            store.latest_heartbeat("watch").unwrap().as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+
+        // UPSERT overwrites the single row instead of accumulating.
+        store.heartbeat("watch").unwrap();
+        let ts = store.latest_heartbeat("watch").unwrap().unwrap();
+        assert_ne!(ts, "2026-01-01T00:00:00Z");
+        store
+            .with_conn(|c| {
+                let n: i64 = c.query_row("SELECT COUNT(*) FROM heartbeats", [], |r| r.get(0))?;
+                assert_eq!(n, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 }

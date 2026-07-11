@@ -39,6 +39,11 @@ impl Scheduler {
         }
 
         loop {
+            // Liveness beacon for external readers (`meguri serve`).
+            if let Err(e) = store.heartbeat("watch") {
+                tracing::warn!("heartbeat failed: {e:#}");
+            }
+
             // Reap finished drivers.
             while let Some(res) = running.try_join_next() {
                 if let Ok(run_id) = res {

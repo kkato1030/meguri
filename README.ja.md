@@ -79,6 +79,7 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
+meguri serve              # 読み取り専用 web ダッシュボード (http://127.0.0.1:8607)
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -87,6 +88,40 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
+
+### 常駐させる（daemon）
+
+`meguri watch` はフォアグラウンドに留まります。シェルを閉じても回り続けさせるには detach します:
+
+```bash
+meguri daemon start       # watch を detach 起動（ログ: ~/.meguri/logs/watch.log）
+meguri daemon status      # pid / モード / 稼働状態 / ログ位置 / アクティブ run 数
+meguri daemon logs -f     # daemon ログを follow
+meguri daemon restart
+meguri daemon stop        # SIGTERM。kill-safe なので次回起動時の recovery が再開する
+```
+
+macOS では監視を launchd に委ねると、ログアウト・再起動・クラッシュ後も自動復帰します:
+
+```bash
+meguri daemon install --mode launchd   # user LaunchAgent を生成して bootstrap
+meguri daemon uninstall                # bootout + plist 削除
+```
+
+LaunchAgent には install 時の `PATH`（および設定されていれば `HERDR_SOCKET_PATH` /
+`MEGURI_HOME`）が焼き込まれるため、launchd 配下でも `gh`・`tmux`/`herdr`・エージェント
+CLI が解決できます。ログは `~/.meguri/logs/launchd.log` へ。restart policy と throttle は
+config の `[daemon]` セクションから来ます — 変更したら `meguri daemon install` を再実行して
+反映します。非対応プラットフォームでは明示エラーになります（silent fallback しません）。
+systemd user unit は後続予定です。
+
+どのモードでも watch プロセスは排他ロック（`~/.meguri/daemon/watch.lock`）を保持するので、
+2 つ目のスケジューラ — フォアグラウンドでも detached でも — は二重駆動せず明示エラーで
+落ちます。
+
+### web ダッシュボード
+
+`meguri serve` で読み取り専用ダッシュボードが `http://127.0.0.1:8607` に立ちます（`--port` / `--bind` または config の `[server]` セクションで変更可）。`meguri ps` 相当の runs テーブル（`awaiting_human` の run を最上部で強調表示）に加え、run ごとの詳細ページでイベントトレイル、端末風のペインテール、turn 履歴、コピー可能な attach コマンドが見られます。同じ sqlite を読む独立プロセスなので `meguri watch` が動いていなくても使え、watch の生死は scheduler が tick ごとに書くハートビートから表示されます。認証はないためデフォルトは loopback バインドです（それ以外を指定すると警告が出ます）。
 
 ### ラベル
 
@@ -99,6 +134,8 @@ meguri clean              # reclaim worktrees of closed issues (--dry-run / --fo
 | `meguri:working` | meguri がクレーム済み（PR が開くと外れる） |
 | `meguri:hold` | discovery がこの issue をスキップする |
 | `meguri:needs-human` | meguri が断念。理由はコメントで説明される |
+
+discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004）も尊重します: 他の issue に *blocked by* されている issue は、すべてのブロッカーが **completed** で close されるまでスキップされます — ラベルもコメントも付けない、静かなスキップです。*not planned* / *duplicate* で close されたブロッカーは解決扱いになりません（依存元 issue は人間の再検討待ち）。ブロッカーが読めない場合も「未解決」として扱われます。
 
 ### spec 先行フロー（オプトイン）
 
@@ -139,6 +176,14 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[daemon]
+restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
+throttle_secs = 10             # launchd ThrottleInterval（再起動の最短間隔・秒）
+
+[server]
+port = 8607            # meguri serve のリッスンポート
+bind = "127.0.0.1"     # 認証なしのため loopback 推奨
 
 [pr]
 draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き

@@ -79,6 +79,7 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
+meguri serve              # read-only web dashboard on http://127.0.0.1:8607
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -87,6 +88,41 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
+
+### Keep it running (daemon)
+
+`meguri watch` stays in the foreground; to survive closing the shell, detach it:
+
+```bash
+meguri daemon start       # spawn watch detached (log: ~/.meguri/logs/watch.log)
+meguri daemon status      # pid / mode / liveness / log location / active runs
+meguri daemon logs -f     # tail the daemon log
+meguri daemon restart
+meguri daemon stop        # SIGTERM; kill-safe, recovery resumes on next start
+```
+
+On macOS, hand supervision to launchd so the watch also survives logout,
+reboot, and crashes:
+
+```bash
+meguri daemon install --mode launchd   # generate + bootstrap a user LaunchAgent
+meguri daemon uninstall                # bootout + remove the plist
+```
+
+The LaunchAgent bakes in your current `PATH` (and `HERDR_SOCKET_PATH` /
+`MEGURI_HOME` if set), so `gh`, `tmux`/`herdr`, and the agent CLI resolve under
+launchd; its log goes to `~/.meguri/logs/launchd.log`. Restart policy and
+throttle come from the `[daemon]` config section — after changing them, re-run
+`meguri daemon install`. Other platforms get an explicit error (no silent
+fallback); systemd user units are planned.
+
+Whatever the mode, the watch process holds an exclusive lock
+(`~/.meguri/daemon/watch.lock`), so a second scheduler — foreground or
+detached — fails loudly instead of double-driving runs.
+
+### Web dashboard
+
+`meguri serve` starts a read-only dashboard at `http://127.0.0.1:8607` (override with `--port` / `--bind` or the `[server]` config section): a runs table like `meguri ps` with `awaiting_human` runs highlighted front and center, plus a per-run page with the event trail, a terminal-style pane tail, turn history, and the attach command ready to copy. It is an independent process that reads the same sqlite database — it works even when `meguri watch` is not running, and shows watch liveness from the heartbeat the scheduler writes each tick. There is no authentication, so it binds loopback by default; binding anything else prints a warning.
 
 ### Labels
 
@@ -99,6 +135,8 @@ meguri clean              # reclaim worktrees of closed issues (--dry-run / --fo
 | `meguri:working` | meguri claimed it (removed when the PR opens) |
 | `meguri:hold` | discovery skips this issue |
 | `meguri:needs-human` | meguri gave up; a comment explains why |
+
+Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an issue *blocked by* another is skipped — silently, no label or comment — until every blocker is closed as **completed**. Blockers closed as *not planned* / *duplicate* don't count as resolved (the dependent issue awaits human re-triage), and unreadable blockers are treated as unresolved.
 
 ### Spec-first flow (opt-in)
 
@@ -139,6 +177,14 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[daemon]
+restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
+throttle_secs = 10             # launchd ThrottleInterval (secs between restarts)
+
+[server]
+port = 8607            # meguri serve listen port
+bind = "127.0.0.1"     # no auth — keep it loopback unless you know your network
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]

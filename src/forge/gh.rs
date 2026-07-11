@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment, ReviewThread,
+    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
+    ReviewThread,
 };
 
 pub struct GhForge {
@@ -188,6 +189,41 @@ impl Forge for GhForge {
         let v: Value = serde_json::from_str(&raw).context("parsing gh issue list output")?;
         Ok(v.as_array()
             .map(|items| items.iter().filter_map(Self::issue_from_json).collect())
+            .unwrap_or_default())
+    }
+
+    /// GitHub-native issue dependencies. Missing fields degrade to an
+    /// unresolved blocker (never to resolved), matching the gate's
+    /// "unreadable means unresolved" rule.
+    async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>> {
+        let raw = self
+            .gh(&[
+                "api",
+                &format!(
+                    "repos/{}/issues/{issue}/dependencies/blocked_by?per_page=100",
+                    self.repo
+                ),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing blocked_by output")?;
+        Ok(v.as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|b| Blocker {
+                        number: b.get("number").and_then(Value::as_i64).unwrap_or(0),
+                        state: b
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_lowercase(),
+                        state_reason: b
+                            .get("state_reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_lowercase),
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 

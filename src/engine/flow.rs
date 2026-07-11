@@ -5,6 +5,7 @@
 //! verification, PR shape, label settling) plugs in via [`Flavor`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -99,6 +100,27 @@ pub trait Flavor: Send + Sync {
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         escalate_on_forge(deps, run.issue_number, reason).await;
     }
+
+    /// The agent ended its execute turn with `needs_plan`: a design decision
+    /// must precede implementation (issue #22). Returns the run's terminal
+    /// outcome. Default: no plan handoff exists for this loop — a human must
+    /// look (only the worker overrides this to demote the issue to
+    /// `meguri:plan`).
+    async fn on_needs_plan(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        worktree: &Path,
+        reason: &str,
+    ) -> Result<WorkerOutcome> {
+        let _ = (deps, worktree);
+        Err(NeedsHuman(format!(
+            "agent asked for a plan on issue #{} but this loop has no plan \
+             handoff: {reason}",
+            run.issue_number
+        ))
+        .into())
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -142,7 +164,8 @@ pub struct NeedsHuman(pub String);
 /// Shared discovery: open issues carrying `label` that are actionable — not
 /// held, not claimed by another host, not already shipped by a succeeded run
 /// of this loop (avoids duplicate PRs when the trigger label lingers or
-/// reappears; humans can force a rerun with `meguri run --issue N`).
+/// reappears; humans can force a rerun with `meguri run --issue N`), and not
+/// gated by an unresolved `blocked_by` dependency.
 pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Result<Vec<Target>> {
     let issues = deps.forge.list_issues_with_label(label).await?;
     let mut targets = Vec::new();
@@ -156,12 +179,27 @@ pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Res
         {
             continue;
         }
+        if has_unresolved_blockers(deps, issue.number).await {
+            continue;
+        }
         targets.push(Target {
             issue_number: issue.number,
             title: issue.title,
         });
     }
     Ok(targets)
+}
+
+/// Dependency gate (looper ADR-0004): GitHub-native `blocked_by` is the
+/// authority. Only a blocker closed as completed resolves; open blockers,
+/// not_planned/duplicate closes, and blockers we cannot read all keep the
+/// issue out of discovery. The skip is silent — no label, no comment: the
+/// dependency graph on the forge already tells a human why nothing starts.
+async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
+    match deps.forge.blocked_by(issue).await {
+        Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
+        Err(_) => true,
+    }
 }
 
 pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<WorkerOutcome> {
@@ -204,6 +242,12 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                         .update_run_status(run_id, RunStatus::Skipped, Some(reason))?;
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
+                }
+                WorkerOutcome::NeedsPlan(reason) => {
+                    deps.store
+                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
+                    deps.store
+                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
                 }
             }
             Ok(outcome)
@@ -253,6 +297,11 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+            StepFlow::NeedsPlan(reason) => {
+                let outcome = flavor.on_needs_plan(deps, &run, &worktree, &reason).await?;
+                cleanup_pane(deps, &run, true).await;
+                return Ok(outcome);
+            }
         }
         step = save_step(deps, &run, STEP_VALIDATE, &checkpoint)?;
     }
@@ -262,6 +311,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+            StepFlow::NeedsPlan(reason) => {
+                // Unreachable: validate() escalates a needs_plan fix turn
+                // (the work is already committed by then).
+                return Err(NeedsHuman(format!(
+                    "agent asked for a plan during validation on issue #{}: {reason}",
+                    run.issue_number
+                ))
+                .into());
+            }
         }
         step = save_step(deps, &run, STEP_OPEN_PR, &checkpoint)?;
     }
@@ -279,6 +337,9 @@ pub(crate) enum StepFlow {
     Continue,
     Stopped,
     Interrupted(String),
+    /// The agent's execute turn ended with `needs_plan` (+ the reason); the
+    /// flavor's [`Flavor::on_needs_plan`] decides the terminal outcome.
+    NeedsPlan(String),
 }
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
@@ -457,26 +518,107 @@ fn turn_engine(deps: &Deps) -> TurnEngine {
     }
 }
 
+/// How long a resume-spawned pane is watched for instant death: an unknown
+/// or expired session id makes the agent CLI print an error and exit within
+/// a few seconds, which is the signal to fall back to full re-injection.
+const RESUME_PROBE: Duration = Duration::from_secs(5);
+const RESUME_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The pane `run_turn` operates on, and how it came to exist.
+struct EnsuredPane {
+    pane: PaneId,
+    /// Trigger already delivered as the agent's initial prompt argument.
+    freshly_spawned: bool,
+    /// Spawned with the agent's native `--resume`; a pane death without a
+    /// result then means the stored session id is no longer trustworthy.
+    resumed: bool,
+}
+
 /// Get the run's pane, spawning it (with the trigger as the agent's initial
-/// prompt argument) if it doesn't exist or died.
+/// prompt argument) if it doesn't exist or died. When a native agent session
+/// id is on record, the spawn resumes it (`claude --resume <id> <trigger>`)
+/// so the agent keeps its conversation context; a resume that dies on the
+/// spot falls back to the plain full-prompt spawn.
 async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     initial_trigger: &str,
-) -> Result<(PaneId, bool)> {
+) -> Result<EnsuredPane> {
     if let Some(id) = &run.mux_pane_id {
         let pane = PaneId(id.clone());
         if run.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            return Ok((pane, false));
+            return Ok(EnsuredPane {
+                pane,
+                freshly_spawned: false,
+                resumed: false,
+            });
         }
     }
 
     deps.mux.ensure_session().await?;
+
+    // Re-read: a completed turn records the session id on the store, not on
+    // the caller's (possibly stale) run snapshot.
+    let session_id = deps
+        .store
+        .get_run(&run.id)?
+        .and_then(|r| r.agent_session_id);
+    if let Some(session_id) = session_id {
+        let resumed =
+            match spawn_agent_pane(deps, run, worktree, initial_trigger, Some(&session_id)).await {
+                Ok(pane) => {
+                    if resumed_pane_survives(deps, &pane).await {
+                        Some(pane)
+                    } else {
+                        // Dead on arrival: the CLI rejected the session id.
+                        let _ = deps.mux.kill_pane(&pane).await;
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+        if let Some(pane) = resumed {
+            return Ok(EnsuredPane {
+                pane,
+                freshly_spawned: true,
+                resumed: true,
+            });
+        }
+        // Forget the id and fall back to full re-injection.
+        deps.store.update_run_agent_session(&run.id, None)?;
+        deps.store.emit(
+            Some(&run.id),
+            "pane.resume_failed",
+            json!({ "agent_session_id": session_id }),
+        )?;
+    }
+
+    let pane = spawn_agent_pane(deps, run, worktree, initial_trigger, None).await?;
+    Ok(EnsuredPane {
+        pane,
+        freshly_spawned: true,
+        resumed: false,
+    })
+}
+
+/// Spawn the agent pane (optionally resuming a native session) and persist
+/// its handle on the run.
+async fn spawn_agent_pane(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    initial_trigger: &str,
+    resume_session: Option<&str>,
+) -> Result<PaneId> {
     let mut command = vec![deps.config.agent.command.clone()];
     command.extend(deps.config.agent.args.iter().cloned());
+    if let Some(session_id) = resume_session {
+        command.extend(deps.config.agent.resume_args.iter().cloned());
+        command.push(session_id.to_string());
+    }
     command.push(initial_trigger.to_string());
 
     let mut env = Vec::new();
@@ -503,9 +645,26 @@ async fn ensure_pane(
         Some(&run.id),
         "pane.spawned",
         json!({ "pane": pane.0, "mux": deps.mux.kind().as_str(),
+                "resumed": resume_session.is_some(),
                 "attach": deps.mux.attach_command(&pane) }),
     )?;
-    Ok((pane, true))
+    Ok(pane)
+}
+
+/// Watch a freshly resume-spawned pane briefly; false means it died (the
+/// session id was rejected) and the caller should fall back.
+async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if !deps.mux.pane_alive(pane).await.unwrap_or(false) {
+            return false;
+        }
+        if waited >= RESUME_PROBE {
+            return true;
+        }
+        tokio::time::sleep(RESUME_PROBE_INTERVAL).await;
+        waited += RESUME_PROBE_INTERVAL;
+    }
 }
 
 /// Run one prompt-turn: prepare files, deliver the trigger (spawn or
@@ -518,14 +677,15 @@ pub(crate) async fn run_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let prepared = prepare_turn(worktree, prompt_body)?;
-    let (pane, freshly_spawned) = ensure_pane(deps, run, worktree, &prepared.trigger_line).await?;
+    let ensured = ensure_pane(deps, run, worktree, &prepared.trigger_line).await?;
+    let pane = ensured.pane.clone();
     deps.store.begin_turn(
         &run.id,
         &prepared.turn_id,
         purpose,
         &prepared.prompt_path.to_string_lossy(),
     )?;
-    if !freshly_spawned {
+    if !ensured.freshly_spawned {
         deps.mux.send_line(&pane, &prepared.trigger_line).await?;
     }
 
@@ -537,6 +697,8 @@ pub(crate) async fn run_turn(
     let outcome = engine
         .await_completion(&pane, worktree, &prepared.turn_id, &control)
         .await?;
+
+    record_agent_session(deps, run, &pane, &ensured, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -551,6 +713,44 @@ pub(crate) async fn run_turn(
     deps.store
         .finish_turn(&prepared.turn_id, &outcome_str, result_json.as_deref())?;
     Ok((outcome, prepared.turn_id))
+}
+
+/// Keep `runs.agent_session_id` in sync with what the turn taught us: a
+/// completed turn reports the id (result file first, mux second — herdr
+/// carries it on `pane get`); a resumed pane dying without a result means
+/// the stored id no longer restores a working session, so drop it rather
+/// than resume-loop on it forever.
+async fn record_agent_session(
+    deps: &Deps,
+    run: &RunRecord,
+    pane: &PaneId,
+    ensured: &EnsuredPane,
+    outcome: &TurnOutcome,
+) -> Result<()> {
+    match outcome {
+        TurnOutcome::Completed(r) => {
+            let session_id = match &r.agent_session_id {
+                Some(id) => Some(id.clone()),
+                None => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+            };
+            if let Some(id) = session_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                deps.store.update_run_agent_session(&run.id, Some(&id))?;
+            }
+        }
+        TurnOutcome::PaneDied if ensured.resumed => {
+            deps.store.update_run_agent_session(&run.id, None)?;
+            deps.store.emit(
+                Some(&run.id),
+                "agent_session.cleared",
+                json!({ "reason": "resumed pane died without a result" }),
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// execute: agent does the loop's work; the orchestrator independently
@@ -591,6 +791,9 @@ async fn execute(
                     run.issue_number, result.summary
                 ))
                 .into());
+            }
+            TurnStatus::NeedsPlan => {
+                return Ok(StepFlow::NeedsPlan(result.summary));
             }
         }
 
@@ -714,7 +917,9 @@ async fn validate(
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
                 TurnStatus::Success => continue,
-                TurnStatus::Failure | TurnStatus::NeedsHuman => {
+                // needs_plan makes no sense once work is committed and
+                // failing validation — escalate like the other two.
+                TurnStatus::Failure | TurnStatus::NeedsHuman | TurnStatus::NeedsPlan => {
                     return Err(NeedsHuman(format!(
                         "agent could not fix validation: {}",
                         r.summary

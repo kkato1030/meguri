@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, ProjectConfig};
+use crate::daemon;
 use crate::engine::Deps;
 use crate::engine::reaper;
 use crate::engine::scheduler::Scheduler;
@@ -87,6 +88,13 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
             println!("⏭️  skipped: {reason}");
             Ok(())
         }
+        WorkerOutcome::NeedsPlan(reason) => {
+            println!(
+                "📝 needs a plan first — issue handed to {}: {reason}",
+                crate::forge::LABEL_PLAN
+            );
+            Ok(())
+        }
     }
 }
 
@@ -98,6 +106,17 @@ pub async fn cmd_watch() -> Result<()> {
             config::config_path().display()
         );
     }
+
+    // Single-instance guard: held for the watch's whole lifetime, so a second
+    // scheduler (foreground or detached) fails loudly instead of double-driving.
+    let home = config::meguri_home();
+    let _lock = daemon::try_acquire_lock(&home)?;
+    let mode = daemon::WatchMode::from_env();
+    daemon::write_state(
+        &home,
+        &daemon::DaemonState::for_current_process(&home, mode),
+    )?;
+
     let mut projects = Vec::new();
     for project in &cfg.projects {
         projects.push(build_deps(&cfg, project, None)?);
@@ -118,7 +137,30 @@ pub async fn cmd_watch() -> Result<()> {
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
     };
-    scheduler.watch().await
+    let result = scheduler.watch().await;
+    daemon::clear_state(&home);
+    result
+}
+
+pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let bind = bind.unwrap_or(&cfg.server.bind);
+    let port = port.unwrap_or(cfg.server.port);
+    let addr: std::net::IpAddr = bind
+        .parse()
+        .with_context(|| format!("invalid bind address {bind:?}"))?;
+    if !addr.is_loopback() {
+        eprintln!(
+            "⚠️  binding {bind} — the dashboard has no authentication; \
+             anyone who can reach this address can read run data"
+        );
+    }
+    let listener = tokio::net::TcpListener::bind((addr, port))
+        .await
+        .with_context(|| format!("cannot bind {bind}:{port}"))?;
+    println!("meguri dashboard on http://{}", listener.local_addr()?);
+    crate::server::serve(store, cfg, listener).await
 }
 
 pub async fn cmd_clean(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {

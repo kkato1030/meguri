@@ -196,6 +196,106 @@ async fn watch_skips_working_and_hold_issues() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn watch_gates_on_open_blocker_until_closed_as_completed() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        41,
+        "Blocked work",
+        "Depends on #40.",
+        &[LABEL_READY],
+    ));
+    // GitHub-native dependency: #41 is blocked by the still-open #40.
+    forge.block_issue(41, 40);
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let agent = spawn_scripted_agent(root.path().join("worktrees"));
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    // While the blocker is open, discovery must skip — quietly: no run, no
+    // claim, no escalation label, no comment.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        store.list_runs(false).unwrap().is_empty(),
+        "no runs may start while a blocker is open"
+    );
+    let labels = forge.labels_of(41);
+    assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&meguri::forge::LABEL_NEEDS_HUMAN.to_string()));
+    assert!(forge.comments_of(41).is_empty(), "skips must be silent");
+
+    // Closing the blocker as completed resolves the dependency; the next
+    // discovery pass picks the issue up and drives it to a PR.
+    forge.close_issue(40);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "run never succeeded after the blocker closed; runs: {:?}",
+                store.list_runs(false).unwrap()
+            );
+        }
+        let runs = store.list_runs(false).unwrap();
+        if runs
+            .iter()
+            .any(|r| r.status == RunStatus::Succeeded && r.issue_number == 41)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    watch.abort();
+    agent.abort();
+
+    assert_eq!(forge.prs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        43,
+        "Blocked work",
+        "Depends on #42.",
+        &[LABEL_READY],
+    ));
+    forge.block_issue(43, 42);
+    // not_planned does not resolve the dependency: the plan this issue was
+    // built on never happened, so a human has to re-triage it.
+    forge.close_issue_as(42, "not_planned");
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    watch.abort();
+
+    assert!(
+        store.list_runs(false).unwrap().is_empty(),
+        "a not_planned blocker must keep the issue skipped"
+    );
+    // Still a quiet skip: no escalation, no comment.
+    let labels = forge.labels_of(43);
+    assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(!labels.contains(&meguri::forge::LABEL_NEEDS_HUMAN.to_string()));
+    assert!(forge.comments_of(43).is_empty(), "skips must be silent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn watch_does_not_refile_issue_with_succeeded_run() {
     let root = tempfile::tempdir().unwrap();
     let forge = Arc::new(FakeForge::with_issue(
@@ -439,6 +539,35 @@ impl Loop for FixedLoop {
             pr_url: "fixed://pr".into(),
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_ticks_write_a_heartbeat() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = setup(root.path(), forge).await;
+    let store = deps.store.clone();
+    assert_eq!(store.latest_heartbeat("watch").unwrap(), None);
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if store.latest_heartbeat("watch").unwrap().is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("watch never wrote a heartbeat");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
