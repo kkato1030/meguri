@@ -1,5 +1,6 @@
 pub mod flow;
 pub mod planner;
+pub mod reviewer;
 pub mod scheduler;
 pub mod worker;
 
@@ -63,7 +64,11 @@ pub trait Loop: Send + Sync {
 
 /// The loops meguri ships today.
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
-    vec![Arc::new(worker::WorkerLoop), Arc::new(planner::PlannerLoop)]
+    vec![
+        Arc::new(worker::WorkerLoop),
+        Arc::new(planner::PlannerLoop),
+        Arc::new(reviewer::ReviewerLoop),
+    ]
 }
 
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
