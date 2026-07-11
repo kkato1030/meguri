@@ -1,6 +1,7 @@
 pub mod fixer;
 pub mod flow;
 pub mod planner;
+pub mod reaper;
 pub mod reviewer;
 pub mod scheduler;
 pub mod spec_worker;

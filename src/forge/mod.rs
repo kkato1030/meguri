@@ -27,6 +27,15 @@ pub const LABEL_HOLD: &str = "meguri:hold";
 /// meguri gave up and a human needs to look (a comment explains why).
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
 
+/// Open/closed lifecycle of an issue on the forge — the authority that
+/// decides when local resources tied to the issue (worktrees, panes) may be
+/// reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub number: i64,
@@ -93,6 +102,8 @@ pub struct ReviewThread {
 #[async_trait]
 pub trait Forge: Send + Sync {
     async fn get_issue(&self, number: i64) -> Result<Issue>;
+    /// Open/closed state of a single issue (see [`IssueState`]).
+    async fn issue_state(&self, number: i64) -> Result<IssueState>;
     /// Open issues carrying `label` (candidates for discovery).
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;

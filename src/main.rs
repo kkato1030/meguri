@@ -33,6 +33,11 @@ async fn main() -> Result<()> {
         Command::Takeover { run } => app::cmd_takeover(&run),
         Command::Handback { run } => app::cmd_handback(&run),
         Command::Stop { run } => app::cmd_stop(&run).await,
+        Command::Clean {
+            project,
+            dry_run,
+            force,
+        } => app::cmd_clean(project.as_deref(), dry_run, force).await,
     }
 }
 

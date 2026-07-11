@@ -55,7 +55,7 @@ impl super::Loop for SpecWorkerLoop {
             {
                 continue;
             }
-            let Some(issue) = gitops::branch_issue(&pr.head_branch) else {
+            let Some(issue) = gitops::issue_from_branch(&pr.head_branch) else {
                 continue; // human-made head: not meguri's to take over
             };
             if deps
@@ -88,7 +88,7 @@ async fn spec_ready_pr(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
         .list_prs_with_label(forge::LABEL_SPEC_READY)
         .await?
         .into_iter()
-        .find(|pr| pr.state == "open" && gitops::branch_issue(&pr.head_branch) == Some(issue)))
+        .find(|pr| pr.state == "open" && gitops::issue_from_branch(&pr.head_branch) == Some(issue)))
 }
 
 /// The PR this run claimed, from its persisted checkpoint (release/escalate

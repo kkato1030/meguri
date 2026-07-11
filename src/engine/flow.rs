@@ -274,7 +274,16 @@ pub(crate) enum StepFlow {
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
 pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
-    let Some(pane_id) = &run.mux_pane_id else {
+    // The caller's record may predate the pane spawn (execute updates the
+    // store, not the in-memory run) — read the current pane id.
+    let pane_id = deps
+        .store
+        .get_run(&run.id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.mux_pane_id)
+        .or_else(|| run.mux_pane_id.clone());
+    let Some(pane_id) = &pane_id else {
         return;
     };
     let keep = match deps.config.mux.keep_pane.as_str() {
@@ -357,6 +366,13 @@ async fn claim_issue(
     deps.forge
         .add_label(issue.number, forge::LABEL_WORKING)
         .await?;
+    // A fresh claim supersedes a previous run's escalation: the human is no
+    // longer needed while this run is in flight (and a new failure re-adds
+    // the label). No-op if absent; best-effort like the escalation side.
+    let _ = deps
+        .forge
+        .remove_label(issue.number, forge::LABEL_NEEDS_HUMAN)
+        .await;
     deps.store.emit(
         Some(&run.id),
         "issue.claimed",

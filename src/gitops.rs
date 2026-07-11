@@ -61,15 +61,15 @@ mod hex {
 }
 
 /// The issue number a [`branch_name`]-style branch encodes
-/// (`meguri/<issue>-<slug>-<hash>`); None for branches that don't follow the
-/// convention (human-made heads).
-pub fn branch_issue(branch: &str) -> Option<i64> {
-    let rest = branch.strip_prefix("meguri/")?;
-    let digits = &rest[..rest.chars().take_while(|c| c.is_ascii_digit()).count()];
-    match rest.as_bytes().get(digits.len()) {
-        Some(b'-') | None => digits.parse().ok(),
-        Some(_) => None,
-    }
+/// (`meguri/<issue>-<slug>-<runhash>`); None for branches that don't follow
+/// the convention (human-made heads).
+pub fn issue_from_branch(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix("meguri/")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }
 
 pub fn worktree_path(worktrees_root: &Path, project_id: &str, branch: &str) -> PathBuf {
@@ -251,6 +251,68 @@ pub async fn remove_worktree(repo_path: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A worktree registered on the repo, as reported by
+/// `git worktree list --porcelain` (includes the primary checkout).
+#[derive(Debug, Clone)]
+pub struct ListedWorktree {
+    pub path: PathBuf,
+    /// `None` for a detached HEAD.
+    pub branch: Option<String>,
+}
+
+pub async fn list_worktrees(repo_path: &Path) -> Result<Vec<ListedWorktree>> {
+    let out = run_git(repo_path, &["worktree", "list", "--porcelain"]).await?;
+    let mut worktrees = Vec::new();
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            worktrees.push(ListedWorktree {
+                path: PathBuf::from(path),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+            && let Some(last) = worktrees.last_mut()
+        {
+            last.branch = Some(branch.to_string());
+        }
+    }
+    Ok(worktrees)
+}
+
+/// Delete a local branch. Without `force`, the branch must be merged into
+/// the default branch (`origin/<default>` when a remote exists) — checked
+/// explicitly with merge-base, because `git branch -d`'s own heuristic
+/// depends on whatever upstream the branch happens to track.
+pub async fn delete_branch(
+    repo_path: &Path,
+    branch: &str,
+    default_branch: &str,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        let base = if run_git(
+            repo_path,
+            &["rev-parse", "--verify", &format!("origin/{default_branch}")],
+        )
+        .await
+        .is_ok()
+        {
+            format!("origin/{default_branch}")
+        } else {
+            default_branch.to_string()
+        };
+        run_git(repo_path, &["merge-base", "--is-ancestor", branch, &base])
+            .await
+            .with_context(|| format!("branch {branch} is not merged into {base}"))?;
+    }
+    run_git(repo_path, &["branch", "-D", branch]).await?;
+    Ok(())
+}
+
+pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["worktree", "prune"]).await?;
+    Ok(())
+}
+
 /// True when nothing is uncommitted (untracked counts as dirty).
 pub async fn status_clean(worktree: &Path) -> Result<bool> {
     Ok(run_git(worktree, &["status", "--porcelain"])
@@ -295,23 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn issue_from_branch_parses_meguri_branches_only() {
+        assert_eq!(
+            issue_from_branch("meguri/28-clean-worktrees-ab12cd"),
+            Some(28)
+        );
+        assert_eq!(issue_from_branch("meguri/7-fix-bug-000000"), Some(7));
+        assert_eq!(
+            issue_from_branch(&branch_name(21, "Take over", "r")),
+            Some(21)
+        );
+        assert_eq!(issue_from_branch("meguri/7"), Some(7));
+        assert_eq!(issue_from_branch("meguri/not-a-number-x"), None);
+        assert_eq!(issue_from_branch("meguri/-no-number"), None);
+        assert_eq!(issue_from_branch("feature/28-something"), None);
+        assert_eq!(issue_from_branch("main"), None);
+    }
+
+    #[test]
     fn branch_name_is_stable_and_scoped() {
         let a = branch_name(7, "Fix bug", "run-1");
         let b = branch_name(7, "Fix bug", "run-2");
         assert!(a.starts_with("meguri/7-fix-bug-"));
         assert_ne!(a, b);
         assert_eq!(a, branch_name(7, "Fix bug", "run-1"));
-    }
-
-    #[test]
-    fn branch_issue_round_trips_the_convention() {
-        assert_eq!(branch_issue(&branch_name(21, "Take over", "r")), Some(21));
-        assert_eq!(branch_issue("meguri/7-fix-bug-abc123"), Some(7));
-        assert_eq!(branch_issue("meguri/7"), Some(7));
-        assert_eq!(branch_issue("meguri/7abc-x"), None);
-        assert_eq!(branch_issue("meguri/-no-number"), None);
-        assert_eq!(branch_issue("feature/manual"), None);
-        assert_eq!(branch_issue("main"), None);
     }
 
     async fn init_repo(dir: &Path) {
@@ -361,6 +430,31 @@ mod tests {
 
         remove_worktree(repo.path(), &wt).await.unwrap();
         assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn list_worktrees_reports_paths_and_branches() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = branch_name(3, "List me", "run-l");
+        let wt = worktree_path(wt_root.path(), "proj", &branch);
+        create_worktree(repo.path(), &wt, &branch, "main")
+            .await
+            .unwrap();
+
+        let listed = list_worktrees(repo.path()).await.unwrap();
+        assert_eq!(listed.len(), 2, "primary checkout + worktree: {listed:?}");
+        assert_eq!(listed[0].branch.as_deref(), Some("main"));
+        let entry = listed
+            .iter()
+            .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+            .expect("worktree listed");
+        assert_eq!(
+            std::fs::canonicalize(&entry.path).unwrap(),
+            std::fs::canonicalize(&wt).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -416,6 +510,38 @@ mod tests {
         let missing = worktree_path(new_root.path(), "proj", "meguri/none");
         assert!(
             attach_worktree(repo.path(), &missing, "meguri/none")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_branch_requires_merge_unless_forced() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = branch_name(4, "Unmerged", "run-u");
+        let wt = worktree_path(wt_root.path(), "proj", &branch);
+        create_worktree(repo.path(), &wt, &branch, "main")
+            .await
+            .unwrap();
+        run_git(&wt, &["commit", "--allow-empty", "-m", "unmerged work"])
+            .await
+            .unwrap();
+        remove_worktree(repo.path(), &wt).await.unwrap();
+
+        // Unmerged: refused without force, removed with it.
+        assert!(
+            delete_branch(repo.path(), &branch, "main", false)
+                .await
+                .is_err()
+        );
+        delete_branch(repo.path(), &branch, "main", true)
+            .await
+            .unwrap();
+        assert!(
+            run_git(repo.path(), &["rev-parse", "--verify", &branch])
                 .await
                 .is_err()
         );

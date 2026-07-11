@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{CreatedPr, Forge, Issue, PullRequest, ReviewComment, ReviewThread};
+use super::{CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread};
 
 pub struct GhForge {
     /// "owner/repo"
@@ -140,6 +140,30 @@ impl Forge for GhForge {
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh issue view output")?;
         Self::issue_from_json(&v).with_context(|| format!("unexpected issue shape: {raw}"))
+    }
+
+    async fn issue_state(&self, number: i64) -> Result<IssueState> {
+        let raw = self
+            .gh(&[
+                "issue",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "state",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue view output")?;
+        let state = v
+            .get("state")
+            .and_then(Value::as_str)
+            .with_context(|| format!("unexpected issue state shape: {raw}"))?;
+        Ok(if state.eq_ignore_ascii_case("closed") {
+            IssueState::Closed
+        } else {
+            IssueState::Open
+        })
     }
 
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>> {
