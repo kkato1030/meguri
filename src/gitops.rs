@@ -60,6 +60,18 @@ mod hex {
     }
 }
 
+/// The issue number a [`branch_name`]-style branch encodes
+/// (`meguri/<issue>-<slug>-<hash>`); None for branches that don't follow the
+/// convention (human-made heads).
+pub fn branch_issue(branch: &str) -> Option<i64> {
+    let rest = branch.strip_prefix("meguri/")?;
+    let digits = &rest[..rest.chars().take_while(|c| c.is_ascii_digit()).count()];
+    match rest.as_bytes().get(digits.len()) {
+        Some(b'-') | None => digits.parse().ok(),
+        Some(_) => None,
+    }
+}
+
 pub fn worktree_path(worktrees_root: &Path, project_id: &str, branch: &str) -> PathBuf {
     worktrees_root
         .join(project_id)
@@ -289,6 +301,17 @@ mod tests {
         assert!(a.starts_with("meguri/7-fix-bug-"));
         assert_ne!(a, b);
         assert_eq!(a, branch_name(7, "Fix bug", "run-1"));
+    }
+
+    #[test]
+    fn branch_issue_round_trips_the_convention() {
+        assert_eq!(branch_issue(&branch_name(21, "Take over", "r")), Some(21));
+        assert_eq!(branch_issue("meguri/7-fix-bug-abc123"), Some(7));
+        assert_eq!(branch_issue("meguri/7"), Some(7));
+        assert_eq!(branch_issue("meguri/7abc-x"), None);
+        assert_eq!(branch_issue("meguri/-no-number"), None);
+        assert_eq!(branch_issue("feature/manual"), None);
+        assert_eq!(branch_issue("main"), None);
     }
 
     async fn init_repo(dir: &Path) {

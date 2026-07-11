@@ -152,7 +152,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-The **worker** loop (issue → PR), the **planner** loop (`meguri:plan` issue → spec PR), and the **reviewer** loop (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`) run on GitHub today. The architecture mirrors looper's role model, so a fixer loop — and the worker picking up `meguri:spec-ready` spec PRs to continue implementation on the same branch — are planned as additional `Loop` implementations sharing the same turn engine.
+Five loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), and the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it).
 
 ## License
 

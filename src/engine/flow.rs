@@ -27,8 +27,8 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
 /// The default method bodies implement the issue-triggered "new branch, new
-/// PR" shape the worker and planner share; PR-targeted loops (the fixer)
-/// override the claim, worktree, and escalation hooks.
+/// PR" shape the worker and planner share; PR-targeted loops (the fixer, the
+/// spec worker) override the claim, worktree, and escalation hooks.
 #[async_trait]
 pub trait Flavor: Send + Sync {
     /// Label that queues an issue for this loop; re-checked at claim time by
@@ -301,7 +301,7 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
 
 /// Failure escalation on the forge ("Authority": the durable record of why
 /// the run stopped lives on the issue, not in meguri's local state).
-async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
+pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
     let _ = deps.forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
     let _ = deps.forge.remove_label(issue, forge::LABEL_WORKING).await;
     let _ = deps
@@ -391,6 +391,35 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
     deps.store.emit(
         Some(&run.id),
         "worktree.created",
+        json!({ "branch": branch, "path": wt.to_string_lossy() }),
+    )?;
+    Ok(())
+}
+
+/// Attach the run's worktree to an existing PR head branch instead of
+/// cutting a new one (branch-takeover loops: fixer, spec worker).
+pub(crate) async fn attach_pr_worktree(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &Checkpoint,
+) -> Result<()> {
+    let branch = run
+        .branch
+        .clone()
+        .or_else(|| cp.head_branch.clone())
+        .context("checkpoint has no PR head branch")?;
+    let root = deps
+        .project
+        .worktree_root
+        .clone()
+        .unwrap_or_else(crate::config::worktrees_root);
+    let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
+    gitops::attach_worktree(&deps.project.repo_path, &wt, &branch).await?;
+    deps.store
+        .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())?;
+    deps.store.emit(
+        Some(&run.id),
+        "worktree.attached",
         json!({ "branch": branch, "path": wt.to_string_lossy() }),
     )?;
     Ok(())

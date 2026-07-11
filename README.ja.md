@@ -152,7 +152,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-GitHub 上で **worker** ループ（issue → PR）、**planner** ループ（`meguri:plan` issue → spec PR）、**reviewer** ループ（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）が動きます。アーキテクチャは looper のロールモデルを踏襲しているため、fixer ループ — そして worker が `meguri:spec-ready` の spec PR を拾って同じブランチで実装を続ける後段 — は、同じターンエンジンを共有する追加の `Loop` 実装として計画されています。
+GitHub 上で 5 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）。
 
 ## ライセンス
 

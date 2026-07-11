@@ -3,6 +3,7 @@ pub mod flow;
 pub mod planner;
 pub mod reviewer;
 pub mod scheduler;
+pub mod spec_worker;
 pub mod worker;
 
 use std::sync::Arc;
@@ -68,6 +69,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
+        Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(reviewer::ReviewerLoop),
     ]
