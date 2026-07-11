@@ -85,12 +85,7 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        _pr_number: Option<i64>,
-    ) -> Result<()> {
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
         deps.forge
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await

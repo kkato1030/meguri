@@ -274,6 +274,29 @@ impl Store {
         })
     }
 
+    /// Runs that own a worktree, matched by branch name or recorded path
+    /// (newest first). Both keys are tried because the reaper resolves
+    /// worktrees from `git worktree list`, whose paths may be canonicalized
+    /// differently than what was stored.
+    pub fn runs_for_worktree(
+        &self,
+        project_id: &str,
+        branch: Option<&str>,
+        worktree_path: &str,
+    ) -> Result<Vec<RunRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM runs WHERE project_id = ?1
+                   AND (branch = ?2 OR worktree_path = ?3)
+                 ORDER BY created_at DESC",
+            )?;
+            let runs = stmt
+                .query_map(params![project_id, branch, worktree_path], run_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(runs)
+        })
+    }
+
     pub fn list_runs(&self, active_only: bool) -> Result<Vec<RunRecord>> {
         self.with_conn(|c| {
             let sql = if active_only {
@@ -535,6 +558,44 @@ mod tests {
         assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
+    }
+
+    #[test]
+    fn runs_for_worktree_matches_branch_or_path() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 5, "t").unwrap();
+        store
+            .update_run_worktree(&run.id, "meguri/5-t-abc123", "/wt/demo/meguri-5-t-abc123")
+            .unwrap();
+
+        let by_branch = store
+            .runs_for_worktree("demo", Some("meguri/5-t-abc123"), "/other/path")
+            .unwrap();
+        assert_eq!(by_branch.len(), 1);
+        assert_eq!(by_branch[0].id, run.id);
+
+        let by_path = store
+            .runs_for_worktree("demo", None, "/wt/demo/meguri-5-t-abc123")
+            .unwrap();
+        assert_eq!(by_path.len(), 1);
+
+        assert!(
+            store
+                .runs_for_worktree(
+                    "other",
+                    Some("meguri/5-t-abc123"),
+                    "/wt/demo/meguri-5-t-abc123"
+                )
+                .unwrap()
+                .is_empty(),
+            "scoped by project"
+        );
+        assert!(
+            store
+                .runs_for_worktree("demo", Some("meguri/9-x-ffffff"), "/nope")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

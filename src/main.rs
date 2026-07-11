@@ -34,6 +34,11 @@ async fn main() -> Result<()> {
         Command::Takeover { run } => app::cmd_takeover(&run),
         Command::Handback { run } => app::cmd_handback(&run),
         Command::Stop { run } => app::cmd_stop(&run).await,
+        Command::Clean {
+            project,
+            dry_run,
+            force,
+        } => app::cmd_clean(project.as_deref(), dry_run, force).await,
     }
 }
 
@@ -42,16 +47,19 @@ fn cmd_init() -> Result<()> {
     if cfg_path.exists() {
         println!("config already exists: {}", cfg_path.display());
     } else {
-        Config::default().save_to(&cfg_path)?;
+        if let Some(dir) = cfg_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&cfg_path, config::INIT_TEMPLATE)?;
         println!("wrote {}", cfg_path.display());
     }
     let db = config::db_path();
     Store::open(&db)?;
     println!("db ready: {}", db.display());
     std::fs::create_dir_all(config::worktrees_root())?;
-    println!("\nNext: add a project to {} :", cfg_path.display());
     println!(
-        "\n[[projects]]\nid = \"myproj\"\nrepo_path = \"/abs/path/to/clone\"\nrepo_slug = \"owner/repo\"\ndefault_branch = \"main\"\ncheck_command = \"cargo test\"  # optional"
+        "\nNext: edit {} — fill in the [[projects]] stub (repo_path, repo_slug).",
+        cfg_path.display()
     );
     Ok(())
 }

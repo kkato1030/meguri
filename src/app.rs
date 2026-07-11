@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, ProjectConfig};
 use crate::engine::Deps;
+use crate::engine::reaper;
 use crate::engine::scheduler::Scheduler;
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::forge::gh::GhForge;
@@ -102,11 +103,12 @@ pub async fn cmd_watch() -> Result<()> {
         projects.push(build_deps(&cfg, project, None)?);
     }
     println!(
-        "watching {} project(s) for {}/{} issues and {} PRs (poll {}s, slots {})",
+        "watching {} project(s) for {}/{} issues and {}/{} PRs (poll {}s, slots {})",
         projects.len(),
         crate::forge::LABEL_READY,
         crate::forge::LABEL_PLAN,
         crate::forge::LABEL_SPEC_REVIEWING,
+        crate::forge::LABEL_SPEC_READY,
         cfg.scheduler.poll_interval_secs,
         cfg.scheduler.max_concurrent_runs,
     );
@@ -138,6 +140,85 @@ pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
         .with_context(|| format!("cannot bind {bind}:{port}"))?;
     println!("meguri dashboard on http://{}", listener.local_addr()?);
     crate::server::serve(store, cfg, listener).await
+}
+
+pub async fn cmd_clean(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {
+    let cfg = Config::load()?;
+    let projects: Vec<&ProjectConfig> = match project {
+        Some(id) => vec![pick_project(&cfg, Some(id))?],
+        None => cfg.projects.iter().collect(),
+    };
+    if projects.is_empty() {
+        bail!(
+            "no projects configured — edit {}",
+            config::config_path().display()
+        );
+    }
+
+    for project in projects {
+        let deps = build_deps(&cfg, project, None)?;
+        let candidates = reaper::plan(&deps).await?;
+        if candidates.is_empty() {
+            println!("{}: no meguri worktrees", project.id);
+            continue;
+        }
+
+        println!("{}:", project.id);
+        println!("  {:<9} {:<18} {:>9}  PATH", "ISSUE", "STATE", "SIZE");
+        for c in &candidates {
+            let state = match c.verdict {
+                reaper::Verdict::Reclaim => "reclaim".to_string(),
+                reaper::Verdict::Dirty if force => "reclaim (dirty)".to_string(),
+                reaper::Verdict::Dirty => "dirty (skip)".to_string(),
+                other => format!("{} (skip)", other.as_str()),
+            };
+            println!(
+                "  {:<9} {:<18} {:>9}  {}",
+                c.issue
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "-".into()),
+                state,
+                human_size(reaper::dir_size(&c.path)),
+                c.path.display(),
+            );
+        }
+        if dry_run {
+            continue;
+        }
+
+        let reclaimed = reaper::reclaim(&deps, &candidates, force).await?;
+        let dirty_skipped = candidates
+            .iter()
+            .filter(|c| c.verdict == reaper::Verdict::Dirty)
+            .count();
+        println!("  reclaimed {} worktree(s)", reclaimed.len());
+        for r in &reclaimed {
+            if !r.branch_deleted
+                && let Some(branch) = &r.branch
+            {
+                println!("  kept branch {branch} (not merged; delete with --force)");
+            }
+        }
+        if !force && dirty_skipped > 0 {
+            println!("  skipped {dirty_skipped} dirty worktree(s) — rerun with --force to reclaim");
+        }
+    }
+    Ok(())
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn require_run(store: &Store, needle: &str) -> Result<RunRecord> {

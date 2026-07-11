@@ -55,16 +55,18 @@ meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
 
-Register a project in `~/.meguri/config.toml`:
+`meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
 
 ```toml
 [[projects]]
 id = "myproj"
 repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
-default_branch = "main"
-check_command = "cargo test"   # optional but recommended: meguri runs this itself
+# default_branch = "main"
+# check_command = "cargo test"   # recommended: meguri runs this itself
 ```
+
+Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
 ## Use
 
@@ -84,6 +86,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
+meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
 
 ### Web dashboard
@@ -106,11 +109,11 @@ meguri stop <run>         # kill pane, release the claim, cancel
 
 Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. While watching, meguri also reclaims the worktree (and merged local branch) of every issue that closes; `meguri clean` does the same on demand for one-shot usage.
 
 ## Configuration
 
-See `meguri init` output for the full default `config.toml`. Highlights:
+Every key has a built-in default, so `config.toml` only needs `[[projects]]` plus whatever you want to override — `meguri init` writes a minimal template on exactly that premise. The defaults:
 
 ```toml
 # Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
@@ -161,7 +164,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-The **worker** loop (issue → PR), the **planner** loop (`meguri:plan` issue → spec PR), and the **reviewer** loop (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`) run on GitHub today. The architecture mirrors looper's role model, so a fixer loop — and the worker picking up `meguri:spec-ready` spec PRs to continue implementation on the same branch — are planned as additional `Loop` implementations sharing the same turn engine.
+Five loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), and the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it).
 
 ## License
 

@@ -55,16 +55,18 @@ meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
 
-`~/.meguri/config.toml` にプロジェクトを登録します:
+`meguri init` は次のプロジェクトスタブ入りの最小 `~/.meguri/config.toml` を書き出すので、値を埋めます:
 
 ```toml
 [[projects]]
 id = "myproj"
 repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
-default_branch = "main"
-check_command = "cargo test"   # optional but recommended: meguri runs this itself
+# default_branch = "main"
+# check_command = "cargo test"   # 推奨: meguri 自身がこれを実行して検証します
 ```
+
+それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
 
 ## 使い方
 
@@ -84,6 +86,7 @@ meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
+meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
 
 ### web ダッシュボード
@@ -106,11 +109,11 @@ meguri stop <run>         # kill pane, release the claim, cancel
 
 `meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 watch 中は issue が close されると対応する worktree（とマージ済みローカルブランチ）も自動回収されます。一発実行運用では `meguri clean` で同じ掃除ができます。
 
 ## 設定
 
-デフォルトの `config.toml` の全体は `meguri init` の出力を参照してください。要点:
+すべての項目に既定値があるため、`config.toml` には `[[projects]]` と上書きしたい項目だけを書けば残りは既定値で埋まります — `meguri init` はその前提の最小テンプレートを書き出します。既定値の一覧:
 
 ```toml
 # エージェントが書く成果物（PR 説明・summary・spec・レビュー）の言語。自由記述
@@ -161,7 +164,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-GitHub 上で **worker** ループ（issue → PR）、**planner** ループ（`meguri:plan` issue → spec PR）、**reviewer** ループ（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）が動きます。アーキテクチャは looper のロールモデルを踏襲しているため、fixer ループ — そして worker が `meguri:spec-ready` の spec PR を拾って同じブランチで実装を続ける後段 — は、同じターンエンジンを共有する追加の `Loop` 実装として計画されています。
+GitHub 上で 5 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）。
 
 ## ライセンス
 
