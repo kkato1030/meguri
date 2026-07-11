@@ -41,6 +41,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
     Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: Arc::new(FakeMux::new(false)),
         forge,
         config: Config::default(),

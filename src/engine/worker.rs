@@ -258,6 +258,7 @@ mod tests {
             store,
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: forge.clone(),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: Config::default(),
             project: ProjectConfig {
                 id: "proj".into(),

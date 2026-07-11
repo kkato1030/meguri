@@ -45,6 +45,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     config.limits.result_grace_secs = 1;
     Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: Arc::new(FakeMux::new(false)),
         forge,
         config,

@@ -13,6 +13,7 @@ use crate::engine::scheduler::Scheduler;
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::forge::gh::GhForge;
 use crate::mux;
+use crate::notify::Notifier;
 use crate::store::{DesiredState, RunRecord, RunStatus, Store};
 
 pub fn open_store() -> Result<Store> {
@@ -26,6 +27,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         store: open_store()?,
         mux,
         forge: Arc::new(GhForge::new(&project.repo_slug)),
+        notifier: Arc::new(Notifier::from_config(&cfg.notifications)),
         config: cfg.clone(),
         project: project.clone(),
     })
