@@ -1,8 +1,9 @@
 use anyhow::{Result, bail};
 use clap::Parser;
 use meguri::app;
-use meguri::cli::{Cli, Command};
+use meguri::cli::{Cli, Command, DaemonCommand};
 use meguri::config::{self, Config};
+use meguri::daemon;
 use meguri::store::Store;
 
 #[tokio::main]
@@ -20,6 +21,15 @@ async fn main() -> Result<()> {
         Command::Init => cmd_init(),
         Command::Doctor => cmd_doctor(),
         Command::Watch => app::cmd_watch().await,
+        Command::Daemon { command } => match command {
+            DaemonCommand::Start => daemon::cmd_start(),
+            DaemonCommand::Stop => daemon::cmd_stop(),
+            DaemonCommand::Restart => daemon::cmd_restart(),
+            DaemonCommand::Status => daemon::cmd_status(),
+            DaemonCommand::Logs { follow } => daemon::cmd_logs(follow),
+            DaemonCommand::Install { mode } => daemon::launchd::cmd_install(&mode),
+            DaemonCommand::Uninstall => daemon::launchd::cmd_uninstall(),
+        },
         Command::Serve { port, bind } => app::cmd_serve(port, bind.as_deref()).await,
         Command::Run {
             project,

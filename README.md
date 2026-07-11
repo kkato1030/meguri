@@ -89,6 +89,37 @@ meguri stop <run>         # kill pane, release the claim, cancel
 meguri clean              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
 
+### Keep it running (daemon)
+
+`meguri watch` stays in the foreground; to survive closing the shell, detach it:
+
+```bash
+meguri daemon start       # spawn watch detached (log: ~/.meguri/logs/watch.log)
+meguri daemon status      # pid / mode / liveness / log location / active runs
+meguri daemon logs -f     # tail the daemon log
+meguri daemon restart
+meguri daemon stop        # SIGTERM; kill-safe, recovery resumes on next start
+```
+
+On macOS, hand supervision to launchd so the watch also survives logout,
+reboot, and crashes:
+
+```bash
+meguri daemon install --mode launchd   # generate + bootstrap a user LaunchAgent
+meguri daemon uninstall                # bootout + remove the plist
+```
+
+The LaunchAgent bakes in your current `PATH` (and `HERDR_SOCKET_PATH` /
+`MEGURI_HOME` if set), so `gh`, `tmux`/`herdr`, and the agent CLI resolve under
+launchd; its log goes to `~/.meguri/logs/launchd.log`. Restart policy and
+throttle come from the `[daemon]` config section — after changing them, re-run
+`meguri daemon install`. Other platforms get an explicit error (no silent
+fallback); systemd user units are planned.
+
+Whatever the mode, the watch process holds an exclusive lock
+(`~/.meguri/daemon/watch.lock`), so a second scheduler — foreground or
+detached — fails loudly instead of double-driving runs.
+
 ### Web dashboard
 
 `meguri serve` starts a read-only dashboard at `http://127.0.0.1:8607` (override with `--port` / `--bind` or the `[server]` config section): a runs table like `meguri ps` with `awaiting_human` runs highlighted front and center, plus a per-run page with the event trail, a terminal-style pane tail, turn history, and the attach command ready to copy. It is an independent process that reads the same sqlite database — it works even when `meguri watch` is not running, and shows watch liveness from the heartbeat the scheduler writes each tick. There is no authentication, so it binds loopback by default; binding anything else prints a warning.
@@ -146,6 +177,10 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+
+[daemon]
+restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
+throttle_secs = 10             # launchd ThrottleInterval (secs between restarts)
 
 [server]
 port = 8607            # meguri serve listen port

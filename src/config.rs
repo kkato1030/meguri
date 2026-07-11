@@ -65,6 +65,8 @@ pub struct Config {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
+    pub daemon: DaemonConfig,
+    #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
     pub pr: PrConfig,
@@ -243,6 +245,53 @@ fn default_max_concurrent() -> u32 {
     2
 }
 
+/// Restart policy for the OS-supervised watch (maps to launchd `KeepAlive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Start at load only; never resurrect.
+    Never,
+    /// Restart only after a non-zero exit (default).
+    OnFailure,
+    /// Restart whenever the process exits.
+    Always,
+}
+
+impl RestartPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnFailure => "on-failure",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default = "default_restart_policy")]
+    pub restart_policy: RestartPolicy,
+    /// Minimum seconds between supervisor restarts (launchd `ThrottleInterval`).
+    #[serde(default = "default_throttle_secs")]
+    pub throttle_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            restart_policy: default_restart_policy(),
+            throttle_secs: default_throttle_secs(),
+        }
+    }
+}
+
+fn default_restart_policy() -> RestartPolicy {
+    RestartPolicy::OnFailure
+}
+fn default_throttle_secs() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// `meguri serve` listen port.
@@ -341,6 +390,8 @@ mod tests {
         assert_eq!(back.mux.kind, "auto");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
+        assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(back.daemon.throttle_secs, 10);
         assert!(back.pr.draft);
         assert_eq!(back.server.port, 8607);
         assert_eq!(back.server.bind, "127.0.0.1");
@@ -358,6 +409,20 @@ mod tests {
         let cfg: Config = toml::from_str("[server]\nport = 9000\nbind = \"0.0.0.0\"\n").unwrap();
         assert_eq!(cfg.server.port, 9000);
         assert_eq!(cfg.server.bind, "0.0.0.0");
+    }
+
+    #[test]
+    fn daemon_config_parses_kebab_case_policy() {
+        let cfg: Config =
+            toml::from_str("[daemon]\nrestart_policy = \"on-failure\"\nthrottle_secs = 30\n")
+                .unwrap();
+        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(cfg.daemon.throttle_secs, 30);
+        let cfg: Config = toml::from_str("[daemon]\nrestart_policy = \"always\"\n").unwrap();
+        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::Always);
+        assert_eq!(cfg.daemon.throttle_secs, 10);
+        let cfg: Config = toml::from_str("[daemon]\nrestart_policy = \"never\"\n").unwrap();
+        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::Never);
     }
 
     #[test]

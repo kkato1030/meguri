@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, ProjectConfig};
+use crate::daemon;
 use crate::engine::Deps;
 use crate::engine::reaper;
 use crate::engine::scheduler::Scheduler;
@@ -98,6 +99,17 @@ pub async fn cmd_watch() -> Result<()> {
             config::config_path().display()
         );
     }
+
+    // Single-instance guard: held for the watch's whole lifetime, so a second
+    // scheduler (foreground or detached) fails loudly instead of double-driving.
+    let home = config::meguri_home();
+    let _lock = daemon::try_acquire_lock(&home)?;
+    let mode = daemon::WatchMode::from_env();
+    daemon::write_state(
+        &home,
+        &daemon::DaemonState::for_current_process(&home, mode),
+    )?;
+
     let mut projects = Vec::new();
     for project in &cfg.projects {
         projects.push(build_deps(&cfg, project, None)?);
@@ -118,7 +130,9 @@ pub async fn cmd_watch() -> Result<()> {
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
     };
-    scheduler.watch().await
+    let result = scheduler.watch().await;
+    daemon::clear_state(&home);
+    result
 }
 
 pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
