@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{Deps, StoreControl, Target, WorkerOutcome};
-use crate::forge::{self, Issue};
+use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
 use crate::store::{RunRecord, RunStatus};
@@ -26,10 +26,31 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
+/// The default method bodies implement the issue-triggered "new branch, new
+/// PR" shape the worker and planner share; PR-targeted loops (the fixer)
+/// override the claim, worktree, and escalation hooks.
 #[async_trait]
 pub trait Flavor: Send + Sync {
-    /// Label that queues an issue for this loop; re-checked at claim time.
+    /// Label that queues an issue for this loop; re-checked at claim time by
+    /// the default [`Flavor::prepare_work`].
     fn trigger_label(&self) -> &'static str;
+
+    /// Claim the run's target and fill the checkpoint. Default: re-verify
+    /// the trigger label on the issue, then claim it with `meguri:working`.
+    async fn prepare_work(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &mut Checkpoint,
+    ) -> Result<PreparedWork> {
+        claim_issue(deps, run, self.trigger_label(), cp).await
+    }
+
+    /// Set up the run's worktree and persist branch/path. Default: a new
+    /// run-scoped branch off the project's default branch.
+    async fn prepare_worktree(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+        create_branch_worktree(deps, run, cp).await
+    }
 
     /// Prompt body for the execute turn.
     fn execute_prompt(
@@ -45,16 +66,34 @@ pub trait Flavor: Send + Sync {
     /// prompt.
     fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String>;
 
+    /// Base ref the execute step counts commits against. Default: the
+    /// project's default branch (new-branch loops); the fixer counts against
+    /// the PR branch's pushed tip instead.
+    fn verify_base(&self, deps: &Deps, run: &RunRecord) -> String {
+        let _ = run;
+        deps.project.default_branch.clone()
+    }
+
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String;
 
     /// Settle forge labels once the PR exists. Re-run on resume, so keep it
     /// idempotent.
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        pr_number: Option<i64>,
-    ) -> Result<()>;
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()>;
+
+    /// Release the claim marker on `meguri stop`. Default: the issue's
+    /// `meguri:working` label.
+    async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
+        deps.forge
+            .remove_label(run.issue_number, forge::LABEL_WORKING)
+            .await
+            .ok();
+    }
+
+    /// Failure escalation ("Authority": the durable record of why the run
+    /// stopped lives on the forge). Default: label + comment on the issue.
+    async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
+        escalate_on_forge(deps, run.issue_number, reason).await;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -76,6 +115,13 @@ pub struct Checkpoint {
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
+    /// Existing PR head branch to attach to (fixer runs).
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    /// Review threads the run set out to address (fixer runs); replied to
+    /// after the push.
+    #[serde(default)]
+    pub thread_ids: Vec<String>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -133,7 +179,7 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                         .emit(Some(run_id), "run.succeeded", json!({ "pr": pr_url }))?;
                 }
                 WorkerOutcome::Stopped => {
-                    finalize_cancelled(deps, &run).await?;
+                    finalize_cancelled(deps, &run, flavor).await?;
                 }
                 WorkerOutcome::Interrupted(reason) => {
                     deps.store
@@ -159,7 +205,7 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                 .update_run_status(run_id, RunStatus::Failed, Some(&msg))?;
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
-            escalate_on_forge(deps, run.issue_number, &msg).await;
+            flavor.escalate(deps, &run, &msg).await;
             Err(e)
         }
     }
@@ -170,17 +216,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     let mut step = run.step.clone();
 
     if step == STEP_PREPARE_WORK {
-        let issue = match prepare_work(deps, run, flavor).await? {
-            PreparedWork::Claimed(issue) => issue,
+        match flavor.prepare_work(deps, run, &mut checkpoint).await? {
+            PreparedWork::Claimed => {}
             PreparedWork::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
-        };
-        checkpoint.issue_title = issue.title;
-        checkpoint.issue_body = issue.body;
+        }
         step = save_step(deps, run, STEP_PREPARE_WORKTREE, &checkpoint)?;
     }
 
     if step == STEP_PREPARE_WORKTREE {
-        prepare_worktree(deps, run, &checkpoint).await?;
+        flavor.prepare_worktree(deps, run, &checkpoint).await?;
         step = save_step(deps, run, STEP_EXECUTE, &checkpoint)?;
     }
 
@@ -244,13 +288,10 @@ pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
 }
 
 /// `meguri stop`: cancel the run, release the claim, kill the pane.
-async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
+async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
-    deps.forge
-        .remove_label(run.issue_number, forge::LABEL_WORKING)
-        .await
-        .ok();
+    flavor.release_claim(deps, run).await;
     if let Some(pane_id) = &run.mux_pane_id {
         let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
     }
@@ -282,18 +323,23 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &Checkpoint) -> Resul
     Ok(step.to_string())
 }
 
-/// What prepare-work decided: the issue was claimed, or the run should end
-/// quietly because the issue is no longer actionable.
-enum PreparedWork {
-    Claimed(Issue),
+/// What prepare-work decided: the target was claimed (checkpoint filled),
+/// or the run should end quietly because it is no longer actionable.
+pub enum PreparedWork {
+    Claimed,
     Skip(String),
 }
 
-/// prepare-work: re-verify labels on the forge, then claim with
+/// Default prepare-work: re-verify labels on the forge, then claim with
 /// `meguri:working` (the durable claim marker). A hold or missing trigger
 /// label here is a benign race (the issue changed between discovery and
 /// claim, e.g. another run just shipped it) — skip, don't escalate.
-async fn prepare_work(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<PreparedWork> {
+async fn claim_issue(
+    deps: &Deps,
+    run: &RunRecord,
+    trigger_label: &str,
+    cp: &mut Checkpoint,
+) -> Result<PreparedWork> {
     let issue = deps.forge.get_issue(run.issue_number).await?;
     if issue.has_label(forge::LABEL_HOLD) {
         return Ok(PreparedWork::Skip(format!(
@@ -302,11 +348,10 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Resu
             forge::LABEL_HOLD
         )));
     }
-    if !issue.has_label(flavor.trigger_label()) {
+    if !issue.has_label(trigger_label) {
         return Ok(PreparedWork::Skip(format!(
-            "issue #{} is not labeled {} (removed since discovery?)",
+            "issue #{} is not labeled {trigger_label} (removed since discovery?)",
             issue.number,
-            flavor.trigger_label()
         )));
     }
     deps.forge
@@ -317,10 +362,13 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Resu
         "issue.claimed",
         json!({ "issue": issue.number }),
     )?;
-    Ok(PreparedWork::Claimed(issue))
+    cp.issue_title = issue.title;
+    cp.issue_body = issue.body;
+    Ok(PreparedWork::Claimed)
 }
 
-async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+/// Default prepare-worktree: a new run-scoped branch off the default branch.
+async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
     let branch = run
         .branch
         .clone()
@@ -494,13 +542,13 @@ async fn execute(
 
         // Trust but verify: success means commits exist, nothing dangles,
         // and the flavor's expected artifact is in place.
+        let base = flavor.verify_base(deps, run);
         let clean = gitops::status_clean(worktree).await?;
-        let ahead = gitops::commits_ahead(worktree, &deps.project.default_branch).await?;
+        let ahead = gitops::commits_ahead(worktree, &base).await?;
         let problem = if !clean || ahead == 0 {
             Some(format!(
                 "- working tree clean: {clean} (must be true — commit or discard everything)\n\
                  - commits ahead of {base}: {ahead} (must be > 0)",
-                base = deps.project.default_branch,
             ))
         } else {
             flavor.verify_work(run, worktree).err()
@@ -668,7 +716,7 @@ async fn open_pr(
         pr.url
     };
 
-    flavor.settle_labels(deps, run, cp.pr_number).await?;
+    flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
 }
 

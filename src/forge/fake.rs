@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::{CreatedPr, Forge, Issue, PullRequest};
+use super::{CreatedPr, Forge, Issue, PullRequest, ReviewComment, ReviewThread};
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
@@ -18,6 +18,8 @@ pub struct RecordedPr {
     pub draft: bool,
     pub labels: Vec<String>,
     pub head_sha: String,
+    /// "open", "merged" or "closed".
+    pub state: String,
 }
 
 #[derive(Default)]
@@ -25,6 +27,8 @@ pub struct FakeForge {
     pub issues: Mutex<Vec<Issue>>,
     pub comments: Mutex<Vec<(i64, String)>>,
     pub prs: Mutex<Vec<RecordedPr>>,
+    /// Review threads per PR number.
+    pub threads: Mutex<Vec<(i64, ReviewThread)>>,
     pub pr_comments: Mutex<Vec<(i64, String)>>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
 }
@@ -61,6 +65,7 @@ impl FakeForge {
             draft: false,
             labels: labels.iter().map(|s| s.to_string()).collect(),
             head_sha: head_sha.into(),
+            state: "open".into(),
         });
     }
 
@@ -121,15 +126,98 @@ impl FakeForge {
             .collect()
     }
 
+    /// Seed an already-open PR (as if a worker run shipped it earlier);
+    /// returns its number.
+    pub fn push_pr(&self, head: &str, title: &str, labels: &[&str]) -> i64 {
+        let mut prs = self.prs.lock().unwrap();
+        let number = prs.len() as i64 + 1;
+        prs.push(RecordedPr {
+            number,
+            head: head.into(),
+            base: "main".into(),
+            title: title.into(),
+            body: String::new(),
+            draft: true,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            head_sha: String::new(),
+            state: "open".into(),
+        });
+        number
+    }
+
+    pub fn set_pr_state(&self, pr: i64, state: &str) {
+        let mut prs = self.prs.lock().unwrap();
+        if let Some(rec) = prs.iter_mut().find(|p| p.number == pr) {
+            rec.state = state.to_string();
+        }
+    }
+
+    pub fn pr_labels(&self, pr: i64) -> Vec<String> {
+        self.pr_labels_of(pr)
+    }
+
+    /// The reviewer side of the ping-pong: open an unresolved thread.
+    pub fn add_review_thread(&self, pr: i64, id: &str, path: &str, author: &str, body: &str) {
+        self.threads.lock().unwrap().push((
+            pr,
+            ReviewThread {
+                id: id.into(),
+                resolved: false,
+                path: Some(path.into()),
+                line: None,
+                comments: vec![ReviewComment {
+                    author: author.into(),
+                    body: body.into(),
+                }],
+            },
+        ));
+    }
+
+    /// The reviewer follows up inside an existing thread.
+    pub fn add_thread_comment(&self, pr: i64, thread_id: &str, author: &str, body: &str) {
+        let mut threads = self.threads.lock().unwrap();
+        if let Some((_, t)) = threads
+            .iter_mut()
+            .find(|(n, t)| *n == pr && t.id == thread_id)
+        {
+            t.comments.push(ReviewComment {
+                author: author.into(),
+                body: body.into(),
+            });
+        }
+    }
+
+    /// The reviewer accepts the fix.
+    pub fn resolve_thread(&self, pr: i64, thread_id: &str) {
+        let mut threads = self.threads.lock().unwrap();
+        if let Some((_, t)) = threads
+            .iter_mut()
+            .find(|(n, t)| *n == pr && t.id == thread_id)
+        {
+            t.resolved = true;
+        }
+    }
+
+    pub fn threads_of(&self, pr: i64) -> Vec<ReviewThread> {
+        self.threads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == pr)
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+
     fn pr_to_public(pr: &RecordedPr) -> PullRequest {
         PullRequest {
             number: pr.number,
             title: pr.title.clone(),
             body: pr.body.clone(),
-            labels: pr.labels.clone(),
+            url: format!("https://fake.example/pr/{}", pr.number),
             head_branch: pr.head.clone(),
             head_sha: pr.head_sha.clone(),
-            url: format!("https://fake.example/pr/{}", pr.number),
+            state: pr.state.clone(),
+            labels: pr.labels.clone(),
         }
     }
 }
@@ -242,6 +330,11 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn pr_comment(&self, pr: i64, body: &str) -> Result<()> {
+        self.comments.lock().unwrap().push((pr, body.into()));
+        Ok(())
+    }
+
     async fn create_pr(
         &self,
         head: &str,
@@ -261,10 +354,41 @@ impl Forge for FakeForge {
             draft,
             labels: Vec::new(),
             head_sha: String::new(),
+            state: "open".into(),
         });
         Ok(CreatedPr {
             number,
             url: format!("https://fake.example/pr/{number}"),
         })
+    }
+
+    async fn list_open_prs(&self) -> Result<Vec<PullRequest>> {
+        Ok(self
+            .prs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|rec| rec.state == "open")
+            .map(Self::pr_to_public)
+            .collect())
+    }
+
+    async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>> {
+        Ok(self.threads_of(pr))
+    }
+
+    async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()> {
+        let mut threads = self.threads.lock().unwrap();
+        let Some((_, t)) = threads
+            .iter_mut()
+            .find(|(n, t)| *n == pr && t.id == thread_id)
+        else {
+            bail!("thread {thread_id} on PR #{pr} not found");
+        };
+        t.comments.push(ReviewComment {
+            author: "meguri".into(),
+            body: body.into(),
+        });
+        Ok(())
     }
 }
