@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crate::config::{self, Config, ProjectConfig};
 use crate::daemon;
 use crate::engine::Deps;
 use crate::engine::reaper;
-use crate::engine::scheduler::Scheduler;
+use crate::engine::scheduler::{Reload, Scheduler};
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::forge::gh::GhForge;
 use crate::mux;
@@ -105,7 +106,8 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
 }
 
 pub async fn cmd_watch() -> Result<()> {
-    let cfg = Config::load()?;
+    let mut reloader = config::ConfigReloader::load(&config::config_path())?;
+    let cfg = reloader.current().clone();
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
@@ -137,11 +139,46 @@ pub async fn cmd_watch() -> Result<()> {
         cfg.scheduler.poll_interval_secs,
         cfg.scheduler.max_concurrent_runs,
     );
+
+    // Hot reload (issue #73): every tick re-reads config.toml, so edits reach
+    // the runs spawned after them without a daemon restart. Notifiers carry
+    // per-run throttle state across turn boundaries, so each project keeps
+    // its notifier through a reload unless [notifications] itself changed.
+    let mut notifiers: HashMap<String, Arc<Notifier>> = projects
+        .iter()
+        .map(|d| (d.project.id.clone(), d.notifier.clone()))
+        .collect();
+    let reload = Box::new(move || {
+        let next = reloader.poll(|prev, next| {
+            let keep_notifiers = next.notifications == prev.notifications;
+            let mut fresh = Vec::new();
+            for project in &next.projects {
+                let mut deps = build_deps(next, project, None)?;
+                if keep_notifiers && let Some(notifier) = notifiers.get(&project.id) {
+                    deps.notifier = notifier.clone();
+                }
+                fresh.push(deps);
+            }
+            Ok(Reload {
+                projects: fresh,
+                poll_interval: Duration::from_secs(next.scheduler.poll_interval_secs),
+                max_concurrent: next.scheduler.max_concurrent_runs as usize,
+            })
+        })?;
+        notifiers = next
+            .projects
+            .iter()
+            .map(|d| (d.project.id.clone(), d.notifier.clone()))
+            .collect();
+        Some(next)
+    });
+
     let scheduler = Scheduler {
         projects,
         loops: crate::engine::default_loops(),
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
+        reload: Some(reload),
     };
     let result = scheduler.watch().await;
     daemon::clear_state(&home);

@@ -14,6 +14,14 @@ use super::{Deps, Loop};
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
 
+/// A fresh view of everything the watch derives from the config, produced by
+/// the `reload` hook when `config.toml` changed on disk.
+pub struct Reload {
+    pub projects: Vec<Deps>,
+    pub poll_interval: Duration,
+    pub max_concurrent: usize,
+}
+
 pub struct Scheduler {
     /// One Deps per configured project (mux/store shared via clones).
     pub projects: Vec<Deps>,
@@ -21,12 +29,18 @@ pub struct Scheduler {
     pub loops: Vec<Arc<dyn Loop>>,
     pub poll_interval: Duration,
     pub max_concurrent: usize,
+    /// Config hot reload (issue #73), polled once per tick before discovery:
+    /// `Some(_)` swaps the per-project Deps and the scheduler knobs, so every
+    /// run spawned from that tick on sees the new config. Runs already
+    /// dispatched keep the Deps they were spawned with — no retroactive
+    /// application.
+    pub reload: Option<Box<dyn FnMut() -> Option<Reload> + Send + Sync>>,
 }
 
 impl Scheduler {
-    pub async fn watch(&self) -> Result<()> {
-        let store = &self.projects[0].store;
-        self.recover(store).await?;
+    pub async fn watch(mut self) -> Result<()> {
+        let mut store = self.projects[0].store.clone();
+        self.recover(&store).await?;
 
         let mut running: JoinSet<String> = JoinSet::new();
         let mut active_run_ids: HashSet<String> = HashSet::new();
@@ -39,6 +53,23 @@ impl Scheduler {
         }
 
         loop {
+            // Pick up config edits before this tick's discovery, so a change
+            // applies to every run spawned from here on.
+            if let Some(reload) = self.reload.as_mut()
+                && let Some(next) = reload()
+            {
+                self.projects = next.projects;
+                self.poll_interval = next.poll_interval;
+                self.max_concurrent = next.max_concurrent;
+                store = self.projects[0].store.clone();
+                tracing::info!(
+                    projects = self.projects.len(),
+                    poll_secs = self.poll_interval.as_secs(),
+                    slots = self.max_concurrent,
+                    "scheduler picked up reloaded config"
+                );
+            }
+
             // Liveness beacon for external readers (`meguri serve`).
             if let Err(e) = store.heartbeat("watch") {
                 tracing::warn!("heartbeat failed: {e:#}");

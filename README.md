@@ -151,7 +151,11 @@ Labels and comments on GitHub are the durable workflow state (looper's "Authorit
 
 ## Configuration
 
-Every key has a built-in default, so `config.toml` only needs `[[projects]]` plus whatever you want to override — `meguri init` writes a minimal template on exactly that premise. The defaults:
+Every key has a built-in default, so `config.toml` only needs `[[projects]]` plus whatever you want to override — `meguri init` writes a minimal template on exactly that premise.
+
+`meguri watch` re-reads `config.toml` on every poll tick, so edits take effect for the runs spawned after them — no daemon restart (in-flight runs keep the config they started with). An invalid edit (bad TOML, no projects) is rejected with a log warning and the last good config stays in effect. Two exceptions are bound to the process lifetime and need a restart, which the log points out: `mux.kind` / `mux.session` (restart `meguri watch`) and the `[daemon]` section (re-run `meguri daemon install`).
+
+The defaults:
 
 ```toml
 # Language for agent-authored deliverables (PR descriptions, summaries, specs, reviews).
