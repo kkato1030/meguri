@@ -541,6 +541,36 @@ impl Multiplexer for HerdrMux {
         Ok(map_agent_status(status))
     }
 
+    /// Native session id as last reported to herdr (`pane
+    /// report-agent-session`), carried on the pane object of `pane get`.
+    /// A missing pane or an empty report reads as None, never an error.
+    async fn agent_session_id(&self, pane: &PaneId) -> MuxResult<Option<String>> {
+        let result =
+            match herdr_socket::request(&self.socket, "pane.get", json!({ "pane_id": pane.0 }))
+                .await
+            {
+                Ok(result) => result,
+                // Socket transport unusable → CLI.
+                Err(MuxError::Io(_)) => match self.herdr_json(&["pane", "get", &pane.0]).await {
+                    Ok(result) => result,
+                    Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+        Ok(result
+            .pointer("/pane/agent_session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string))
+    }
+
     /// Native wait: the event subscription reacts within milliseconds of a
     /// transition; `herdr wait agent-status` (one racing process per target)
     /// covers a missing subscription; tolerant polling covers a dead herdr —

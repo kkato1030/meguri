@@ -105,6 +105,15 @@ pub trait Multiplexer: Send + Sync {
 
     async fn agent_state(&self, pane: &PaneId) -> MuxResult<AgentState>;
 
+    /// Native session id of the agent CLI in the pane, when the mux can
+    /// supply it (herdr carries it on `pane get` after the agent integration
+    /// calls `pane report-agent-session`). Used to `--resume` the agent after
+    /// its pane dies; muxes without the capability return None.
+    async fn agent_session_id(&self, pane: &PaneId) -> MuxResult<Option<String>> {
+        let _ = pane;
+        Ok(None)
+    }
+
     /// Wait until state ∈ `targets`, polling or via native events.
     /// Returns the matched state, or `WaitTimeout`.
     async fn wait_state(
