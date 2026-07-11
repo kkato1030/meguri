@@ -5,6 +5,7 @@
 //! verification, PR shape, label settling) plugs in via [`Flavor`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{Deps, StoreControl, Target, WorkerOutcome};
-use crate::forge::{self, Issue};
+use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
 use crate::store::{RunRecord, RunStatus};
@@ -26,10 +27,31 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
+/// The default method bodies implement the issue-triggered "new branch, new
+/// PR" shape the worker and planner share; PR-targeted loops (the fixer, the
+/// spec worker) override the claim, worktree, and escalation hooks.
 #[async_trait]
 pub trait Flavor: Send + Sync {
-    /// Label that queues an issue for this loop; re-checked at claim time.
+    /// Label that queues an issue for this loop; re-checked at claim time by
+    /// the default [`Flavor::prepare_work`].
     fn trigger_label(&self) -> &'static str;
+
+    /// Claim the run's target and fill the checkpoint. Default: re-verify
+    /// the trigger label on the issue, then claim it with `meguri:working`.
+    async fn prepare_work(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &mut Checkpoint,
+    ) -> Result<PreparedWork> {
+        claim_issue(deps, run, self.trigger_label(), cp).await
+    }
+
+    /// Set up the run's worktree and persist branch/path. Default: a new
+    /// run-scoped branch off the project's default branch.
+    async fn prepare_worktree(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+        create_branch_worktree(deps, run, cp).await
+    }
 
     /// Prompt body for the execute turn.
     fn execute_prompt(
@@ -45,16 +67,34 @@ pub trait Flavor: Send + Sync {
     /// prompt.
     fn verify_work(&self, run: &RunRecord, worktree: &Path) -> std::result::Result<(), String>;
 
+    /// Base ref the execute step counts commits against. Default: the
+    /// project's default branch (new-branch loops); the fixer counts against
+    /// the PR branch's pushed tip instead.
+    fn verify_base(&self, deps: &Deps, run: &RunRecord) -> String {
+        let _ = run;
+        deps.project.default_branch.clone()
+    }
+
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String;
 
     /// Settle forge labels once the PR exists. Re-run on resume, so keep it
     /// idempotent.
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        pr_number: Option<i64>,
-    ) -> Result<()>;
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()>;
+
+    /// Release the claim marker on `meguri stop`. Default: the issue's
+    /// `meguri:working` label.
+    async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
+        deps.forge
+            .remove_label(run.issue_number, forge::LABEL_WORKING)
+            .await
+            .ok();
+    }
+
+    /// Failure escalation ("Authority": the durable record of why the run
+    /// stopped lives on the forge). Default: label + comment on the issue.
+    async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
+        escalate_on_forge(deps, run.issue_number, reason).await;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -76,6 +116,13 @@ pub struct Checkpoint {
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
+    /// Existing PR head branch to attach to (fixer runs).
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    /// Review threads the run set out to address (fixer runs); replied to
+    /// after the push.
+    #[serde(default)]
+    pub thread_ids: Vec<String>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -133,7 +180,7 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                         .emit(Some(run_id), "run.succeeded", json!({ "pr": pr_url }))?;
                 }
                 WorkerOutcome::Stopped => {
-                    finalize_cancelled(deps, &run).await?;
+                    finalize_cancelled(deps, &run, flavor).await?;
                 }
                 WorkerOutcome::Interrupted(reason) => {
                     deps.store
@@ -159,7 +206,7 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                 .update_run_status(run_id, RunStatus::Failed, Some(&msg))?;
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
-            escalate_on_forge(deps, run.issue_number, &msg).await;
+            flavor.escalate(deps, &run, &msg).await;
             Err(e)
         }
     }
@@ -170,17 +217,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     let mut step = run.step.clone();
 
     if step == STEP_PREPARE_WORK {
-        let issue = match prepare_work(deps, run, flavor).await? {
-            PreparedWork::Claimed(issue) => issue,
+        match flavor.prepare_work(deps, run, &mut checkpoint).await? {
+            PreparedWork::Claimed => {}
             PreparedWork::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
-        };
-        checkpoint.issue_title = issue.title;
-        checkpoint.issue_body = issue.body;
+        }
         step = save_step(deps, run, STEP_PREPARE_WORKTREE, &checkpoint)?;
     }
 
     if step == STEP_PREPARE_WORKTREE {
-        prepare_worktree(deps, run, &checkpoint).await?;
+        flavor.prepare_worktree(deps, run, &checkpoint).await?;
         step = save_step(deps, run, STEP_EXECUTE, &checkpoint)?;
     }
 
@@ -230,7 +275,16 @@ pub(crate) enum StepFlow {
 
 /// Apply the keep_pane policy after a run reaches a terminal state.
 pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
-    let Some(pane_id) = &run.mux_pane_id else {
+    // The caller's record may predate the pane spawn (execute updates the
+    // store, not the in-memory run) — read the current pane id.
+    let pane_id = deps
+        .store
+        .get_run(&run.id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.mux_pane_id)
+        .or_else(|| run.mux_pane_id.clone());
+    let Some(pane_id) = &pane_id else {
         return;
     };
     let keep = match deps.config.mux.keep_pane.as_str() {
@@ -244,13 +298,10 @@ pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
 }
 
 /// `meguri stop`: cancel the run, release the claim, kill the pane.
-async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
+async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
-    deps.forge
-        .remove_label(run.issue_number, forge::LABEL_WORKING)
-        .await
-        .ok();
+    flavor.release_claim(deps, run).await;
     if let Some(pane_id) = &run.mux_pane_id {
         let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
     }
@@ -260,7 +311,7 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 
 /// Failure escalation on the forge ("Authority": the durable record of why
 /// the run stopped lives on the issue, not in meguri's local state).
-async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
+pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
     let _ = deps.forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
     let _ = deps.forge.remove_label(issue, forge::LABEL_WORKING).await;
     let _ = deps
@@ -282,18 +333,23 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &Checkpoint) -> Resul
     Ok(step.to_string())
 }
 
-/// What prepare-work decided: the issue was claimed, or the run should end
-/// quietly because the issue is no longer actionable.
-enum PreparedWork {
-    Claimed(Issue),
+/// What prepare-work decided: the target was claimed (checkpoint filled),
+/// or the run should end quietly because it is no longer actionable.
+pub enum PreparedWork {
+    Claimed,
     Skip(String),
 }
 
-/// prepare-work: re-verify labels on the forge, then claim with
+/// Default prepare-work: re-verify labels on the forge, then claim with
 /// `meguri:working` (the durable claim marker). A hold or missing trigger
 /// label here is a benign race (the issue changed between discovery and
 /// claim, e.g. another run just shipped it) — skip, don't escalate.
-async fn prepare_work(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<PreparedWork> {
+async fn claim_issue(
+    deps: &Deps,
+    run: &RunRecord,
+    trigger_label: &str,
+    cp: &mut Checkpoint,
+) -> Result<PreparedWork> {
     let issue = deps.forge.get_issue(run.issue_number).await?;
     if issue.has_label(forge::LABEL_HOLD) {
         return Ok(PreparedWork::Skip(format!(
@@ -302,25 +358,34 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Resu
             forge::LABEL_HOLD
         )));
     }
-    if !issue.has_label(flavor.trigger_label()) {
+    if !issue.has_label(trigger_label) {
         return Ok(PreparedWork::Skip(format!(
-            "issue #{} is not labeled {} (removed since discovery?)",
+            "issue #{} is not labeled {trigger_label} (removed since discovery?)",
             issue.number,
-            flavor.trigger_label()
         )));
     }
     deps.forge
         .add_label(issue.number, forge::LABEL_WORKING)
         .await?;
+    // A fresh claim supersedes a previous run's escalation: the human is no
+    // longer needed while this run is in flight (and a new failure re-adds
+    // the label). No-op if absent; best-effort like the escalation side.
+    let _ = deps
+        .forge
+        .remove_label(issue.number, forge::LABEL_NEEDS_HUMAN)
+        .await;
     deps.store.emit(
         Some(&run.id),
         "issue.claimed",
         json!({ "issue": issue.number }),
     )?;
-    Ok(PreparedWork::Claimed(issue))
+    cp.issue_title = issue.title;
+    cp.issue_body = issue.body;
+    Ok(PreparedWork::Claimed)
 }
 
-async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+/// Default prepare-worktree: a new run-scoped branch off the default branch.
+async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
     let branch = run
         .branch
         .clone()
@@ -348,6 +413,35 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Resu
     Ok(())
 }
 
+/// Attach the run's worktree to an existing PR head branch instead of
+/// cutting a new one (branch-takeover loops: fixer, spec worker).
+pub(crate) async fn attach_pr_worktree(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &Checkpoint,
+) -> Result<()> {
+    let branch = run
+        .branch
+        .clone()
+        .or_else(|| cp.head_branch.clone())
+        .context("checkpoint has no PR head branch")?;
+    let root = deps
+        .project
+        .worktree_root
+        .clone()
+        .unwrap_or_else(crate::config::worktrees_root);
+    let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
+    gitops::attach_worktree(&deps.project.repo_path, &wt, &branch).await?;
+    deps.store
+        .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())?;
+    deps.store.emit(
+        Some(&run.id),
+        "worktree.attached",
+        json!({ "branch": branch, "path": wt.to_string_lossy() }),
+    )?;
+    Ok(())
+}
+
 fn turn_engine(deps: &Deps) -> TurnEngine {
     TurnEngine {
         mux: deps.mux.clone(),
@@ -355,26 +449,107 @@ fn turn_engine(deps: &Deps) -> TurnEngine {
     }
 }
 
+/// How long a resume-spawned pane is watched for instant death: an unknown
+/// or expired session id makes the agent CLI print an error and exit within
+/// a few seconds, which is the signal to fall back to full re-injection.
+const RESUME_PROBE: Duration = Duration::from_secs(5);
+const RESUME_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The pane `run_turn` operates on, and how it came to exist.
+struct EnsuredPane {
+    pane: PaneId,
+    /// Trigger already delivered as the agent's initial prompt argument.
+    freshly_spawned: bool,
+    /// Spawned with the agent's native `--resume`; a pane death without a
+    /// result then means the stored session id is no longer trustworthy.
+    resumed: bool,
+}
+
 /// Get the run's pane, spawning it (with the trigger as the agent's initial
-/// prompt argument) if it doesn't exist or died.
+/// prompt argument) if it doesn't exist or died. When a native agent session
+/// id is on record, the spawn resumes it (`claude --resume <id> <trigger>`)
+/// so the agent keeps its conversation context; a resume that dies on the
+/// spot falls back to the plain full-prompt spawn.
 async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     initial_trigger: &str,
-) -> Result<(PaneId, bool)> {
+) -> Result<EnsuredPane> {
     if let Some(id) = &run.mux_pane_id {
         let pane = PaneId(id.clone());
         if run.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            return Ok((pane, false));
+            return Ok(EnsuredPane {
+                pane,
+                freshly_spawned: false,
+                resumed: false,
+            });
         }
     }
 
     deps.mux.ensure_session().await?;
+
+    // Re-read: a completed turn records the session id on the store, not on
+    // the caller's (possibly stale) run snapshot.
+    let session_id = deps
+        .store
+        .get_run(&run.id)?
+        .and_then(|r| r.agent_session_id);
+    if let Some(session_id) = session_id {
+        let resumed =
+            match spawn_agent_pane(deps, run, worktree, initial_trigger, Some(&session_id)).await {
+                Ok(pane) => {
+                    if resumed_pane_survives(deps, &pane).await {
+                        Some(pane)
+                    } else {
+                        // Dead on arrival: the CLI rejected the session id.
+                        let _ = deps.mux.kill_pane(&pane).await;
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+        if let Some(pane) = resumed {
+            return Ok(EnsuredPane {
+                pane,
+                freshly_spawned: true,
+                resumed: true,
+            });
+        }
+        // Forget the id and fall back to full re-injection.
+        deps.store.update_run_agent_session(&run.id, None)?;
+        deps.store.emit(
+            Some(&run.id),
+            "pane.resume_failed",
+            json!({ "agent_session_id": session_id }),
+        )?;
+    }
+
+    let pane = spawn_agent_pane(deps, run, worktree, initial_trigger, None).await?;
+    Ok(EnsuredPane {
+        pane,
+        freshly_spawned: true,
+        resumed: false,
+    })
+}
+
+/// Spawn the agent pane (optionally resuming a native session) and persist
+/// its handle on the run.
+async fn spawn_agent_pane(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    initial_trigger: &str,
+    resume_session: Option<&str>,
+) -> Result<PaneId> {
     let mut command = vec![deps.config.agent.command.clone()];
     command.extend(deps.config.agent.args.iter().cloned());
+    if let Some(session_id) = resume_session {
+        command.extend(deps.config.agent.resume_args.iter().cloned());
+        command.push(session_id.to_string());
+    }
     command.push(initial_trigger.to_string());
 
     let mut env = Vec::new();
@@ -401,9 +576,26 @@ async fn ensure_pane(
         Some(&run.id),
         "pane.spawned",
         json!({ "pane": pane.0, "mux": deps.mux.kind().as_str(),
+                "resumed": resume_session.is_some(),
                 "attach": deps.mux.attach_command(&pane) }),
     )?;
-    Ok((pane, true))
+    Ok(pane)
+}
+
+/// Watch a freshly resume-spawned pane briefly; false means it died (the
+/// session id was rejected) and the caller should fall back.
+async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if !deps.mux.pane_alive(pane).await.unwrap_or(false) {
+            return false;
+        }
+        if waited >= RESUME_PROBE {
+            return true;
+        }
+        tokio::time::sleep(RESUME_PROBE_INTERVAL).await;
+        waited += RESUME_PROBE_INTERVAL;
+    }
 }
 
 /// Run one prompt-turn: prepare files, deliver the trigger (spawn or
@@ -416,14 +608,15 @@ pub(crate) async fn run_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let prepared = prepare_turn(worktree, prompt_body)?;
-    let (pane, freshly_spawned) = ensure_pane(deps, run, worktree, &prepared.trigger_line).await?;
+    let ensured = ensure_pane(deps, run, worktree, &prepared.trigger_line).await?;
+    let pane = ensured.pane.clone();
     deps.store.begin_turn(
         &run.id,
         &prepared.turn_id,
         purpose,
         &prepared.prompt_path.to_string_lossy(),
     )?;
-    if !freshly_spawned {
+    if !ensured.freshly_spawned {
         deps.mux.send_line(&pane, &prepared.trigger_line).await?;
     }
 
@@ -435,6 +628,8 @@ pub(crate) async fn run_turn(
     let outcome = engine
         .await_completion(&pane, worktree, &prepared.turn_id, &control)
         .await?;
+
+    record_agent_session(deps, run, &pane, &ensured, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -449,6 +644,44 @@ pub(crate) async fn run_turn(
     deps.store
         .finish_turn(&prepared.turn_id, &outcome_str, result_json.as_deref())?;
     Ok((outcome, prepared.turn_id))
+}
+
+/// Keep `runs.agent_session_id` in sync with what the turn taught us: a
+/// completed turn reports the id (result file first, mux second — herdr
+/// carries it on `pane get`); a resumed pane dying without a result means
+/// the stored id no longer restores a working session, so drop it rather
+/// than resume-loop on it forever.
+async fn record_agent_session(
+    deps: &Deps,
+    run: &RunRecord,
+    pane: &PaneId,
+    ensured: &EnsuredPane,
+    outcome: &TurnOutcome,
+) -> Result<()> {
+    match outcome {
+        TurnOutcome::Completed(r) => {
+            let session_id = match &r.agent_session_id {
+                Some(id) => Some(id.clone()),
+                None => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+            };
+            if let Some(id) = session_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                deps.store.update_run_agent_session(&run.id, Some(&id))?;
+            }
+        }
+        TurnOutcome::PaneDied if ensured.resumed => {
+            deps.store.update_run_agent_session(&run.id, None)?;
+            deps.store.emit(
+                Some(&run.id),
+                "agent_session.cleared",
+                json!({ "reason": "resumed pane died without a result" }),
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// execute: agent does the loop's work; the orchestrator independently
@@ -494,13 +727,13 @@ async fn execute(
 
         // Trust but verify: success means commits exist, nothing dangles,
         // and the flavor's expected artifact is in place.
+        let base = flavor.verify_base(deps, run);
         let clean = gitops::status_clean(worktree).await?;
-        let ahead = gitops::commits_ahead(worktree, &deps.project.default_branch).await?;
+        let ahead = gitops::commits_ahead(worktree, &base).await?;
         let problem = if !clean || ahead == 0 {
             Some(format!(
                 "- working tree clean: {clean} (must be true — commit or discard everything)\n\
                  - commits ahead of {base}: {ahead} (must be > 0)",
-                base = deps.project.default_branch,
             ))
         } else {
             flavor.verify_work(run, worktree).err()
@@ -668,7 +901,7 @@ async fn open_pr(
         pr.url
     };
 
-    flavor.settle_labels(deps, run, cp.pr_number).await?;
+    flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
 }
 
@@ -694,6 +927,24 @@ fn find_pr_template(worktree: &Path) -> Option<String> {
         .find_map(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Prompt section pinning the language of agent-authored deliverables.
+/// Returns "" when no language is configured (the agent's default, usually
+/// English, wins). Prefixed with a blank line so callers can append it
+/// unconditionally.
+pub fn language_instruction(language: Option<&str>) -> String {
+    let Some(lang) = language else {
+        return String::new();
+    };
+    format!(
+        "\n\n# Output language\n\
+         Write every human-readable deliverable in {lang}: the free-text \
+         fields of the result file (`summary`, `pr_body`) and anything you \
+         author for humans (specs, ADRs, review comments, ...). Code \
+         identifiers and commit messages follow the repository's existing \
+         conventions."
+    )
 }
 
 /// Prompt section asking the agent to author the PR description (`pr_body`).
@@ -738,6 +989,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pull_request_template.md"), "  \n\n").unwrap();
         assert_eq!(find_pr_template(dir.path()), None);
+    }
+
+    #[test]
+    fn language_instruction_is_empty_unless_configured() {
+        assert_eq!(language_instruction(None), "");
+        let section = language_instruction(Some("日本語"));
+        assert!(section.contains("# Output language"));
+        assert!(section.contains("日本語"));
     }
 
     #[test]

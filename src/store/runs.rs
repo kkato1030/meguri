@@ -82,7 +82,8 @@ impl InteractionState {
 /// Control channel written by CLI commands, honored by the orchestrator.
 /// This is a *target* the orchestrator converges to; clearing it (NULL)
 /// means "run normally" — so `resume` and `handback` just clear it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DesiredState {
     Paused,
     Stopped,
@@ -108,7 +109,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
     pub id: String,
     pub project_id: String,
@@ -127,7 +128,13 @@ pub struct RunRecord {
     pub mux_pane_id: Option<String>,
     pub turn_no: i64,
     pub current_turn_id: Option<String>,
+    /// Native session id of the agent CLI last seen in the run's pane
+    /// (reported via the turn contract or the mux); used to `--resume`
+    /// the conversation when the pane dies.
+    pub agent_session_id: Option<String>,
     pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub created_at: String,
 }
 
@@ -153,9 +160,26 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         mux_pane_id: row.get("mux_pane_id")?,
         turn_no: row.get("turn_no")?,
         current_turn_id: row.get("current_turn_id")?,
+        agent_session_id: row.get("agent_session_id")?,
         error: row.get("error")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
     })
+}
+
+/// One agent turn as recorded in the `turns` table (read path for the UI).
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRecord {
+    pub id: String,
+    pub run_id: String,
+    pub turn_no: i64,
+    pub purpose: String,
+    pub prompt_path: Option<String>,
+    pub result_json: Option<String>,
+    pub outcome: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
 }
 
 impl Store {
@@ -255,6 +279,29 @@ impl Store {
         })
     }
 
+    /// Runs that own a worktree, matched by branch name or recorded path
+    /// (newest first). Both keys are tried because the reaper resolves
+    /// worktrees from `git worktree list`, whose paths may be canonicalized
+    /// differently than what was stored.
+    pub fn runs_for_worktree(
+        &self,
+        project_id: &str,
+        branch: Option<&str>,
+        worktree_path: &str,
+    ) -> Result<Vec<RunRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM runs WHERE project_id = ?1
+                   AND (branch = ?2 OR worktree_path = ?3)
+                 ORDER BY created_at DESC",
+            )?;
+            let runs = stmt
+                .query_map(params![project_id, branch, worktree_path], run_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(runs)
+        })
+    }
+
     pub fn list_runs(&self, active_only: bool) -> Result<Vec<RunRecord>> {
         self.with_conn(|c| {
             let sql = if active_only {
@@ -322,6 +369,17 @@ impl Store {
             c.execute(
                 "UPDATE runs SET mux_kind = ?2, mux_session = ?3, mux_pane_id = ?4 WHERE id = ?1",
                 params![id, kind, session, pane],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record (or clear, with None) the run's native agent session id.
+    pub fn update_run_agent_session(&self, id: &str, session: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET agent_session_id = ?2 WHERE id = ?1",
+                params![id, session],
             )?;
             Ok(())
         })
@@ -398,6 +456,32 @@ impl Store {
                 params![turn_id, outcome, result_json, now()],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn list_turns(&self, run_id: &str) -> Result<Vec<TurnRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, run_id, turn_no, purpose, prompt_path, result_json,
+                        outcome, started_at, finished_at
+                 FROM turns WHERE run_id = ?1 ORDER BY turn_no ASC",
+            )?;
+            let turns = stmt
+                .query_map([run_id], |row| {
+                    Ok(TurnRecord {
+                        id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        turn_no: row.get(2)?,
+                        purpose: row.get(3)?,
+                        prompt_path: row.get(4)?,
+                        result_json: row.get(5)?,
+                        outcome: row.get(6)?,
+                        started_at: row.get(7)?,
+                        finished_at: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(turns)
         })
     }
 }
@@ -493,6 +577,44 @@ mod tests {
     }
 
     #[test]
+    fn runs_for_worktree_matches_branch_or_path() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 5, "t").unwrap();
+        store
+            .update_run_worktree(&run.id, "meguri/5-t-abc123", "/wt/demo/meguri-5-t-abc123")
+            .unwrap();
+
+        let by_branch = store
+            .runs_for_worktree("demo", Some("meguri/5-t-abc123"), "/other/path")
+            .unwrap();
+        assert_eq!(by_branch.len(), 1);
+        assert_eq!(by_branch[0].id, run.id);
+
+        let by_path = store
+            .runs_for_worktree("demo", None, "/wt/demo/meguri-5-t-abc123")
+            .unwrap();
+        assert_eq!(by_path.len(), 1);
+
+        assert!(
+            store
+                .runs_for_worktree(
+                    "other",
+                    Some("meguri/5-t-abc123"),
+                    "/wt/demo/meguri-5-t-abc123"
+                )
+                .unwrap()
+                .is_empty(),
+            "scoped by project"
+        );
+        assert!(
+            store
+                .runs_for_worktree("demo", Some("meguri/9-x-ffffff"), "/nope")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn desired_state_roundtrip() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 1, "t").unwrap();
@@ -508,6 +630,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert_eq!(run.agent_session_id, None);
+
+        store
+            .update_run_agent_session(&run.id, Some("sess-abc"))
+            .unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id.as_deref(), Some("sess-abc"));
+
+        store.update_run_agent_session(&run.id, None).unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_session_id, None);
+    }
+
+    #[test]
     fn turns_recorded() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 1, "t").unwrap();
@@ -518,5 +657,52 @@ mod tests {
         let got = store.get_run(&run.id).unwrap().unwrap();
         assert_eq!(got.turn_no, 1);
         assert_eq!(got.current_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn list_turns_in_turn_order() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        assert!(store.list_turns(&run.id).unwrap().is_empty());
+
+        store
+            .begin_turn(&run.id, "turn-1", "execute", "/tmp/p1.md")
+            .unwrap();
+        store.finish_turn("turn-1", "success", Some("{}")).unwrap();
+        store
+            .begin_turn(&run.id, "turn-2", "validate-fix", "/tmp/p2.md")
+            .unwrap();
+
+        let turns = store.list_turns(&run.id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_no, 1);
+        assert_eq!(turns[0].purpose, "execute");
+        assert_eq!(turns[0].outcome.as_deref(), Some("success"));
+        assert!(turns[0].finished_at.is_some());
+        assert_eq!(turns[1].turn_no, 2);
+        assert_eq!(turns[1].outcome, None);
+    }
+
+    #[test]
+    fn run_record_serializes_snake_case_states() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 5, "t").unwrap();
+        store
+            .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+            .unwrap();
+        store
+            .set_desired_state(&run.id, Some(DesiredState::Paused))
+            .unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Running, None)
+            .unwrap();
+
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["interaction_state"], "awaiting_human");
+        assert_eq!(v["desired_state"], "paused");
+        assert!(v["started_at"].is_string());
+        assert!(v["finished_at"].is_null());
     }
 }

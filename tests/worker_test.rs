@@ -3,7 +3,7 @@
 //! worktree for prompt files and reacts (commit work, write results).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
@@ -67,6 +67,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         repo_path: clone,
         repo_slug: "me/proj".into(),
         default_branch: "main".into(),
+        language: None,
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
@@ -512,6 +513,53 @@ async fn worker_needs_human_escalates_on_forge() {
     let comments = env.forge.comments_of(7);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_claim_clears_stale_needs_human_from_previous_run() {
+    let env = setup(None).await;
+    // A previous run escalated and left its label behind; this retry run
+    // discovers the issue with both ready and needs-human.
+    env.forge.add_label(7, LABEL_NEEDS_HUMAN).await.unwrap();
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // Snapshot the issue labels as the agent's first turn starts, i.e.
+    // right after the claim.
+    let labels_at_claim: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+    let forge = env.forge.clone();
+    let snapshot = labels_at_claim.clone();
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), move |_, wt, turn_id| {
+        snapshot
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| forge.labels_of(7));
+        write_result(wt, turn_id, "needs_human");
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+    agent.abort();
+
+    // The claim superseded the previous escalation.
+    let seen = labels_at_claim.lock().unwrap().clone().expect("agent ran");
+    assert!(
+        !seen.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels at claim: {seen:?}"
+    );
+    assert!(seen.contains(&LABEL_WORKING.to_string()));
+
+    // ...and this run's own failure re-escalates as before.
+    assert!(result.is_err(), "needs_human must fail the run");
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

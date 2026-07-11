@@ -24,6 +24,15 @@ pub enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Serve the read-only web dashboard on localhost
+    Serve {
+        /// Listen port (default: config `[server].port`, 8607)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Bind address (default: config `[server].bind`, 127.0.0.1)
+        #[arg(long)]
+        bind: Option<String>,
+    },
     /// Run the worker loop once for a single issue
     Run {
         /// Project id from config.toml (defaults to the sole configured project)
@@ -56,6 +65,18 @@ pub enum Command {
     Handback { run: String },
     /// Kill the pane and cancel the run
     Stop { run: String },
+    /// Reclaim worktrees (and merged local branches) of closed issues
+    Clean {
+        /// Only clean this project (default: all configured projects)
+        #[arg(long)]
+        project: Option<String>,
+        /// List what would be reclaimed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also reclaim dirty worktrees and force-delete unmerged branches
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -49,7 +49,7 @@ impl Flavor for WorkerFlavor {
 
     fn execute_prompt(
         &self,
-        _deps: &Deps,
+        deps: &Deps,
         run: &RunRecord,
         cp: &Checkpoint,
         worktree: &Path,
@@ -66,12 +66,13 @@ impl Flavor for WorkerFlavor {
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; meguri handles both.\n\
              - Do NOT switch branches or touch other worktrees.\n\n\
-             {pr_section}",
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
             pr_section = flow::pr_body_instruction(worktree),
+            lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
         // The completion contract is appended by prepare_turn.
     }
@@ -84,12 +85,7 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        _pr_number: Option<i64>,
-    ) -> Result<()> {
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
         deps.forge
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await

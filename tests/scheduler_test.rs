@@ -53,6 +53,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             repo_path: clone,
             repo_slug: "me/proj".into(),
             default_branch: "main".into(),
+            language: None,
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
             pr: None,
@@ -351,6 +352,63 @@ async fn watch_dispatches_multiple_ready_issues_concurrently() {
     assert_eq!(forge.prs().len(), 2);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_reclaims_worktree_after_issue_closes() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(
+        31,
+        "Ship then close",
+        "Do it.",
+        &[LABEL_READY],
+    ));
+    let deps = setup(root.path(), forge.clone()).await;
+    let store = deps.store.clone();
+
+    let agent = spawn_scripted_agent(root.path().join("worktrees"));
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(300),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    // Drive the issue to a successful run first.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let worktree = loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "run never succeeded; runs: {:?}",
+                store.list_runs(false).unwrap()
+            );
+        }
+        let runs = store.list_runs(false).unwrap();
+        if let Some(run) = runs
+            .iter()
+            .find(|r| r.status == RunStatus::Succeeded && r.issue_number == 31)
+        {
+            break PathBuf::from(run.worktree_path.clone().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert!(
+        worktree.exists(),
+        "worktree survives while the issue is open"
+    );
+
+    // Closing the issue (PR merged) lets the watch sweep reclaim it.
+    forge.close_issue(31);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while worktree.exists() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("worktree was not reclaimed after the issue closed");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    watch.abort();
+    agent.abort();
+}
+
 /// A minimal non-worker loop: discovers one fixed target and drives its run
 /// straight to success.
 struct FixedLoop;
@@ -381,6 +439,35 @@ impl Loop for FixedLoop {
             pr_url: "fixed://pr".into(),
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_ticks_write_a_heartbeat() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = setup(root.path(), forge).await;
+    let store = deps.store.clone();
+    assert_eq!(store.latest_heartbeat("watch").unwrap(), None);
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: default_loops(),
+        poll_interval: Duration::from_millis(200),
+        max_concurrent: 2,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if store.latest_heartbeat("watch").unwrap().is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("watch never wrote a heartbeat");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

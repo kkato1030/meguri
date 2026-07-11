@@ -25,8 +25,37 @@ pub fn worktrees_root() -> PathBuf {
     meguri_home().join("worktrees")
 }
 
+/// Minimal `config.toml` written by `meguri init`. Loading fills every
+/// omitted section/key from the serde defaults, so the template only carries
+/// the projects stub plus commented override examples.
+pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目だけ書けば、残りは既定値が使われます。
+# 既定値一覧は README を参照。
+
+[[projects]]
+id = "myproj"
+repo_path = "/abs/path/to/clone"
+repo_slug = "owner/repo"
+# default_branch = "main"
+# check_command = "cargo test"
+
+# 既定を上書きしたい時だけ、必要なセクション/キーを書く:
+# [scheduler]
+# max_concurrent_runs = 3
+#
+# [limits]
+# idle_grace_secs = 120
+#
+# [agent]
+# args = ["--permission-mode", "acceptEdits"]  # yolo をやめて確認ダイアログ運用にする例
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    /// Language for agent-authored deliverables (PR descriptions, summaries,
+    /// specs). Free-form, passed verbatim into the prompt (e.g. "日本語",
+    /// "Japanese"). None leaves the agent to its default (usually English).
+    #[serde(default)]
+    pub language: Option<String>,
     #[serde(default)]
     pub mux: MuxConfig,
     #[serde(default)]
@@ -37,6 +66,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
     #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
@@ -109,6 +140,11 @@ pub struct AgentConfig {
     /// "acceptEdits"]` and answer dialogs by attaching to the pane.
     #[serde(default = "default_agent_args")]
     pub args: Vec<String>,
+    /// Args that resume a previous native session; the session id follows
+    /// them (`{command} {args} {resume_args} <session-id> <trigger>`).
+    /// Defaults to Claude Code's `--resume`.
+    #[serde(default = "default_agent_resume_args")]
+    pub resume_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -119,6 +155,7 @@ impl Default for AgentConfig {
         Self {
             command: default_agent_command(),
             args: default_agent_args(),
+            resume_args: default_agent_resume_args(),
             herdr_agent_hint: None,
         }
     }
@@ -131,6 +168,10 @@ fn default_agent_command() -> String {
 fn default_agent_args() -> Vec<String> {
     // Yolo by default; see AgentConfig::args for the rationale and opt-out.
     vec!["--dangerously-skip-permissions".into()]
+}
+
+fn default_agent_resume_args() -> Vec<String> {
+    vec!["--resume".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +293,33 @@ fn default_throttle_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// `meguri serve` listen port.
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    /// Bind address. Loopback by default — the dashboard has no auth; serve
+    /// warns (but proceeds) on anything else.
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: default_server_port(),
+            bind: default_server_bind(),
+        }
+    }
+}
+
+fn default_server_port() -> u16 {
+    8607
+}
+fn default_server_bind() -> String {
+    "127.0.0.1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
     /// Absolute path to the primary clone.
@@ -260,6 +328,9 @@ pub struct ProjectConfig {
     pub repo_slug: String,
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    /// Per-project deliverable language; overrides the top-level `language`.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Command the orchestrator runs in the worktree to validate agent work.
     #[serde(default)]
     pub check_command: Option<String>,
@@ -292,15 +363,6 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let raw = toml::to_string_pretty(self)?;
-        std::fs::write(path, raw)?;
-        Ok(())
-    }
-
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
         self.projects.iter().find(|p| p.id == id)
     }
@@ -308,6 +370,11 @@ impl Config {
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
+    }
+
+    /// Effective deliverable language for a project (project override wins).
+    pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
+        project.language.as_deref().or(self.language.as_deref())
     }
 }
 
@@ -326,6 +393,22 @@ mod tests {
         assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
         assert_eq!(back.daemon.throttle_secs, 10);
         assert!(back.pr.draft);
+        assert_eq!(back.server.port, 8607);
+        assert_eq!(back.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.server.port, 8607);
+        assert_eq!(cfg.server.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_section_overrides_defaults() {
+        let cfg: Config = toml::from_str("[server]\nport = 9000\nbind = \"0.0.0.0\"\n").unwrap();
+        assert_eq!(cfg.server.port, 9000);
+        assert_eq!(cfg.server.bind, "0.0.0.0");
     }
 
     #[test]
@@ -361,6 +444,18 @@ args = ["--permission-mode", "acceptEdits"]
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.agent.args, vec!["--permission-mode", "acceptEdits"]);
+        // resume_args keeps its Claude Code default unless overridden.
+        assert_eq!(cfg.agent.resume_args, vec!["--resume"]);
+    }
+
+    #[test]
+    fn agent_resume_args_can_be_overridden() {
+        let raw = r#"
+[agent]
+resume_args = ["resume", "--session"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.agent.resume_args, vec!["resume", "--session"]);
     }
 
     #[test]
@@ -391,6 +486,63 @@ draft = false
         assert!(cfg.pr.draft, "global default stays true");
         let p = cfg.project("demo").unwrap();
         assert!(!cfg.pr_for(p).draft);
+    }
+
+    #[test]
+    fn language_defaults_to_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn language_project_override_wins() {
+        let raw = r#"
+language = "日本語"
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "en"
+repo_path = "/tmp/en"
+repo_slug = "me/en"
+language = "English"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.language_for(demo), Some("日本語"));
+        let en = cfg.project("en").unwrap();
+        assert_eq!(cfg.language_for(en), Some("English"));
+    }
+
+    #[test]
+    fn init_template_is_minimal_and_loads_with_defaults() {
+        // Only the projects stub is active; every other section stays commented.
+        let active_tables: Vec<&str> = INIT_TEMPLATE
+            .lines()
+            .filter(|l| l.trim_start().starts_with('['))
+            .collect();
+        assert_eq!(active_tables, vec!["[[projects]]"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, INIT_TEMPLATE).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+
+        let p = cfg.project("myproj").unwrap();
+        assert_eq!(p.repo_slug, "owner/repo");
+        assert_eq!(p.default_branch, "main");
+        assert_eq!(p.check_command, None);
+
+        // Omitted sections/keys fall back to the serde defaults.
+        assert_eq!(cfg.language, None);
+        assert_eq!(cfg.mux.kind, "auto");
+        assert_eq!(cfg.agent.args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(cfg.limits.idle_grace_secs, 90);
+        assert_eq!(cfg.scheduler.max_concurrent_runs, 2);
+        assert!(cfg.pr.draft);
     }
 
     #[test]

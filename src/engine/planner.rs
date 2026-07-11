@@ -4,8 +4,9 @@
 //! going straight to the worker.
 //!
 //! The spec PR and the implementation PR are the same PR: after review (the
-//! reviewer loop, or a human) flips the PR to `meguri:spec-ready`, the worker takes over the branch and
-//! stacks implementation commits on it (issue #21). Branch naming, run
+//! reviewer loop, or a human) flips the PR to `meguri:spec-ready`, the
+//! spec-worker loop takes over the branch and stacks implementation commits
+//! on it (issue #21). Branch naming, run
 //! bookkeeping, and escalation therefore follow the worker conventions
 //! exactly — only the trigger label, prompt, spec-file verification, and PR
 //! shape differ.
@@ -61,7 +62,7 @@ impl Flavor for PlannerFlavor {
 
     fn execute_prompt(
         &self,
-        _deps: &Deps,
+        deps: &Deps,
         run: &RunRecord,
         cp: &Checkpoint,
         worktree: &Path,
@@ -86,13 +87,14 @@ impl Flavor for PlannerFlavor {
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; meguri handles both.\n\
              - Do NOT switch branches or touch other worktrees.\n\n\
-             {pr_section}",
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
             spec = spec_rel_path(run.issue_number),
             pr_section = flow::pr_body_instruction(worktree),
+            lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
         // The completion contract is appended by prepare_turn.
     }
@@ -118,13 +120,8 @@ impl Flavor for PlannerFlavor {
     /// `meguri:spec-reviewing` — the PR is the reviewable artifact from here
     /// on. The PR label is load-bearing (review discovery keys off it), so
     /// failing to apply it fails the run instead of passing silently.
-    async fn settle_labels(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        pr_number: Option<i64>,
-    ) -> Result<()> {
-        if let Some(pr) = pr_number {
+    async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
+        if let Some(pr) = cp.pr_number {
             deps.forge
                 .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
                 .await?;
@@ -178,6 +175,19 @@ mod tests {
         assert!(prompt.contains("do NOT implement"));
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Pull request description"));
+        assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_pins_output_language_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let cp = Checkpoint::default();
+        let mut deps = fake_deps();
+        deps.config.language = Some("日本語".into());
+        let prompt = PlannerFlavor.execute_prompt(&deps, &run, &cp, dir.path());
+        assert!(prompt.contains("# Output language"));
+        assert!(prompt.contains("日本語"));
     }
 
     #[test]
@@ -211,6 +221,7 @@ mod tests {
                 repo_path: "/tmp/unused".into(),
                 repo_slug: "me/proj".into(),
                 default_branch: "main".into(),
+                language: None,
                 check_command: None,
                 worktree_root: None,
                 pr: None,

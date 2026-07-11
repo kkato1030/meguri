@@ -39,6 +39,11 @@ impl Scheduler {
         }
 
         loop {
+            // Liveness beacon for external readers (`meguri serve`).
+            if let Err(e) = store.heartbeat("watch") {
+                tracing::warn!("heartbeat failed: {e:#}");
+            }
+
             // Reap finished drivers.
             while let Some(res) = running.try_join_next() {
                 if let Ok(run_id) = res {
@@ -50,6 +55,14 @@ impl Scheduler {
                 && let Err(e) = self.discover(&mut running, &mut active_run_ids).await
             {
                 tracing::warn!("discovery failed: {e:#}");
+            }
+
+            // Ride the poll: reclaim worktrees whose issue closed (#13's
+            // worktree half; pane lifecycle stays with the runs above).
+            for deps in &self.projects {
+                if let Err(e) = super::reaper::sweep(deps).await {
+                    tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {
