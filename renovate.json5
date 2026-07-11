@@ -1,0 +1,70 @@
+// Renovate 設定(Mend Renovate ホスト型 App で稼働)— issue #76
+//
+// 方針: 依存追従を自動化しつつ、「公開直後の汚染バージョンを自動で取り込む」
+// 供給網リスクを cooldown / digest pin で抑える。
+// automerge は branch protection の必須チェック(CI + cargo-deny)が緑であることが前提((4/4) で設定)。
+// コミット履歴は conventional commits ではないため semanticCommits はデフォルト(auto)のまま。
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    'helpers:pinGitHubActionDigests',
+    ':dependencyDashboard',
+  ],
+
+  // 週次バッチで PR を作り、洪水を抑える
+  timezone: 'Asia/Tokyo',
+  schedule: ['before 9am on monday'],
+  prConcurrentLimit: 5,
+  prHourlyLimit: 2,
+
+  // cooldown: 新リリースを 7 日寝かせてから採用する
+  // (crates.io 等への「公開直後に汚染版を出す」攻撃への最有効の緩和策)
+  minimumReleaseAge: '7 days',
+  internalChecksFilter: 'strict',
+
+  // GitHub Actions を可変タグではなく commit SHA に固定(タグ差し替え攻撃を無効化)
+  pinDigests: true,
+
+  // Cargo.lock の推移依存を週次でリフレッシュし、間接依存の脆弱性も追従する
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ['before 9am on monday'],
+  },
+
+  // 脆弱性パッチだけは cooldown をバイパスして即時 PR を開く。
+  // ただし automerge はせず、`security` ラベルを付けて手動レビューに乗せる。
+  vulnerabilityAlerts: {
+    enabled: true,
+    minimumReleaseAge: null,
+    labels: ['security'],
+    automerge: false,
+  },
+  osvVulnerabilityAlerts: true,
+
+  packageRules: [
+    // cargo の minor/patch はグループ化して 1 PR にし、automerge する
+    // (cooldown 7 日経過 + 必須チェック緑が前提)。
+    // runtime 依存だけ手動レビューに絞りたくなったら、この rule に
+    // `matchDepTypes: ['devDependencies']` を付けて automerge を dev 依存に限定し、
+    // `dependencies` 用の rule を automerge: false で分ければよい。
+    {
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['minor', 'patch'],
+      groupName: 'cargo minor/patch',
+      automerge: true,
+    },
+    // cargo の major は個別 PR・手動レビュー
+    {
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['major'],
+      automerge: false,
+    },
+    // GitHub Actions の digest/patch/minor 更新は automerge(major は手動のまま)
+    {
+      matchManagers: ['github-actions'],
+      matchUpdateTypes: ['digest', 'patch', 'minor'],
+      automerge: true,
+    },
+  ],
+}
