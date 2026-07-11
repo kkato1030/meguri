@@ -1,12 +1,12 @@
 //! In-memory Forge for tests: records every mutation for assertions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use super::{CreatedPr, Forge, Issue, PullRequest, ReviewComment, ReviewThread};
+use super::{CreatedPr, Forge, Issue, IssueState, PullRequest, ReviewComment, ReviewThread};
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
@@ -25,6 +25,7 @@ pub struct RecordedPr {
 #[derive(Default)]
 pub struct FakeForge {
     pub issues: Mutex<Vec<Issue>>,
+    pub closed: Mutex<HashSet<i64>>,
     pub comments: Mutex<Vec<(i64, String)>>,
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
@@ -43,6 +44,10 @@ impl FakeForge {
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
         forge
+    }
+
+    pub fn close_issue(&self, number: i64) {
+        self.closed.lock().unwrap().insert(number);
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
@@ -234,13 +239,31 @@ impl Forge for FakeForge {
             .ok_or_else(|| anyhow::anyhow!("issue #{number} not found"))
     }
 
+    async fn issue_state(&self, number: i64) -> Result<IssueState> {
+        if self.closed.lock().unwrap().contains(&number) {
+            return Ok(IssueState::Closed);
+        }
+        if self
+            .issues
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.number == number)
+        {
+            Ok(IssueState::Open)
+        } else {
+            bail!("issue #{number} not found")
+        }
+    }
+
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>> {
+        let closed = self.closed.lock().unwrap();
         Ok(self
             .issues
             .lock()
             .unwrap()
             .iter()
-            .filter(|i| i.has_label(label))
+            .filter(|i| i.has_label(label) && !closed.contains(&i.number))
             .cloned()
             .collect())
     }
