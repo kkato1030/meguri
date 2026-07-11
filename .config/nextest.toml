@@ -1,0 +1,6 @@
+# cargo-nextest 設定(https://nexte.st/docs/configuration/)
+
+[profile.ci]
+# 統合テストは実時間 sleep / tmux IO バウンドで CPU をほぼ使わないため、
+# CI ランナー(ubuntu-latest = 4 vCPU)のコア数より広い並列度で回す。
+test-threads = 16

@@ -30,11 +30,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2.83.1
+        with:
+          tool: cargo-nextest
+
       - name: cargo fmt
         run: cargo fmt --check
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: cargo nextest
+        run: cargo nextest run --profile ci
+
+      # nextest は doctest を実行しないため別途カバーする(現状 0 件、ほぼ即時)
+      - name: cargo test --doc
+        run: cargo test --doc
