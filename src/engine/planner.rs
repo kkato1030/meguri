@@ -11,6 +11,11 @@
 //! exactly — only the trigger label, prompt, spec-file verification, and PR
 //! shape differ.
 //!
+//! The spec itself is transient scaffolding: the spec-worker prunes it when
+//! the implementation lands, so it never reaches the default branch (issue
+//! #48). Anything with durable value is routed out of the spec by the prompt
+//! — design decisions to ADRs, domain rules to permanent domain documents.
+//!
 //! Second normal ending — decompose (issue #24): when the agent finds the
 //! issue too big for one spec, it ends the turn with `status: decompose` and
 //! a `children` list; meguri (not the agent) files the sub-issues, wires
@@ -106,8 +111,16 @@ impl Flavor for PlannerFlavor {
                Keep it lightweight — it exists to converge review on the approach \
                before implementation: acceptance criteria, files to touch, and \
                key decisions are enough.\n\
-             - A decision worth keeping after the PR merges belongs in an ADR \
-               (`docs/adr/NNNN-<slug>.md`, next free number), not the spec.\n\
+             - The spec is disposable scaffolding: it is deleted when the \
+               implementation lands and never survives the merge. Anything \
+               with durable value therefore belongs in a structured permanent \
+               document, not the spec:\n\
+               - a design decision (why this approach) goes in an ADR \
+                 (`docs/adr/NNNN-<slug>.md`, next free number);\n\
+               - a business rule / domain invariant the system must keep \
+                 satisfying goes in the permanent domain document the \
+                 repository already uses (create one only if this issue \
+                 introduces such rules and no such document exists yet).\n\
              - Do NOT implement the issue; the spec (plus any ADR) is the only \
                deliverable. The implementation continues later on this same branch.\n\
              - COMMIT your work to the current branch with clear messages. \
@@ -380,6 +393,18 @@ mod tests {
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Pull request description"));
         assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_routes_durable_value_out_of_the_disposable_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let cp = Checkpoint::default();
+        let prompt = PlannerFlavor.execute_prompt(&fake_deps(), &run, &cp, dir.path());
+        assert!(prompt.contains("disposable scaffolding"));
+        assert!(prompt.contains("deleted when the implementation lands"));
+        assert!(prompt.contains("docs/adr/NNNN-<slug>.md"));
+        assert!(prompt.contains("domain document"));
     }
 
     #[test]
