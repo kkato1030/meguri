@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::{
-    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
-    PaneSpec, Split,
+    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
+    PaneId, PaneSpec, Split,
     herdr_socket::{self, EventStream},
 };
 
@@ -47,16 +47,21 @@ impl Drop for PaneWatch {
 /// herdr-backed multiplexer, driven through the local socket API where
 /// possible (no subprocess per call) with the `herdr` CLI as fallback.
 ///
-/// Layout: one workspace labeled with the configured session name, one tab
-/// per run. The agent is launched *inside the tab's shell* (`pane run`), so
-/// the pane and its final screen survive agent exit.
+/// Layout: one workspace per project, labeled `<session>:<project>` (the bare
+/// `<session>` — no project — is the cross-project `meguri top` view). Issue
+/// tabs land in their project's workspace; the label is chosen at construction
+/// (`mux::detect`, per project). One tab per run. The agent is launched
+/// *inside the tab's shell* (`pane run`), so the pane and its final screen
+/// survive agent exit. Operations on an existing pane address it by its id
+/// (`wN:pM`, which carries the workspace), so they never need the label.
 ///
 /// Agent state is served from a per-pane cache fed by a
 /// `pane.agent_status_changed` subscription, so the turn engine's poll loop
 /// costs no subprocess spawns and `wait_state` reacts within milliseconds of
 /// a transition instead of a poll interval.
 pub struct HerdrMux {
-    /// Workspace label that groups all meguri panes.
+    /// Workspace label this mux creates panes in — `<session>:<project>` for a
+    /// project, or the bare `<session>` for the cross-project `meguri top` view.
     session: String,
     /// Unix socket for direct requests and event subscriptions.
     socket: PathBuf,
@@ -148,7 +153,7 @@ impl HerdrMux {
         Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    async fn find_workspace(&self) -> MuxResult<Option<String>> {
+    async fn find_workspace_labeled(&self, label: &str) -> MuxResult<Option<String>> {
         let result = self.herdr_json(&["workspace", "list"]).await?;
         let workspaces = result
             .get("workspaces")
@@ -156,7 +161,7 @@ impl HerdrMux {
             .cloned()
             .unwrap_or_default();
         for ws in workspaces {
-            if ws.get("label").and_then(Value::as_str) == Some(self.session.as_str())
+            if ws.get("label").and_then(Value::as_str) == Some(label)
                 && let Some(id) = ws.get("workspace_id").and_then(Value::as_str)
             {
                 return Ok(Some(id.to_string()));
@@ -165,18 +170,13 @@ impl HerdrMux {
         Ok(None)
     }
 
-    async fn workspace_id(&self) -> MuxResult<String> {
-        if let Some(id) = self.find_workspace().await? {
+    /// Find or create a workspace with `label`, returning its id.
+    async fn workspace_id_labeled(&self, label: &str) -> MuxResult<String> {
+        if let Some(id) = self.find_workspace_labeled(label).await? {
             return Ok(id);
         }
         let result = self
-            .herdr_json(&[
-                "workspace",
-                "create",
-                "--label",
-                &self.session,
-                "--no-focus",
-            ])
+            .herdr_json(&["workspace", "create", "--label", label, "--no-focus"])
             .await?;
         result
             .pointer("/workspace/workspace_id")
@@ -186,6 +186,11 @@ impl HerdrMux {
                 kind: "herdr",
                 detail: format!("workspace create returned no id: {result}"),
             })
+    }
+
+    /// The workspace that holds the agent panes (labeled with the session name).
+    async fn workspace_id(&self) -> MuxResult<String> {
+        self.workspace_id_labeled(&self.session).await
     }
 
     /// Get or create the event-fed status watcher for `pane`.
@@ -636,11 +641,13 @@ impl Multiplexer for HerdrMux {
         format!("herdr workspace focus {ws} >/dev/null 2>&1; herdr")
     }
 
-    /// Reuse the dashboard tab with this label if one already exists in the
-    /// meguri workspace, else create it. The tab's root pane doubles as the
-    /// status header row (`meguri top` writes into the terminal it runs in).
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
-        let ws = self.workspace_id().await?;
+    /// Construct (or reuse) the dedicated dashboard workspace labeled `label`,
+    /// separate from the agent workspace. Its single tab's root pane is the
+    /// status pane that renders the header; agent panes are later tiled into
+    /// that same tab. Reuse is detected by the tab's label so the status loop
+    /// is started exactly once.
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
+        let ws = self.workspace_id_labeled(label).await?;
         let tabs = self
             .herdr_json(&["tab", "list", "--workspace", &ws])
             .await?;
@@ -649,7 +656,11 @@ impl Multiplexer for HerdrMux {
                 if tab.get("label").and_then(Value::as_str) == Some(label)
                     && let Some(id) = tab.get("tab_id").and_then(Value::as_str)
                 {
-                    return Ok(DashboardId(id.to_string()));
+                    return Ok(Dashboard {
+                        tile: DashboardId(id.to_string()),
+                        status_pane: None,
+                        fresh: false,
+                    });
                 }
             }
         }
@@ -664,14 +675,33 @@ impl Multiplexer for HerdrMux {
                 "--no-focus",
             ])
             .await?;
-        result
+        let tab_id = result
             .pointer("/tab/tab_id")
             .and_then(Value::as_str)
-            .map(|s| DashboardId(s.to_string()))
             .ok_or_else(|| MuxError::CommandFailed {
                 kind: "herdr",
                 detail: format!("tab create returned no tab id: {result}"),
-            })
+            })?
+            .to_string();
+        let status_pane = result
+            .pointer("/root_pane/pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MuxError::CommandFailed {
+                kind: "herdr",
+                detail: format!("tab create returned no root pane: {result}"),
+            })?
+            .to_string();
+        Ok(Dashboard {
+            tile: DashboardId(tab_id),
+            status_pane: Some(PaneId(status_pane)),
+            fresh: true,
+        })
+    }
+
+    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
+        let command_line = shell_join(argv);
+        self.herdr_ok(&["pane", "run", &pane.0, &command_line])
+            .await
     }
 
     async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {

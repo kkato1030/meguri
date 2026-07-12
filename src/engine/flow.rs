@@ -26,6 +26,10 @@ pub const STEP_PREPARE_WORK: &str = "prepare-work";
 pub const STEP_PREPARE_WORKTREE: &str = "prepare-worktree";
 pub const STEP_EXECUTE: &str = "execute";
 pub const STEP_VALIDATE: &str = "validate";
+/// The worker's internal review→fix loop (ADR 0006), between `validate` and
+/// `open-pr`. Only loops whose flavor opts in ([`Flavor::self_reviews`]) run
+/// it; the rest step straight from `validate` to `open-pr`.
+pub const STEP_SELF_REVIEW: &str = "self-review";
 pub const STEP_OPEN_PR: &str = "open-pr";
 
 /// What makes a loop's flow different from another's; everything else
@@ -38,6 +42,13 @@ pub trait Flavor: Send + Sync {
     /// Label that queues an issue for this loop; re-checked at claim time by
     /// the default [`Flavor::prepare_work`].
     fn trigger_label(&self) -> &'static str;
+
+    /// Whether this loop runs the internal self-review phase (ADR 0006)
+    /// between `validate` and `open-pr`. Default: no (the historical
+    /// straight-to-PR shape). Only the worker opts in for the MVP.
+    fn self_reviews(&self) -> bool {
+        false
+    }
 
     /// Claim the run's target and fill the checkpoint. Default: the
     /// coordination layer's atomic claim (label re-verification + working
@@ -193,6 +204,26 @@ pub struct Checkpoint {
     /// after the push.
     #[serde(default)]
     pub thread_ids: Vec<String>,
+    /// The tracked issue carries `meguri:automerge` (auto-merge 1/3, #41):
+    /// open the PR non-draft and copy the label onto it so the auto-merger
+    /// sweep can arm it. Recorded at claim time.
+    #[serde(default)]
+    pub automerge: bool,
+    /// Self-review rounds already spent this run (ADR 0006). Local-only state
+    /// — the internal loop never touches the forge; convergence is bounded by
+    /// this counter, not a forge marker.
+    #[serde(default)]
+    pub self_review_rounds: u32,
+    /// Findings from the latest review turn that the next fix turn must
+    /// address; carried in-memory (via the checkpoint) rather than as forge
+    /// threads.
+    #[serde(default)]
+    pub self_review_pending: Vec<super::impl_reviewer::Finding>,
+    /// Set when the rounds cap was hit without a clean verdict: the PR is
+    /// published anyway (the human merge gate is the backstop), and this
+    /// drives the single footer line noting the non-convergence.
+    #[serde(default)]
+    pub self_review_unconverged: bool,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -319,7 +350,7 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     }
 
     if step == STEP_VALIDATE {
-        match validate(deps, &run, &mut checkpoint, &worktree).await? {
+        match validate(deps, &run, &mut checkpoint, &worktree, STEP_VALIDATE).await? {
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
@@ -340,6 +371,33 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
                     run.issue_number, result.summary
                 ))
                 .into());
+            }
+        }
+        step = save_step(deps, &run, STEP_SELF_REVIEW, &checkpoint)?;
+    }
+
+    if step == STEP_SELF_REVIEW {
+        if flavor.self_reviews() && deps.config.review.enabled {
+            match super::impl_reviewer::self_review(deps, &run, &mut checkpoint, &worktree).await? {
+                StepFlow::Continue => {}
+                StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
+                StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
+                StepFlow::NeedsPlan(reason) => {
+                    // needs_plan makes no sense once work is committed and
+                    // under self-review — a human looks.
+                    return Err(NeedsHuman(format!(
+                        "agent asked for a plan during self-review on issue #{}: {reason}",
+                        run.issue_number
+                    ))
+                    .into());
+                }
+                StepFlow::Decompose(result) => {
+                    return Err(NeedsHuman(format!(
+                        "agent asked to decompose during self-review on issue #{}: {}",
+                        run.issue_number, result.summary
+                    ))
+                    .into());
+                }
             }
         }
         step = save_step(deps, &run, STEP_OPEN_PR, &checkpoint)?;
@@ -449,6 +507,11 @@ async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result
     let key = run.task_key();
     match deps.task_source.claim(&key, tasks::LOCAL_HOST).await? {
         Some(task) => {
+            // Carry the auto-merge opt-in from the issue to the PR (auto-merge
+            // 1/3, #41): recorded now, applied in open-pr (non-draft + label
+            // copy). The coordination layer decides it (github: the
+            // `meguri:automerge` label; local: always off).
+            cp.automerge = task.automerge;
             cp.issue_title = task.title;
             cp.issue_body = task.body;
             deps.store.emit(
@@ -561,9 +624,10 @@ async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
+    lane: &Lane,
     initial_trigger: &str,
 ) -> Result<EnsuredPane> {
-    let role = role_for_loop(&run.loop_kind);
+    let role = lane.role;
     let worktree_str = worktree.to_string_lossy();
     if let Some(record) = deps
         .store
@@ -606,19 +670,27 @@ async fn ensure_pane(
         .get_pane(&deps.project.id, run.issue_number, role)?
         .and_then(|p| p.agent_session_id);
     if let Some(session_id) = session_id {
-        let resumed =
-            match spawn_agent_pane(deps, run, worktree, initial_trigger, Some(&session_id)).await {
-                Ok(pane) => {
-                    if resumed_pane_survives(deps, &pane).await {
-                        Some(pane)
-                    } else {
-                        // Dead on arrival: the CLI rejected the session id.
-                        let _ = deps.mux.kill_pane(&pane).await;
-                        None
-                    }
+        let resumed = match spawn_agent_pane(
+            deps,
+            run,
+            worktree,
+            lane,
+            initial_trigger,
+            Some(&session_id),
+        )
+        .await
+        {
+            Ok(pane) => {
+                if resumed_pane_survives(deps, &pane).await {
+                    Some(pane)
+                } else {
+                    // Dead on arrival: the CLI rejected the session id.
+                    let _ = deps.mux.kill_pane(&pane).await;
+                    None
                 }
-                Err(_) => None,
-            };
+            }
+            Err(_) => None,
+        };
         if let Some(pane) = resumed {
             return Ok(EnsuredPane {
                 pane,
@@ -637,7 +709,7 @@ async fn ensure_pane(
         )?;
     }
 
-    let pane = spawn_agent_pane(deps, run, worktree, initial_trigger, None).await?;
+    let pane = spawn_agent_pane(deps, run, worktree, lane, initial_trigger, None).await?;
     Ok(EnsuredPane {
         pane,
         freshly_spawned: true,
@@ -651,11 +723,13 @@ async fn spawn_agent_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
+    lane: &Lane,
     initial_trigger: &str,
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
-    let role = role_for_loop(&run.loop_kind);
-    let (profile_name, profile) = resolve_run_profile(deps, run)?;
+    let role = lane.role;
+    let profile_name = &lane.profile_name;
+    let profile = &lane.profile;
     let worktree_str = worktree.to_string_lossy();
 
     let mut command = vec![profile.command.clone()];
@@ -772,8 +846,47 @@ async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
     }
 }
 
-/// Run one prompt-turn: prepare files, deliver the trigger (spawn or
-/// send_line), then wait it out.
+/// Which pane lane a turn runs in, and the launch profile it uses. Threading
+/// this explicitly lets the worker's self-review run its review turn in a
+/// separate lane under a different profile than the fix turns (ADR 0006).
+pub(crate) struct Lane {
+    role: &'static str,
+    profile_name: String,
+    profile: crate::config::AgentProfile,
+}
+
+/// The run's own lane: its loop's pane lane, under the profile pinned on the
+/// run (resolved and pinned lazily on first spawn).
+fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
+    let role = role_for_loop(&run.loop_kind);
+    let (profile_name, profile) = resolve_run_profile(deps, run)?;
+    Ok(Lane {
+        role,
+        profile_name,
+        profile,
+    })
+}
+
+/// The worker's self-review lane: a separate pane keyed by the same issue,
+/// launched under the `impl-reviewer` routing profile so the review turn can
+/// be a different model than the author doing the fixes. Resolved without
+/// pinning the run's own (worker) profile.
+fn impl_review_lane(deps: &Deps) -> Result<Lane> {
+    let profile_name = crate::routing::resolve(
+        &deps.config,
+        "impl-reviewer",
+        &crate::routing::detect_command,
+    )?;
+    let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
+    Ok(Lane {
+        role: crate::store::ROLE_IMPL_REVIEW,
+        profile_name,
+        profile,
+    })
+}
+
+/// Run one prompt-turn in the run's own (author) lane: prepare files, deliver
+/// the trigger (spawn or send_line), then wait it out.
 pub(crate) async fn run_turn(
     deps: &Deps,
     run: &RunRecord,
@@ -781,8 +894,33 @@ pub(crate) async fn run_turn(
     purpose: &str,
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
+    let lane = author_lane(deps, run)?;
+    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+}
+
+/// Run one prompt-turn in the worker's self-review (impl-review) lane under
+/// the `impl-reviewer` profile.
+pub(crate) async fn run_review_turn(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    purpose: &str,
+    prompt_body: &str,
+) -> Result<(TurnOutcome, String)> {
+    let lane = impl_review_lane(deps)?;
+    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+}
+
+async fn run_turn_in(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    lane: &Lane,
+    purpose: &str,
+    prompt_body: &str,
+) -> Result<(TurnOutcome, String)> {
     let prepared = prepare_turn(worktree, prompt_body)?;
-    let ensured = ensure_pane(deps, run, worktree, &prepared.trigger_line).await?;
+    let ensured = ensure_pane(deps, run, worktree, lane, &prepared.trigger_line).await?;
     let pane = ensured.pane.clone();
     deps.store.begin_turn(
         &run.id,
@@ -804,7 +942,7 @@ pub(crate) async fn run_turn(
         .await_completion(&pane, worktree, &prepared.turn_id, &control)
         .await?;
 
-    record_agent_session(deps, run, worktree, &pane, &ensured, &outcome).await?;
+    record_agent_session(deps, run, worktree, lane.role, &pane, &ensured, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -835,11 +973,11 @@ async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
+    role: &str,
     pane: &PaneId,
     ensured: &EnsuredPane,
     outcome: &TurnOutcome,
 ) -> Result<()> {
-    let role = role_for_loop(&run.loop_kind);
     match outcome {
         TurnOutcome::Completed(r) => {
             let session_root = agent_session::session_root(&deps.config.agent);
@@ -973,12 +1111,16 @@ async fn execute(
 }
 
 /// validate: the orchestrator itself runs the project's check command and
-/// feeds failures back to the agent, never trusting agent claims.
-async fn validate(
+/// feeds failures back to the agent, never trusting agent claims. Shared by
+/// the `validate` step and the self-review phase's post-fix re-validation;
+/// `persist_step` is the step written while the fix-turn counter advances, so
+/// a crash resumes into the right phase.
+pub(crate) async fn validate(
     deps: &Deps,
     run: &RunRecord,
     cp: &mut Checkpoint,
     worktree: &Path,
+    persist_step: &str,
 ) -> Result<StepFlow> {
     let Some(check) = deps.project.check_command.clone() else {
         deps.store
@@ -1005,7 +1147,7 @@ async fn validate(
         }
 
         cp.fix_turns_used += 1;
-        save_step(deps, run, STEP_VALIDATE, cp)?;
+        save_step(deps, run, persist_step, cp)?;
         if cp.fix_turns_used > deps.config.limits.validate_turns {
             return Err(NeedsHuman(format!(
                 "validation `{check}` still failing after {} fix turns",
@@ -1114,7 +1256,10 @@ async fn open_pr(
     } else {
         let title = flavor.pr_title(run, cp);
         let body = compose_pr_body(run, cp);
-        let draft = deps.config.pr_for(&deps.project).draft;
+        // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
+        // a draft would waste the required-checks run the arm is waiting on
+        // (auto-merge 1/3, #41).
+        let draft = deps.config.pr_for(&deps.project).draft && !cp.automerge;
         let pr = deps
             .forge()
             .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
@@ -1124,6 +1269,15 @@ async fn open_pr(
         save_step(deps, run, STEP_OPEN_PR, cp)?;
         deps.store
             .emit(Some(&run.id), "pr.created", json!({ "url": pr.url }))?;
+        // Copy the opt-in label onto the PR so the sweep can arm it without
+        // re-reading the issue (the sweep keeps the issue-label fallback for
+        // any copy that does not land).
+        if cp.automerge {
+            deps.forge()
+                .add_pr_label(pr.number, forge::LABEL_AUTOMERGE)
+                .await
+                .ok();
+        }
         pr.url
     };
 
@@ -1144,10 +1298,21 @@ pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
+    // The only trace of the AI self-review that reaches the PR: a single
+    // footer line when the rounds cap was hit without a clean verdict (ADR
+    // 0006). The review→fix transcript itself never lands here.
+    let self_review_note = if cp.self_review_unconverged {
+        format!(
+            "\n\n> 🔁 self-review: {} ラウンド回しても収束しませんでした（未解決の指摘が残ったまま公開しています。人間レビューで確認してください）。",
+            cp.self_review_rounds
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "Closes #{}.\n\n{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
-        run.issue_number, description, run.id
+        run.issue_number, description, self_review_note, run.id
     )
 }
 

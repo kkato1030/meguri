@@ -65,11 +65,26 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Tile live agent panes into one mux tab — a terminal dashboard
+    /// Build a dedicated dashboard workspace of tiled live agent panes and
+    /// attach to it — a terminal dashboard
     Top {
         /// Multiplexer override: herdr | tmux
         #[arg(long)]
         mux: Option<String>,
+        /// Status refresh interval in seconds
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
+    /// (internal) status-render loop for `meguri top`, run inside its status
+    /// pane. Not for direct use.
+    #[command(hide = true)]
+    TopStatus {
+        /// Multiplexer override: herdr | tmux
+        #[arg(long)]
+        mux: Option<String>,
+        /// Dashboard tiling container id the outer `top` created
+        #[arg(long)]
+        dashboard: String,
         /// Status refresh interval in seconds
         #[arg(long, default_value_t = 2)]
         interval: u64,

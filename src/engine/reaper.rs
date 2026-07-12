@@ -16,7 +16,7 @@ use crate::agent_session;
 use crate::forge::IssueState;
 use crate::gitops;
 use crate::mux::{Multiplexer, PaneId};
-use crate::store::{PaneRecord, ROLE_AUTHOR, ROLE_REVIEW};
+use crate::store::{PaneRecord, ROLE_AUTHOR, ROLE_IMPL_REVIEW, ROLE_REVIEW};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
@@ -109,7 +109,9 @@ fn mux_for(deps: &Deps, kind: &str) -> Option<Arc<dyn Multiplexer>> {
     if kind == deps.mux.kind().as_str() {
         return Some(deps.mux.clone());
     }
-    crate::mux::from_kind(kind, &deps.config.mux.session).ok()
+    // Cross-kind fallback (a persisted pane on a different mux than we run):
+    // only ever kills/reads by pane id, so the base label suffices.
+    crate::mux::from_kind(kind, &deps.config.mux.session, None).ok()
 }
 
 /// The directory holding this project's worktrees, canonicalized so paths
@@ -195,7 +197,7 @@ async fn classify(
     // runs first, so this only trips when the kill failed (or was skipped);
     // the worktree then waits for the next sweep. Both lanes of the issue
     // are checked — either one alive keeps the worktree.
-    for role in [ROLE_AUTHOR, ROLE_REVIEW] {
+    for role in [ROLE_AUTHOR, ROLE_REVIEW, ROLE_IMPL_REVIEW] {
         if let Some(pane) = deps.store.get_pane(&deps.project.id, issue_number, role)?
             && record_pane_alive(deps, &pane).await
         {

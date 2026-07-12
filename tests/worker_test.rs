@@ -11,7 +11,10 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_WORKING};
+use meguri::forge::{
+    Forge, LABEL_AUTOMERGE, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY,
+    LABEL_WORKING,
+};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -44,6 +47,8 @@ struct TestEnv {
     deps: Deps,
     forge: Arc<FakeForge>,
     #[allow(dead_code)]
+    mux: Arc<FakeMux>,
+    #[allow(dead_code)]
     root: tempfile::TempDir,
     worktree_root: PathBuf,
 }
@@ -63,6 +68,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    // These happy-path tests don't exercise the self-review phase; the
+    // dedicated self-review tests enable it explicitly.
+    config.review.enabled = false;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -77,9 +85,10 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         clean: None,
     };
 
+    let mux = Arc::new(FakeMux::new(false));
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
-        Arc::new(FakeMux::new(false)),
+        mux.clone(),
         forge.clone(),
         config,
         project,
@@ -87,6 +96,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     TestEnv {
         deps,
         forge,
+        mux,
         root,
         worktree_root,
     }
@@ -263,7 +273,9 @@ async fn worker_happy_path_issue_to_pr() {
     assert!(execute_prompt.contains("# Pull request description"));
     assert!(execute_prompt.contains("## Summary"));
 
-    // Labels settled: claim + trigger removed, no escalation.
+    // Phase settled (ADR 0005): the claim + ready trigger are gone and the
+    // issue moved to `implementing` (its implementation PR is open) — exactly
+    // one phase label, no escalation.
     let labels = env.forge.labels_of(7);
     assert!(
         !labels.contains(&LABEL_READY.to_string()),
@@ -271,6 +283,10 @@ async fn worker_happy_path_issue_to_pr() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+    assert!(
+        labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "issue must carry {LABEL_IMPLEMENTING} after the PR opens: {labels:?}"
+    );
 
     // The branch actually landed on origin.
     let clone = &env.deps.project.repo_path;
@@ -354,6 +370,48 @@ async fn worker_pr_draft_false_opens_normal_pr() {
     let prs = env.forge.prs();
     assert_eq!(prs.len(), 1);
     assert!(!prs[0].draft, "pr.draft = false must open a normal PR");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_automerge_issue_opens_nondraft_and_copies_label() {
+    // `meguri:automerge` on the issue: the PR opens non-draft (even though
+    // pr.draft defaults to true) and the label is copied onto the PR so the
+    // auto-merger sweep can arm it (auto-merge 1/3, #41).
+    let env = setup(None).await;
+    env.forge.add_label(7, LABEL_AUTOMERGE).await.unwrap();
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(
+        !prs[0].draft,
+        "automerge PR opens non-draft despite pr.draft = true"
+    );
+    let pr_labels = env.forge.pr_labels_of(prs[0].number);
+    assert!(
+        pr_labels.contains(&LABEL_AUTOMERGE.to_string()),
+        "automerge label copied onto the PR: {pr_labels:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -725,4 +783,331 @@ async fn worker_validation_failure_feeds_back_then_passes() {
     let kinds: Vec<String> = events.iter().map(|e| e.kind.clone()).collect();
     assert!(kinds.contains(&"validate.failed".to_string()), "{kinds:?}");
     assert!(kinds.contains(&"validate.passed".to_string()), "{kinds:?}");
+}
+
+// ---- self-review phase (ADR 0006) ----------------------------------------
+
+/// Read the prompt delivered for a turn, so a scripted agent can tell the
+/// execute / review / fix turns apart.
+fn prompt_of(wt: &Path, turn_id: &str) -> String {
+    std::fs::read_to_string(wt.join(format!(".meguri/prompt-{turn_id}.md"))).unwrap_or_default()
+}
+
+fn write_review(wt: &Path, verdict: &str, findings: serde_json::Value) {
+    let body = serde_json::json!({
+        "verdict": verdict, "review": "self-review note", "findings": findings,
+    });
+    std::fs::write(
+        wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        body.to_string(),
+    )
+    .unwrap();
+}
+
+async fn commit_fix(wt: &Path) {
+    std::fs::write(wt.join("greeting.txt"), "hello there\n").unwrap();
+    run_git(wt, &["add", "greeting.txt"]).await.unwrap();
+    run_git(
+        wt,
+        &[
+            "-c",
+            "user.email=a@example.com",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            "Address self-review",
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+const REVIEW_MARK: &str = "self-review round";
+const FIX_MARK: &str = "# Findings";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_clean_publishes_without_touching_the_forge() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            if prompt_of(&wt, &turn_id).contains(REVIEW_MARK) {
+                write_review(&wt, "clean", serde_json::json!([]));
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    // A self-review actually ran and resolved clean...
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.reviewed".to_string()),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"self_review.clean".to_string()),
+        "{kinds:?}"
+    );
+
+    // ...without leaving a single thread or comment on the PR (the forge is
+    // untouched by the self-review leg).
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    let pr = prs[0].number;
+    assert!(
+        env.forge.threads_of(pr).is_empty(),
+        "self-review must post no threads"
+    );
+    assert!(
+        env.forge.pr_comments_of(pr).is_empty(),
+        "self-review must post no comments"
+    );
+    // A clean review leaves no footer on the PR body.
+    assert!(
+        !prs[0].body.contains("self-review"),
+        "body: {}",
+        prs[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_findings_then_fix_converge_in_one_run() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let reviews = Arc::new(AtomicU32::new(0));
+    let r = reviews.clone();
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), move |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        let r = r.clone();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                // First review flags a finding; the second (post-fix) is clean.
+                if r.fetch_add(1, Ordering::SeqCst) == 0 {
+                    write_review(
+                        &wt,
+                        "findings",
+                        serde_json::json!([
+                            {"path": "greeting.txt", "line": 1, "body": "make it friendlier"}
+                        ]),
+                    );
+                } else {
+                    write_review(&wt, "clean", serde_json::json!([]));
+                }
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix(&wt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        2,
+        "review→fix→review ran in one run"
+    );
+
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.fixed".to_string()),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"self_review.clean".to_string()),
+        "{kinds:?}"
+    );
+
+    // Still no forge threads/comments: the review→fix stayed local.
+    let pr = env.forge.prs()[0].number;
+    assert!(env.forge.threads_of(pr).is_empty());
+    assert!(env.forge.pr_comments_of(pr).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_publishes_with_footer_when_rounds_run_out() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    env.deps.config.review.max_rounds = 2;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // The review never converges; the fix "addresses" it each round.
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                write_review(
+                    &wt,
+                    "findings",
+                    serde_json::json!([
+                        {"path": "greeting.txt", "line": 1, "body": "still not right"}
+                    ]),
+                );
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix(&wt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    // The cap does not block: the PR is published anyway.
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.unconverged".to_string()),
+        "{kinds:?}"
+    );
+
+    // The only trace on the PR is the single footer line — no threads, no
+    // conversation.
+    let prs = env.forge.prs();
+    let pr = prs[0].number;
+    assert!(env.forge.threads_of(pr).is_empty());
+    assert!(env.forge.pr_comments_of(pr).is_empty());
+    assert!(
+        prs[0].body.contains("self-review"),
+        "unconverged PR needs a footer line: {}",
+        prs[0].body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_turn_uses_the_impl_reviewer_profile() {
+    // Model separation survives the internal loop: the review turn spawns
+    // under the `impl-reviewer` profile, the author's turns under `worker`.
+    let mut env = setup(None).await;
+    let mut config: Config = toml::from_str(
+        r#"
+[agents.profiles.p-worker]
+command = "worker-cli"
+args = ["--go"]
+
+[agents.profiles.p-review]
+command = "review-cli"
+args = ["--review"]
+
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "p-worker"
+impl-reviewer = "p-review"
+"#,
+    )
+    .unwrap();
+    config.limits.idle_grace_secs = 3600;
+    config.limits.result_grace_secs = 1;
+    config.review.enabled = true;
+    env.deps.config = config;
+
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            if prompt_of(&wt, &turn_id).contains(REVIEW_MARK) {
+                write_review(&wt, "clean", serde_json::json!([]));
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    let commands = env.mux.spawned_commands();
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("review-cli")),
+        "the review turn must spawn under the impl-reviewer profile: {commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("worker-cli")),
+        "the author turns must spawn under the worker profile: {commands:?}"
+    );
 }

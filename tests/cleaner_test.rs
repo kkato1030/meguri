@@ -16,7 +16,8 @@ use meguri::engine::cleaner::{
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_CLEAN_REPORT, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_READY, LABEL_WORKING,
+    Forge, LABEL_CLEAN_REPORT, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_READY,
+    LABEL_SPECCING, LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -496,17 +497,20 @@ async fn machine_checks_report_stale_branches_and_orphan_working() {
     run_git(&env.clone, &["checkout", "main"]).await.unwrap();
 
     // Orphaned working label (no active run) vs. a legitimately claimed one.
+    // Both carry a phase label so this exercises only the orphan-working check,
+    // not the phase-label-anomaly one (a bare `working` with no phase is itself
+    // an anomaly — covered by its own test).
     env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
         number: 7,
         title: "orphaned claim".into(),
         body: String::new(),
-        labels: vec![LABEL_WORKING.to_string()],
+        labels: vec![LABEL_IMPLEMENTING.to_string(), LABEL_WORKING.to_string()],
     });
     env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
         number: 8,
         title: "active claim".into(),
         body: String::new(),
-        labels: vec![LABEL_WORKING.to_string()],
+        labels: vec![LABEL_IMPLEMENTING.to_string(), LABEL_WORKING.to_string()],
     });
     env.deps
         .store
@@ -541,6 +545,94 @@ async fn machine_checks_report_stale_branches_and_orphan_working() {
 
     // Machine checks read the forge and git but never write: the labels on
     // the orphan candidates are exactly as seeded.
-    assert_eq!(env.forge.labels_of(7), vec![LABEL_WORKING.to_string()]);
-    assert_eq!(env.forge.labels_of(8), vec![LABEL_WORKING.to_string()]);
+    assert_eq!(
+        env.forge.labels_of(7),
+        vec![LABEL_IMPLEMENTING.to_string(), LABEL_WORKING.to_string()]
+    );
+    assert_eq!(
+        env.forge.labels_of(8),
+        vec![LABEL_IMPLEMENTING.to_string(), LABEL_WORKING.to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_checks_report_phase_label_anomalies() {
+    let env = setup().await;
+
+    // Anomaly 1 — two phase labels (a swap that dropped the old one).
+    env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 20,
+        title: "double phase".into(),
+        body: String::new(),
+        labels: vec![LABEL_SPECCING.to_string(), LABEL_IMPLEMENTING.to_string()],
+    });
+    // Anomaly 2 — a ball label with no phase label (engaged, phase missing).
+    env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 21,
+        title: "ball no phase".into(),
+        body: String::new(),
+        labels: vec![LABEL_WORKING.to_string()],
+    });
+    // Healthy — exactly one phase label (plus a ball) is the invariant, so it
+    // must NOT be flagged.
+    env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 22,
+        title: "healthy implementing".into(),
+        body: String::new(),
+        labels: vec![
+            LABEL_IMPLEMENTING.to_string(),
+            LABEL_NEEDS_HUMAN.to_string(),
+        ],
+    });
+    // Untriaged — no labels at all is legitimately unlabeled, not an anomaly.
+    env.forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 23,
+        title: "untriaged".into(),
+        body: String::new(),
+        labels: vec![],
+    });
+
+    let run = create_cleaner_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, "[]");
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    let report = report_issue(&env).await.unwrap();
+    assert!(
+        report.body.contains("### Phase-label anomalies"),
+        "{}",
+        report.body
+    );
+    assert!(
+        report.body.contains("issue #20 — carries 2 phase labels"),
+        "{}",
+        report.body
+    );
+    assert!(
+        report
+            .body
+            .contains("issue #21 — has a ball label but no phase label"),
+        "{}",
+        report.body
+    );
+    // Healthy (one phase), untriaged (no labels), and the ready bystander must
+    // never be flagged.
+    assert!(!report.body.contains("#22"), "{}", report.body);
+    assert!(!report.body.contains("#23"), "{}", report.body);
+    assert!(
+        !report.body.contains(&format!("#{BYSTANDER}")),
+        "{}",
+        report.body
+    );
+
+    // Report-only: the flagged issues' labels are untouched.
+    assert_eq!(
+        env.forge.labels_of(20),
+        vec![LABEL_SPECCING.to_string(), LABEL_IMPLEMENTING.to_string()]
+    );
+    assert_eq!(env.forge.labels_of(21), vec![LABEL_WORKING.to_string()]);
 }

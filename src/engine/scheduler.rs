@@ -97,6 +97,12 @@ impl Scheduler {
                 if let Err(e) = super::reaper::sweep(deps).await {
                     tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Ride the poll: arm GitHub-native auto-merge on eligible PRs
+                // (auto-merge 1/3, #41). Like the reaper, a light API sweep —
+                // no run record, no pane.
+                if let Err(e) = super::auto_merger::sweep(deps).await {
+                    tracing::warn!("auto-merge sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {
@@ -216,7 +222,9 @@ impl Scheduler {
             }
             let pane_alive = match (&run.mux_kind, &run.mux_pane_id) {
                 (Some(kind), Some(pane)) => {
-                    match crate::mux::from_kind(kind, &self.projects[0].config.mux.session) {
+                    // Only checks liveness by pane id — session-independent, so
+                    // the base label (project = None) is sufficient.
+                    match crate::mux::from_kind(kind, &self.projects[0].config.mux.session, None) {
                         Ok(mux) => mux.pane_alive(&PaneId(pane.clone())).await.unwrap_or(false),
                         Err(_) => false,
                     }

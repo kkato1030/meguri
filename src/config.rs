@@ -96,33 +96,36 @@ pub struct Config {
     pub projects: Vec<ProjectConfig>,
 }
 
-/// Settings for the impl-reviewer loop (AI review of implementation PRs).
+/// Settings for the worker's self-review phase (ADR 0006): the internal
+/// review→fix loop that runs before the PR opens. The old `impl_enabled` /
+/// `impl_max_rounds` keys (the forge-based impl-reviewer loop, ADR 0004) are
+/// still accepted as serde aliases so existing configs keep working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
-    /// Kill switch: false silences the impl-reviewer loop entirely
+    /// Kill switch: false skips the worker's self-review phase entirely
     /// (e.g. when an external review bot already covers implementation PRs).
-    #[serde(default = "default_impl_review_enabled")]
-    pub impl_enabled: bool,
-    /// Max impl-review rounds per PR, counted as head markers in the PR's
-    /// comments — the cap that keeps the AI review→fix ping-pong finite.
-    /// Once reached, the loop quietly leaves the PR to the humans.
-    #[serde(default = "default_impl_max_rounds")]
-    pub impl_max_rounds: u32,
+    #[serde(default = "default_self_review_enabled", alias = "impl_enabled")]
+    pub enabled: bool,
+    /// Max self-review rounds per run — the cap that keeps the internal
+    /// review→fix loop finite. Once reached, the PR is published as-is (the
+    /// human merge gate is the backstop, ADR 0006).
+    #[serde(default = "default_self_review_max_rounds", alias = "impl_max_rounds")]
+    pub max_rounds: u32,
 }
 
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
-            impl_enabled: default_impl_review_enabled(),
-            impl_max_rounds: default_impl_max_rounds(),
+            enabled: default_self_review_enabled(),
+            max_rounds: default_self_review_max_rounds(),
         }
     }
 }
 
-fn default_impl_review_enabled() -> bool {
+fn default_self_review_enabled() -> bool {
     true
 }
-fn default_impl_max_rounds() -> u32 {
+fn default_self_review_max_rounds() -> u32 {
     3
 }
 
@@ -165,12 +168,16 @@ pub struct PrConfig {
     /// Open pull requests as drafts (a human promotes them when ready).
     #[serde(default = "default_pr_draft")]
     pub draft: bool,
+    /// GitHub-native auto-merge (auto-merge 1/3, issue #41).
+    #[serde(default)]
+    pub auto_merge: AutoMergeConfig,
 }
 
 impl Default for PrConfig {
     fn default() -> Self {
         Self {
             draft: default_pr_draft(),
+            auto_merge: AutoMergeConfig::default(),
         }
     }
 }
@@ -179,12 +186,67 @@ fn default_pr_draft() -> bool {
     true
 }
 
+/// How a PR opts into auto-merge: `label` requires the `meguri:automerge`
+/// label (on the issue or the PR), `all` arms every eligible meguri PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoMergeOptIn {
+    Label,
+    All,
+}
+
+/// `[pr.auto_merge]` — opt-in GitHub-native auto-merge. meguri never decides
+/// "safe to merge"; it arms auto-merge on eligible PRs and GitHub (branch
+/// protection + required checks) decides (ADR 0003).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoMergeConfig {
+    /// Master switch; off by default.
+    #[serde(default = "default_auto_merge_enabled")]
+    pub enabled: bool,
+    /// Merge strategy to arm with (no fallback if the repo forbids it).
+    #[serde(default = "default_merge_strategy")]
+    pub strategy: crate::forge::MergeStrategy,
+    /// Refuse to arm unless the base has required-checks branch protection.
+    #[serde(default = "default_require_branch_protection")]
+    pub require_branch_protection: bool,
+    /// Which PRs are eligible (label opt-in vs all meguri PRs).
+    #[serde(default = "default_auto_merge_opt_in")]
+    pub opt_in: AutoMergeOptIn,
+}
+
+impl Default for AutoMergeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_merge_enabled(),
+            strategy: default_merge_strategy(),
+            require_branch_protection: default_require_branch_protection(),
+            opt_in: default_auto_merge_opt_in(),
+        }
+    }
+}
+
+fn default_auto_merge_enabled() -> bool {
+    false
+}
+fn default_merge_strategy() -> crate::forge::MergeStrategy {
+    crate::forge::MergeStrategy::Squash
+}
+fn default_require_branch_protection() -> bool {
+    true
+}
+fn default_auto_merge_opt_in() -> AutoMergeOptIn {
+    AutoMergeOptIn::Label
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxConfig {
     /// "auto" | "herdr" | "tmux"
     #[serde(default = "default_mux_kind")]
     pub kind: String,
-    /// mux session name that holds all meguri panes
+    /// Base mux label. Each project's panes live in a per-project workspace
+    /// derived from it — `<session>:<project>` (herdr) / `<session>-<project>`
+    /// (tmux) — while the bare `<session>` is the cross-project `meguri top`
+    /// view. Fixed for the daemon's lifetime (see `ConfigReloader`).
     #[serde(default = "default_session")]
     pub session: String,
     /// Pane lifetime policy: "until-issue-closed" (default — the reaper
@@ -753,20 +815,34 @@ mod tests {
         assert!(back.notifications.macos);
         assert_eq!(back.notifications.webhook_url, None);
         assert_eq!(back.notifications.throttle_secs, 60);
-        assert!(back.review.impl_enabled);
-        assert_eq!(back.review.impl_max_rounds, 3);
+        assert!(back.review.enabled);
+        assert_eq!(back.review.max_rounds, 3);
     }
 
     #[test]
     fn review_section_overrides_defaults() {
         let raw = r#"
 [review]
-impl_enabled = false
-impl_max_rounds = 1
+enabled = false
+max_rounds = 1
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(!cfg.review.impl_enabled);
-        assert_eq!(cfg.review.impl_max_rounds, 1);
+        assert!(!cfg.review.enabled);
+        assert_eq!(cfg.review.max_rounds, 1);
+    }
+
+    #[test]
+    fn review_section_accepts_deprecated_impl_keys() {
+        // The ADR-0004 key names still load (serde aliases) so existing
+        // configs keep working after the ADR-0006 rename.
+        let raw = r#"
+[review]
+impl_enabled = false
+impl_max_rounds = 5
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.review.enabled);
+        assert_eq!(cfg.review.max_rounds, 5);
     }
 
     #[test]
@@ -882,6 +958,65 @@ draft = false
         assert!(cfg.pr.draft, "global default stays true");
         let p = cfg.project("demo").unwrap();
         assert!(!cfg.pr_for(p).draft);
+    }
+
+    #[test]
+    fn auto_merge_defaults_are_conservative() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let am = &cfg.pr.auto_merge;
+        assert!(!am.enabled);
+        assert_eq!(am.strategy, crate::forge::MergeStrategy::Squash);
+        assert!(am.require_branch_protection);
+        assert_eq!(am.opt_in, AutoMergeOptIn::Label);
+    }
+
+    #[test]
+    fn auto_merge_parses_overrides() {
+        let raw = r#"
+[pr.auto_merge]
+enabled = true
+strategy = "rebase"
+require_branch_protection = false
+opt_in = "all"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let am = &cfg.pr.auto_merge;
+        assert!(am.enabled);
+        assert_eq!(am.strategy, crate::forge::MergeStrategy::Rebase);
+        assert!(!am.require_branch_protection);
+        assert_eq!(am.opt_in, AutoMergeOptIn::All);
+    }
+
+    #[test]
+    fn auto_merge_rejects_unknown_strategy_at_load() {
+        let err =
+            toml::from_str::<Config>("[pr.auto_merge]\nstrategy = \"fast-forward\"\n").unwrap_err();
+        assert!(err.to_string().contains("strategy"), "{err}");
+    }
+
+    #[test]
+    fn auto_merge_project_override_wins_whole_section() {
+        // pr_for takes the project's [pr] section wholesale; a project that
+        // sets only draft gets the default auto_merge, not the global one.
+        let raw = r#"
+[pr.auto_merge]
+enabled = true
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[projects.pr]
+draft = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.pr.auto_merge.enabled, "global stays enabled");
+        let p = cfg.project("demo").unwrap();
+        assert!(
+            !cfg.pr_for(p).auto_merge.enabled,
+            "project [pr] wins wholesale, so auto_merge falls back to default (disabled)"
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::{
-    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
-    PaneSpec, Split, tail_looks_blocked,
+    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
+    PaneId, PaneSpec, Split, tail_looks_blocked,
 };
 
 /// How long the screen must stay unchanged before we call the agent Idle/Blocked.
@@ -20,7 +20,12 @@ struct ScreenObservation {
     changed_at: Instant,
 }
 
-/// tmux-backed multiplexer. One meguri session; one window per run.
+/// tmux-backed multiplexer. One session per project (`<session>-<project>`,
+/// the bare `<session>` for `meguri top`); one window per run. The session is
+/// chosen at construction (`mux::detect`, per project); `spawn_pane` and
+/// `ensure_dashboard` create windows in it. Pane ids (`%N`) are tmux-server
+/// global, so `pane_alive`/`kill`/`read` on an existing pane are
+/// session-independent — only creation and attach care about the session.
 ///
 /// Agent state is a screen-stability heuristic — callers must treat it as a
 /// hint (capabilities.native_agent_state == false) and rely on the result
@@ -228,52 +233,75 @@ impl Multiplexer for TmuxMux {
     }
 
     fn attach_command(&self, pane: &PaneId) -> String {
+        // Resolve the owning session from the pane itself, not `self.session`:
+        // per-project sessions mean this mux's label may not be the pane's
+        // session (e.g. a mux built with no project attaching a project pane,
+        // or a pane that predates the per-project split). Pane ids are
+        // server-global, so `#{session_name}` always names the right session.
         format!(
-            "tmux select-window -t {pane} \\; attach -t {session}",
+            "tmux select-window -t {pane} \\; \
+             attach -t \"$(tmux display-message -p -t {pane} '#{{session_name}}')\"",
             pane = pane.0,
-            session = self.session
         )
     }
 
-    /// Reuse the dashboard window with this name if one already exists in the
-    /// meguri session, else create it. `join-pane` + `select-layout tiled`
-    /// gives the same tiled view as herdr's `pane move`.
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
-        self.ensure_session().await?;
-        let list = self
-            .tmux(&[
-                "list-windows",
-                "-t",
-                &self.session,
-                "-F",
-                "#{window_name}\t#{window_id}",
-            ])
-            .await?;
-        for line in list.lines() {
-            if let Some((name, id)) = line.split_once('\t')
-                && name == label
-            {
-                return Ok(DashboardId(id.to_string()));
-            }
+    /// Reuse the dedicated dashboard session if it already exists, else create
+    /// it detached. Its initial pane is the status pane; agent panes are later
+    /// tiled into its window via `join-pane` + `select-layout tiled`.
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
+        let sess = dashboard_session(label);
+        if self
+            .tmux(&["has-session", "-t", &format!("={sess}")])
+            .await
+            .is_ok()
+        {
+            return Ok(Dashboard {
+                tile: DashboardId(sess),
+                status_pane: None,
+                fresh: false,
+            });
         }
-        let id = self
+        // -x/-y: sane size for the tiled dashboard (default 80x24 truncates).
+        let pane_id = self
             .tmux(&[
-                "new-window",
-                "-t",
-                &self.session,
-                "-n",
-                label,
+                "new-session",
+                "-d",
+                "-s",
+                &sess,
+                "-x",
+                "220",
+                "-y",
+                "50",
                 "-P",
                 "-F",
-                "#{window_id}",
+                "#{pane_id}",
             ])
             .await?;
-        Ok(DashboardId(id))
+        Ok(Dashboard {
+            tile: DashboardId(sess),
+            status_pane: Some(PaneId(pane_id)),
+            fresh: true,
+        })
+    }
+
+    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
+        // -k restarts the pane's command in place (the fresh session's shell).
+        let mut args: Vec<String> = vec![
+            "respawn-pane".into(),
+            "-k".into(),
+            "-t".into(),
+            pane.0.clone(),
+            "--".into(),
+        ];
+        args.extend(argv.iter().cloned());
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.tmux(&argv).await.map(|_| ())
     }
 
     async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
         // -h/-v pick the initial split; `select-layout tiled` then reflows all
-        // panes uniformly, so repeated joins stay readable.
+        // panes uniformly, so repeated joins stay readable. The target is the
+        // dashboard session, so panes land in its active window.
         let flag = match dir {
             Split::Right => "-h",
             Split::Down => "-v",
@@ -285,10 +313,15 @@ impl Multiplexer for TmuxMux {
     }
 
     fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
-        format!(
-            "tmux select-window -t {win} \\; attach -t {session}",
-            win = dashboard.0,
-            session = self.session
-        )
+        // The dashboard is a dedicated session and `dashboard.0` is that
+        // session's name (created by `dashboard_session`), so it names the
+        // right target directly — no window→session resolution needed.
+        format!("tmux attach -t {}", dashboard.0)
     }
+}
+
+/// tmux session name for a dashboard label. Session names can't carry ':'
+/// (tmux target syntax), so `meguri:top` becomes `meguri-top`.
+fn dashboard_session(label: &str) -> String {
+    label.replace(':', "-")
 }

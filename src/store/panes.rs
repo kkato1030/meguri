@@ -15,9 +15,13 @@ use super::{Store, now};
 /// fixer, ci-fixer, conflict resolver — and the cleaner's standalone report
 /// pane, which no other loop ever touches).
 pub const ROLE_AUTHOR: &str = "author";
-/// The reviewer's independent lane: separate pane, separate session, but
-/// keyed by the same issue so it stays discoverable and resumable.
+/// The (spec) reviewer's independent lane: separate pane, separate session,
+/// but keyed by the same issue so it stays discoverable and resumable.
 pub const ROLE_REVIEW: &str = "review";
+/// The worker's internal self-review lane (ADR 0006): the review turn of the
+/// pre-publish self-review runs here, under the `impl-reviewer` profile, so
+/// it stays a separate session/model from the author lane doing the fixes.
+pub const ROLE_IMPL_REVIEW: &str = "impl-review";
 
 #[derive(Debug, Clone)]
 pub struct PaneRecord {

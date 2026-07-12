@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use meguri::mux::{AgentState, Multiplexer, PaneSpec, tmux::TmuxMux};
+use meguri::mux::{AgentState, Multiplexer, PaneId, PaneSpec, tmux::TmuxMux};
 
 fn tmux_available() -> bool {
     std::process::Command::new("tmux")
@@ -109,6 +109,27 @@ async fn tmux_spawn_send_read_state_kill() {
     assert!(!mux.pane_alive(&pane).await.unwrap());
 
     cleanup(&session).await;
+}
+
+/// Regression for issue #105 (finding 1): with per-project sessions, the tmux
+/// attach hint must resolve the pane's *own* session (`#{session_name}`), never
+/// hard-code `self.session`. A mux built on the base label attaching a pane that
+/// lives in a project session (or one predating the split) would otherwise
+/// attach to the wrong session and not show the pane. No tmux needed — pure
+/// string formatting.
+#[test]
+fn attach_command_resolves_session_from_pane() {
+    let mux = TmuxMux::new("meguri-base");
+    let cmd = mux.attach_command(&PaneId("%7".into()));
+    assert!(
+        cmd.contains("#{session_name}"),
+        "attach must resolve the session from the pane: {cmd}"
+    );
+    assert!(
+        !cmd.contains("attach -t meguri-base"),
+        "attach must not hard-code the mux label: {cmd}"
+    );
+    assert!(cmd.contains("%7"), "attach must target the pane id: {cmd}");
 }
 
 #[tokio::test]

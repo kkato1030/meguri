@@ -65,6 +65,13 @@ impl Flavor for WorkerFlavor {
         forge::LABEL_READY
     }
 
+    /// The worker self-reviews its own diff before opening the PR (ADR 0006):
+    /// the internal review→fix loop runs in the run's worktree with no forge
+    /// calls, so the human sees an already-self-reviewed PR.
+    fn self_reviews(&self) -> bool {
+        true
+    }
+
     fn execute_prompt(
         &self,
         deps: &Deps,
@@ -143,9 +150,19 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
-    /// Mark the work delivered through the coordination layer: github drops
-    /// the working+ready labels, local flips the task to `done`.
+    /// Phase transition (ADR 0005) + claim release. In github mode the issue's
+    /// `meguri:ready` becomes `meguri:implementing` — the implementation PR is
+    /// now open. The `implementing` add is load-bearing (it backs the
+    /// "unlabeled = untriaged" invariant), so it runs *before* the claim is
+    /// released (which drops `working`+`ready`), keeping the issue always
+    /// labeled; failing the add fails the run. The coordination layer's
+    /// `complete` then releases the claim: github drops `working`+`ready`
+    /// best-effort, local flips the task to `done`. No-op forge in local mode.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
+        if let Some(f) = &deps.forge {
+            f.add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
+                .await?;
+        }
         deps.task_source.complete(&run.task_key()).await
     }
 

@@ -47,6 +47,10 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
+    // These happy-path local tests don't exercise the self-review phase (the
+    // scripted agent only answers the execute turn); the dedicated self-review
+    // tests enable it explicitly.
+    config.review.enabled = false;
 
     let project = ProjectConfig {
         id: "proj".into(),

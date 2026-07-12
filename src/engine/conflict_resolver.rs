@@ -372,6 +372,7 @@ mod tests {
             head_branch: "meguri/9-add-feature-abc123".into(),
             head_sha: String::new(),
             state: "open".into(),
+            is_draft: false,
             labels: vec![],
         };
         assert!(pr_is_resolvable(&pr).is_none());

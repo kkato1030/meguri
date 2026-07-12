@@ -1,5 +1,5 @@
-//! The reviewer loop: open PR labeled `meguri:spec-reviewing` → detached
-//! worktree at the PR head → an agent turn reads the diff and writes a
+//! The spec-reviewer loop: open PR labeled `meguri:spec-reviewing` →
+//! detached worktree at the PR head → an agent turn reads the diff and writes a
 //! summary review. A clean review flips the PR to `meguri:spec-ready`; a
 //! review with findings is posted as a PR comment and the loop waits for the
 //! next push. Every review comment embeds a head-sha marker, so the same
@@ -30,8 +30,9 @@ use crate::store::{ROLE_REVIEW, RunRecord, RunStatus};
 use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
-/// `runs.loop_kind` value for reviewer runs.
-pub const KIND: &str = "reviewer";
+/// `runs.loop_kind` value for spec-reviewer runs. Renamed from `reviewer`
+/// (ADR 0006) to sit symmetrically opposite the internal `impl_reviewer`.
+pub const KIND: &str = "spec-reviewer";
 
 /// Terminal reviewer step: post the review, settle the PR labels.
 pub const STEP_SETTLE: &str = "settle";
@@ -91,12 +92,12 @@ pub struct ReviewCheckpoint {
     pub review: String,
 }
 
-/// The reviewer as a schedulable loop: `meguri:spec-reviewing` PRs in,
+/// The spec reviewer as a schedulable loop: `meguri:spec-reviewing` PRs in,
 /// review comments (and `meguri:spec-ready` transitions) out.
-pub struct ReviewerLoop;
+pub struct SpecReviewerLoop;
 
 #[async_trait]
-impl super::Loop for ReviewerLoop {
+impl super::Loop for SpecReviewerLoop {
     fn kind(&self) -> &'static str {
         KIND
     }
@@ -141,11 +142,11 @@ impl super::Loop for ReviewerLoop {
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_reviewer(deps, run_id).await
+        run_spec_reviewer(deps, run_id).await
     }
 }
 
-pub async fn run_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
+pub async fn run_spec_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     let run = deps
         .store
         .get_run(run_id)?
