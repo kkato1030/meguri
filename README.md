@@ -165,7 +165,10 @@ language = "日本語"
 
 [mux]
 kind = "auto"          # auto | herdr | tmux
-session = "meguri"     # herdr workspace label / tmux session name
+session = "meguri"     # base label; each project gets its own workspace
+                       # `meguri:<project>` (herdr) / `meguri-<project>` (tmux),
+                       # so issue tabs don't intermingle. Bare `meguri` is the
+                       # cross-project `meguri top` view.
 # Panes live per issue (1 issue = 1 pane) and are reclaimed when the issue
 # closes; the agent's native session id is saved first (claude --resume <id>).
 # "never" kills the pane as soon as its run ends (high-throughput operation).

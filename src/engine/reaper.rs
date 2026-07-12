@@ -104,7 +104,9 @@ fn mux_for(deps: &Deps, kind: &str) -> Option<Arc<dyn Multiplexer>> {
     if kind == deps.mux.kind().as_str() {
         return Some(deps.mux.clone());
     }
-    crate::mux::from_kind(kind, &deps.config.mux.session).ok()
+    // Cross-kind fallback (a persisted pane on a different mux than we run):
+    // only ever kills/reads by pane id, so the base label suffices.
+    crate::mux::from_kind(kind, &deps.config.mux.session, None).ok()
 }
 
 /// The directory holding this project's worktrees, canonicalized so paths
