@@ -11,7 +11,9 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_WORKING};
+use meguri::forge::{
+    Forge, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_WORKING,
+};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -262,7 +264,9 @@ async fn worker_happy_path_issue_to_pr() {
     assert!(execute_prompt.contains("# Pull request description"));
     assert!(execute_prompt.contains("## Summary"));
 
-    // Labels settled: claim + trigger removed, no escalation.
+    // Phase settled (ADR 0005): the claim + ready trigger are gone and the
+    // issue moved to `implementing` (its implementation PR is open) — exactly
+    // one phase label, no escalation.
     let labels = env.forge.labels_of(7);
     assert!(
         !labels.contains(&LABEL_READY.to_string()),
@@ -270,6 +274,10 @@ async fn worker_happy_path_issue_to_pr() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+    assert!(
+        labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "issue must carry {LABEL_IMPLEMENTING} after the PR opens: {labels:?}"
+    );
 
     // The branch actually landed on origin.
     let clone = &env.deps.project.repo_path;

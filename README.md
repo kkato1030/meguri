@@ -8,7 +8,7 @@ meguri is a reimplementation of the ideas in [nexu-io/looper](https://github.com
 
 ```
 GitHub issue (label: meguri:ready)
-        │  discover & claim (meguri:working)
+        │  discover & claim (+meguri:working)
         ▼
 git worktree (meguri/<issue>-<slug>-<hash>)
         │
@@ -22,7 +22,7 @@ git worktree (meguri/<issue>-<slug>-<hash>)
 └─────────────────────────────────────┘   answer dialogs, take over
         │  verified commits + checks pass
         ▼
-git push + PR (Closes #N) — labels settled
+git push + PR (Closes #N) — phase swapped to meguri:implementing
 ```
 
 ## Why interactive sessions?
@@ -123,16 +123,30 @@ detached — fails loudly instead of double-driving runs.
 
 ### Labels
 
-| label | meaning |
-|---|---|
-| `meguri:ready` | you queue an issue for the worker loop |
-| `meguri:plan` | you queue an issue for the planner loop (opt-in spec-first flow) |
-| `meguri:spec-reviewing` | on the spec PR: awaiting review by the reviewer loop (or a human) |
-| `meguri:spec-ready` | on the spec PR: review passed; the worker continues implementation |
-| `meguri:working` | meguri claimed it (removed when the PR opens) |
-| `meguri:hold` | discovery skips this issue |
-| `meguri:needs-human` | meguri gave up; a comment explains why |
-| `meguri:clean-report` | the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep) |
+meguri's issue labels form **two axes** (see [ADR 0005](docs/adr/0005-issue-labels-two-axis-phase-and-ball.md)). **Axis 1 — the phase**: a meguri-engaged issue always carries exactly one phase label, from queued right through to close. **Axis 2 — the ball** (who holds it): these layer *on top of* the phase without removing it, so "who's stuck" and "where it's stuck" are both legible. The upshot: **an unlabeled issue means one thing — untriaged** (you decide whether a human or meguri takes it), and filtering on 🔴 `meguri:needs-human` gives you a clean human-TODO list.
+
+**Axis 1 — phase** (exactly one on an engaged issue):
+
+| label | color | meaning |
+|---|---|---|
+| `meguri:plan` | 🔵 blue | queued for the planner loop (opt-in spec-first flow; you apply it) |
+| `meguri:speccing` | 🟣 purple | a spec PR is open (reviewing / ready detail lives on the PR) |
+| `meguri:ready` | 🔵 blue | queued for the worker loop (you apply it, or set after spec approval) |
+| `meguri:implementing` | 🟢 green | an implementation PR is open (CI fixing, review, awaiting merge included) |
+
+**Axis 2 — ball / who holds it** (layered on top of the phase; none = waiting on a loop's next poll):
+
+| label | color | meaning |
+|---|---|---|
+| `meguri:working` | 🟡 yellow | an agent is working on it right now (the claim) |
+| `meguri:needs-human` | 🔴 red | a human needs to look; a comment explains why (the phase label stays, so you can see *whether it stalled in spec or in implementation*) |
+| `meguri:hold` | ⚪ grey | intentionally paused by a human; discovery skips it |
+
+Plus one bookkeeping label: `meguri:clean-report` marks the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep).
+
+The **PR side** stays as it was: a spec PR carries `meguri:spec-reviewing` (awaiting review) then `meguri:spec-ready` (review passed; implementation continues) — these live on the PR, independent of the issue's phase label. CI-red and merge-readiness aren't mirrored to labels (GitHub shows them natively); a `meguri:awaiting-merge` PR label can be added later if needed.
+
+New meguri labels are created with their scheme color automatically. If a label was created before this scheme (all generic blue), recolor it once with `gh label edit <name> --color <hex>` (e.g. `gh label edit meguri:implementing --color 0E8A16`) — meguri does not recolor existing labels on every sweep, so it never clobbers a color you set on purpose.
 
 Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an issue *blocked by* another is skipped — silently, no label or comment — until every blocker is closed as **completed**. Blockers closed as *not planned* / *duplicate* don't count as resolved (the dependent issue awaits human re-triage), and unreadable blockers are treated as unresolved.
 
