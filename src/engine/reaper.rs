@@ -91,7 +91,7 @@ impl IssueStates {
         if let Some(state) = self.0.get(&issue) {
             return *state;
         }
-        let state = match deps.forge.issue_state(issue).await {
+        let state = match deps.forge().issue_state(issue).await {
             Ok(state) => Some(state),
             Err(e) => {
                 tracing::warn!("cannot resolve state of issue #{issue}: {e:#}");
@@ -172,13 +172,21 @@ async fn classify(
         verdict,
     };
 
-    let Some(issue_number) = issue else {
-        return Ok(candidate(Verdict::Orphan));
-    };
     // An active run owns its worktree; don't even ask the forge.
     if runs.iter().any(|r| r.status.is_active()) {
         return Ok(candidate(Verdict::ActiveRun));
     }
+    // Local mode (no forge): there is no issue lifecycle to consult, and a
+    // `deliver = "branch"` deliverable *is* the branch + worktree — so the
+    // Phase 1 reaper never auto-reclaims it. It parks as StateUnknown until
+    // `meguri accept` (issue #54 Phase 2) designs the reclaim conditions.
+    if deps.forge.is_none() {
+        return Ok(candidate(Verdict::StateUnknown));
+    }
+
+    let Some(issue_number) = issue else {
+        return Ok(candidate(Verdict::Orphan));
+    };
     match states.get(deps, issue_number).await {
         Some(IssueState::Open) => return Ok(candidate(Verdict::Open)),
         Some(IssueState::Closed) => {}
@@ -304,7 +312,13 @@ async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool
         }
         Err(e) => e,
     };
-    match deps.forge.pr_for_branch(branch).await {
+    // No forge (local mode): the offline ancestor check is all we have, and it
+    // said unmerged — keep the branch (its verified commits are the deliverable).
+    let Some(forge) = deps.forge.as_ref() else {
+        tracing::warn!("keeping branch {branch}: no forge to check PR merge state (local mode)");
+        return false;
+    };
+    match forge.pr_for_branch(branch).await {
         Ok(Some(pr)) if pr.state == "merged" => {
             match gitops::delete_branch(
                 &deps.project.repo_path,

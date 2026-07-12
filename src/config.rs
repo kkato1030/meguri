@@ -38,6 +38,8 @@ repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
 # default_branch = "main"
 # check_command = "cargo test"
+# mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、成果物はローカルブランチ)。
+                      # `meguri add "タスク"` で投入。詳細は README を参照。
 
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
@@ -518,13 +520,57 @@ fn default_notifications_throttle() -> u64 {
     60
 }
 
+/// How a project coordinates work: through GitHub labels (the default), or
+/// entirely locally against a sqlite `tasks` table. `silent` (issue #54
+/// Phase 2 — read issues but never write labels/comments) is not implemented
+/// yet, so it is deliberately not a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectMode {
+    /// Current behavior: labels are the queue/claim/escalation.
+    #[default]
+    Github,
+    /// No GitHub at all: `meguri add` queues local tasks; state is local.
+    Local,
+}
+
+impl ProjectMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// The shape of a run's deliverable. `patch` (issue #54 Phase 2) is accepted
+/// by the config but not yet implemented by the flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Deliver {
+    /// Push the branch and open a pull request (github default).
+    Pr,
+    /// Leave the verified commits on a local branch; no push, no PR.
+    Branch,
+    /// `git format-patch` into `.meguri/out/` (Phase 2).
+    Patch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
     /// Absolute path to the primary clone.
     pub repo_path: PathBuf,
-    /// "owner/repo" on GitHub.
-    pub repo_slug: String,
+    /// "owner/repo" on GitHub. Optional: required unless `mode = "local"`.
+    #[serde(default)]
+    pub repo_slug: Option<String>,
+    /// Coordination mode (see [`ProjectMode`]).
+    #[serde(default)]
+    pub mode: ProjectMode,
+    /// Deliverable shape (see [`Deliver`]). Defaults by mode: `pr` for
+    /// github, `branch` for local — resolved via [`Config::deliver_for`].
+    #[serde(default)]
+    pub deliver: Option<Deliver>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -572,15 +618,34 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Reject values that would otherwise no-op silently (issue #92:
-    /// `keep_pane = "on-failure"` used to be treated as the default).
+    /// Reject config that would otherwise fail confusingly at run time:
+    /// - a `keep_pane` value that used to no-op silently (issue #92).
+    /// - a non-local project without a `repo_slug` (nothing to talk to on
+    ///   GitHub), and a local project asking to `deliver = "pr"` (no push
+    ///   target) (issue #54).
     fn validate(&self) -> Result<()> {
         match self.mux.keep_pane.as_str() {
-            "until-issue-closed" | "never" => Ok(()),
+            "until-issue-closed" | "never" => {}
             other => anyhow::bail!(
                 "mux.keep_pane = {other:?} is not supported (use \"until-issue-closed\" or \"never\")"
             ),
         }
+        for p in &self.projects {
+            if p.mode != ProjectMode::Local && p.repo_slug.is_none() {
+                anyhow::bail!(
+                    "project {:?} has mode = {:?} but no repo_slug (required unless mode = \"local\")",
+                    p.id,
+                    p.mode.as_str()
+                );
+            }
+            if p.mode == ProjectMode::Local && p.deliver == Some(Deliver::Pr) {
+                anyhow::bail!(
+                    "project {:?} is mode = \"local\" but deliver = \"pr\" (local has no push target)",
+                    p.id
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
@@ -595,6 +660,18 @@ impl Config {
     /// Effective deliverable language for a project (project override wins).
     pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
         project.language.as_deref().or(self.language.as_deref())
+    }
+
+    /// Effective deliverable shape for a project. An explicit `deliver` wins;
+    /// otherwise the default is mode-dependent — `branch` for local (its only
+    /// Phase 1 value), `pr` for github. Splitting the default by mode avoids
+    /// the "default pr + local forbids pr" trap that would force every local
+    /// project to spell out `deliver`.
+    pub fn deliver_for(&self, project: &ProjectConfig) -> Deliver {
+        project.deliver.unwrap_or(match project.mode {
+            ProjectMode::Local => Deliver::Branch,
+            ProjectMode::Github => Deliver::Pr,
+        })
     }
 
     /// Effective cleaner settings for a project (project override wins).
@@ -986,7 +1063,7 @@ language = "English"
         let cfg = Config::load_from(&path).unwrap();
 
         let p = cfg.project("myproj").unwrap();
-        assert_eq!(p.repo_slug, "owner/repo");
+        assert_eq!(p.repo_slug.as_deref(), Some("owner/repo"));
         assert_eq!(p.default_branch, "main");
         assert_eq!(p.check_command, None);
 
@@ -1251,5 +1328,67 @@ check_command = "cargo test"
         let p = cfg.project("demo").unwrap();
         assert_eq!(p.default_branch, "main");
         assert_eq!(p.check_command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn mode_defaults_to_github_and_parses_local() {
+        let cfg: Config = toml::from_str(
+            "[[projects]]\nid = \"g\"\nrepo_path = \"/tmp/g\"\nrepo_slug = \"me/g\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.project("g").unwrap().mode, ProjectMode::Github);
+
+        let cfg: Config =
+            toml::from_str("[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n")
+                .unwrap();
+        assert_eq!(cfg.project("l").unwrap().mode, ProjectMode::Local);
+    }
+
+    #[test]
+    fn deliver_default_is_mode_dependent() {
+        // github without an explicit deliver → pr; local → branch.
+        let cfg: Config = toml::from_str(
+            "[[projects]]\nid = \"g\"\nrepo_path = \"/tmp/g\"\nrepo_slug = \"me/g\"\n\
+             [[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.deliver_for(cfg.project("g").unwrap()), Deliver::Pr);
+        assert_eq!(cfg.deliver_for(cfg.project("l").unwrap()), Deliver::Branch);
+    }
+
+    #[test]
+    fn local_project_loads_without_repo_slug() {
+        // Acceptance criterion 1: a local project needs no repo_slug.
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.project("l").unwrap().repo_slug, None);
+    }
+
+    #[test]
+    fn non_local_without_repo_slug_is_rejected() {
+        let raw = "[[projects]]\nid = \"g\"\nrepo_path = \"/tmp/g\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("repo_slug"), "{err}");
+    }
+
+    #[test]
+    fn local_with_deliver_pr_is_rejected() {
+        // Acceptance criterion 1: local + pr has no push target.
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\n\
+                   mode = \"local\"\ndeliver = \"pr\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("deliver"), "{err}");
+    }
+
+    #[test]
+    fn local_with_deliver_branch_is_accepted() {
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\n\
+                   mode = \"local\"\ndeliver = \"branch\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.deliver_for(cfg.project("l").unwrap()), Deliver::Branch);
     }
 }

@@ -33,6 +33,7 @@ use super::flow::{self, Checkpoint, Flavor, PreparedWork};
 use super::{Deps, Target, canonical_key, open_pr_for_issue};
 use crate::forge::{self, CheckRollup, CheckState, PullRequest};
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for ci-fixer runs.
@@ -89,15 +90,18 @@ impl super::Loop for CiFixerLoop {
     /// needs-human guard runs before the rollup poll, so the escalation
     /// fires once and later sweeps skip the PR cheaply.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
+        for pr in deps.forge().list_open_prs().await? {
             if pr_is_ci_fixable(&pr).is_some()
                 || pr.has_label(forge::LABEL_WORKING)
                 || pr.has_label(forge::LABEL_NEEDS_HUMAN)
             {
                 continue;
             }
-            if deps.forge.pr_check_rollup(pr.number).await?.state() != CheckState::Failure {
+            if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Failure {
                 continue;
             }
             let issue = canonical_key(&pr);
@@ -110,7 +114,7 @@ impl super::Loop for CiFixerLoop {
                 continue;
             }
             targets.push(Target {
-                issue_number: issue,
+                key: TaskKey::Issue(issue),
                 title: pr.title,
             });
         }
@@ -131,11 +135,11 @@ pub async fn run_ci_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
 /// other escalations; the label is what stops rediscovery.
 async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
     let _ = deps
-        .forge
+        .forge()
         .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
         .await;
     let _ = deps
-        .forge
+        .forge()
         .pr_comment(
             pr.number,
             &format!(
@@ -222,7 +226,7 @@ impl Flavor for CiFixerFlavor {
                 forge::LABEL_NEEDS_HUMAN
             )));
         }
-        let rollup = deps.forge.pr_check_rollup(pr.number).await?;
+        let rollup = deps.forge().pr_check_rollup(pr.number).await?;
         if rollup.state() != CheckState::Failure {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{}'s CI is no longer failing",
@@ -232,12 +236,12 @@ impl Flavor for CiFixerFlavor {
         // Logs are context, not the trigger: a fetch failure must not stall
         // the fix (the agent can query CI itself from the prompt's hints).
         let logs = deps
-            .forge
+            .forge()
             .pr_failed_check_logs(pr.number)
             .await
             .unwrap_or_else(|e| format!("(fetching the failed job logs failed: {e:#})"));
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store.emit(
@@ -336,7 +340,7 @@ impl Flavor for CiFixerFlavor {
             .pr_number
             .context("ci-fixer checkpoint has no PR number")?;
         let _ = deps
-            .forge
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -346,7 +350,7 @@ impl Flavor for CiFixerFlavor {
                 ),
             )
             .await;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -355,7 +359,7 @@ impl Flavor for CiFixerFlavor {
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
         if let Some(pr) = flow::claimed_pr(deps, &run.id) {
-            deps.forge
+            deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
@@ -370,10 +374,13 @@ impl Flavor for CiFixerFlavor {
             flow::escalate_on_forge(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -512,23 +519,25 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-                clean: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

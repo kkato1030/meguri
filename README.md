@@ -90,6 +90,34 @@ meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
+### Local mode (no GitHub, no labels)
+
+For repos whose labels you can't (or won't) touch, run a project **entirely locally**: the task queue, claim, escalation, and completion live in meguri's sqlite instead of GitHub labels, and the deliverable is a verified local branch instead of a PR. Set `mode = "local"` — `repo_slug` becomes optional and `meguri doctor` stops requiring `gh`:
+
+```toml
+[[projects]]
+id = "work"
+repo_path = "/abs/path/to/repo"
+mode = "local"          # "github" (default) | "local"
+default_branch = "main"
+check_command = "cargo test"
+# deliver = "branch"    # local default: verified commits on a local branch (no push, no PR)
+```
+
+Queue and track work with the local task commands instead of labels:
+
+```bash
+meguri add "Add a --json flag to the export command"   # queue a task
+meguri add --file task.md                              # first heading → title, rest → body
+meguri add --plan "Design the export format"           # queue for the planner instead of the worker
+meguri tasks                                           # list open tasks (needs_human highlighted)
+meguri watch                                           # picks tasks up within one poll interval
+```
+
+A local run works on a `meguri/t<task-id>-<slug>-<hash>` branch; on success it leaves the verified commits there and flips the task to `done` — nothing is pushed. A failed run marks the task `needs_human` with a reason (shown by `meguri tasks` / `meguri ps`), and the next run re-claims it and clears the flag. Review the branch yourself and merge when happy (`meguri review` / `accept` land in a later phase).
+
+> **Single machine only (through Phase 3).** Local mode's local sqlite is the *single source of truth*, so run exactly one meguri host per repo. Coordinating several hosts against a shared task queue is Phase 4 (a remote-DB `TaskSource` with leases); the vocabulary and contract are fixed in [ADR 0003](docs/adr/0003-tasksource-task-moves-run-pins.md). The `silent` mode (read issues, never write labels), `deliver = "patch"`, and `meguri review`/`accept`/`reject` are later phases too.
+
 ### Keep it running (daemon)
 
 `meguri watch` stays in the foreground; to survive closing the shell, detach it:

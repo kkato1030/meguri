@@ -109,6 +109,9 @@ fn short_sha(head_sha: &str) -> &str {
 /// Watch-poll sweep: arm auto-merge on every eligible open meguri PR. A
 /// per-PR failure warns and is retried next poll; it never aborts the sweep.
 pub async fn sweep(deps: &Deps) -> Result<()> {
+    if deps.forge.is_none() {
+        return Ok(()); // no forge, no PRs to arm (local mode)
+    }
     let am = deps.config.pr_for(&deps.project).auto_merge.clone();
     if !am.enabled {
         return Ok(());
@@ -116,7 +119,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     // Fetched at most once per sweep (only when a candidate reaches
     // condition 7), then reused for every candidate in the same project.
     let mut policy: Option<MergePolicy> = None;
-    for pr in deps.forge.list_open_prs().await? {
+    for pr in deps.forge().list_open_prs().await? {
         if let Err(e) = process_pr(deps, &am, &pr, &mut policy).await {
             tracing::warn!("auto-merge sweep failed for PR #{}: {e:#}", pr.number);
         }
@@ -152,14 +155,14 @@ async fn process_pr(
     // 5: idempotency / human-override marker for the current head. Placed
     // before the GraphQL thread fetch so steady-state armed PRs cost one
     // comments read, not a review-threads query, each poll.
-    let comments = deps.forge.pr_comments(pr.number).await?;
+    let comments = deps.forge().pr_comments(pr.number).await?;
     if head_already_armed(&comments, &pr.head_sha) {
         return Ok(());
     }
     // 6: zero unresolved review threads. Stricter than `thread_awaits_fixer`:
     // a fixer reply parks a thread but does not mean the reviewer accepted, so
     // we require actual resolution before arming.
-    let threads = deps.forge.list_review_threads(pr.number).await?;
+    let threads = deps.forge().list_review_threads(pr.number).await?;
     if threads.iter().any(|t| !t.resolved) {
         return Ok(());
     }
@@ -168,7 +171,7 @@ async fn process_pr(
     // warn and skip rather than error.
     if policy.is_none() {
         *policy = Some(
-            deps.forge
+            deps.forge()
                 .merge_policy(&deps.project.default_branch, am.require_branch_protection)
                 .await?,
         );
@@ -202,7 +205,7 @@ async fn opted_in(
     }
     // The worker copies the label onto the PR, but fall back to the issue for
     // PRs opened before that or where the copy did not land.
-    let issue = deps.forge.get_issue(issue_number).await?;
+    let issue = deps.forge().get_issue(issue_number).await?;
     Ok(issue.has_label(forge::LABEL_AUTOMERGE))
 }
 
@@ -211,13 +214,13 @@ async fn opted_in(
 /// also converges.
 async fn arm(deps: &Deps, am: &AutoMergeConfig, pr: &PullRequest) -> Result<()> {
     if pr.is_draft {
-        deps.forge.mark_pr_ready(pr.number).await?;
+        deps.forge().mark_pr_ready(pr.number).await?;
         deps.store
             .emit(None, "pr.readied", json!({ "pr": pr.number }))?;
     }
 
     let (body, kind) = match deps
-        .forge
+        .forge()
         .enable_auto_merge(pr.number, am.strategy, &pr.head_sha)
         .await?
     {
@@ -230,7 +233,7 @@ async fn arm(deps: &Deps, am: &AutoMergeConfig, pr: &PullRequest) -> Result<()> 
             // green): no block to reserve against, so we finalize on GitHub's
             // verdict. `--match-head-commit` guarantees only the confirmed
             // head merges (ADR 0003).
-            deps.forge
+            deps.forge()
                 .merge_pr(pr.number, am.strategy, &pr.head_sha)
                 .await?;
             (
@@ -242,7 +245,7 @@ async fn arm(deps: &Deps, am: &AutoMergeConfig, pr: &PullRequest) -> Result<()> 
 
     // The marker is head-keyed, so the same comment is the idempotency key for
     // both the arm and the merge path.
-    deps.forge.comment_pr(pr.number, &body).await?;
+    deps.forge().comment_pr(pr.number, &body).await?;
     deps.store.emit(
         None,
         kind,

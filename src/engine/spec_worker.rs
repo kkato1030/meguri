@@ -35,6 +35,7 @@ use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 
 /// `runs.loop_kind` value for spec-worker runs.
 pub const KIND: &str = "spec-worker";
@@ -55,8 +56,11 @@ impl super::Loop for SpecWorkerLoop {
     /// (avoids a second takeover when the label lingers; humans can force a
     /// rerun with `meguri run --issue N`).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let prs = deps
-            .forge
+            .forge()
             .list_prs_with_label(forge::LABEL_SPEC_READY)
             .await?;
         let mut targets = Vec::new();
@@ -77,7 +81,7 @@ impl super::Loop for SpecWorkerLoop {
                 continue;
             }
             targets.push(Target {
-                issue_number: issue,
+                key: TaskKey::Issue(issue),
                 title: pr.title,
             });
         }
@@ -96,7 +100,7 @@ pub async fn run_spec_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome>
 /// The open spec-ready PR whose head branch encodes `issue`, if any.
 async fn spec_ready_pr(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
     Ok(deps
-        .forge
+        .forge()
         .list_prs_with_label(forge::LABEL_SPEC_READY)
         .await?
         .into_iter()
@@ -143,7 +147,7 @@ impl Flavor for SpecWorkerFlavor {
                 forge::LABEL_WORKING
             )));
         }
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store.emit(
@@ -160,16 +164,16 @@ impl Flavor for SpecWorkerFlavor {
         // remove are idempotent, so a resumed run re-running this is safe. The
         // add is load-bearing (the unlabeled = untriaged invariant); the remove
         // is best-effort.
-        deps.forge
+        deps.forge()
             .add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
             .await?;
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_SPECCING)
             .await
             .ok();
 
         // The prompt carries the issue (what to build) plus the spec (how).
-        let issue = deps.forge.get_issue(run.issue_number).await?;
+        let issue = deps.forge().get_issue(run.issue_number).await?;
         cp.issue_title = issue.title;
         cp.issue_body = issue.body;
         cp.head_branch = Some(pr.head_branch);
@@ -286,10 +290,10 @@ impl Flavor for SpecWorkerFlavor {
         let pr = cp
             .pr_number
             .context("spec-worker checkpoint has no PR number")?;
-        deps.forge
+        deps.forge()
             .update_pr_title(pr, &self.pr_title(run, cp))
             .await?;
-        deps.forge
+        deps.forge()
             .update_pr_body(pr, &flow::compose_pr_body(run, cp))
             .await?;
         deps.store.emit(
@@ -310,10 +314,10 @@ impl Flavor for SpecWorkerFlavor {
         let pr = cp
             .pr_number
             .context("spec-worker checkpoint has no PR number")?;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_SPEC_READY)
             .await?;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -323,7 +327,7 @@ impl Flavor for SpecWorkerFlavor {
     /// The claim marker lives on the PR, not the issue.
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
         if let Some(pr) = claimed_pr(deps, &run.id) {
-            deps.forge
+            deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
@@ -448,23 +452,25 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                language: None,
-                check_command: None,
-                worktree_root: None,
-                pr: None,
-                clean: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }
