@@ -333,8 +333,12 @@ pub fn cmd_ps(all: bool) -> Result<()> {
     Ok(())
 }
 
-/// Label of the herdr tab / tmux window `meguri top` tiles panes into.
-const TOP_DASHBOARD_LABEL: &str = "meguri:top";
+/// Label of the dedicated dashboard workspace/session `meguri top` builds.
+/// Derived from the configured session so it stays distinct from the agent
+/// workspace and aligns with future per-project workspace separation.
+fn top_label(session: &str) -> String {
+    format!("{session}:top")
+}
 
 /// One row of the `meguri top` status header — one active run and its pane.
 struct TopRow {
@@ -367,10 +371,31 @@ fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
     now.saturating_sub(then) < poll_interval_secs * 2 + 30
 }
 
+/// Resolve the pane an active run drives, following the same precedence as
+/// [`resolve_attach_pane`]: the issue's persistent lane pane (panes table) wins
+/// over the pane id a run once recorded, which can be a stale start-of-run
+/// snapshot. The lane comes from the run's loop kind (the reviewer keeps its
+/// own `review` lane). Returns `(mux_kind, pane_id)`, or `None` when the run
+/// has no pane yet.
+fn run_pane(store: &Store, run: &RunRecord) -> Result<Option<(String, String)>> {
+    let role = engine::role_for_loop(&run.loop_kind);
+    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
+        && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
+    {
+        return Ok(Some((kind, id)));
+    }
+    if let (Some(kind), Some(id)) = (&run.mux_kind, &run.mux_pane_id) {
+        return Ok(Some((kind.clone(), id.clone())));
+    }
+    Ok(None)
+}
+
 /// One refresh: tile any newly-appeared live run panes into the dashboard and
 /// collect the status rows. `tiled` remembers panes already moved so each is
 /// joined exactly once; dead/finished panes are pruned so a reused pane id
 /// re-tiles cleanly. Runs on a different mux than the one we drive are skipped.
+/// Panes are resolved via the panes table ([`run_pane`]), not the run's
+/// start-of-run snapshot, so stale ids no longer read as all-`unknown`.
 async fn top_refresh(
     store: &Store,
     mux: &Arc<dyn mux::Multiplexer>,
@@ -384,23 +409,27 @@ async fn top_refresh(
     let mut live_panes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for run in &runs {
-        let (Some(rk), Some(pid)) = (run.mux_kind.as_deref(), run.mux_pane_id.as_deref()) else {
+        let Some((rk, pid)) = run_pane(store, run)? else {
             continue;
         };
         if rk != kind {
             continue;
         }
-        live_panes.insert(pid.to_string());
-        let pane = mux::PaneId(pid.to_string());
+        // 1 issue = 1 pane: several active runs on the same issue resolve to
+        // the same pane, so dedup keeps one row and tiles it once.
+        if !live_panes.insert(pid.clone()) {
+            continue;
+        }
+        let pane = mux::PaneId(pid.clone());
         let alive = mux.pane_alive(&pane).await.unwrap_or(false);
         if alive
-            && !tiled.contains(pid)
+            && !tiled.contains(&pid)
             && mux
                 .tile_pane(&pane, dashboard, mux::Split::Down)
                 .await
                 .is_ok()
         {
-            tiled.insert(pid.to_string());
+            tiled.insert(pid.clone());
         }
         let agent = if alive {
             mux.agent_state(&pane)
@@ -417,7 +446,7 @@ async fn top_refresh(
             issue: run.issue_number,
             interaction: run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             agent: agent.as_str(),
-            pane: pid.to_string(),
+            pane: pid.clone(),
             awaiting_human,
         });
     }
@@ -474,23 +503,87 @@ fn render_top(status: &TopStatus, attach_hint: &str) -> String {
     out
 }
 
-/// `meguri top` — tile the live agent panes into one mux tab and keep a status
-/// header refreshed above them. The layout commands only move panes between
-/// containers, so the orchestrator keeps driving each pane by id and the watch
-/// loop's prompt injection / result verification continue uninterrupted.
+/// argv of the internal status-render loop (`meguri top-status`) that runs
+/// inside the dashboard's status pane, pinned to the same mux and dashboard the
+/// outer `meguri top` set up.
+fn top_status_argv(
+    kind: &str,
+    dashboard: &mux::DashboardId,
+    interval_secs: u64,
+) -> Result<Vec<String>> {
+    let exe = std::env::current_exe().context("locating the meguri binary")?;
+    Ok(vec![
+        exe.to_string_lossy().into_owned(),
+        "top-status".into(),
+        "--mux".into(),
+        kind.into(),
+        "--dashboard".into(),
+        dashboard.0.clone(),
+        "--interval".into(),
+        interval_secs.to_string(),
+    ])
+}
+
+/// `meguri top` — build (once) a dedicated dashboard workspace/session holding
+/// a status pane plus the tiled live agent panes, then `exec`-attach the caller
+/// to it so the screen is immediately visible. The status-render loop lives in
+/// the status pane (`meguri top-status`), not this process; here we only set it
+/// up and hand the terminal over — mirroring `cmd_attach`. The layout only
+/// moves panes between containers, so the orchestrator keeps driving each pane
+/// by id and the watch loop continues uninterrupted.
 pub async fn cmd_top(mux_override: Option<&str>, interval_secs: u64) -> Result<()> {
     let cfg = Config::load()?;
-    let store = open_store()?;
-    // `meguri top` is the cross-project view: build on the base workspace (no
-    // project) and pull each project's panes in by id — `tile_pane` moves panes
-    // across workspaces/sessions, so it reaches every project's workspace.
+    // Cross-project view: build on the base workspace (no project); the
+    // dashboard is a separate dedicated workspace/session either way.
     let mux = mux::detect(
         mux_override.unwrap_or(&cfg.mux.kind),
         &cfg.mux.session,
         None,
     )?;
+    // The base workspace must exist first (the dashboard is separate).
     mux.ensure_session().await?;
-    let dashboard = mux.ensure_dashboard(TOP_DASHBOARD_LABEL).await?;
+    let label = top_label(&cfg.mux.session);
+    let dashboard = mux.ensure_dashboard(&label).await?;
+    // Start the render loop only on a fresh dashboard, so re-running `meguri
+    // top` just re-attaches instead of double-driving the header.
+    if dashboard.fresh
+        && let Some(status_pane) = &dashboard.status_pane
+    {
+        let argv = top_status_argv(mux.kind().as_str(), &dashboard.tile, interval_secs)?;
+        mux.run_in_pane(status_pane, &argv).await?;
+    }
+
+    let attach = mux.dashboard_attach_command(&dashboard.tile);
+    println!("attaching: {attach}");
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&attach)
+        .exec();
+    bail!("exec failed: {err}");
+}
+
+/// `meguri top-status` (internal) — the render loop that runs inside a
+/// dashboard's status pane: tile any newly live agent panes into `dashboard`
+/// and refresh the status header in place on its own terminal. Not for humans
+/// (hidden subcommand); `meguri top` launches it.
+pub async fn cmd_top_status(
+    mux_override: Option<&str>,
+    dashboard: &str,
+    interval_secs: u64,
+) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    // `meguri top` is the cross-project view: build on the base workspace (no
+    // project) so `tile_pane` can move every project's panes into the dashboard
+    // by id, reaching across the per-project workspaces/sessions. The dashboard
+    // itself was created by the outer `cmd_top`; here we only tile into it.
+    let mux = mux::detect(
+        mux_override.unwrap_or(&cfg.mux.kind),
+        &cfg.mux.session,
+        None,
+    )?;
+    let dashboard = mux::DashboardId(dashboard.to_string());
     let attach_hint = mux.dashboard_attach_command(&dashboard);
 
     let interval = Duration::from_secs(interval_secs.max(1));
@@ -556,14 +649,11 @@ pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
 fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
     let wanted_role = if review { ROLE_REVIEW } else { ROLE_AUTHOR };
     if let Some(run) = store.find_run(needle)? {
-        let role = engine::role_for_loop(&run.loop_kind);
-        if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
-            && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
-        {
-            return Ok((kind, id));
-        }
-        if let (Some(kind), Some(id)) = (&run.mux_kind, &run.mux_pane_id) {
-            return Ok((kind.clone(), id.clone()));
+        // `run_pane` derives the run's lane from its loop kind, so a review-lane
+        // run resolves its review pane and everything else the author pane —
+        // `--review` only matters for the bare-issue-number path below.
+        if let Some(pane) = run_pane(store, &run)? {
+            return Ok(pane);
         }
         bail!("run {} has no pane yet", run.id);
     }
@@ -735,6 +825,81 @@ mod tests {
         assert!(out.contains("▶ run-bbbb"), "awaiting run gets a marker");
         assert!(out.contains("#42"));
         assert!(out.contains("herdr tab focus wD:t9"));
+    }
+
+    #[tokio::test]
+    async fn top_refresh_resolves_panes_from_table_and_dedups() {
+        use crate::mux::fake::FakeMux;
+
+        let store = Store::open_in_memory().unwrap();
+        let fake = Arc::new(FakeMux::new(true)); // kind() == tmux
+        let mux: Arc<dyn mux::Multiplexer> = fake.clone();
+
+        // The panes table holds the *live* ids; the runs carry stale snapshots.
+        fake.register_live_pane("wD:pN");
+        fake.register_live_pane("wD:pR");
+
+        // Issue 7: two active runs share one pane (worker + fixer).
+        let r1 = store.create_run("demo", 7, "t").unwrap();
+        store
+            .update_run_mux(&r1.id, "tmux", "meguri", "wD:pStale1")
+            .unwrap();
+        let r2 = store.create_run_for_loop("demo", "fixer", 7, "t").unwrap();
+        store
+            .update_run_mux(&r2.id, "tmux", "meguri", "wD:pStale2")
+            .unwrap();
+        store
+            .upsert_pane(
+                "demo",
+                7,
+                ROLE_AUTHOR,
+                "tmux",
+                "meguri",
+                "wD:pN",
+                "/wt/demo/7",
+            )
+            .unwrap();
+
+        // Issue 8: one run, also stale snapshot vs the table's live pane.
+        let r3 = store.create_run("demo", 8, "t").unwrap();
+        store
+            .update_run_mux(&r3.id, "tmux", "meguri", "wD:pStale3")
+            .unwrap();
+        store
+            .upsert_pane(
+                "demo",
+                8,
+                ROLE_AUTHOR,
+                "tmux",
+                "meguri",
+                "wD:pR",
+                "/wt/demo/8",
+            )
+            .unwrap();
+
+        let dashboard = mux::DashboardId("dash".into());
+        let mut tiled = std::collections::HashSet::new();
+        let status = top_refresh(&store, &mux, &dashboard, &mut tiled, 60)
+            .await
+            .unwrap();
+
+        // One row per pane (issue 7's two runs collapse), from the panes table.
+        let mut panes: Vec<&str> = status.rows.iter().map(|r| r.pane.as_str()).collect();
+        panes.sort_unstable();
+        assert_eq!(panes, vec!["wD:pN", "wD:pR"]);
+        // The stale run snapshots are never touched.
+        assert!(!panes.iter().any(|p| p.contains("Stale")));
+        // Live panes read as working, not unknown (the #104 regression).
+        assert!(status.rows.iter().all(|r| r.agent == "working"));
+
+        // Each live pane tiled exactly once, by its table id.
+        let mut tiled_ids: Vec<String> = fake
+            .tiled_panes()
+            .into_iter()
+            .map(|(p, _, _)| p.0)
+            .collect();
+        tiled_ids.sort_unstable();
+        assert_eq!(tiled_ids, vec!["wD:pN".to_string(), "wD:pR".to_string()]);
     }
 
     #[test]

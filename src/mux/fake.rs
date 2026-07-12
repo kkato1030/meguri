@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 
 use super::{
-    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
-    PaneSpec, Split,
+    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
+    PaneId, PaneSpec, Split,
 };
 
 #[derive(Debug)]
@@ -34,6 +34,10 @@ pub struct FakeMux {
     dead_spawn_matching: Mutex<Option<String>>,
     /// Panes tiled into a dashboard, in tile order (for `meguri top` tests).
     tiled: Mutex<Vec<(PaneId, DashboardId, Split)>>,
+    /// Dashboards created so far, keyed by label (idempotency for `top`).
+    dashboards: Mutex<HashMap<String, DashboardId>>,
+    /// Commands launched via `run_in_pane`, in call order.
+    ran_in_pane: Mutex<Vec<(PaneId, Vec<String>)>>,
 }
 
 impl FakeMux {
@@ -45,6 +49,8 @@ impl FakeMux {
             spawn_log: Mutex::new(Vec::new()),
             dead_spawn_matching: Mutex::new(None),
             tiled: Mutex::new(Vec::new()),
+            dashboards: Mutex::new(HashMap::new()),
+            ran_in_pane: Mutex::new(Vec::new()),
         }
     }
 
@@ -103,6 +109,30 @@ impl FakeMux {
     /// Panes that were tiled into a dashboard, in tile order.
     pub fn tiled_panes(&self) -> Vec<(PaneId, DashboardId, Split)> {
         self.tiled.lock().unwrap().clone()
+    }
+
+    /// Commands launched into a pane via `run_in_pane`, in call order.
+    pub fn ran_in_pane(&self) -> Vec<(PaneId, Vec<String>)> {
+        self.ran_in_pane.lock().unwrap().clone()
+    }
+
+    /// Register a live pane with an explicit id (for `top` pane-resolution
+    /// tests that must line up with panes-table rows). Returns the id.
+    pub fn register_live_pane(&self, id: &str) -> PaneId {
+        let pane = PaneId(id.to_string());
+        self.panes.lock().unwrap().insert(
+            pane.clone(),
+            FakePane {
+                spec_title: String::new(),
+                spec_command: Vec::new(),
+                sent_lines: Vec::new(),
+                state: AgentState::Working,
+                alive: true,
+                tail: Vec::new(),
+                agent_session: None,
+            },
+        );
+        pane
     }
 }
 
@@ -212,8 +242,34 @@ impl Multiplexer for FakeMux {
         format!("echo fake pane {pane}")
     }
 
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
-        Ok(DashboardId(format!("fake-dash:{label}")))
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
+        let tile = {
+            let mut dashboards = self.dashboards.lock().unwrap();
+            if let Some(tile) = dashboards.get(label) {
+                return Ok(Dashboard {
+                    tile: tile.clone(),
+                    status_pane: None,
+                    fresh: false,
+                });
+            }
+            let tile = DashboardId(format!("fake-dash:{label}"));
+            dashboards.insert(label.to_string(), tile.clone());
+            tile
+        };
+        let status = self.register_live_pane(&format!("fake-status:{label}"));
+        Ok(Dashboard {
+            tile,
+            status_pane: Some(status),
+            fresh: true,
+        })
+    }
+
+    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
+        self.ran_in_pane
+            .lock()
+            .unwrap()
+            .push((pane.clone(), argv.to_vec()));
+        Ok(())
     }
 
     async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
