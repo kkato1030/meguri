@@ -81,7 +81,7 @@ meguri ps                 # runs, interaction state, panes
 meguri top                # 稼働中の agent ペインを 1 タブにタイル表示するダッシュボード
 meguri logs <run>         # event trail + live pane tail
 meguri attach <issue>     # issue の agent pane に入る（run id も可）
-meguri attach <issue> --review  # reviewer の独立 pane
+meguri attach <issue> --review  # spec reviewer の独立 pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -151,26 +151,28 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 ### spec 先行フロー（オプトイン）
 
-`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
+`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **spec reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
 
-### 実装レビュー（実装 diff の AI レビュー）
+### self-review（実装 diff の内部 AI レビュー）
 
-meguri の AI レビューは **spec PR と実装 diff の両方** を対象にします。meguri の実装 PR が静かになったら — CI が green、spec 系ラベルなし、fixer 待ちのレビュースレッドなし — **impl reviewer** ループが head を read-only でチェックアウトして diff をレビューします: 指摘は **inline のレビュースレッド**（+ マーカー入りサマリコメント）として投稿されます。これはまさに fixer の入力そのものなので、既存の review→fix の往復（ping-pong）が新しい機構なしでそのまま拾います。指摘なしならマーカー入りコメントだけが投稿され、何も反応しません。このループはラベルレスで、収束は三重に栓がされています（ADR 0004）: 同じ head は 1 回しかレビューされない（PR 上の隠し head-sha マーカー）、PR ごとのラウンド数に上限がある（`review.impl_max_rounds`）、そして clean 判定はスレッドを作りません。AI は approve も request-changes も決してしません — レビューは常に COMMENT のみで、**マージは人間の判断のまま**です。外部のレビュー bot を使っている場合は `review.impl_enabled = false` で止められます。
+実装 diff の AI レビューは **内部ループ**です（ADR 0006）: worker が PR を push する前に自分の diff をレビューするので、review→fix の往復は GitHub に一切触れません。`validate` と `open-pr` の間で worker は自分の worktree の中で self-review フェーズを回します — **review turn** が `git diff <base>...HEAD` をローカルで読んで `{verdict, findings[]}` を書き、findings があれば **fix turn** が潰して commit、プロジェクトの check を再実行し、review に戻ります。収束は forge マーカーではなく **ローカルのラウンドカウンタ**（`review.max_rounds`）で縛り、上限に達しても clean にならなければ **block せず** PR を公開します（人間の merge ゲートが最後の砦）。未収束のときだけ PR 本文にフッタ 1 行が付きます。投稿は一切なし: thread も comment もポーリングもありません — 人間には最初から自己レビュー済みの PR が届き、PR 会話は人間・外部レビュー専用の綺麗な場に保たれます。review turn は routing の `impl-reviewer` profile で走るので、fix を行う author とは別モデルにもできます。外部のレビュー bot を使っている場合は `review.enabled = false` で止められます。
+
+AI が thread を作らなくなるので、**fixer** の discover は自然と人間・外部 bot の thread だけを拾います — GitHub をレビュー transport に使うのは「人間が居る側」に限定されます。
 
 ### cleaner（read-only のリポジトリ巡回）
 
 **cleaner** ループは default branch の head を定期的に歩いて回り、蓄積した乖離 — spec と実装のずれ、dead code の候補、規約からの逸脱、置き去りの TODO、stale なリモートブランチ、孤児化した `meguri:working` ラベル — を `meguri:clean-report` ラベル付きの **1 本のレポート issue**（1 project = 1 issue）に書き留めます。修正は一切しません: 書き込みはこの issue の作成・更新だけで、push もブランチ操作も、他の issue / PR へのラベルやコメントもしません。本文は巡回のたびに完全に書き直されるスナップショットで、隠しマーカーの head sha により同じ head が二度走査されることはなく、head が進んでも `clean.interval_hours` を過ぎるまで次の巡回は走りません。検出項目を採用するなら通常の issue を切って `meguri:plan` / `meguri:ready` を付け、誤検知なら `clean.ignore` に部分文字列を足し、ループを止めたければレポート issue に `meguri:hold` を貼ってください。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。pane・claude session・worktree は **issue が寿命の単位**です — branch を編集するループ全員が共有する **author** pane が 1 枚（planner → worker/spec worker → fixer/ci fixer/conflict resolver が同じ live session で文脈を継ぐ）と、reviewer 専用の独立した **review** pane が 1 枚。turn が完了するたびにエージェントのネイティブ session id が issue の lane に保存されるので、idle 中に pane が死んでも次の run は同じ会話に `claude --resume <id>` で復帰します。watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。pane・claude session・worktree は **issue が寿命の単位**です — branch を編集するループ全員が共有する **author** pane が 1 枚（planner → worker/spec worker → fixer/ci fixer/conflict resolver が同じ live session で文脈を継ぐ）と、spec reviewer 専用の独立した **review** pane が 1 枚（さらに worker が self-review する間だけ一時的な **impl-review** pane）。turn が完了するたびにエージェントのネイティブ session id が issue の lane に保存されるので、idle 中に pane が死んでも次の run は同じ会話に `claude --resume <id>` で復帰します。watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
 
 ループ別の寿命の一覧:
 
 | loop | trigger | 鍵 | worktree | 正常終了 | pane 後始末 |
 |---|---|---|---|---|---|
 | planner (author) | `meguri:plan` issue | issue | 新 branch | spec PR 作成 → `spec-reviewing` | keep |
-| reviewer (review) | `spec-reviewing` PR / head 未レビュー | issue + `review` | read-only detached（`review-<issue>` 固定） | clean → `spec-ready` / findings → 据置 | keep（独立） |
+| spec reviewer (review) | `spec-reviewing` PR / head 未レビュー | issue + `review` | read-only detached（`review-<issue>` 固定） | clean → `spec-ready` / findings → 据置 | keep（独立） |
 | spec worker (author) | `spec-ready` PR | issue（branch 復元） | 既存 branch を継ぐ | 実装 → PR 更新 | keep・author pane を継ぐ |
-| worker (author) | `meguri:ready` issue | issue | 新 branch | PR `Closes #N` | keep |
+| worker (author) | `meguri:ready` issue | issue | 新 branch | self-review → PR `Closes #N` | keep |
 | fixer (author) | PR の未解決スレッド | issue（branch 復元） | PR head に attach | スレッドに再 review 依頼返信 | keep・author pane を継ぐ |
 | ci fixer (author) | meguri PR の CI 赤 | issue（branch 復元） | PR head に attach | fix push（≤3 round） | keep・author pane を継ぐ |
 | conflict resolver (author) | PR が Conflicting（≤3） | issue（branch 復元） | PR head に attach | base merge & 解消 → push | keep・author pane を継ぐ |
@@ -236,8 +238,9 @@ stale_branch_days = 30  # 最終コミットがこれより古いリモートブ
 ignore = []             # 誤検知を黙らせる部分文字列。プロジェクト単位は [projects.clean] で上書き
 
 [review]
-impl_enabled = true    # impl-reviewer ループ（実装 PR の AI レビュー）のキルスイッチ
-impl_max_rounds = 3    # PR ごとの impl レビューのラウンド上限。超えたら人間に委ねる
+enabled = true    # worker の self-review フェーズ（実装 diff の内部 AI レビュー）のキルスイッチ
+max_rounds = 3    # run ごとの self-review ラウンド上限。超えたら PR をそのまま公開する
+# （旧 impl_enabled / impl_max_rounds キーも alias として読み込めます）
 ```
 
 ## 開発
@@ -251,7 +254,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-GitHub 上で 9 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**impl reviewer**（静かで green な meguri の実装 PR → inline レビュースレッドとして AI レビューを投稿し fixer に流す）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。
+GitHub 上で 8 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → self-review → PR）、**planner**（`meguri:plan` issue → spec PR）、**spec reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。実装 diff の AI レビューはもうループではなく worker の内部フェーズ（**self-review**、ADR 0006）です: run の worktree の中で回り、forge には一切触れません。
 
 ## ライセンス
 

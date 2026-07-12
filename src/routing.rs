@@ -31,16 +31,44 @@ pub const GENERATED_AT: &str = "2026-07-12";
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// Loop kinds routing knows about (= `runs.loop_kind`). Explicit entries for
-/// anything outside this set are a startup error.
+/// Roles routing knows about. Most are loop kinds (= `runs.loop_kind`);
+/// `impl-reviewer` is not a loop but the profile of the worker's internal
+/// self-review turn (ADR 0006). Explicit entries for anything outside this
+/// set are a startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
-    "reviewer",
+    "spec-reviewer",
+    "impl-reviewer",
     "worker",
     "spec-worker",
     "fixer",
     "conflict-resolver",
 ];
+
+/// Deprecated routing role keys → their current name (issue #108). A config
+/// still using the old key resolves as if it named the new one.
+const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[("reviewer", "spec-reviewer")];
+
+/// Map a (possibly deprecated) config role key to its canonical name.
+fn canonical_role(role: &str) -> &str {
+    DEPRECATED_ROLE_ALIASES
+        .iter()
+        .find(|(old, _)| *old == role)
+        .map(|(_, new)| *new)
+        .unwrap_or(role)
+}
+
+/// Look up a canonical role in a user's `[routing.roles]` map, honoring the
+/// deprecated aliases (so `reviewer = …` still steers `spec-reviewer`).
+fn role_override<'a>(roles: &'a HashMap<String, String>, role: &str) -> Option<&'a String> {
+    if let Some(name) = roles.get(role) {
+        return Some(name);
+    }
+    DEPRECATED_ROLE_ALIASES
+        .iter()
+        .filter(|(_, new)| *new == role)
+        .find_map(|(old, _)| roles.get(*old))
+}
 
 /// The built-in profiles baked in alongside the recommendation table, so
 /// `[routing] mode = "auto"` works with no other config. A user
@@ -96,8 +124,9 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         // Small consumption, top leverage: best spec = fewest downstream turns.
         "planner" => &["claude-opus", DEFAULT_PROFILE],
         // Cross-vendor on purpose: reviewing with the author's model shares its
-        // blind spots (and spares the Claude quota).
-        "reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
+        // blind spots (and spares the Claude quota). Both the external spec
+        // reviewer and the worker's internal self-review turn key off this.
+        "spec-reviewer" | "impl-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
         // The bulk of consumption; Sonnet lands close to Opus on coding at
         // roughly half the quota/price.
         "worker" | "spec-worker" => &["claude-sonnet", DEFAULT_PROFILE],
@@ -153,7 +182,7 @@ pub fn resolve(cfg: &Config, role: &str, detect: &dyn Fn(&str) -> bool) -> Resul
         return Ok(DEFAULT_PROFILE.to_string());
     };
 
-    if let Some(name) = routing.roles.get(role) {
+    if let Some(name) = role_override(&routing.roles, role) {
         return Ok(name.clone());
     }
 
@@ -196,7 +225,7 @@ pub fn validate(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Result<()> {
     };
 
     for (role, profile_name) in &routing.roles {
-        if !KNOWN_ROLES.contains(&role.as_str()) {
+        if !KNOWN_ROLES.contains(&canonical_role(role)) {
             bail!(
                 "[routing.roles] has unknown role {role:?} — valid roles: {}",
                 KNOWN_ROLES.join(", "),
@@ -269,7 +298,10 @@ args = ["--yolo"]
 "#,
         );
         let never = |_: &str| panic!("detection must not run when profiles are inert");
-        assert_eq!(resolve(&cfg, "reviewer", &never).unwrap(), DEFAULT_PROFILE);
+        assert_eq!(
+            resolve(&cfg, "spec-reviewer", &never).unwrap(),
+            DEFAULT_PROFILE
+        );
         assert_eq!(resolve(&cfg, "worker", &never).unwrap(), DEFAULT_PROFILE);
     }
 
@@ -295,20 +327,25 @@ worker = "claude-opus"
     #[test]
     fn auto_falls_back_along_the_chain() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
-        // codex present → reviewer uses codex.
+        // codex present → spec-reviewer uses codex.
         assert_eq!(
-            resolve(&cfg, "reviewer", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "spec-reviewer", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
-        // codex absent → reviewer falls to claude-opus.
+        // codex absent → spec-reviewer falls to claude-opus.
         assert_eq!(
-            resolve(&cfg, "reviewer", &only(&["claude"])).unwrap(),
+            resolve(&cfg, "spec-reviewer", &only(&["claude"])).unwrap(),
             "claude-opus"
         );
-        // neither present → reviewer falls to default.
+        // neither present → spec-reviewer falls to default.
         assert_eq!(
-            resolve(&cfg, "reviewer", &only(&[])).unwrap(),
+            resolve(&cfg, "spec-reviewer", &only(&[])).unwrap(),
             DEFAULT_PROFILE
+        );
+        // The internal-review role shares the cross-vendor chain.
+        assert_eq!(
+            resolve(&cfg, "impl-reviewer", &only(&["codex", "claude"])).unwrap(),
+            "codex"
         );
     }
 
@@ -333,17 +370,37 @@ worker = "claude-opus"
 mode = "manual"
 
 [routing.roles]
-reviewer = "codex"
+spec-reviewer = "codex"
 "#,
         );
         // Listed role uses its explicit profile; unlisted roles go to default
         // with no detection (chain is off in manual).
         assert_eq!(
-            resolve(&cfg, "reviewer", &only(&["codex"])).unwrap(),
+            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
             "codex"
         );
         let never = |_: &str| panic!("manual unlisted roles must not detect");
         assert_eq!(resolve(&cfg, "worker", &never).unwrap(), DEFAULT_PROFILE);
+    }
+
+    #[test]
+    fn deprecated_reviewer_key_steers_spec_reviewer() {
+        // A config still using the old `reviewer` key resolves as if it named
+        // `spec-reviewer`, and validate() accepts it.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+reviewer = "codex"
+"#,
+        );
+        assert_eq!(
+            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
+            "codex"
+        );
+        validate(&cfg, &only(&["codex"])).unwrap();
     }
 
     #[test]

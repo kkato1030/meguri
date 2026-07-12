@@ -16,7 +16,7 @@ use crate::agent_session;
 use crate::forge::IssueState;
 use crate::gitops;
 use crate::mux::{Multiplexer, PaneId};
-use crate::store::{PaneRecord, ROLE_AUTHOR, ROLE_REVIEW};
+use crate::store::{PaneRecord, ROLE_AUTHOR, ROLE_IMPL_REVIEW, ROLE_REVIEW};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
@@ -187,7 +187,7 @@ async fn classify(
     // runs first, so this only trips when the kill failed (or was skipped);
     // the worktree then waits for the next sweep. Both lanes of the issue
     // are checked — either one alive keeps the worktree.
-    for role in [ROLE_AUTHOR, ROLE_REVIEW] {
+    for role in [ROLE_AUTHOR, ROLE_REVIEW, ROLE_IMPL_REVIEW] {
         if let Some(pane) = deps.store.get_pane(&deps.project.id, issue_number, role)?
             && record_pane_alive(deps, &pane).await
         {

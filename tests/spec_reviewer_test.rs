@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::reviewer::{
-    self, DIFF_FILE, REVIEW_FILE, ReviewerLoop, review_marker, run_reviewer,
+use meguri::engine::spec_reviewer::{
+    self, DIFF_FILE, REVIEW_FILE, SpecReviewerLoop, review_marker, run_spec_reviewer,
 };
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
@@ -137,7 +137,7 @@ fn create_reviewer_run(env: &TestEnv) -> meguri::store::RunRecord {
         .store
         .create_run_for_loop(
             "proj",
-            reviewer::KIND,
+            spec_reviewer::KIND,
             ISSUE,
             "Spec: Add caching layer (#5)",
         )
@@ -244,10 +244,13 @@ async fn reviewer_clean_flips_spec_reviewing_to_spec_ready() {
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
     agent.abort();
 
     let WorkerOutcome::Succeeded { pr_url } = outcome else {
@@ -258,8 +261,8 @@ async fn reviewer_clean_flips_spec_reviewing_to_spec_ready() {
     // Run record is terminal and complete under the reviewer loop kind.
     let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
     assert_eq!(record.status, RunStatus::Succeeded);
-    assert_eq!(record.step, reviewer::STEP_SETTLE);
-    assert_eq!(record.loop_kind, reviewer::KIND);
+    assert_eq!(record.step, spec_reviewer::STEP_SETTLE);
+    assert_eq!(record.loop_kind, spec_reviewer::KIND);
 
     // Label transition: spec-reviewing → spec-ready, claim released.
     let labels = env.forge.pr_labels_of(PR);
@@ -307,10 +310,13 @@ async fn reviewer_findings_comment_then_re_review_after_push() {
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
     agent.abort();
 
     assert!(
@@ -334,7 +340,7 @@ async fn reviewer_findings_comment_then_re_review_after_push() {
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
 
     // Idempotency: the reviewed head is skipped by discovery...
-    let targets = ReviewerLoop.discover(&env.deps).await.unwrap();
+    let targets = SpecReviewerLoop.discover(&env.deps).await.unwrap();
     assert!(
         targets.is_empty(),
         "same head must not be reviewed twice: {targets:?}"
@@ -342,7 +348,7 @@ async fn reviewer_findings_comment_then_re_review_after_push() {
 
     // ...until a new push moves the head.
     env.forge.set_pr_head(PR, "feedfacefeedface");
-    let targets = ReviewerLoop.discover(&env.deps).await.unwrap();
+    let targets = SpecReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
         vec![ISSUE],
@@ -364,10 +370,13 @@ async fn reviewer_double_review_skipped_even_after_claim() {
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
 
     assert!(
         matches!(outcome, WorkerOutcome::Skipped(_)),
@@ -391,10 +400,13 @@ async fn reviewer_skips_quietly_when_label_removed_after_discovery() {
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
 
     assert!(
         matches!(outcome, WorkerOutcome::Skipped(_)),
@@ -424,10 +436,13 @@ async fn reviewer_corrective_turn_when_review_file_missing() {
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
     agent.abort();
 
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
@@ -462,9 +477,12 @@ async fn reviewer_needs_human_escalates_on_the_pr() {
         write_result(wt, turn_id, "needs_human");
     });
 
-    let result = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run.id))
-        .await
-        .expect("reviewer timed out");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run.id),
+    )
+    .await
+    .expect("reviewer timed out");
     agent.abort();
 
     assert!(result.is_err(), "needs_human must fail the run");
@@ -515,7 +533,7 @@ async fn reviewer_discovery_filters_hold_working_and_reviewed_heads() {
         .unwrap();
     env.forge.add_pr(16, "unlabeled", "", &[], "b16", "sha16");
 
-    let targets = ReviewerLoop.discover(&env.deps).await.unwrap();
+    let targets = SpecReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
         vec![ISSUE]
@@ -537,10 +555,13 @@ async fn reviewer_second_round_reuses_pane_and_worktree() {
 
     // Round 1: findings at the first head.
     let run1 = create_reviewer_run(&env);
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run1.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run1.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
     let pane1 = env
         .deps
@@ -571,10 +592,13 @@ async fn reviewer_second_round_reuses_pane_and_worktree() {
 
     // Round 2: same pane, same worktree, new head checked out.
     let run2 = create_reviewer_run(&env);
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run2.id))
-        .await
-        .expect("reviewer timed out")
-        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_spec_reviewer(&env.deps, &run2.id),
+    )
+    .await
+    .expect("reviewer timed out")
+    .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 

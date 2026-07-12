@@ -93,7 +93,7 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
 async fn add_review_worktree(deps: &Deps, pr: i64) -> PathBuf {
     let run = deps
         .store
-        .create_run_for_loop("proj", "reviewer", pr, &format!("Review PR #{pr}"))
+        .create_run_for_loop("proj", "spec-reviewer", pr, &format!("Review PR #{pr}"))
         .unwrap();
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &format!("review-{pr}-{}", run.id));

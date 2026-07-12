@@ -427,6 +427,26 @@ pub async fn commits_ahead(worktree: &Path, default_branch: &str) -> Result<u64>
     Ok(count.parse().unwrap_or(0))
 }
 
+/// The unified diff of HEAD against the base ref — three-dot, i.e. the
+/// changes introduced on HEAD since it diverged from base (the same shape a
+/// PR shows). Mirrors [`commits_ahead`]'s `origin/<base>` vs `<base>`
+/// resolution so the self-review reads exactly the PR's own diff, locally,
+/// without any forge call (ADR 0006).
+pub async fn diff_against_base(worktree: &Path, default_branch: &str) -> Result<String> {
+    let base = if run_git(
+        worktree,
+        &["rev-parse", "--verify", &format!("origin/{default_branch}")],
+    )
+    .await
+    .is_ok()
+    {
+        format!("origin/{default_branch}")
+    } else {
+        default_branch.to_string()
+    };
+    run_git(worktree, &["diff", &format!("{base}...HEAD")]).await
+}
+
 pub async fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
     run_git(worktree, &["push", "-u", "origin", branch]).await?;
     Ok(())
