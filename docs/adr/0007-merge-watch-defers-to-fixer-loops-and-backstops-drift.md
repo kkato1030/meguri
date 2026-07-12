@@ -27,7 +27,9 @@ ADR-0003 で meguri は「マージして安全か」を自前で判定せず、
 
 4. **「required checks のみを数える」は GitHub の `mergeStateStatus` に委ねる。** required かどうかを meguri が branch protection の required check 名を列挙して自前判定すると、GitHub 側の設定変更に判定が置いていかれる(ADR-0003 が禁じた二重判定の再来)。代わりに GitHub の判定をそのまま使う: required でない check の失敗は GitHub が `UNSTABLE`(マージ可能)を返すので触らない、required check の失敗は `BLOCKED` を返すので RedCI として扱う。required の権威は GitHub にあり、meguri は再導出しない。
 
-5. **watch 状態はローカルにも専用マーカーにも持たず、既存の forge データから毎掃引導出する。** 必要な状態は「いつから watch しているか(#41 arm マーカーコメントの `createdAt`)」「今どうなっているか(ライブの `mergeStateStatus` / `autoMergeRequest` / rollup)」「エスカレーション済みか(`meguri:needs-human` ラベル)」の 3 つで、すべて forge 上にある。専用の `meguri:merge-watch` マーカー(コメント upsert)を新設しない。TransientError(429/5xx)も別勘定にせず、状態が取れないまま放置閾値を超えたら Stuck に畳む。これにより sqlite に一切依存せず、meguri をいつ kill しても forge から復旧できる(Authority 原則)。
+5. **watch 状態はローカルにも専用マーカーにも持たず、既存の forge データから毎掃引導出する。** 必要な状態は「いつから watch しているか(#41 arm マーカーコメントの `createdAt`)」「今どうなっているか(ライブの `mergeStateStatus` / `autoMergeRequest` / rollup)」「エスカレーション済みか(`meguri:needs-human` ラベル)」の 3 つで、すべて forge 上にある。専用の `meguri:merge-watch` マーカー(コメント upsert)を新設しない。これにより sqlite に一切依存せず、meguri をいつ kill しても forge から復旧できる(Authority 原則)。
+
+6. **TransientError(429/5xx でスナップショットが取れない)は Stuck に畳まず、常に no-op/retry にする。** スナップショットが取れていない間は、その PR が Conflict(conflict-resolver 対象)なのか RedCI(ci-fixer 対象)なのか判定できない。にもかかわらず「取れないまま放置閾値超」という時間条件だけで `meguri:needs-human` を貼ると、API 障害後にラベルが残り、fixer ループがその PR を discover から除外して decision 1 の不変条件(Conflict / RedCI に needs-human を貼らない)を破り、機械的に直せるドリフトをデッドロックさせる。したがって Transient は独立分類とし、エスカレーションは「状態を positive に読めて、かつ Conflict / RedCI / HumanDisabled のいずれでもないと確認できた Stuck」だけに限る。`STALE_AFTER` の壁時計は読めている Stuck 状態の継続時間にのみ適用し、取得失敗の連続時間には適用しない。リトライは掃引ごとに自動。
 
 ## Consequences
 
