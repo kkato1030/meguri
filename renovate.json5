@@ -2,7 +2,9 @@
 //
 // 方針: 依存追従を自動化しつつ、「公開直後の汚染バージョンを自動で取り込む」
 // 供給網リスクを cooldown / digest pin で抑える。
-// automerge は branch protection の必須チェック(CI + cargo-deny)が緑であることが前提((4/4) で設定)。
+// automerge のゲートは Renovate 側マージ(CI + cargo-deny の全チェック緑を待つ)。
+// private + Free では branch protection が使えないため、platformAutomerge を無効化して
+// この 1 経路に固定している((4/4) issue #79 / ADR 0004、運用は docs/ops/github-settings.md)。
 // コミット履歴は conventional commits ではないため semanticCommits はデフォルト(auto)のまま。
 {
   $schema: 'https://docs.renovatebot.com/renovate-schema.json',
@@ -25,6 +27,11 @@
 
   // GitHub Actions を可変タグではなく commit SHA に固定(タグ差し替え攻撃を無効化)
   pinDigests: true,
+
+  // GitHub ネイティブ auto-merge は使わない(branch protection の required checks が
+  // 使えない形態では、有効化された瞬間にゲートなしの即マージ経路になり得るため)。
+  // automerge は「チェック緑を待つ Renovate 自身のマージ」1 本に固定する(ADR 0004)。
+  platformAutomerge: false,
 
   // Cargo.lock の推移依存を週次でリフレッシュし、間接依存の脆弱性も追従する
   lockFileMaintenance: {
