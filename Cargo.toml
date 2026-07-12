@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Run AI coding agents on a loop inside a terminal multiplexer, so humans can step in anytime."
 license = "MIT"
+repository = "https://github.com/kkato1030/meguri"
+readme = "README.md"
+keywords = ["ai", "agents", "tmux", "automation", "github"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"
