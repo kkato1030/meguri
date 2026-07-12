@@ -81,7 +81,7 @@ meguri ps                 # runs, interaction state, panes
 meguri top                # build a dashboard workspace of tiled agent panes & attach
 meguri logs <run>         # event trail + live pane tail
 meguri attach <issue>     # jump into the issue's agent pane (or pass a run id)
-meguri attach <issue> --review  # the reviewer's independent pane
+meguri attach <issue> --review  # the spec reviewer's independent pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -152,26 +152,28 @@ Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an i
 
 ### Spec-first flow (opt-in)
 
-Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together. The spec itself is disposable review scaffolding: the spec worker deletes it as part of the implementation, so `docs/specs/` never accumulates on the default branch — anything worth keeping (design decisions, domain rules) is routed to an ADR (`docs/adr/`) or a permanent domain document instead.
+Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **spec reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together. The spec itself is disposable review scaffolding: the spec worker deletes it as part of the implementation, so `docs/specs/` never accumulates on the default branch — anything worth keeping (design decisions, domain rules) is routed to an ADR (`docs/adr/`) or a permanent domain document instead.
 
-### Impl review (AI review of implementation diffs)
+### Self-review (internal AI review of the diff)
 
-meguri's AI review covers **both the spec PR and the implementation diff**. Once a meguri implementation PR is quiet — CI green, no spec labels, no review thread already awaiting the fixer — the **impl reviewer** loop checks out the head read-only and reviews the diff: findings are posted as **inline review threads** (plus a marked summary comment), which is exactly the fixer's input, so the existing review→fix ping-pong picks them up with no new machinery; a clean review posts only the marked comment and nothing reacts. The loop is label-less and triple-stopped (ADR 0004): each head is reviewed at most once (a hidden head-sha marker on the PR), the rounds per PR are capped (`review.impl_max_rounds`), and a clean verdict creates no threads. The AI never approves or requests changes — reviews are always COMMENT-only, and **merging stays a human decision**. Running an external review bot instead? Set `review.impl_enabled = false`.
+The AI review of the **implementation diff** is an *internal loop* (ADR 0006): the worker reviews its own diff before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` the worker runs a self-review phase in its own worktree — a **review turn** reads `git diff <base>...HEAD` locally and writes `{verdict, findings[]}`; if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; if the cap is hit without a clean verdict the PR is published anyway (the human merge gate is the backstop) with a single footer line noting the non-convergence. Nothing is posted: no threads, no comments, no polling — the human opens a PR that has already been self-reviewed, and the PR conversation stays a clean human/external-review-only space. The review turn runs under the `impl-reviewer` routing profile, so it can still be a different model than the author doing the fixes. Running an external review bot instead? Set `review.enabled = false`.
+
+Because the AI no longer creates review threads, the **fixer** naturally picks up only human and external-bot threads — GitHub stays the review transport exactly where a human sits.
 
 ### Cleaner (read-only repository sweeps)
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the reviewer. After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the spec reviewer (and a transient **impl-review** pane while the worker self-reviews). After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
 
 Per-loop lifetimes at a glance:
 
 | loop | trigger | key | worktree | normal end | pane |
 |---|---|---|---|---|---|
 | planner (author) | `meguri:plan` issue | issue | new branch | spec PR → `spec-reviewing` | kept |
-| reviewer (review) | `spec-reviewing` PR, head unreviewed | issue + `review` | read-only detached, fixed at `review-<issue>` | clean → `spec-ready` / findings → wait for push | kept (independent) |
+| spec reviewer (review) | `spec-reviewing` PR, head unreviewed | issue + `review` | read-only detached, fixed at `review-<issue>` | clean → `spec-ready` / findings → wait for push | kept (independent) |
 | spec worker (author) | `spec-ready` PR | issue (from branch) | takes over the PR branch | implementation → same PR | kept — continues the author pane |
-| worker (author) | `meguri:ready` issue | issue | new branch | PR `Closes #N` | kept |
+| worker (author) | `meguri:ready` issue | issue | new branch | self-review → PR `Closes #N` | kept |
 | fixer (author) | unresolved PR threads | issue (from branch) | attached to the PR head | replies on threads for re-review | kept — continues the author pane |
 | ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
 | conflict resolver (author) | CONFLICTING meguri PR | issue (from branch) | attached to the PR head | base merged & pushed (≤3) | kept — continues the author pane |
@@ -240,13 +242,14 @@ stale_branch_days = 30  # remote branches older than this are reported as stale
 ignore = []             # substrings that silence false positives; override per project with [projects.clean]
 
 [review]
-impl_enabled = true    # kill switch for the impl-reviewer loop (AI review of implementation PRs)
-impl_max_rounds = 3    # max impl-review rounds per PR; past the cap the PR is left to the humans
+enabled = true    # kill switch for the worker's self-review phase (internal AI review of the diff)
+max_rounds = 3    # max self-review rounds per run; past the cap the PR is published as-is
+# (the old impl_enabled / impl_max_rounds keys still load as aliases)
 ```
 
 ### Role-based agent routing (optional)
 
-By default every loop — planner, reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+By default every role — planner, spec-reviewer, impl-reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
 
 ```toml
 # A profile is one CLI's launch bundle — same shape as [agent].
@@ -268,12 +271,13 @@ resume_args = ["resume"]
 mode = "auto"        # auto | manual (default auto once [routing] exists)
 
 [routing.roles]      # explicit picks always beat auto; per-role overrides
-reviewer = "codex"
+spec-reviewer = "codex"   # (the old `reviewer` key still works as an alias)
+# impl-reviewer = "codex"  # the model for the worker's internal self-review turn
 # worker = "claude-sonnet"
 ```
 
 - **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
-- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, reviewer → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, spec-reviewer/impl-reviewer → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
 - **manual** turns the table off: roles you don't list run `default`.
 - **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
 - The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
@@ -289,7 +293,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-Nine loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **impl reviewer** (quiet green meguri implementation PR → AI review as inline threads feeding the fixer), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue).
+Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
 
 ## License
 

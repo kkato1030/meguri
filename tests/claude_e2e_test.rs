@@ -141,6 +141,7 @@ async fn real_claude_implements_issue_in_tmux() {
     let mut config = Config::default();
     config.agent.command = "claude".into();
     config.agent.args = vec!["--permission-mode".into(), "acceptEdits".into()];
+    config.review.enabled = false; // one execute turn under test, not the self-review phase
     config.limits.idle_grace_secs = 120; // claude thinks quietly at times
     config.limits.result_grace_secs = 20;
     config.mux.session = session.clone();

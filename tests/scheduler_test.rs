@@ -61,6 +61,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
+    config.review.enabled = false; // self-review not under test in the scheduler suite
     Deps {
         store: Store::open_in_memory().unwrap(),
         notifier: meguri::notify::fake::recording_notifier().0,

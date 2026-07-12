@@ -10,6 +10,11 @@
 //! (done) or answers again (next fixer round). Spec-ready and merged PRs are
 //! the spec worker's and the humans' territory — the fixer never touches them.
 //!
+//! Since ADR 0006 the AI's implementation review is an internal loop that
+//! never posts threads, so the fixer's discovery naturally narrows to
+//! **human and external-bot** review threads — GitHub stays the transport
+//! only where a human actually sits.
+//!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
 //! (recovered from the `meguri/<issue>-…` head branch), so the fixer joins
 //! the issue's author lane — same pane, same live session as the worker or
