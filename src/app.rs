@@ -829,7 +829,15 @@ mod tests {
             .update_run_mux(&r2.id, "tmux", "meguri", "wD:pStale2")
             .unwrap();
         store
-            .upsert_pane("demo", 7, ROLE_AUTHOR, "tmux", "meguri", "wD:pN", "/wt/demo/7")
+            .upsert_pane(
+                "demo",
+                7,
+                ROLE_AUTHOR,
+                "tmux",
+                "meguri",
+                "wD:pN",
+                "/wt/demo/7",
+            )
             .unwrap();
 
         // Issue 8: one run, also stale snapshot vs the table's live pane.
@@ -838,7 +846,15 @@ mod tests {
             .update_run_mux(&r3.id, "tmux", "meguri", "wD:pStale3")
             .unwrap();
         store
-            .upsert_pane("demo", 8, ROLE_AUTHOR, "tmux", "meguri", "wD:pR", "/wt/demo/8")
+            .upsert_pane(
+                "demo",
+                8,
+                ROLE_AUTHOR,
+                "tmux",
+                "meguri",
+                "wD:pR",
+                "/wt/demo/8",
+            )
             .unwrap();
 
         let dashboard = mux::DashboardId("dash".into());
