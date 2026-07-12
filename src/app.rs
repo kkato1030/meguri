@@ -165,7 +165,7 @@ async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
     }
     let policy = deps
         .forge
-        .merge_policy(&deps.project.default_branch)
+        .merge_policy(&deps.project.default_branch, am.require_branch_protection)
         .await
         .with_context(|| {
             format!(

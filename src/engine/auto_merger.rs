@@ -169,7 +169,7 @@ async fn process_pr(
     if policy.is_none() {
         *policy = Some(
             deps.forge
-                .merge_policy(&deps.project.default_branch)
+                .merge_policy(&deps.project.default_branch, am.require_branch_protection)
                 .await?,
         );
     }

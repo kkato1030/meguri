@@ -285,6 +285,51 @@ async fn insufficient_repo_policy_warns_and_skips() {
 }
 
 #[tokio::test]
+async fn require_branch_protection_false_arms_without_protection() {
+    // The escape hatch: with `require_branch_protection = false`, the base
+    // having no required-checks protection must not block arming (and the
+    // GhForge probe — which 403s on a non-admin token — is skipped entirely).
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha");
+    forge.set_merge_policy(MergePolicy {
+        auto_merge_allowed: true,
+        allowed_strategies: vec![MergeStrategy::Squash],
+        protected_with_required_checks: false,
+    });
+    let mut deps = deps_with(forge.clone());
+    deps.config.pr.auto_merge.require_branch_protection = false;
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(pr),
+        Some((MergeStrategy::Squash, "sha".into())),
+        "escape hatch arms without branch protection"
+    );
+}
+
+#[tokio::test]
+async fn merge_policy_skips_protection_probe_when_not_required() {
+    // FakeForge mirrors GhForge: when protection isn't required the probe is
+    // skipped and its result reads false, even if a policy set it true.
+    let forge = FakeForge::default();
+    forge.set_merge_policy(MergePolicy {
+        auto_merge_allowed: true,
+        allowed_strategies: vec![MergeStrategy::Squash],
+        protected_with_required_checks: true,
+    });
+    let probed = forge.merge_policy("main", true).await.unwrap();
+    assert!(
+        probed.protected_with_required_checks,
+        "required: probe runs"
+    );
+    let skipped = forge.merge_policy("main", false).await.unwrap();
+    assert!(
+        !skipped.protected_with_required_checks,
+        "not required: probe skipped, reports false"
+    );
+}
+
+#[tokio::test]
 async fn clean_status_pr_is_finalized_with_merge() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");

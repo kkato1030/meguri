@@ -727,7 +727,11 @@ impl Forge for GhForge {
         Ok(())
     }
 
-    async fn merge_policy(&self, base_branch: &str) -> Result<MergePolicy> {
+    async fn merge_policy(
+        &self,
+        base_branch: &str,
+        require_branch_protection: bool,
+    ) -> Result<MergePolicy> {
         let raw = self.gh(&["api", &format!("repos/{}", self.repo)]).await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh api repos output")?;
         let flag = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
@@ -742,21 +746,30 @@ impl Forge for GhForge {
             allowed_strategies.push(MergeStrategy::Rebase);
         }
 
-        // Classic branch protection only: 200 = required checks present,
-        // 404 = no protection, 403 = admin required (ADR 0003 — never
-        // silently "unprotected").
-        let protected_with_required_checks = match self
-            .gh_try(&[
-                "api",
-                &format!(
-                    "repos/{}/branches/{base_branch}/protection/required_status_checks",
-                    self.repo
-                ),
-            ])
-            .await?
-        {
-            Ok(_) => true,
-            Err(stderr) => self.protection_from_stderr(base_branch, &stderr)?,
+        // The protection probe needs an admin-scoped token and 403s without
+        // one. It is the escape hatch's whole point that `require_branch_
+        // protection = false` skips it — otherwise the 403 would bail here and
+        // fail `meguri watch` / `doctor` before `validate_policy` (which
+        // ignores protection when not required) ever runs. So only probe when
+        // protection is actually required. Classic branch protection only:
+        // 200 = required checks present, 404 = no protection, 403 = admin
+        // required (ADR 0003 — never silently "unprotected").
+        let protected_with_required_checks = if require_branch_protection {
+            match self
+                .gh_try(&[
+                    "api",
+                    &format!(
+                        "repos/{}/branches/{base_branch}/protection/required_status_checks",
+                        self.repo
+                    ),
+                ])
+                .await?
+            {
+                Ok(_) => true,
+                Err(stderr) => self.protection_from_stderr(base_branch, &stderr)?,
+            }
+        } else {
+            false
         };
 
         Ok(MergePolicy {

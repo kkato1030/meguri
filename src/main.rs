@@ -182,7 +182,10 @@ async fn check_auto_merge(cfg: &Config) -> bool {
         }
         let forge = GhForge::new(&project.repo_slug);
         let label = format!("auto-merge ({})", project.id);
-        match forge.merge_policy(&project.default_branch).await {
+        match forge
+            .merge_policy(&project.default_branch, am.require_branch_protection)
+            .await
+        {
             Ok(policy) => match validate_policy(am, &policy) {
                 Ok(()) => println!(
                     "✅ {label}: repo settings OK (strategy={}, protection {})",

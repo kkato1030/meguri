@@ -656,12 +656,22 @@ impl Forge for FakeForge {
         Ok(())
     }
 
-    async fn merge_policy(&self, _base_branch: &str) -> Result<MergePolicy> {
-        Ok(self
+    async fn merge_policy(
+        &self,
+        _base_branch: &str,
+        require_branch_protection: bool,
+    ) -> Result<MergePolicy> {
+        let mut policy = self
             .policy
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(permissive_policy))
+            .unwrap_or_else(permissive_policy);
+        // Mirror GhForge: when protection isn't required the probe is skipped,
+        // so its result is reported false rather than read.
+        if !require_branch_protection {
+            policy.protected_with_required_checks = false;
+        }
+        Ok(policy)
     }
 }

@@ -271,8 +271,16 @@ pub trait Forge: Send + Sync {
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
     /// The repository's merge configuration for `base_branch` (ADR 0003
-    /// fail-fast + arm gate).
-    async fn merge_policy(&self, base_branch: &str) -> Result<MergePolicy>;
+    /// fail-fast + arm gate). When `require_branch_protection` is false the
+    /// branch-protection probe is skipped and `protected_with_required_checks`
+    /// comes back false — the caller opted out, so the (admin-only, 403-prone)
+    /// probe must not run and must not be able to fail startup. When true, the
+    /// probe runs and a 403 (non-admin token) surfaces as an error.
+    async fn merge_policy(
+        &self,
+        base_branch: &str,
+        require_branch_protection: bool,
+    ) -> Result<MergePolicy>;
 }
 
 #[cfg(test)]
