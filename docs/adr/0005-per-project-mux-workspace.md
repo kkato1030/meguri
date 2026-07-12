@@ -40,21 +40,28 @@ herdr レイアウトは長らく **workspace 1 個**(`mux.session` のラベル
    これにより「project をエンジン全体へ配線する」必要がなくなる — 観察 2 の通り、
    既存ペインを扱う経路(attach / logs / reaper / recovery / top)はペイン id で宛先が決まるからだ。
 
-3. **既存ペインの宛先を組み立て直す少数の経路では、そのペインの `project_id` を渡す。** 
-   herdr ではラベルは無視される(ペイン id が workspace を内包)。tmux では attach 時に
-   正しい session 名が要るため、`project_id` から session を再合成する。project_id は run / pane
-   レコードに載っており、新たな永続化は要らない。
+3. **既存ペインを扱う経路(attach / logs / kill / recovery / top)には project を渡さない。**
+   herdr は `attach_command` が既にペイン id `wN:pM` から workspace id を導く。tmux は attach が
+   `self.session` に依存する唯一の経路だが、**`project_id` から session を再合成しない** — 再合成は
+   分離前に base session で作られた既存ペインを取り違える(その run の project から作った
+   `<session>-<project>` は、当該ペインが実在しない session を指す)。代わりに、**印字するシェル
+   文字列の中でペインから実 session を解決する** — `attach -t "$(tmux display-message -p -t %N
+   '#{session_name}')"`。これで宛先が真にペイン id 由来になり、分離前の既存ペインも分離後の新規
+   ペインも取り違えなく attach でき、attach 経路へ project を配線する必要すら無くなる。結果として
+   **project を渡すのは spawn 側(`build_deps`)だけ**で、他の全呼び出し側は `None` を渡す。
 
 4. **tmux フォールバックはプロジェクトごとの session** `<session>-<project_id>` にする
    (`:` は tmux のターゲット指定で予約語なので `-` を使う)。ペイン id `%N` は tmux サーバ全体で
-   一意なので get/kill/read は session 非依存で成立する。session が要るのは新規 window 生成と
-   attach だけで、後者は決定 3 と同じく project から再合成する。
+   一意なので get/kill/read は session 非依存で成立する。session が要るのは新規 window 生成
+   (spawn 側、project は既知)と attach だけで、後者は決定 3 の自己解決方式で賄う。
 
 ## 帰結
 
 - issue タブは自プロジェクトの workspace(`meguri:<project>`)に作られ、workspace 一覧が
   プロジェクト単位で分かれる。単一 workspace 時代に作られた既存ペインは **移行不要** —
-  ペイン id はそのまま有効で、変わるのは新規ペインの作成先だけ。
+  ペイン id はそのまま有効で、変わるのは新規ペインの作成先だけ。その帰結として、base workspace
+  `<session>` は `meguri top` の dashboard に加えて分離前の既存ペインも当面同居する
+  (移行しないため。cosmetic で、時間とともに issue の close で解消する)。
 - `meguri top` は base workspace(`meguri`)に dashboard タブを持ち、各プロジェクト
   workspace からペインを **id 指定で** タイルする(`pane move` は workspace 跨ぎで動く)。
   横断ビューは自然に成立し、#96 の実装は無変更で乗る。
