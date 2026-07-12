@@ -21,6 +21,7 @@ use crate::forge::{self, PullRequest};
 use crate::gitops;
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus};
+use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for reviewer runs.
@@ -96,8 +97,11 @@ impl super::Loop for ReviewerLoop {
     /// succeeded findings-review must not block re-reviewing the next push —
     /// the head-sha marker is the dedup.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let prs = deps
-            .forge
+            .forge()
             .list_prs_with_label(forge::LABEL_SPEC_REVIEWING)
             .await?;
         let mut targets = Vec::new();
@@ -105,12 +109,12 @@ impl super::Loop for ReviewerLoop {
             if pr.has_label(forge::LABEL_HOLD) || pr.has_label(forge::LABEL_WORKING) {
                 continue;
             }
-            let comments = deps.forge.pr_comments(pr.number).await?;
+            let comments = deps.forge().pr_comments(pr.number).await?;
             if head_already_reviewed(&comments, &pr.head_sha) {
                 continue;
             }
             targets.push(Target {
-                issue_number: pr.number,
+                key: TaskKey::Issue(pr.number),
                 title: pr.title,
             });
         }
@@ -269,7 +273,7 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &ReviewCheckpoint) ->
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
-    deps.forge
+    deps.forge()
         .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
         .await
         .ok();
@@ -282,10 +286,13 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 
 /// Failure escalation on the PR (mirrors the worker's issue escalation).
 async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
-    let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
     let _ = deps
-        .forge
+        .forge()
+        .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+        .await;
+    let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+    let _ = deps
+        .forge()
         .comment_pr(
             pr,
             &format!(
@@ -306,7 +313,7 @@ enum Prepared {
 /// `meguri:working`. A hold, a missing review label, or a head that got its
 /// review while we queued is a benign race — skip, don't escalate.
 async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
-    let pr = deps.forge.get_pr(run.issue_number).await?;
+    let pr = deps.forge().get_pr(run.issue_number).await?;
     if pr.has_label(forge::LABEL_HOLD) {
         return Ok(Prepared::Skip(format!(
             "PR #{} is on hold ({})",
@@ -321,14 +328,14 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
             forge::LABEL_SPEC_REVIEWING
         )));
     }
-    let comments = deps.forge.pr_comments(pr.number).await?;
+    let comments = deps.forge().pr_comments(pr.number).await?;
     if head_already_reviewed(&comments, &pr.head_sha) {
         return Ok(Prepared::Skip(format!(
             "PR #{} head {} already carries a review",
             pr.number, pr.head_sha
         )));
     }
-    deps.forge
+    deps.forge()
         .add_pr_label(pr.number, forge::LABEL_WORKING)
         .await?;
     deps.store.emit(
@@ -429,7 +436,7 @@ async fn execute(
     worktree: &Path,
 ) -> Result<flow::StepFlow> {
     // Drop the diff where the prompt says it is (idempotent on resume).
-    let diff = deps.forge.pr_diff(run.issue_number).await?;
+    let diff = deps.forge().pr_diff(run.issue_number).await?;
     std::fs::create_dir_all(worktree.join(crate::turn::prompts::MEGURI_DIR))?;
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
 
@@ -548,9 +555,9 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
     let pr = run.issue_number;
     let verdict = cp.verdict.context("checkpoint has no review verdict")?;
 
-    let comments = deps.forge.pr_comments(pr).await?;
+    let comments = deps.forge().pr_comments(pr).await?;
     if !head_already_reviewed(&comments, &cp.head_sha) {
-        deps.forge
+        deps.forge()
             .comment_pr(pr, &review_comment(cp, verdict))
             .await?;
         deps.store.emit(
@@ -561,15 +568,17 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
     }
 
     if verdict == ReviewVerdict::Clean {
-        deps.forge.add_pr_label(pr, forge::LABEL_SPEC_READY).await?;
-        deps.forge
+        deps.forge()
+            .add_pr_label(pr, forge::LABEL_SPEC_READY)
+            .await?;
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
             .await
             .ok();
     }
     // Findings: keep `meguri:spec-reviewing` — the next push moves the head
     // past the marker and discovery re-reviews it.
-    deps.forge
+    deps.forge()
         .remove_pr_label(pr, forge::LABEL_WORKING)
         .await
         .ok();

@@ -100,7 +100,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
@@ -108,13 +110,13 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         pr: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -354,7 +356,7 @@ async fn resolver_discovery_wants_conflicting_unclaimed_meguri_prs_only() {
 
     let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![1],
         "only the open, unclaimed, unescalated meguri PR that conflicts is actionable"
     );

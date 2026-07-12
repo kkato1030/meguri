@@ -17,6 +17,7 @@ use crate::config::{Config, ProjectConfig};
 use crate::forge::Forge;
 use crate::mux::Multiplexer;
 use crate::store::{DesiredState, InteractionState, Store};
+use crate::tasks::{TaskKey, TaskSource};
 use crate::turn::TurnControl;
 
 /// Everything a loop needs to drive runs for one project.
@@ -24,15 +25,63 @@ use crate::turn::TurnControl;
 pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
-    pub forge: Arc<dyn Forge>,
+    /// The GitHub forge — issue reading, PR/label/review operations. `None`
+    /// in local mode; the label-free loops (fixer, reviewer, spec-worker,
+    /// conflict-resolver) then discover nothing. Task coordination goes
+    /// through [`Deps::task_source`], not here.
+    pub forge: Option<Arc<dyn Forge>>,
+    /// The task coordination layer (discover / claim / release / escalate /
+    /// complete) — `LabelTaskSource` in github mode, `LocalTaskSource` in
+    /// local mode.
+    pub task_source: Arc<dyn TaskSource>,
     pub config: Config,
     pub project: ProjectConfig,
 }
 
-/// A unit of work a loop wants a run for: the issue to drive.
+impl Deps {
+    /// Assemble github-mode deps: the forge is present and its labels are the
+    /// coordination layer, so `task_source` is a [`LabelTaskSource`] wrapping
+    /// it. This is the shape `app::build_coordination` produces for github
+    /// projects; tests use it so their FakeForge flows through the same
+    /// `TaskSource` seam production does (issue #54 acceptance criterion 6).
+    pub fn with_label_source(
+        store: Store,
+        mux: Arc<dyn Multiplexer>,
+        forge: Arc<dyn Forge>,
+        config: Config,
+        project: ProjectConfig,
+    ) -> Self {
+        let task_source = Arc::new(crate::tasks::LabelTaskSource::new(
+            forge.clone(),
+            store.clone(),
+            project.id.clone(),
+        ));
+        Self {
+            store,
+            mux,
+            forge: Some(forge),
+            task_source,
+            config,
+            project,
+        }
+    }
+
+    /// The forge for github-mode loops. Panics if absent — only the label-free
+    /// loops run without a forge, and they short-circuit their discovery
+    /// before ever reaching here.
+    pub fn forge(&self) -> &Arc<dyn Forge> {
+        self.forge
+            .as_ref()
+            .expect("forge is required for this loop (github mode)")
+    }
+}
+
+/// A unit of work a loop wants a run for: the task to drive.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub issue_number: i64,
+    /// The coordination-layer identity of the task (github issue or local
+    /// task row). Also the run-creation and dispatch-sort key.
+    pub key: TaskKey,
     pub title: String,
 }
 

@@ -45,6 +45,29 @@ pub enum Command {
         #[arg(long)]
         mux: Option<String>,
     },
+    /// Queue a local task (local-mode projects; watch picks it up)
+    Add {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Queue it for the planner instead of the worker
+        #[arg(long)]
+        plan: bool,
+        /// Read the task from a markdown file (first heading → title, body → body)
+        #[arg(long)]
+        file: Option<String>,
+        /// Task title (omit only when --file supplies a heading)
+        title: Option<String>,
+    },
+    /// List local tasks (needs_human is highlighted)
+    Tasks {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Include done/cancelled tasks
+        #[arg(long)]
+        all: bool,
+    },
     /// List runs and their interaction state
     Ps {
         /// Include finished runs

@@ -12,8 +12,10 @@ use serde_json::json;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
 use super::{Deps, Target};
+use crate::config::Deliver;
 use crate::forge;
 use crate::store::RunRecord;
+use crate::tasks::{TaskKey, TaskKind};
 
 /// `runs.loop_kind` value for worker runs (the schema default).
 pub const KIND: &str = "worker";
@@ -28,7 +30,16 @@ impl super::Loop for WorkerLoop {
     }
 
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        flow::discover_by_label(deps, KIND, forge::LABEL_READY).await
+        Ok(deps
+            .task_source
+            .discover(TaskKind::Work)
+            .await?
+            .into_iter()
+            .map(|t| Target {
+                key: t.key,
+                title: t.title,
+            })
+            .collect())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -55,34 +66,61 @@ impl Flavor for WorkerFlavor {
         cp: &Checkpoint,
         worktree: &Path,
     ) -> String {
-        format!(
-            "You are implementing GitHub issue #{number} in this repository \
-             (branch `{branch}`, a dedicated worktree).\n\n\
-             # Issue: {title}\n\n{body}\n\n\
-             # Instructions\n\
-             - Explore the repository first and follow its existing conventions.\n\
-             - Implement the issue completely, including tests where the project has them.\n\
-             - Run the relevant tests/checks yourself before declaring success.\n\
-             - COMMIT all your work to the current branch with clear messages. \
-               Leave the working tree clean.\n\
-             - Do NOT push and do NOT create a pull request; meguri handles both.\n\
-             - Do NOT switch branches or touch other worktrees.\n\n\
-             # Needs a design decision first?\n\
-             If your investigation shows a design decision must be settled before \
-             this issue can be implemented, do NOT implement a guess. Instead end \
-             the turn with `\"status\": \"needs_plan\"` in the result file (accepted \
-             here in addition to the completion contract's statuses) and put one \
-             paragraph in `summary` explaining what you found and which decision \
-             is needed. meguri will hand the issue to the planning flow with that \
-             paragraph.\n\n\
-             {pr_section}{lang_section}",
-            number = run.issue_number,
-            branch = run.branch.as_deref().unwrap_or("?"),
-            title = cp.issue_title,
-            body = cp.issue_body,
-            pr_section = flow::pr_body_instruction(worktree),
-            lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
-        )
+        let branch = run.branch.as_deref().unwrap_or("?");
+        let lang_section = flow::language_instruction(deps.config.language_for(&deps.project));
+        // The PR-body section only matters when the deliverable is a PR.
+        let pr_section = if deps.config.deliver_for(&deps.project) == Deliver::Pr {
+            flow::pr_body_instruction(worktree)
+        } else {
+            String::new()
+        };
+        match run.task_key() {
+            // github issue: the familiar prompt, including the needs-plan
+            // handoff (only the label flow has a planner to hand to).
+            TaskKey::Issue(number) => format!(
+                "You are implementing GitHub issue #{number} in this repository \
+                 (branch `{branch}`, a dedicated worktree).\n\n\
+                 # Issue: {title}\n\n{body}\n\n\
+                 # Instructions\n\
+                 - Explore the repository first and follow its existing conventions.\n\
+                 - Implement the issue completely, including tests where the project has them.\n\
+                 - Run the relevant tests/checks yourself before declaring success.\n\
+                 - COMMIT all your work to the current branch with clear messages. \
+                   Leave the working tree clean.\n\
+                 - Do NOT push and do NOT create a pull request; meguri handles both.\n\
+                 - Do NOT switch branches or touch other worktrees.\n\n\
+                 # Needs a design decision first?\n\
+                 If your investigation shows a design decision must be settled before \
+                 this issue can be implemented, do NOT implement a guess. Instead end \
+                 the turn with `\"status\": \"needs_plan\"` in the result file (accepted \
+                 here in addition to the completion contract's statuses) and put one \
+                 paragraph in `summary` explaining what you found and which decision \
+                 is needed. meguri will hand the issue to the planning flow with that \
+                 paragraph.\n\n\
+                 {pr_section}{lang_section}",
+                title = cp.issue_title,
+                body = cp.issue_body,
+            ),
+            // local task: no issue number, no planner handoff; the deliverable
+            // is the verified branch.
+            TaskKey::Local(_) => format!(
+                "You are implementing a local task in this repository \
+                 (branch `{branch}`, a dedicated worktree).\n\n\
+                 # Task: {title}\n\n{body}\n\n\
+                 # Instructions\n\
+                 - Explore the repository first and follow its existing conventions.\n\
+                 - Implement the task completely, including tests where the project has them.\n\
+                 - Run the relevant tests/checks yourself before declaring success.\n\
+                 - COMMIT all your work to the current branch with clear messages. \
+                   Leave the working tree clean.\n\
+                 - Do NOT push and do NOT create a pull request; meguri leaves the \
+                   verified branch in place for you to review.\n\
+                 - Do NOT switch branches or touch other worktrees.\n\n\
+                 {pr_section}{lang_section}",
+                title = cp.issue_title,
+                body = cp.issue_body,
+            ),
+        }
         // The completion contract is appended by prepare_turn.
     }
 
@@ -99,16 +137,10 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
+    /// Mark the work delivered through the coordination layer: github drops
+    /// the working+ready labels, local flips the task to `done`.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
-        deps.forge
-            .remove_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
-        deps.forge
-            .remove_label(run.issue_number, forge::LABEL_READY)
-            .await
-            .ok();
-        Ok(())
+        deps.task_source.complete(&run.task_key()).await
     }
 
     /// needs-plan demotion (issue #22): release the claim and swap the issue
@@ -124,6 +156,15 @@ impl Flavor for WorkerFlavor {
         worktree: &Path,
         reason: &str,
     ) -> Result<WorkerOutcome> {
+        // Local mode has no planner loop yet (issue #54 Phase 3), so a local
+        // task that asks for a plan goes to a human via the task source.
+        if let TaskKey::Local(_) = run.task_key() {
+            return Err(NeedsHuman(format!(
+                "a local task asked for a plan, but local mode has no planner \
+                 yet (issue #54 Phase 3): {reason}"
+            ))
+            .into());
+        }
         let spec = super::planner::spec_rel_path(run.issue_number);
         if worktree.join(&spec).is_file() {
             return Err(NeedsHuman(format!(
@@ -135,7 +176,7 @@ impl Flavor for WorkerFlavor {
         }
         // Comment first so the planner's prompt (built from the issue +
         // comments) always sees the findings once the label is on.
-        deps.forge
+        deps.forge()
             .comment(
                 run.issue_number,
                 &format!(
@@ -149,14 +190,14 @@ impl Flavor for WorkerFlavor {
         // The plan label is load-bearing (planner discovery keys off it), so
         // failing to apply it fails the run instead of passing silently; the
         // removals are best-effort like every other label release.
-        deps.forge
+        deps.forge()
             .add_label(run.issue_number, forge::LABEL_PLAN)
             .await?;
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_READY)
             .await
             .ok();
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await
             .ok();
@@ -254,22 +295,25 @@ mod tests {
         let run = store.create_run_for_loop("proj", KIND, 7, "t").unwrap();
         let mut run = store.get_run(&run.id).unwrap().unwrap();
         run.branch = Some("meguri/test".into());
-        let deps = Deps {
-            store,
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: forge.clone(),
-            config: Config::default(),
-            project: ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                language: None,
-                check_command: None,
-                worktree_root: None,
-                pr: None,
-            },
+        let project = ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
         };
+        let deps = Deps::with_label_source(
+            store,
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            Config::default(),
+            project,
+        );
         (deps, run, forge)
     }
 }

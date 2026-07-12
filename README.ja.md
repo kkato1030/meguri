@@ -89,6 +89,34 @@ meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim worktrees of closed issues (--dry-run / --force)
 ```
 
+### ローカルモード（GitHub もラベルも使わない）
+
+ラベルを触れない/触りたくないリポジトリでは、プロジェクトを**完全に手元で**回せます。タスクキュー・claim・エスカレーション・完了判定は GitHub ラベルではなく meguri の sqlite に載り、成果物は PR ではなく検証済みのローカルブランチになります。`mode = "local"` を設定すると `repo_slug` は optional になり、`meguri doctor` も `gh` を要求しなくなります:
+
+```toml
+[[projects]]
+id = "work"
+repo_path = "/abs/path/to/repo"
+mode = "local"          # "github"（デフォルト） | "local"
+default_branch = "main"
+check_command = "cargo test"
+# deliver = "branch"    # local のデフォルト: 検証済みコミットをローカルブランチに残す（push も PR もしない）
+```
+
+ラベルの代わりにローカルタスクコマンドで投入・追跡します:
+
+```bash
+meguri add "export コマンドに --json フラグを足す"   # タスクを投入
+meguri add --file task.md                            # 1 行目の見出し → title、本文 → body
+meguri add --plan "export フォーマットを設計する"    # worker ではなく planner に投入
+meguri tasks                                         # 未完了タスク一覧（needs_human は強調）
+meguri watch                                         # poll 間隔以内に拾って走らせる
+```
+
+ローカル run は `meguri/t<task-id>-<slug>-<hash>` ブランチで作業し、成功すると検証済みコミットをそこに残して task を `done` にします（push はしません）。失敗した run は task を reason 付きの `needs_human` にし（`meguri tasks` / `meguri ps` で見えます）、次の run が再 claim して解除します。ブランチは自分で確認してマージしてください（`meguri review` / `accept` は後のフェーズで入ります）。
+
+> **Phase 3 までは単一マシン前提。** ローカルモードではローカル sqlite が*唯一の真実*なので、1 リポジトリにつき meguri ホストは 1 台で回してください。共有キューに複数ホストを載せるのは Phase 4（lease 付きのリモート DB `TaskSource`）で、語彙と契約は [ADR 0003](docs/adr/0003-tasksource-task-moves-run-pins.md) で固定済みです。`silent` モード（issue を読むがラベルは書かない）・`deliver = "patch"`・`meguri review`/`accept`/`reject` も後のフェーズです。
+
 ### 常駐させる（daemon）
 
 `meguri watch` はフォアグラウンドに留まります。シェルを閉じても回り続けさせるには detach します:

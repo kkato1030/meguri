@@ -20,6 +20,7 @@ use super::flow::{self, Checkpoint, Flavor, PreparedWork};
 use super::{Deps, Target};
 use crate::forge::{self, PullRequest, ReviewThread};
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for fixer runs.
@@ -81,15 +82,18 @@ impl super::Loop for FixerLoop {
     /// The active-run unique index still dedups concurrent rounds, and the
     /// thread reply marker keeps a pushed-but-not-re-reviewed PR quiet.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
+        for pr in deps.forge().list_open_prs().await? {
             if pr_is_fixable(&pr).is_some() || pr.has_label(forge::LABEL_WORKING) {
                 continue;
             }
-            let threads = deps.forge.list_review_threads(pr.number).await?;
+            let threads = deps.forge().list_review_threads(pr.number).await?;
             if threads.iter().any(thread_awaits_fixer) {
                 targets.push(Target {
-                    issue_number: pr.number,
+                    key: TaskKey::Issue(pr.number),
                     title: pr.title,
                 });
             }
@@ -147,7 +151,7 @@ impl Flavor for FixerFlavor {
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        let pr = deps.forge.get_pr(run.issue_number).await?;
+        let pr = deps.forge().get_pr(run.issue_number).await?;
         if let Some(reason) = pr_is_fixable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
@@ -159,7 +163,7 @@ impl Flavor for FixerFlavor {
             )));
         }
         let threads: Vec<ReviewThread> = deps
-            .forge
+            .forge()
             .list_review_threads(pr.number)
             .await?
             .into_iter()
@@ -172,7 +176,7 @@ impl Flavor for FixerFlavor {
             )));
         }
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store
@@ -254,7 +258,7 @@ impl Flavor for FixerFlavor {
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         let pr = cp.pr_number.context("fixer checkpoint has no PR number")?;
         for thread_id in &cp.thread_ids {
-            deps.forge
+            deps.forge()
                 .reply_review_thread(
                     pr,
                     thread_id,
@@ -271,7 +275,7 @@ impl Flavor for FixerFlavor {
             "threads.replied",
             json!({ "pr": pr, "threads": cp.thread_ids }),
         )?;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -279,7 +283,7 @@ impl Flavor for FixerFlavor {
     }
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
+        deps.forge()
             .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
             .await
             .ok();
@@ -288,10 +292,13 @@ impl Flavor for FixerFlavor {
     /// Escalation lands on the PR (the fixer's target), not an issue.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let pr = run.issue_number;
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -420,21 +427,24 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

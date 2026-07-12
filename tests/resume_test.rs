@@ -68,7 +68,9 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
@@ -76,13 +78,13 @@ async fn setup() -> TestEnv {
         pr: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: mux.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
         forge,
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         mux,

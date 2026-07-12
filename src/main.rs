@@ -36,6 +36,13 @@ async fn main() -> Result<()> {
             issue,
             mux,
         } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
+        Command::Add {
+            project,
+            plan,
+            file,
+            title,
+        } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
+        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
         Command::Ps { all } => app::cmd_ps(all),
         Command::Logs { run } => app::cmd_logs(&run).await,
         Command::Attach { run } => app::cmd_attach(&run),
@@ -82,12 +89,24 @@ fn cmd_doctor() -> Result<()> {
         pass
     };
 
+    // Whether any configured project talks to GitHub. If every project is
+    // local-mode, gh/gh-auth are informational, not required (issue #54).
+    // A config that fails to load is treated conservatively as needing gh.
+    let cfg = Config::load();
+    let needs_github = match &cfg {
+        Ok(c) => c
+            .projects
+            .iter()
+            .any(|p| p.mode != config::ProjectMode::Local),
+        Err(_) => true,
+    };
+
     let git = run_capture("git", &["--version"]);
     ok &= check("git", git.is_ok(), git.unwrap_or_else(|e| e));
 
     let gh = run_capture("gh", &["--version"]);
     let gh_present = gh.is_ok();
-    ok &= check(
+    let gh_pass = check(
         "gh",
         gh_present,
         gh.map(|v| v.lines().next().unwrap_or_default().to_string())
@@ -95,11 +114,19 @@ fn cmd_doctor() -> Result<()> {
     );
     if gh_present {
         let auth = run_capture("gh", &["auth", "status"]);
-        ok &= check(
+        let auth_pass = check(
             "gh auth",
             auth.is_ok(),
             auth.map(|_| "authenticated".into()).unwrap_or_else(|e| e),
         );
+        if needs_github {
+            ok &= auth_pass;
+        }
+    }
+    if needs_github {
+        ok &= gh_pass;
+    } else if !gh_pass {
+        println!("   (all projects are local-mode — gh is optional)");
     }
 
     let herdr = run_capture("herdr", &["--version"]);
@@ -130,7 +157,7 @@ fn cmd_doctor() -> Result<()> {
         ok = false;
     }
 
-    match Config::load() {
+    match &cfg {
         Ok(cfg) => {
             let agent = run_capture(&cfg.agent.command, &["--version"]);
             ok &= check(

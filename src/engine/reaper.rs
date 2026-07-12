@@ -118,14 +118,22 @@ async fn classify(deps: &Deps, path: PathBuf, branch: Option<String>) -> Result<
         verdict,
     };
 
-    let Some(issue_number) = issue else {
-        return Ok(candidate(Verdict::Orphan));
-    };
     // An active run owns its worktree; don't even ask the forge.
     if runs.iter().any(|r| r.status.is_active()) {
         return Ok(candidate(Verdict::ActiveRun));
     }
-    match deps.forge.issue_state(issue_number).await {
+    // Local mode (no forge): there is no issue lifecycle to consult, and a
+    // `deliver = "branch"` deliverable *is* the branch + worktree — so the
+    // Phase 1 reaper never auto-reclaims it. It parks as StateUnknown until
+    // `meguri accept` (issue #54 Phase 2) designs the reclaim conditions.
+    if deps.forge.is_none() {
+        return Ok(candidate(Verdict::StateUnknown));
+    }
+
+    let Some(issue_number) = issue else {
+        return Ok(candidate(Verdict::Orphan));
+    };
+    match deps.forge().issue_state(issue_number).await {
         Ok(IssueState::Open) => return Ok(candidate(Verdict::Open)),
         Ok(IssueState::Closed) => {}
         Err(e) => {

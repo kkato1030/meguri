@@ -84,7 +84,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
@@ -92,13 +94,13 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         pr: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -295,7 +297,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     // Round 1: the reviewer's comment gets fixed and pushed.
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![1]
     );
     let run1 = create_fixer_run(&env);
@@ -382,7 +384,7 @@ async fn fixer_discovery_skips_spec_ready_merged_held_and_foreign_prs() {
 
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![1],
         "only the open, unclaimed meguri PR with an awaiting thread is actionable"
     );

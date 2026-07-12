@@ -29,6 +29,7 @@ use super::{Deps, Target};
 use crate::forge::{self, MergeableState, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for conflict-resolver runs.
@@ -75,8 +76,11 @@ impl super::Loop for ConflictResolverLoop {
     /// the per-PR resolve budget stops a resolve→re-conflict ping-pong; the
     /// active-run unique index dedups concurrent rounds as usual.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
+        for pr in deps.forge().list_open_prs().await? {
             if pr_is_resolvable(&pr).is_some()
                 || pr.has_label(forge::LABEL_WORKING)
                 || pr.has_label(forge::LABEL_NEEDS_HUMAN)
@@ -90,11 +94,11 @@ impl super::Loop for ConflictResolverLoop {
             {
                 continue;
             }
-            if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
                 continue;
             }
             targets.push(Target {
-                issue_number: pr.number,
+                key: TaskKey::Issue(pr.number),
                 title: pr.title,
             });
         }
@@ -130,7 +134,7 @@ impl Flavor for ConflictResolverFlavor {
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        let pr = deps.forge.get_pr(run.issue_number).await?;
+        let pr = deps.forge().get_pr(run.issue_number).await?;
         if let Some(reason) = pr_is_resolvable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
@@ -148,7 +152,7 @@ impl Flavor for ConflictResolverFlavor {
                 forge::LABEL_NEEDS_HUMAN
             )));
         }
-        if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+        if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{} is no longer conflicting",
                 pr.number
@@ -160,7 +164,7 @@ impl Flavor for ConflictResolverFlavor {
         let base_sha =
             gitops::fetch_base_tip(&deps.project.repo_path, &deps.project.default_branch).await?;
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store.emit(
@@ -285,7 +289,7 @@ impl Flavor for ConflictResolverFlavor {
             .context("conflict-resolver checkpoint has no PR number")?;
         let base = cp.base_sha.as_deref().unwrap_or("?");
         let _ = deps
-            .forge
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -296,7 +300,7 @@ impl Flavor for ConflictResolverFlavor {
                 ),
             )
             .await;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -304,7 +308,7 @@ impl Flavor for ConflictResolverFlavor {
     }
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
+        deps.forge()
             .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
             .await
             .ok();
@@ -313,10 +317,13 @@ impl Flavor for ConflictResolverFlavor {
     /// Escalation lands on the PR (the resolver's target), not an issue.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let pr = run.issue_number;
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -490,21 +497,24 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

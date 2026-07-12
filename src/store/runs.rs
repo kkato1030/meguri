@@ -3,6 +3,7 @@ use rusqlite::{Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Store, now};
+use crate::tasks::TaskKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,7 +125,12 @@ pub struct RunRecord {
     pub id: String,
     pub project_id: String,
     pub loop_kind: String,
+    /// GitHub issue/PR number the run targets. `0` for local runs (their
+    /// target is [`RunRecord::task_id`]); the DB column is NULL there.
     pub issue_number: i64,
+    /// Local task id the run targets (local/silent runs); `None` for github
+    /// runs. Exactly one of `issue_number`/`task_id` identifies the target.
+    pub task_id: Option<i64>,
     pub issue_title: Option<String>,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
@@ -148,6 +154,17 @@ pub struct RunRecord {
     pub created_at: String,
 }
 
+impl RunRecord {
+    /// The coordination-layer key this run targets: a local task id when the
+    /// run has one, otherwise its github issue number.
+    pub fn task_key(&self) -> TaskKey {
+        match self.task_id {
+            Some(id) => TaskKey::Local(id),
+            None => TaskKey::Issue(self.issue_number),
+        }
+    }
+}
+
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
     let status: String = row.get("status")?;
     let interaction: Option<String> = row.get("interaction_state")?;
@@ -156,7 +173,11 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         id: row.get("id")?,
         project_id: row.get("project_id")?,
         loop_kind: row.get("loop_kind")?,
-        issue_number: row.get("issue_number")?,
+        // A local run stores NULL here (its target is task_id); map it to the
+        // 0 sentinel so the issue-number path never mistakes it for a real
+        // issue while keeping the field ergonomic for github runs.
+        issue_number: row.get::<_, Option<i64>>("issue_number")?.unwrap_or(0),
+        task_id: row.get("task_id")?,
         issue_title: row.get("issue_title")?,
         branch: row.get("branch")?,
         worktree_path: row.get("worktree_path")?,
@@ -219,6 +240,30 @@ impl Store {
                                    status, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
                 params![id, project_id, loop_kind, issue_number, issue_title, now()],
+            )?;
+            Ok(())
+        })?;
+        Ok(self.get_run(&id)?.expect("run just inserted"))
+    }
+
+    /// Create a run targeting a local task (local/silent mode). `issue_number`
+    /// is left NULL; `task_id` carries the target, and the `runs_active_task`
+    /// partial index enforces one active run per (project, loop, task).
+    pub fn create_run_for_task(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        task_id: i64,
+        title: &str,
+    ) -> Result<RunRecord> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let id = format!("run-{}", &id[..8]);
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO runs (id, project_id, loop_kind, task_id, issue_title,
+                                   status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                params![id, project_id, loop_kind, task_id, title, now()],
             )?;
             Ok(())
         })?;

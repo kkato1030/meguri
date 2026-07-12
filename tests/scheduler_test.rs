@@ -13,6 +13,7 @@ use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
+use meguri::tasks::TaskKey;
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -43,22 +44,25 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
-    Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(root.join("worktrees")),
+        pr: None,
+    };
+    Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
         forge,
         config,
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: clone,
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(root.join("worktrees")),
-            pr: None,
-        },
-    }
+        project,
+    )
 }
 
 /// Scripted pane-side agent (same protocol as worker_test).
@@ -527,7 +531,7 @@ impl Loop for FixedLoop {
             return Ok(vec![]);
         }
         Ok(vec![Target {
-            issue_number: 99,
+            key: TaskKey::Issue(99),
             title: "Fixed target".into(),
         }])
     }
@@ -569,7 +573,7 @@ impl Loop for StubLoop {
                     .issue_has_succeeded_run(&deps.project.id, self.kind, *n)?
             {
                 targets.push(Target {
-                    issue_number: *n,
+                    key: TaskKey::Issue(*n),
                     title: format!("stub {n}"),
                 });
             }
