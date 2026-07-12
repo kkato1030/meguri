@@ -481,7 +481,11 @@ pub async fn cmd_top(mux_override: Option<&str>, interval_secs: u64) -> Result<(
     // `meguri top` is the cross-project view: build on the base workspace (no
     // project) and pull each project's panes in by id — `tile_pane` moves panes
     // across workspaces/sessions, so it reaches every project's workspace.
-    let mux = mux::detect(mux_override.unwrap_or(&cfg.mux.kind), &cfg.mux.session, None)?;
+    let mux = mux::detect(
+        mux_override.unwrap_or(&cfg.mux.kind),
+        &cfg.mux.session,
+        None,
+    )?;
     mux.ensure_session().await?;
     let dashboard = mux.ensure_dashboard(TOP_DASHBOARD_LABEL).await?;
     let attach_hint = mux.dashboard_attach_command(&dashboard);
