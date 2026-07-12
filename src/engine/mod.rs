@@ -7,8 +7,8 @@ pub mod flow;
 pub mod impl_reviewer;
 pub mod planner;
 pub mod reaper;
-pub mod reviewer;
 pub mod scheduler;
+pub mod spec_reviewer;
 pub mod spec_worker;
 pub mod worker;
 
@@ -112,12 +112,14 @@ pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullReq
     }
 }
 
-/// The pane lane a loop's runs live in: the reviewer keeps its independent
-/// `review` lane; every other loop shares the issue's `author` lane (the
-/// cleaner's report issue is only ever touched by the cleaner, so the
-/// default lane cannot collide).
+/// The pane lane a loop's runs live in: the spec reviewer keeps its
+/// independent `review` lane; every other loop shares the issue's `author`
+/// lane (the cleaner's report issue is only ever touched by the cleaner, so
+/// the default lane cannot collide). The worker's internal self-review turn
+/// runs in its own `impl-review` lane, but that lane is entered explicitly by
+/// the flow, not via a loop_kind, so it is not resolved here.
 pub fn role_for_loop(loop_kind: &str) -> &'static str {
-    if loop_kind == reviewer::KIND {
+    if loop_kind == spec_reviewer::KIND {
         ROLE_REVIEW
     } else {
         ROLE_AUTHOR
@@ -170,9 +172,8 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
-        Arc::new(impl_reviewer::ImplReviewerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(reviewer::ReviewerLoop),
+        Arc::new(spec_reviewer::SpecReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
@@ -271,8 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_is_review_only_for_the_reviewer() {
-        assert_eq!(role_for_loop(reviewer::KIND), ROLE_REVIEW);
+    fn lane_is_review_only_for_the_spec_reviewer() {
+        assert_eq!(role_for_loop(spec_reviewer::KIND), ROLE_REVIEW);
         for kind in [
             "worker",
             "planner",

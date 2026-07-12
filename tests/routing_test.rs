@@ -78,7 +78,7 @@ mode = "manual"
 
 [routing.roles]
 planner = "p-planner"
-reviewer = "p-reviewer"
+spec-reviewer = "p-reviewer"
 worker = "p-worker"
 spec-worker = "p-spec"
 fixer = "p-fixer"
@@ -87,6 +87,9 @@ conflict-resolver = "p-conflict"
     let mut config: Config = toml::from_str(toml).unwrap();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    // This suite drives every kind through run_worker only to observe profile
+    // resolution; the worker's self-review phase is not under test here.
+    config.review.enabled = false;
     config
 }
 
@@ -232,7 +235,7 @@ async fn every_loop_kind_spawns_from_its_resolved_profile() {
     // (loop_kind, expected profile name, expected command, first arg)
     let cases = [
         ("planner", "p-planner", "planner-cli", "planner"),
-        ("reviewer", "p-reviewer", "reviewer-cli", "reviewer"),
+        ("spec-reviewer", "p-reviewer", "reviewer-cli", "reviewer"),
         ("worker", "p-worker", "worker-cli", "worker"),
         ("spec-worker", "p-spec", "spec-cli", "spec"),
         ("fixer", "p-fixer", "fixer-cli", "fixer"),

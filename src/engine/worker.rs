@@ -54,6 +54,13 @@ impl Flavor for WorkerFlavor {
         forge::LABEL_READY
     }
 
+    /// The worker self-reviews its own diff before opening the PR (ADR 0006):
+    /// the internal review→fix loop runs in the run's worktree with no forge
+    /// calls, so the human sees an already-self-reviewed PR.
+    fn self_reviews(&self) -> bool {
+        true
+    }
+
     fn execute_prompt(
         &self,
         deps: &Deps,
