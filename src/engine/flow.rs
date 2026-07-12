@@ -660,16 +660,18 @@ async fn spawn_agent_pane(
     initial_trigger: &str,
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
-    let mut command = vec![deps.config.agent.command.clone()];
-    command.extend(deps.config.agent.args.iter().cloned());
+    let (profile_name, profile) = resolve_run_profile(deps, run)?;
+
+    let mut command = vec![profile.command.clone()];
+    command.extend(profile.args.iter().cloned());
     if let Some(session_id) = resume_session {
-        command.extend(deps.config.agent.resume_args.iter().cloned());
+        command.extend(profile.resume_args.iter().cloned());
         command.push(session_id.to_string());
     }
     command.push(initial_trigger.to_string());
 
     let mut env = Vec::new();
-    if let Some(hint) = &deps.config.agent.herdr_agent_hint {
+    if let Some(hint) = &profile.herdr_agent_hint {
         env.push(("HERDR_AGENT".to_string(), hint.clone()));
     }
 
@@ -693,9 +695,55 @@ async fn spawn_agent_pane(
         "pane.spawned",
         json!({ "pane": pane.0, "mux": deps.mux.kind().as_str(),
                 "resumed": resume_session.is_some(),
+                "profile": profile_name,
                 "attach": deps.mux.attach_command(&pane) }),
     )?;
     Ok(pane)
+}
+
+/// Resolve the launch profile for a run, pinning it on first spawn.
+///
+/// Role→profile resolution runs once, lazily, at the first pane spawn: the
+/// result is persisted to `runs.agent_profile` and every later spawn/resume
+/// of this run reuses it (auto detection is not re-run). If a run created
+/// before migration 0004 has no pin, or a fresh run reaches here first, we
+/// resolve from `runs.loop_kind` now. A pinned name that has since vanished
+/// from config is a loud error — never a silent fall back to `default`.
+fn resolve_run_profile(
+    deps: &Deps,
+    run: &RunRecord,
+) -> Result<(String, crate::config::AgentProfile)> {
+    // Re-read: a concurrent spawn (or an earlier turn) may have pinned the
+    // profile on the store even though the caller's snapshot predates it.
+    let pinned = deps
+        .store
+        .get_run(&run.id)?
+        .and_then(|r| r.agent_profile)
+        .filter(|s| !s.is_empty());
+    let name = match pinned {
+        Some(name) => name,
+        None => {
+            let name = crate::routing::resolve(
+                &deps.config,
+                &run.loop_kind,
+                &crate::routing::detect_command,
+            )?;
+            deps.store.update_run_agent_profile(&run.id, &name)?;
+            deps.store.emit(
+                Some(&run.id),
+                "run.profile_resolved",
+                json!({ "profile": name, "role": run.loop_kind }),
+            )?;
+            name
+        }
+    };
+    let profile = crate::routing::profile_by_name(&deps.config, &name).with_context(|| {
+        format!(
+            "run {} is pinned to agent profile {name:?}, which is no longer in config",
+            run.id
+        )
+    })?;
+    Ok((name, profile))
 }
 
 /// Watch a freshly resume-spawned pane briefly; false means it died (the
