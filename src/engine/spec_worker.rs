@@ -203,15 +203,19 @@ impl Flavor for SpecWorkerFlavor {
              - Do NOT push and do NOT create a pull request; the PR already \
                exists and meguri pushes to it.\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
-               worktrees.{lang_section}",
+               worktrees.\n\n\
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
+            pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
-        // The completion contract is appended by prepare_turn. No PR-body
-        // section: the PR already exists, nothing consumes `pr_body` here.
+        // The completion contract is appended by prepare_turn. The PR already
+        // exists, but the takeover still authors `pr_body`: settle rewrites
+        // the PR's body from the planner's spec description to this one
+        // (issue #98).
     }
 
     /// The planner's "spec must exist" check, inverted: the spec is
@@ -242,9 +246,42 @@ impl Flavor for SpecWorkerFlavor {
             .unwrap_or_else(|| deps.project.default_branch.clone())
     }
 
-    /// Unused: the PR already exists, so open-pr never creates one.
+    /// open-pr never *creates* the PR (it already exists), but
+    /// [`Flavor::settle_presentation`] retitles it to this: the planner opened
+    /// the PR as `Spec: X (#N)`, and once implementation lands the `Spec:`
+    /// prefix is dropped so the title reads as an implementation PR (issue #98).
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
         format!("{} (#{})", cp.issue_title, run.issue_number)
+    }
+
+    /// Transition the takeover PR's presentation from spec to implementation.
+    /// The planner authored it as `Spec: X (#N)` with a spec-premised body;
+    /// now that the implementation is committed, retitle it `X (#N)` and
+    /// replace the body with the implementation description the agent wrote
+    /// (issue #98). Idempotent: re-running sets the same values. This is the
+    /// spec-worker-only half of the presentation the normal worker sets at PR
+    /// creation, so the two paths converge instead of diverging.
+    async fn settle_presentation(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &Checkpoint,
+    ) -> Result<()> {
+        let pr = cp
+            .pr_number
+            .context("spec-worker checkpoint has no PR number")?;
+        deps.forge
+            .update_pr_title(pr, &self.pr_title(run, cp))
+            .await?;
+        deps.forge
+            .update_pr_body(pr, &flow::compose_pr_body(run, cp))
+            .await?;
+        deps.store.emit(
+            Some(&run.id),
+            "pr.presentation_settled",
+            json!({ "pr": pr }),
+        )?;
+        Ok(())
     }
 
     /// Label transition on the PR: the takeover consumed `meguri:spec-ready`;
@@ -313,8 +350,8 @@ mod tests {
         assert!(prompt.contains("the PR already exists"));
         assert!(prompt.contains("Do NOT push"));
         assert!(
-            !prompt.contains("# Pull request description"),
-            "the PR exists; nothing consumes pr_body"
+            prompt.contains("# Pull request description"),
+            "settle rewrites the takeover PR's body, so pr_body is consumed"
         );
         assert!(!prompt.contains("# Output language"));
     }

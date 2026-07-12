@@ -185,27 +185,6 @@ pub async fn cmd_watch() -> Result<()> {
     result
 }
 
-pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
-    let cfg = Config::load()?;
-    let store = open_store()?;
-    let bind = bind.unwrap_or(&cfg.server.bind);
-    let port = port.unwrap_or(cfg.server.port);
-    let addr: std::net::IpAddr = bind
-        .parse()
-        .with_context(|| format!("invalid bind address {bind:?}"))?;
-    if !addr.is_loopback() {
-        eprintln!(
-            "⚠️  binding {bind} — the dashboard has no authentication; \
-             anyone who can reach this address can read run data"
-        );
-    }
-    let listener = tokio::net::TcpListener::bind((addr, port))
-        .await
-        .with_context(|| format!("cannot bind {bind}:{port}"))?;
-    println!("meguri dashboard on http://{}", listener.local_addr()?);
-    crate::server::serve(store, cfg, listener).await
-}
-
 pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {
     let cfg = Config::load()?;
     let projects: Vec<&ProjectConfig> = match project {

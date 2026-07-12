@@ -72,15 +72,45 @@ pub struct Config {
     #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
-    pub server: ServerConfig,
-    #[serde(default)]
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub pr: PrConfig,
     #[serde(default)]
     pub clean: CleanConfig,
     #[serde(default)]
+    pub review: ReviewConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+/// Settings for the impl-reviewer loop (AI review of implementation PRs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Kill switch: false silences the impl-reviewer loop entirely
+    /// (e.g. when an external review bot already covers implementation PRs).
+    #[serde(default = "default_impl_review_enabled")]
+    pub impl_enabled: bool,
+    /// Max impl-review rounds per PR, counted as head markers in the PR's
+    /// comments — the cap that keeps the AI review→fix ping-pong finite.
+    /// Once reached, the loop quietly leaves the PR to the humans.
+    #[serde(default = "default_impl_max_rounds")]
+    pub impl_max_rounds: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            impl_enabled: default_impl_review_enabled(),
+            impl_max_rounds: default_impl_max_rounds(),
+        }
+    }
+}
+
+fn default_impl_review_enabled() -> bool {
+    true
+}
+fn default_impl_max_rounds() -> u32 {
+    3
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -344,33 +374,6 @@ fn default_throttle_secs() -> u64 {
     10
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    /// `meguri serve` listen port.
-    #[serde(default = "default_server_port")]
-    pub port: u16,
-    /// Bind address. Loopback by default — the dashboard has no auth; serve
-    /// warns (but proceeds) on anything else.
-    #[serde(default = "default_server_bind")]
-    pub bind: String,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            port: default_server_port(),
-            bind: default_server_bind(),
-        }
-    }
-}
-
-fn default_server_port() -> u16 {
-    8607
-}
-fn default_server_bind() -> String {
-    "127.0.0.1".into()
-}
-
 /// awaiting_human escalations paged to a human (issue #7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationsConfig {
@@ -620,11 +623,23 @@ mod tests {
         assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
         assert_eq!(back.daemon.throttle_secs, 10);
         assert!(back.pr.draft);
-        assert_eq!(back.server.port, 8607);
-        assert_eq!(back.server.bind, "127.0.0.1");
         assert!(back.notifications.macos);
         assert_eq!(back.notifications.webhook_url, None);
         assert_eq!(back.notifications.throttle_secs, 60);
+        assert!(back.review.impl_enabled);
+        assert_eq!(back.review.impl_max_rounds, 3);
+    }
+
+    #[test]
+    fn review_section_overrides_defaults() {
+        let raw = r#"
+[review]
+impl_enabled = false
+impl_max_rounds = 1
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.review.impl_enabled);
+        assert_eq!(cfg.review.impl_max_rounds, 1);
     }
 
     #[test]
@@ -663,20 +678,6 @@ throttle_secs = 10
             Some("https://example.com/hook")
         );
         assert_eq!(cfg.notifications.throttle_secs, 10);
-    }
-
-    #[test]
-    fn server_defaults_apply_without_section() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.server.port, 8607);
-        assert_eq!(cfg.server.bind, "127.0.0.1");
-    }
-
-    #[test]
-    fn server_section_overrides_defaults() {
-        let cfg: Config = toml::from_str("[server]\nport = 9000\nbind = \"0.0.0.0\"\n").unwrap();
-        assert_eq!(cfg.server.port, 9000);
-        assert_eq!(cfg.server.bind, "0.0.0.0");
     }
 
     #[test]

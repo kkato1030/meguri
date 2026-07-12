@@ -3,6 +3,7 @@ pub mod cleaner;
 pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
+pub mod impl_reviewer;
 pub mod planner;
 pub mod reaper;
 pub mod reviewer;
@@ -168,6 +169,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
+        Arc::new(impl_reviewer::ImplReviewerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(reviewer::ReviewerLoop),
         Arc::new(worker::WorkerLoop),

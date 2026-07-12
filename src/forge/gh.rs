@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergeableState, PullRequest, ReviewComment, ReviewThread,
+    MergeableState, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// How much of each failed job log survives into the fix prompt (logs can be
@@ -34,6 +34,36 @@ impl GhForge {
             .output()
             .await
             .context("spawning gh (is the GitHub CLI installed?)")?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        } else {
+            bail!(
+                "gh {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+
+    /// Like [`Self::gh`] but with a JSON payload on stdin (`--input -`), for
+    /// endpoints whose body nests arrays that `-f` flags cannot express.
+    async fn gh_stdin(&self, args: &[&str], input: &str) -> Result<String> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = tokio::process::Command::new("gh")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("spawning gh (is the GitHub CLI installed?)")?;
+        child
+            .stdin
+            .take()
+            .context("gh stdin unavailable")?
+            .write_all(input.as_bytes())
+            .await
+            .context("writing gh stdin")?;
+        let out = child.wait_with_output().await.context("waiting for gh")?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
         } else {
@@ -437,6 +467,34 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--title",
+            title,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn get_pr(&self, number: i64) -> Result<PullRequest> {
         let raw = self
             .gh(&[
@@ -808,6 +866,40 @@ impl Forge for GhForge {
                 })
             })
             .collect())
+    }
+
+    async fn create_pr_review(
+        &self,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewCommentDraft],
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "event": "COMMENT",
+            "body": body,
+            "comments": comments
+                .iter()
+                .map(|c| serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": c.body,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        self.gh_stdin(
+            &[
+                "api",
+                &format!("repos/{}/pulls/{pr}/reviews", self.repo),
+                "--method",
+                "POST",
+                "--input",
+                "-",
+            ],
+            &payload.to_string(),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn reply_review_thread(&self, _pr: i64, thread_id: &str, body: &str) -> Result<()> {
