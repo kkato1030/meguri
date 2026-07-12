@@ -67,6 +67,12 @@ pub struct FakeForge {
     pub merged: Mutex<HashMap<i64, String>>,
     /// Repository merge policy; `None` means the permissive default.
     pub policy: Mutex<Option<MergePolicy>>,
+    /// When true, the branch-protection probe is "forbidden" — it mirrors a
+    /// non-admin token's HTTP 403 (see [`FakeForge::forbid_protection_probe`]).
+    /// `merge_policy` only consults the probe when `require_branch_protection`
+    /// is true, so this errors then and is silently skipped otherwise — the
+    /// exact escape hatch the real GhForge implements.
+    pub protection_probe_forbidden: Mutex<bool>,
     /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
     pub pr_for_branch_errors: Mutex<HashSet<String>>,
     /// CI checks per PR number (ci-fixer tests); unset PRs report an empty
@@ -377,6 +383,14 @@ impl FakeForge {
     /// base protected).
     pub fn set_merge_policy(&self, policy: MergePolicy) {
         *self.policy.lock().unwrap() = Some(policy);
+    }
+
+    /// Make the branch-protection probe fail like a non-admin token's HTTP 403.
+    /// `merge_policy` only errors when `require_branch_protection` is true;
+    /// with it false the probe is skipped and never surfaces the 403 — the
+    /// escape hatch under test (issue #41 review).
+    pub fn forbid_protection_probe(&self) {
+        *self.protection_probe_forbidden.lock().unwrap() = true;
     }
 
     /// The armed (strategy, head_sha) for a PR, if any.
@@ -798,10 +812,21 @@ impl Forge for FakeForge {
             .unwrap()
             .clone()
             .unwrap_or_else(permissive_policy);
-        // Mirror GhForge: when protection isn't required the probe is skipped,
-        // so its result is reported false rather than read.
+        // Mirror GhForge: the probe only runs when protection is required.
         if !require_branch_protection {
+            // Skipped — its result is reported false rather than read, and a
+            // forbidden (403) probe can never surface. This is the escape hatch.
             policy.protected_with_required_checks = false;
+            return Ok(policy);
+        }
+        // Required: the probe runs. A forbidden probe mirrors a non-admin
+        // token's HTTP 403 (GhForge's `protection_from_stderr` bail).
+        if *self.protection_probe_forbidden.lock().unwrap() {
+            bail!(
+                "cannot read branch protection: the token lacks admin rights \
+                 (HTTP 403). Use an admin-scoped token, or set \
+                 `require_branch_protection = false` if you are not an admin"
+            );
         }
         Ok(policy)
     }

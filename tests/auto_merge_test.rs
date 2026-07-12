@@ -332,6 +332,32 @@ async fn merge_policy_skips_protection_probe_when_not_required() {
 }
 
 #[tokio::test]
+async fn require_branch_protection_false_escapes_a_non_admin_403() {
+    // The reviewer's exact scenario (issue #41): a non-admin / write-only
+    // token 403s on the branch-protection probe. With protection required the
+    // probe runs and the 403 surfaces as an error (admin token needed); with
+    // `require_branch_protection = false` the probe is skipped, so no 403 —
+    // `merge_policy` (hence `meguri watch` / `doctor` preflight) succeeds and
+    // the documented escape hatch actually works for non-admin tokens.
+    let forge = FakeForge::default();
+    forge.forbid_protection_probe();
+
+    let err = forge.merge_policy("main", true).await.unwrap_err();
+    assert!(err.to_string().contains("HTTP 403"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("require_branch_protection = false"),
+        "{err}"
+    );
+
+    let escaped = forge
+        .merge_policy("main", false)
+        .await
+        .expect("escape hatch: probe skipped, no 403");
+    assert!(!escaped.protected_with_required_checks);
+}
+
+#[tokio::test]
 async fn clean_status_pr_is_finalized_with_merge() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
