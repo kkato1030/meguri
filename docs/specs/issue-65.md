@@ -1,0 +1,78 @@
+# issue-65 spec — routing (2/3): 振り分け基準の継続検査(meguri stats routing + doctor 鮮度チェック)
+
+#64 で入れた役割ベース振り分けが**古びていないか**を継続検査する。2 層構成 — 表そのものの賞味期限を見る**静的鮮度チェック**(doctor)と、実 run データで裏切られていないかを見る**成果ドリフト検知**(scheduler + stats)。設計判断は ADR 0007 に置いた(本 PR 同梱)。ここは収束のための実装仕様。
+
+## 調査で判明した前提(この branch の現状)
+
+- **`meguri serve` は撤去済み**(#95/#97、ADR 0002 は superseded)。ダッシュボードは端末ネイティブな `meguri top`(`src/app.rs`)。→ issue の「serve ダッシュボードの 1 ページ」は **`meguri stats routing`(CLI)+ `meguri top` ヘッダの drift 行**に読み替える(ADR 0007)。
+- **役割の軸はすでにある**: `runs.loop_kind`(= `routing::resolve` がキーにする役割)と `runs.agent_profile`(#64 が spawn 時に固定)。集計は両カラムの GROUP BY で足りる。次元表は不要。
+- **成果指標の素材はすでに揃っている**:
+  - `runs`: `status`(succeeded/failed/cancelled/skipped/…)、`turn_no`、`started_at`/`finished_at`。
+  - `events`(`src/events.rs`): `turn.nudged`・`validate.failed`・`turn.awaiting_human` などが run 単位で残る。
+- **doctor** は `src/main.rs::cmd_doctor` +`doctor_agents`。`routing::GENERATED_AT`(= `"2026-07-12"`)は #64 で導入済み。既存の profile 検出は `run_capture(cmd, ["--version"])`。
+- **CLI 検出のテスト注入**の前例: `routing::detect_command` をクロージャ差し替えする(`routing.rs` / `routing_test.rs`)。プローブも同じ流儀にする。
+- スキーマ移行は `src/store/migrations/` の連番(次は `0007_`)、`MIGRATIONS` 配列に登録すれば冪等適用(`store/mod.rs`)。
+- ドリフト sweep を載せる先は scheduler の per-project poll(`scheduler.rs` の `reaper::sweep` / `auto_merger::sweep` と同じ場所)。
+
+## 決定(詳細は ADR 0007)
+
+- 検査は 2 層独立。層 1 = doctor の静的鮮度、層 2 = 実履歴の成果ドリフト。
+- 集計軸 = `runs.loop_kind` × `runs.agent_profile`。`impl-reviewer`(worker 内の 1 ターン、独立 run でない)は層 2 の対象外 = v1 の既知の限界として明記。
+- 成功率の分母 = `succeeded`+`failed`+`cancelled` のみ(`skipped`/`needs_plan`/`decomposed` は除外)。この定義をテストで固定。
+- コスト代理 = ターン数 × 所要時間。トークン会計はスコープ外。
+- 読み取り(stats/doctor/top)は sqlite 直読み。ドリフト**検知**だけ scheduler の sweep が担い、`routing.drift` イベントを書く。doctor/top は最新 drift を読むだけ。
+- 閾値は `[routing.drift]`。既定 = 成功率 -20pt または平均ターン数 +50%。テストで固定。
+- プローブは「モデル不正 → ❌」「ネットワーク/認証失敗 → ⚠️」を区別。注入クロージャ + fake agent でテスト。
+
+## 実装内容
+
+### 層 1 — `meguri doctor` の拡張(`src/main.rs`)
+
+1. **推奨表の賞味期限**: `routing::GENERATED_AT` を今日と比較し 90 日超で ⚠️「routing 推奨は YYYY-MM 版。新モデルのリリースを確認してください」。日付差の算出は `store::parse_ts`/`now` を使う純関数を `routing.rs` に足す(例 `routing::table_age_days()` → テスト可能)。閾値 90 日は定数。
+2. **実起動プローブ**(opt-in、quota 消費): profile ごとに超短命 1 ターンを打ち、モデルエイリアスの生死を確認。結果を **model-invalid(❌)/ network・auth 失敗(⚠️)/ ok(✅)** に 3 分類。プローブ関数は `Fn(&AgentProfile) -> ProbeOutcome` のクロージャとして注入し、本番実装は該当 CLI を spawn(claude 系は `-p "reply: ok" --model <alias>` 相当)。既定でプローブを走らせるか `--probe` フラグにするかは spec レビューで決める(既定案: フラグ opt-in にして無課金の doctor を保つ)。
+3. **CLI バージョンドリフト**: 検出した各 CLI の version 文字列を sqlite に UPSERT し、前回保存値とメジャー番号を比較。上がっていたら「挙動が変わっている可能性。ルーティング再評価を推奨」。メジャー抽出は先頭 `\d+` を拾う純関数(`vX.Y.Z` / `X.Y.Z` 双方)+ テスト。
+
+### 層 2 — 成果集計とドリフト検知
+
+4. **集計(sqlite 直読み)**: `Store` に `routing_stats(project_id, window)` を追加。(loop_kind, agent_profile) ごとに、直近 N 件の terminal run から成功率・平均ターン数(`AVG(turn_no)`)・平均所要時間(`finished_at - started_at` を `parse_ts` で秒化)を返す構造体 `RoutingStatRow` を返す。`agent_profile IS NULL`(未固定の旧 run)は「(unrouted)」等でまとめる。
+5. **`meguri stats routing`**(`src/cli.rs` に `Stats { StatsCommand::Routing }`、`src/main.rs` で dispatch、レンダリングは `src/app.rs`): 上記 3 指標を (役割, プロファイル) 表で表示。直近 drift があれば併記。
+6. **ドリフト検知(scheduler の sweep)**: 新モジュール(例 `src/engine/routing_drift.rs`)の `sweep(deps)` を poll に追加。(役割, プロファイル) ごとに直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、`成功率 -Δpt` か `平均ターン数 +Δ%` が閾値超えなら `routing.drift` イベントを emit(data に role/profile/before/after を積む)。**同じ状態を毎 tick 書かない**(直前と drift 状態が変わったときだけ)。ウィンドウが埋まっていない (役割, プロファイル) は判定しない。
+7. **表示**:
+   - **doctor**: 最新の未解消 `routing.drift` を読み「worker/claude-sonnet の成績が悪化 — CLI 更新かモデル変更の影響の可能性」を ⚠️ 表示。
+   - **`meguri top`**(`src/app.rs::render_top` / `TopStatus`): ヘッダに drift 件数/要約行を 1 行追加。
+
+### 設定(`src/config.rs`)
+
+8. `RoutingConfig` に `#[serde(default)] drift: DriftConfig` を追加。`DriftConfig { success_rate_drop_pt: f64 = 20.0, turns_increase_pct: f64 = 50.0, window: usize = 20 }`(既定値関数 + `Default`)。`[routing]` 無し(legacy)でも既定が引けること。
+
+### スキーマ(`src/store/migrations/0007_cli_versions.sql`)
+
+9. CLI バージョン履歴の最小永続化。`CREATE TABLE cli_versions (command TEXT PRIMARY KEY, version TEXT NOT NULL, major INTEGER, checked_at TEXT NOT NULL)` を UPSERT。`MIGRATIONS` 配列に登録。ドリフトイベントは既存 `events` を使うので新テーブル不要。
+
+## 受け入れ条件(元 issue から）
+
+- [ ] `meguri stats routing` が (役割, プロファイル) 別の成功率・平均ターン数・平均所要時間を表示する
+- [ ] ウィンドウ比較でドリフト警告イベント(`routing.drift`)が書かれ、`meguri top` と doctor に表示される(閾値はテストで固定 / serve 撤去に伴い web ページではなく top+stats に表示)
+- [ ] doctor: `GENERATED_AT` 90 日超で ⚠️ が出る
+- [ ] doctor: 実起動プローブが無効モデルを ❌ で検知する(fake agent = 注入クロージャでのテスト)。ネットワーク/認証失敗は ⚠️ に落ちて doctor を fail させない
+- [ ] doctor: CLI メジャーバージョン変化で再評価推奨が出る(sqlite 前回値との比較をテストで固定)
+
+## 触るファイル
+
+- `src/main.rs` — doctor に 3 検査(表鮮度 / プローブ / CLI バージョン)を追加
+- `src/routing.rs` — `table_age_days()` 等の純関数、プローブ結果型 `ProbeOutcome`、プローブ本番実装
+- `src/cli.rs` — `Stats` サブコマンド(`routing`)
+- `src/app.rs` — `meguri stats routing` レンダリング、`render_top`/`TopStatus` に drift 行
+- `src/engine/routing_drift.rs`(新規)+ `src/engine/scheduler.rs` — poll に drift sweep を追加、`super::routing_drift` を配線
+- `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats()`、CLI バージョン UPSERT/読み出し、最新 drift 読み出し
+- `src/store/migrations/0007_cli_versions.sql` + `src/store/mod.rs` — 移行登録
+- `src/config.rs` — `[routing.drift]`(`DriftConfig`)
+- `docs/adr/0007-routing-freshness-and-outcome-drift.md` — 本 PR 同梱
+- tests: `tests/stats_routing_test.rs`(集計 + ドリフト閾値)、doctor プローブ/バージョンのユニットテスト(`main.rs`/`routing.rs`/`store`)
+
+## スコープ外
+
+- Claude Code セッション jsonl からのトークン usage 収集(将来拡張、issue 明記)。
+- `impl-reviewer` のターン単位成果集計(独立 run でないため層 2 対象外。層 1 のプローブ検証は受ける)。
+- routing 3/3(ドリフト検知を受けたエスカレーション/自動再評価)。
+- Web ダッシュボード復活(serve は撤去済み。表示は top + stats に集約)。
