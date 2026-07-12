@@ -34,7 +34,8 @@ automerge のゲートは引き続き ADR 0004 本文どおり「チェック緑
 
 ```console
 # 1. public 化(#116 の別ステップ。本手順書は #116 からの参照専用)
-$ gh repo edit kkato1030/meguri --visibility public
+#    --visibility を使う場合 --accept-visibility-change-consequences が必須(gh CLI)
+$ gh repo edit kkato1030/meguri --visibility public --accept-visibility-change-consequences
 
 # 2. secret scanning + push protection を有効化(public で無料解禁)
 $ gh api -X PATCH repos/kkato1030/meguri \
