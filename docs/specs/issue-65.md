@@ -20,7 +20,7 @@
 - 集計軸 = `runs.loop_kind` × `runs.agent_profile`。`impl-reviewer`(worker 内の 1 ターン、独立 run でない)は層 2 の対象外 = v1 の既知の限界として明記。
 - 成功率の分母 = `succeeded`+`failed`+`cancelled` のみ(`skipped`/`needs_plan`/`decomposed` は除外)。この定義をテストで固定。
 - コスト代理 = ターン数 × 所要時間。トークン会計はスコープ外。
-- 読み取り(stats/doctor/top)は sqlite 直読み。ドリフト**検知**だけ scheduler の sweep が担い、`routing.drift` イベントを書く。doctor/top は最新 drift を読むだけ。
+- 読み取り(stats/doctor/top)は sqlite 直読み。ドリフト**検知**だけ scheduler の sweep が担う。sweep は (project, 役割, プロファイル) 単位の**現在の drift 状態**を `routing_drift` テーブルに UPSERT し(現状態のソースオブトゥルース)、状態が遷移したときだけ `routing.drift` / `routing.drift_cleared` イベントを履歴として追記する。doctor/top/stats は `routing_drift` を `project_id` で絞って未解消(`active`)行を読むだけ。`events` は `project_id` を持たず drift は run 非依存の集計なので、read 側のスコープ・解消判定はイベントではなく状態テーブルで担保する。
 - 閾値は `[routing.drift]`。既定 = 成功率 -20pt または平均ターン数 +50%。テストで固定。
 - プローブは「モデル不正 → ❌」「ネットワーク/認証失敗 → ⚠️」を区別。注入クロージャ + fake agent でテスト。
 
@@ -36,23 +36,41 @@
 
 4. **集計(sqlite 直読み)**: `Store` に `routing_stats(project_id, window)` を追加。(loop_kind, agent_profile) ごとに、直近 N 件の terminal run から成功率・平均ターン数(`AVG(turn_no)`)・平均所要時間(`finished_at - started_at` を `parse_ts` で秒化)を返す構造体 `RoutingStatRow` を返す。`agent_profile IS NULL`(未固定の旧 run)は「(unrouted)」等でまとめる。
 5. **`meguri stats routing`**(`src/cli.rs` に `Stats { StatsCommand::Routing }`、`src/main.rs` で dispatch、レンダリングは `src/app.rs`): 上記 3 指標を (役割, プロファイル) 表で表示。直近 drift があれば併記。
-6. **ドリフト検知(scheduler の sweep)**: 新モジュール(例 `src/engine/routing_drift.rs`)の `sweep(deps)` を poll に追加。(役割, プロファイル) ごとに直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、`成功率 -Δpt` か `平均ターン数 +Δ%` が閾値超えなら `routing.drift` イベントを emit(data に role/profile/before/after を積む)。**同じ状態を毎 tick 書かない**(直前と drift 状態が変わったときだけ)。ウィンドウが埋まっていない (役割, プロファイル) は判定しない。
+6. **ドリフト検知(scheduler の sweep)**: 新モジュール(例 `src/engine/routing_drift.rs`)の `sweep(deps)` を poll に追加。project ごとに (役割, プロファイル) 単位で直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、`成功率 -Δpt` か `平均ターン数 +Δ%` が閾値超えなら drift ありと判定。判定結果を `routing_drift` に UPSERT する(`active=1` + before/after 指標、または `active=0`)。**`active` が遷移したときだけ**イベントを追記する(0→1 で `routing.drift`、1→0 で `routing.drift_cleared`。payload に `project_id`/`role`/`profile`/`before`/`after`)。この「テーブルの現在値と比較して遷移時のみ書く」が dedup(同じ状態を毎 tick 書かない)の実装であり、テストで「同一状態の連続 sweep でイベントが 1 度だけ / 回復で cleared が 1 度だけ」を固定する。ウィンドウが埋まっていない (役割, プロファイル) は判定せず状態を書かない。
 7. **表示**:
-   - **doctor**: 最新の未解消 `routing.drift` を読み「worker/claude-sonnet の成績が悪化 — CLI 更新かモデル変更の影響の可能性」を ⚠️ 表示。
+   - **doctor**: 現在 project の `routing_drift` の未解消(`active`)行を読み「worker/claude-sonnet の成績が悪化 — CLI 更新かモデル変更の影響の可能性」を ⚠️ 表示。回復済み(`active=0`)は出さない。
    - **`meguri top`**(`src/app.rs::render_top` / `TopStatus`): ヘッダに drift 件数/要約行を 1 行追加。
 
 ### 設定(`src/config.rs`)
 
 8. `RoutingConfig` に `#[serde(default)] drift: DriftConfig` を追加。`DriftConfig { success_rate_drop_pt: f64 = 20.0, turns_increase_pct: f64 = 50.0, window: usize = 20 }`(既定値関数 + `Default`)。`[routing]` 無し(legacy)でも既定が引けること。
 
-### スキーマ(`src/store/migrations/0007_cli_versions.sql`)
+### スキーマ(`src/store/migrations/0007_routing_freshness.sql`)
 
-9. CLI バージョン履歴の最小永続化。`CREATE TABLE cli_versions (command TEXT PRIMARY KEY, version TEXT NOT NULL, major INTEGER, checked_at TEXT NOT NULL)` を UPSERT。`MIGRATIONS` 配列に登録。ドリフトイベントは既存 `events` を使うので新テーブル不要。
+9. **CLI バージョン履歴**の最小永続化。`CREATE TABLE cli_versions (command TEXT PRIMARY KEY, version TEXT NOT NULL, major INTEGER, checked_at TEXT NOT NULL)` を UPSERT。
+10. **drift 現在状態テーブル**。read 側のスコープ(project 別)と解消判定を担保するため、集計イベントとは別に現在状態を 1 行 = 1 (project, 役割, プロファイル) で持つ:
+    ```sql
+    CREATE TABLE routing_drift (
+      project_id     TEXT NOT NULL,
+      loop_kind      TEXT NOT NULL,
+      agent_profile  TEXT NOT NULL DEFAULT '',   -- '' = unrouted(NULL 不可で複合 PK を成立させる)
+      active         INTEGER NOT NULL,           -- 1 = 未解消 / 0 = 解消
+      metric_json    TEXT NOT NULL DEFAULT '{}', -- before/after 指標
+      detected_at    TEXT NOT NULL,              -- drift 開始時刻(active=1 になった時)
+      updated_at     TEXT NOT NULL,
+      PRIMARY KEY (project_id, loop_kind, agent_profile)
+    );
+    ```
+    sweep がここへ UPSERT し、doctor/top/stats は `WHERE project_id=? AND active=1` で読む。`routing.drift` / `routing.drift_cleared` イベントは履歴(閾値を跨いだ瞬間の記録)として `events` に残すが、read 側の現在状態はこのテーブルが真。
+
+両テーブルとも `MIGRATIONS` 配列に登録(冪等適用)。
 
 ## 受け入れ条件(元 issue から）
 
 - [ ] `meguri stats routing` が (役割, プロファイル) 別の成功率・平均ターン数・平均所要時間を表示する
-- [ ] ウィンドウ比較でドリフト警告イベント(`routing.drift`)が書かれ、`meguri top` と doctor に表示される(閾値はテストで固定 / serve 撤去に伴い web ページではなく top+stats に表示)
+- [ ] ウィンドウ比較でドリフトが `routing_drift` に記録され(`routing.drift` イベントも追記)、`meguri top` と doctor に表示される(閾値はテストで固定 / serve 撤去に伴い web ページではなく top+stats に表示)
+- [ ] 複数 project の drift が `project_id` で正しく分離される(ある project の drift が別 project の doctor/top/stats に出ない)
+- [ ] 成績が閾値内に回復すると `active=0` になり(`routing.drift_cleared` イベント)、doctor/top/stats から消える。同一状態の連続 sweep でイベントが増えない(テストで固定)
 - [ ] doctor: `GENERATED_AT` 90 日超で ⚠️ が出る
 - [ ] doctor: 実起動プローブが無効モデルを ❌ で検知する(fake agent = 注入クロージャでのテスト)。ネットワーク/認証失敗は ⚠️ に落ちて doctor を fail させない
 - [ ] doctor: CLI メジャーバージョン変化で再評価推奨が出る(sqlite 前回値との比較をテストで固定)
@@ -64,8 +82,8 @@
 - `src/cli.rs` — `Stats` サブコマンド(`routing`)
 - `src/app.rs` — `meguri stats routing` レンダリング、`render_top`/`TopStatus` に drift 行
 - `src/engine/routing_drift.rs`(新規)+ `src/engine/scheduler.rs` — poll に drift sweep を追加、`super::routing_drift` を配線
-- `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats()`、CLI バージョン UPSERT/読み出し、最新 drift 読み出し
-- `src/store/migrations/0007_cli_versions.sql` + `src/store/mod.rs` — 移行登録
+- `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats()`、CLI バージョン UPSERT/読み出し、`routing_drift` の UPSERT / project 別未解消行の読み出し
+- `src/store/migrations/0007_routing_freshness.sql` + `src/store/mod.rs` — `cli_versions` + `routing_drift` の移行登録
 - `src/config.rs` — `[routing.drift]`(`DriftConfig`)
 - `docs/adr/0007-routing-freshness-and-outcome-drift.md` — 本 PR 同梱
 - tests: `tests/stats_routing_test.rs`(集計 + ドリフト閾値)、doctor プローブ/バージョンのユニットテスト(`main.rs`/`routing.rs`/`store`)

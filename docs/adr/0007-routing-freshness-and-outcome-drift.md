@@ -21,7 +21,7 @@ ADR 0003 で「auto の推奨表はバイナリに焼き込み、生成日(`GENE
 | 層 | 何を見るか | データ源 | いつ走るか | 出力 |
 |---|---|---|---|---|
 | 静的鮮度 | 表の `generated_at`・モデルエイリアスの生死・CLI メジャーバージョン | 定数 + 実起動プローブ + sqlite(前回バージョン) | `meguri doctor` 実行時 | doctor の ⚠️/❌ |
-| 成果ドリフト | (役割, プロファイル) 別の成功率・平均ターン数の悪化 | `runs` + `events`(実履歴) | watch の poll(scheduler の sweep) | `routing.drift` イベント → doctor / top / stats |
+| 成果ドリフト | (役割, プロファイル) 別の成功率・平均ターン数の悪化 | `runs`(実履歴)→ `routing_drift`(現在状態)+ `events`(遷移履歴) | watch の poll(scheduler の sweep) | `routing_drift` を project 別に読む → doctor / top / stats |
 
 層をまたぐ唯一の接点は「どちらも routing の陳腐化を疑わせる」ことだけで、実装は独立している。
 
@@ -41,13 +41,14 @@ ADR 0003 で「auto の推奨表はバイナリに焼き込み、生成日(`GENE
 
 読み取り(`meguri stats routing`・doctor・top)は `Config::load` + `Store::open` だけで完結させ、watch が止まっていても過去 run を集計できる(ADR 0002 で撤去した serve の read path 原則をそのまま継承)。
 
-一方**ドリフトの「検知」は watch の poll に乗せる**。reaper / auto-merger と同じ per-project sweep で、直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、閾値超えを `routing.drift` イベントとして書く。理由:
+一方**ドリフトの「検知」は watch の poll に乗せる**。reaper / auto-merger と同じ per-project sweep で、直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、閾値超えを判定する。理由:
 
 - 検知はループを持つ主体(scheduler)だけがやればよく、read-only な stats/doctor に毎回計算させない。
-- イベントとして永続化すれば doctor と top は「最新の drift を読むだけ」で一貫表示でき、閾値を跨いだ瞬間が履歴に残る。
-- 閾値は決定的(config)なので、テストで固定して同じ入力から同じイベントを再現できる。
+- 閾値は決定的(config)なので、テストで固定して同じ入力から同じ結果を再現できる。
 
-同じドリフトを毎 tick 書かないよう、sweep は「直前と状態が変わったときだけ」書く(dedup は実装詳細だが、テストで一度だけ書かれることを固定する)。
+**現在状態は状態テーブル、履歴はイベント** に分ける。当初は `events` だけに書く案だったが、`events` は `run_id`/`data_json` しか持たず `project_id` を持たない一方、drift は run 非依存の (役割×プロファイル) 集計なので `run_id` では紐づかない。よって read 側(doctor/top/stats)が「この project の未解消 drift だけ」を絞れず、また「解消したら消える」判定の拠り所も無かった。これを解消するため、現在状態を専用テーブル `routing_drift`(PK = `project_id`×`loop_kind`×`agent_profile`、`active` 0/1 + before/after 指標)に UPSERT し、read 側はこのテーブルを `project_id` で絞って `active=1` を読む。`routing.drift` / `routing.drift_cleared` イベントは**閾値を跨いだ瞬間の履歴**として `events` に残す(監査・後追い用)が、read 側の真の現在状態はテーブルが担う。
+
+同じドリフトを毎 tick 書かないための dedup は、この状態テーブルに自然な置き場を得る: sweep は判定結果をテーブルの現在値と突き合わせ、`active` が遷移したときだけイベントを追記する(0→1 で `routing.drift`、1→0 で `routing.drift_cleared`)。テストで「同一状態の連続 sweep でイベントが 1 度だけ / 回復で cleared が 1 度だけ / 複数 project が混ざらない」を固定する。
 
 ### 5. 閾値は `[routing.drift]` で調整可能。既定は成功率 -20pt / 平均ターン数 +50%
 
@@ -67,4 +68,5 @@ doctor 実行時のみ、各プロファイルで超短命の 1 ターン(claude
 - routing の陳腐化に対して「表の日付が古い」「モデルが消えた」「CLI が更新された」「実成績が落ちた」の 4 兆候が、それぞれ独立した安い検査で出るようになる。
 - serve 撤去(ADR 0002)を受け、issue が想定した「serve ダッシュボードの 1 ページ」は **`meguri stats routing`(CLI)+ `meguri top` ヘッダの drift 行**に置き換わる。Web ページは作らない。
 - CLI バージョンは doctor 実行ごとに sqlite に UPSERT し、メジャー番号の変化で「再評価推奨」を出す。バージョン履歴の最小の永続化(1 CLI = 1 行)を新設する。
+- drift の現在状態は `routing_drift` テーブル(project×役割×プロファイル = 1 行、`active` フラグ)に持ち、read 側の project スコープと「解消したら消える」を保証する。`events` は project を持たず run 非依存の drift を絞れないため、read の真実源にはしない(履歴としては残す)。
 - 成果ドリフトの精度はターン単位集計・トークン会計を足せば上げられるが、いずれも本 ADR の軸(役割×プロファイル / ターン数×所要時間)の**下**に足す拡張であり、この決定を覆さない。
