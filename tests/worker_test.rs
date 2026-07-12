@@ -12,7 +12,8 @@ use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_WORKING,
+    Forge, LABEL_AUTOMERGE, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY,
+    LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -368,6 +369,48 @@ async fn worker_pr_draft_false_opens_normal_pr() {
     let prs = env.forge.prs();
     assert_eq!(prs.len(), 1);
     assert!(!prs[0].draft, "pr.draft = false must open a normal PR");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_automerge_issue_opens_nondraft_and_copies_label() {
+    // `meguri:automerge` on the issue: the PR opens non-draft (even though
+    // pr.draft defaults to true) and the label is copied onto the PR so the
+    // auto-merger sweep can arm it (auto-merge 1/3, #41).
+    let env = setup(None).await;
+    env.forge.add_label(7, LABEL_AUTOMERGE).await.unwrap();
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(
+        !prs[0].draft,
+        "automerge PR opens non-draft despite pr.draft = true"
+    );
+    let pr_labels = env.forge.pr_labels_of(prs[0].number);
+    assert!(
+        pr_labels.contains(&LABEL_AUTOMERGE.to_string()),
+        "automerge label copied onto the PR: {pr_labels:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => cmd_init(),
-        Command::Doctor => cmd_doctor(),
+        Command::Doctor => cmd_doctor().await,
         Command::Watch => app::cmd_watch().await,
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon::cmd_start(),
@@ -79,7 +79,7 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor() -> Result<()> {
+async fn cmd_doctor() -> Result<()> {
     let mut ok = true;
 
     let check = |name: &str, pass: bool, detail: String| {
@@ -148,6 +148,9 @@ fn cmd_doctor() -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
+            // Auto-merge preconditions (ADR 0003): only for projects that
+            // enabled it — the same gate `meguri watch` fail-fasts on.
+            ok &= check_auto_merge(&cfg).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -160,6 +163,51 @@ fn cmd_doctor() -> Result<()> {
     } else {
         bail!("doctor found problems");
     }
+}
+
+/// Doctor item: for every project that enabled auto-merge, confirm the
+/// repository can honor it (the same validation `meguri watch` fail-fasts on,
+/// ADR 0003). Returns false if any enabled project fails; projects that did
+/// not enable auto-merge print nothing.
+async fn check_auto_merge(cfg: &Config) -> bool {
+    use meguri::engine::auto_merger::validate_policy;
+    use meguri::forge::Forge;
+    use meguri::forge::gh::GhForge;
+
+    let mut ok = true;
+    for project in &cfg.projects {
+        let am = &cfg.pr_for(project).auto_merge;
+        if !am.enabled {
+            continue;
+        }
+        let forge = GhForge::new(&project.repo_slug);
+        let label = format!("auto-merge ({})", project.id);
+        match forge
+            .merge_policy(&project.default_branch, am.require_branch_protection)
+            .await
+        {
+            Ok(policy) => match validate_policy(am, &policy) {
+                Ok(()) => println!(
+                    "✅ {label}: repo settings OK (strategy={}, protection {})",
+                    am.strategy.as_str(),
+                    if policy.protected_with_required_checks {
+                        "present"
+                    } else {
+                        "not required"
+                    },
+                ),
+                Err(problems) => {
+                    println!("❌ {label}: {}", problems.join("; "));
+                    ok = false;
+                }
+            },
+            Err(e) => {
+                println!("❌ {label}: cannot read repo merge settings: {e:#}");
+                ok = false;
+            }
+        }
+    }
+    ok
 }
 
 /// Doctor's routing section: list every defined profile (default + builtin +

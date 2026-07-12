@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 pub mod fake;
 pub mod gh;
@@ -41,9 +42,76 @@ pub const LABEL_WORKING: &str = "meguri:working";
 pub const LABEL_HOLD: &str = "meguri:hold";
 /// meguri gave up and a human needs to look (a comment explains why).
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
+/// Opt-in to GitHub-native auto-merge (auto-merge 1/3, issue #41). A human
+/// applies it to an issue (the worker copies it onto the PR) or straight to a
+/// PR; the auto-merger sweep arms auto-merge on PRs carrying it.
+pub const LABEL_AUTOMERGE: &str = "meguri:automerge";
 /// The cleaner loop's per-project report issue (one per project; its body is
 /// a snapshot of the current divergence, rewritten on every sweep).
 pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
+
+/// GitHub's three merge strategies. This is the forge's vocabulary and config
+/// deserializes straight into it (`serde(lowercase)`); ADR 0003 forbids
+/// falling back between them, so an unavailable strategy is an error, never a
+/// silent substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStrategy {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeStrategy {
+    /// The `gh pr merge` flag that selects this strategy.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+/// A snapshot of a repository's merge configuration for one base branch — the
+/// input to the auto-merge fail-fast (ADR 0003) and the sweep's arm gate.
+#[derive(Debug, Clone)]
+pub struct MergePolicy {
+    /// The repo's "Allow auto-merge" toggle (`allow_auto_merge`).
+    pub auto_merge_allowed: bool,
+    /// Strategies the repo permits (`allow_squash_merge` / `allow_merge_commit`
+    /// / `allow_rebase_merge`).
+    pub allowed_strategies: Vec<MergeStrategy>,
+    /// Whether the base branch carries classic branch protection with required
+    /// status checks. Rulesets are not detected (ADR 0003) — a rulesets-only
+    /// repo reads as `false`, and `require_branch_protection = false` is the
+    /// escape hatch.
+    pub protected_with_required_checks: bool,
+}
+
+impl MergePolicy {
+    pub fn allows(&self, strategy: MergeStrategy) -> bool {
+        self.allowed_strategies.contains(&strategy)
+    }
+}
+
+/// The result of trying to arm GitHub-native auto-merge on a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmOutcome {
+    /// auto-merge was reserved; GitHub merges the PR once required checks pass.
+    Armed,
+    /// GitHub already considers the PR mergeable (clean status), so there was
+    /// no block to reserve against — the caller finalizes with `merge_pr`.
+    AlreadyClean,
+}
 
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
@@ -172,6 +240,9 @@ pub struct PullRequest {
     pub head_sha: String,
     /// Lowercase state: "open", "merged" or "closed".
     pub state: String,
+    /// Whether the PR is still a draft (`isDraft`). The auto-merger readies a
+    /// draft before arming; the worker opens automerge PRs non-draft.
+    pub is_draft: bool,
     pub labels: Vec<String>,
 }
 
@@ -290,6 +361,35 @@ pub trait Forge: Send + Sync {
         body: &str,
         comments: &[ReviewCommentDraft],
     ) -> Result<()>;
+
+    /// Arm GitHub-native auto-merge, pinned to `head_sha`
+    /// (`--match-head-commit`). Already-armed is treated as success
+    /// (idempotent). The [`ArmOutcome`] distinguishes a reservation
+    /// ([`ArmOutcome::Armed`]) from GitHub already judging the PR mergeable
+    /// ([`ArmOutcome::AlreadyClean`]) — the caller `merge_pr`s the latter.
+    async fn enable_auto_merge(
+        &self,
+        pr: i64,
+        strategy: MergeStrategy,
+        head_sha: &str,
+    ) -> Result<ArmOutcome>;
+    /// Finalize a PR GitHub already judged clean, pinned to `head_sha`
+    /// (`gh pr merge --match-head-commit`, no `--auto`). A moved head is
+    /// rejected by GitHub, so no head other than the confirmed one merges.
+    async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
+    /// Ready a draft PR (`gh pr ready`).
+    async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
+    /// The repository's merge configuration for `base_branch` (ADR 0003
+    /// fail-fast + arm gate). When `require_branch_protection` is false the
+    /// branch-protection probe is skipped and `protected_with_required_checks`
+    /// comes back false — the caller opted out, so the (admin-only, 403-prone)
+    /// probe must not run and must not be able to fail startup. When true, the
+    /// probe runs and a 403 (non-admin token) surfaces as an error.
+    async fn merge_policy(
+        &self,
+        base_branch: &str,
+        require_branch_protection: bool,
+    ) -> Result<MergePolicy>;
 }
 
 #[cfg(test)]

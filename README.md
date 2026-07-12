@@ -142,7 +142,7 @@ meguri's issue labels form **two axes** (see [ADR 0005](docs/adr/0005-issue-labe
 | `meguri:needs-human` | 🔴 red | a human needs to look; a comment explains why (the phase label stays, so you can see *whether it stalled in spec or in implementation*) |
 | `meguri:hold` | ⚪ grey | intentionally paused by a human; discovery skips it |
 
-Plus one bookkeeping label: `meguri:clean-report` marks the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep).
+Plus two bookkeeping / opt-in labels: `meguri:clean-report` marks the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep), and `meguri:automerge` opts an issue (the worker copies it onto the PR) or a PR directly into GitHub-native auto-merge (see [Auto-merge (opt-in)](#auto-merge-opt-in) below).
 
 The **PR side** stays as it was: a spec PR carries `meguri:spec-reviewing` (awaiting review) then `meguri:spec-ready` (review passed; implementation continues) — these live on the PR, independent of the issue's phase label. CI-red and merge-readiness aren't mirrored to labels (GitHub shows them natively); a `meguri:awaiting-merge` PR label can be added later if needed.
 
@@ -178,6 +178,22 @@ Per-loop lifetimes at a glance:
 | ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
 | conflict resolver (author) | CONFLICTING meguri PR | issue (from branch) | attached to the PR head | base merged & pushed (≤3) | kept — continues the author pane |
 | cleaner (standalone) | report issue + default-branch movement | report issue | read-only detached | report issue rewritten | self-reclaimed |
+
+### Auto-merge (opt-in)
+
+meguri never decides "safe to merge" — it arms GitHub-native auto-merge (`gh pr merge --auto`) on eligible PRs and lets GitHub (branch protection + required checks) decide when to merge (see `docs/adr/0003-auto-merge-github-native-arm-only.md`). It is off by default and gated behind two opt-ins: the master switch `[pr.auto_merge].enabled`, and (unless `opt_in = "all"`) the `meguri:automerge` label. Put the label on an *issue* and the worker copies it onto the PR (opening that PR non-draft); put it straight on a PR and it works too.
+
+Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meguri/` branch linked to its issue via `Closes #N.`; it carries no `meguri:hold` / `meguri:needs-human` / `meguri:working` / `meguri:spec-reviewing` / `meguri:spec-ready` label (auto-merge never fires mid-spec); it has zero unresolved review threads; and the repository allows auto-merge with the configured strategy (and, when required, required-checks branch protection). The arm is pinned to the reviewed head with `--match-head-commit`, and a marker comment (`<!-- meguri:automerge armed head=<sha> -->`) makes it idempotent and respects a human who later disables auto-merge — that head is never re-armed (a new push re-evaluates). If GitHub already reports the PR mergeable when meguri goes to arm it, meguri finalizes the merge on GitHub's own verdict instead.
+
+```toml
+[pr.auto_merge]
+enabled = false                  # master switch
+strategy = "squash"              # squash | merge | rebase (no fallback if the repo forbids it)
+require_branch_protection = true # refuse to arm without required-checks branch protection
+opt_in = "label"                 # label (needs meguri:automerge) | all (every eligible meguri PR)
+```
+
+When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). Note also the review gap until auto-merge 3/3: the reviewer gate (`require_clean_review`) that makes meguri's own review a precondition arrives in a later issue, so until then an opt-in PR can merge on green required checks before meguri has reviewed it — rely on branch protection for the bar you want.
 
 ## Configuration
 
@@ -236,6 +252,12 @@ throttle_secs = 60     # min seconds between notifications for the same run
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]
 
+[pr.auto_merge]        # GitHub-native auto-merge, opt-in (see "Auto-merge" above)
+enabled = false
+strategy = "squash"    # squash | merge | rebase
+require_branch_protection = true
+opt_in = "label"       # label | all
+
 [clean]
 interval_hours = 24     # min hours between cleaner sweeps (a moved head alone doesn't trigger one)
 stale_branch_days = 30  # remote branches older than this are reported as stale
@@ -246,6 +268,8 @@ enabled = true    # kill switch for the worker's self-review phase (internal AI 
 max_rounds = 3    # max self-review rounds per run; past the cap the PR is published as-is
 # (the old impl_enabled / impl_max_rounds keys still load as aliases)
 ```
+
+`[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
 
 ### Role-based agent routing (optional)
 

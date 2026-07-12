@@ -1,3 +1,4 @@
+pub mod auto_merger;
 pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
@@ -231,6 +232,7 @@ mod tests {
             head_branch: head_branch.into(),
             head_sha: String::new(),
             state: "open".into(),
+            is_draft: false,
             labels: vec![],
         }
     }
