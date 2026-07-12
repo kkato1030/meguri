@@ -12,7 +12,10 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING};
+use meguri::forge::{
+    Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPECCING, LABEL_SPEC_READY,
+    LABEL_WORKING,
+};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -85,13 +88,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let spec_head = seed_spec_branch(&clone).await;
     let worktree_root = root.path().join("worktrees");
 
-    // The issue the planner consumed `meguri:plan` from, plus the reviewed
-    // spec PR that now carries `meguri:spec-ready`.
+    // The issue the planner consumed `meguri:plan` from — it now carries the
+    // `meguri:speccing` phase label (ADR 0005) — plus the reviewed spec PR
+    // that carries `meguri:spec-ready`.
     let forge = Arc::new(FakeForge::with_issue(
         5,
         "Add caching layer",
         "Requests are slow; add a cache.",
-        &[],
+        &[LABEL_SPECCING],
     ));
     forge.add_pr(
         1,
@@ -348,10 +352,20 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+    // Phase flip on the issue (ADR 0005): the claim moved it from speccing to
+    // implementing — the spec PR is now an implementation PR.
+    let issue_labels = env.forge.labels_of(5);
     assert!(
-        !env.forge
-            .labels_of(5)
-            .contains(&LABEL_NEEDS_HUMAN.to_string())
+        !issue_labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {issue_labels:?}"
+    );
+    assert!(
+        !issue_labels.contains(&LABEL_SPECCING.to_string()),
+        "speccing must be gone once implementation starts: {issue_labels:?}"
+    );
+    assert!(
+        issue_labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "issue must carry {LABEL_IMPLEMENTING} once the claim succeeds: {issue_labels:?}"
     );
 
     // The implementation commit actually landed on the spec branch at origin.
@@ -402,10 +416,17 @@ async fn spec_worker_needs_human_escalates_like_the_worker() {
 
     // Same escalation as the worker: needs-human label + comment on the
     // issue; the PR claim is released and spec-ready stays for a retrigger.
+    // The phase label survives the escalation (ADR 0005): the claim already
+    // flipped the issue to implementing, so it reads as "stuck in
+    // implementation" (implementing + needs-human), not "stuck in spec".
     let labels = env.forge.labels_of(5);
     assert!(
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
         "labels: {labels:?}"
+    );
+    assert!(
+        labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "the phase label must survive needs-human: {labels:?}"
     );
     let comments = env.forge.comments_of(5);
     assert_eq!(comments.len(), 1);

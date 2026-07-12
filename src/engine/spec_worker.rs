@@ -155,6 +155,22 @@ impl Flavor for SpecWorkerFlavor {
             json!({ "pr": pr.number, "issue": run.issue_number }),
         )?;
 
+        // Phase flip on the issue (ADR 0005): implementation has begun, so the
+        // issue moves from `meguri:speccing` to `meguri:implementing`. Flipping
+        // at claim time (not at settle) means an in-implementation escalation
+        // leaves `implementing` + `needs-human` — "stuck in implementation" —
+        // instead of `speccing`, which would read as "stuck in spec". add/
+        // remove are idempotent, so a resumed run re-running this is safe. The
+        // add is load-bearing (the unlabeled = untriaged invariant); the remove
+        // is best-effort.
+        deps.forge
+            .add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
+            .await?;
+        deps.forge
+            .remove_label(run.issue_number, forge::LABEL_SPECCING)
+            .await
+            .ok();
+
         // The prompt carries the issue (what to build) plus the spec (how).
         let issue = deps.forge.get_issue(run.issue_number).await?;
         cp.issue_title = issue.title;

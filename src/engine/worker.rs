@@ -99,7 +99,16 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
+    /// Phase transition (ADR 0005): the issue's `meguri:ready` becomes
+    /// `meguri:implementing` — the implementation PR is now open. The
+    /// `implementing` label is load-bearing (it backs the "unlabeled =
+    /// untriaged" invariant), so failing to apply it fails the run instead of
+    /// dropping the issue to unlabeled; the `ready` / `working` removals stay
+    /// best-effort like every other claim release.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
+        deps.forge
+            .add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
+            .await?;
         deps.forge
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await

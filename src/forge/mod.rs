@@ -8,11 +8,26 @@ use async_trait::async_trait;
 pub mod fake;
 pub mod gh;
 
-/// Issue is queued for the worker loop (applied by a human).
+// Issue labels form two axes (ADR 0005). Axis 1 — the phase: a meguri-engaged
+// open issue always carries exactly one of `plan` / `speccing` / `ready` /
+// `implementing`, so an unlabeled issue means "untriaged". Axis 2 — the ball
+// (who holds it): `working` / `needs-human` / `hold` layer on top of the phase
+// without removing it.
+
+/// Phase (axis 1): issue is queued for the worker loop (applied by a human).
 pub const LABEL_READY: &str = "meguri:ready";
-/// Issue is queued for the planner loop (applied by a human; opt-in
-/// spec-first flow — the default stays `meguri:ready` straight to a PR).
+/// Phase (axis 1): issue is queued for the planner loop (applied by a human;
+/// opt-in spec-first flow — the default stays `meguri:ready` straight to a PR).
 pub const LABEL_PLAN: &str = "meguri:plan";
+/// Phase (axis 1): the issue's spec PR is open. The planner swaps `plan` for
+/// this at spec-PR creation; the spec-worker swaps it for `implementing` when
+/// it claims the takeover. Detail (reviewing / ready) lives on the PR.
+pub const LABEL_SPECCING: &str = "meguri:speccing";
+/// Phase (axis 1): the issue's implementation PR is open (CI fixing, review,
+/// awaiting merge all included). The worker/spec-worker apply it at PR
+/// creation/takeover and it stays until the issue closes. Load-bearing: it
+/// backs the "unlabeled = untriaged" invariant.
+pub const LABEL_IMPLEMENTING: &str = "meguri:implementing";
 /// The planner's spec PR awaits review; the reviewer loop picks it up,
 /// posts a summary review, and flips it to `meguri:spec-ready` when clean.
 pub const LABEL_SPEC_REVIEWING: &str = "meguri:spec-reviewing";

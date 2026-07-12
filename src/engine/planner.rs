@@ -163,16 +163,21 @@ impl Flavor for PlannerFlavor {
         format!("Spec: {} (#{})", cp.issue_title, run.issue_number)
     }
 
-    /// Label transition: the issue's `meguri:plan` becomes the PR's
-    /// `meguri:spec-reviewing` — the PR is the reviewable artifact from here
-    /// on. The PR label is load-bearing (review discovery keys off it), so
-    /// failing to apply it fails the run instead of passing silently.
+    /// Label transition (ADR 0005): the PR gets `meguri:spec-reviewing` (it is
+    /// the reviewable artifact from here on) and the issue's phase moves from
+    /// `meguri:plan` to `meguri:speccing` (a spec PR is now open). Both adds
+    /// are load-bearing — the PR label backs review discovery, the issue's
+    /// phase label backs the "unlabeled = untriaged" invariant — so failing
+    /// either fails the run; the `plan` / `working` removals stay best-effort.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         if let Some(pr) = cp.pr_number {
             deps.forge
                 .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
                 .await?;
         }
+        deps.forge
+            .add_label(run.issue_number, forge::LABEL_SPECCING)
+            .await?;
         deps.forge
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await
