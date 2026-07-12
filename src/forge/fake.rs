@@ -506,6 +506,24 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.title = title.to_string();
+        Ok(())
+    }
+
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.body = body.to_string();
+        Ok(())
+    }
+
     async fn get_pr(&self, number: i64) -> Result<PullRequest> {
         self.prs
             .lock()
