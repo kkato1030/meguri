@@ -251,7 +251,11 @@ async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
     let Some(forge) = &deps.forge else {
         return Ok(());
     };
-    let slug = deps.project.repo_slug.as_deref().unwrap_or(&deps.project.id);
+    let slug = deps
+        .project
+        .repo_slug
+        .as_deref()
+        .unwrap_or(&deps.project.id);
     let policy = forge
         .merge_policy(&deps.project.default_branch, am.require_branch_protection)
         .await
