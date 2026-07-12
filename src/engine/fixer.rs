@@ -29,9 +29,9 @@ pub const KIND: &str = "fixer";
 /// Discovery treats a thread whose last comment starts with this as parked.
 pub const FIXER_REPLY_MARKER: &str = "🔁 meguri";
 
-/// Head-branch prefix identifying meguri's own PRs (the fixer only amends
-/// work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
+/// Head-branch prefix identifying meguri's own PRs (the fixer only amends —
+/// and the impl-reviewer only reviews — work meguri opened).
+pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 /// A thread the fixer still owes a fix: unresolved, and the ball is in
 /// meguri's court (the last comment is not meguri's reply).

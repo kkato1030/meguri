@@ -142,6 +142,10 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 `meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
 
+### 実装レビュー（実装 diff の AI レビュー）
+
+meguri の AI レビューは **spec PR と実装 diff の両方** を対象にします。meguri の実装 PR が静かになったら — CI が green、spec 系ラベルなし、fixer 待ちのレビュースレッドなし — **impl reviewer** ループが head を read-only でチェックアウトして diff をレビューします: 指摘は **inline のレビュースレッド**（+ マーカー入りサマリコメント）として投稿されます。これはまさに fixer の入力そのものなので、既存の review→fix の往復（ping-pong）が新しい機構なしでそのまま拾います。指摘なしならマーカー入りコメントだけが投稿され、何も反応しません。このループはラベルレスで、収束は三重に栓がされています（ADR 0004）: 同じ head は 1 回しかレビューされない（PR 上の隠し head-sha マーカー）、PR ごとのラウンド数に上限がある（`review.impl_max_rounds`）、そして clean 判定はスレッドを作りません。AI は approve も request-changes も決してしません — レビューは常に COMMENT のみで、**マージは人間の判断のまま**です。外部のレビュー bot を使っている場合は `review.impl_enabled = false` で止められます。
+
 ### cleaner（read-only のリポジトリ巡回）
 
 **cleaner** ループは default branch の head を定期的に歩いて回り、蓄積した乖離 — spec と実装のずれ、dead code の候補、規約からの逸脱、置き去りの TODO、stale なリモートブランチ、孤児化した `meguri:working` ラベル — を `meguri:clean-report` ラベル付きの **1 本のレポート issue**（1 project = 1 issue）に書き留めます。修正は一切しません: 書き込みはこの issue の作成・更新だけで、push もブランチ操作も、他の issue / PR へのラベルやコメントもしません。本文は巡回のたびに完全に書き直されるスナップショットで、隠しマーカーの head sha により同じ head が二度走査されることはなく、head が進んでも `clean.interval_hours` を過ぎるまで次の巡回は走りません。検出項目を採用するなら通常の issue を切って `meguri:plan` / `meguri:ready` を付け、誤検知なら `clean.ignore` に部分文字列を足し、ループを止めたければレポート issue に `meguri:hold` を貼ってください。
@@ -209,6 +213,10 @@ draft = true   # PR をドラフトで作成。プロジェクト単位は [proj
 interval_hours = 24     # cleaner の巡回間隔の下限（head が進んだだけでは走らない）
 stale_branch_days = 30  # 最終コミットがこれより古いリモートブランチを stale として報告
 ignore = []             # 誤検知を黙らせる部分文字列。プロジェクト単位は [projects.clean] で上書き
+
+[review]
+impl_enabled = true    # impl-reviewer ループ（実装 PR の AI レビュー）のキルスイッチ
+impl_max_rounds = 3    # PR ごとの impl レビューのラウンド上限。超えたら人間に委ねる
 ```
 
 ## 開発
@@ -222,7 +230,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-GitHub 上で 8 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。
+GitHub 上で 9 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**impl reviewer**（静かで green な meguri の実装 PR → inline レビュースレッドとして AI レビューを投稿し fixer に流す）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。
 
 ## ライセンス
 

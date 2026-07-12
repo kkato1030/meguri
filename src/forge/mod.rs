@@ -186,6 +186,17 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewComment>,
 }
 
+/// Draft of one inline review comment (a thread anchor). The line is
+/// mandatory: GitHub's review REST API only anchors comments to a line of
+/// the diff — anchor-less remarks belong in the review body instead.
+#[derive(Debug, Clone)]
+pub struct ReviewCommentDraft {
+    pub path: String,
+    /// Line on the NEW side of the diff (side=RIGHT).
+    pub line: u64,
+    pub body: String,
+}
+
 #[async_trait]
 pub trait Forge: Send + Sync {
     async fn get_issue(&self, number: i64) -> Result<Issue>;
@@ -248,6 +259,16 @@ pub trait Forge: Send + Sync {
     async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>>;
     /// Reply inside an existing review thread.
     async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()>;
+    /// Post a PR review with inline comments — each draft becomes a review
+    /// thread the fixer can pick up. Always event=COMMENT: meguri never
+    /// approves or requests changes; the human merge gate stays human
+    /// (ADR 0004).
+    async fn create_pr_review(
+        &self,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewCommentDraft],
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

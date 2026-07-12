@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::{
     Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergeableState, PullRequest, ReviewComment, ReviewThread,
+    MergeableState, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 #[derive(Debug, Clone)]
@@ -50,6 +50,12 @@ pub struct FakeForge {
     pub checks: Mutex<HashMap<i64, Vec<CheckRun>>>,
     /// What pr_failed_check_logs returns, per PR number.
     pub failed_check_logs: Mutex<HashMap<i64, String>>,
+    /// Bodies of PR reviews posted via create_pr_review, per PR number
+    /// (the inline comments land in `threads`).
+    pub pr_reviews: Mutex<Vec<(i64, String)>>,
+    /// PRs whose create_pr_review call fails (inline-anchor-rejected
+    /// scenarios; the impl-reviewer falls back to a summary comment).
+    pub create_pr_review_errors: Mutex<HashSet<i64>>,
 }
 
 impl FakeForge {
@@ -98,6 +104,23 @@ impl FakeForge {
             .lock()
             .unwrap()
             .insert(branch.to_string());
+    }
+
+    /// Make create_pr_review fail for `pr` (e.g. GitHub rejecting an inline
+    /// anchor that is not part of the diff).
+    pub fn fail_create_pr_review(&self, pr: i64) {
+        self.create_pr_review_errors.lock().unwrap().insert(pr);
+    }
+
+    /// Review bodies posted on `pr` via create_pr_review.
+    pub fn pr_reviews_of(&self, pr: i64) -> Vec<String> {
+        self.pr_reviews
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == pr)
+            .map(|(_, b)| b.clone())
+            .collect()
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
@@ -633,6 +656,36 @@ impl Forge for FakeForge {
             author: "meguri".into(),
             body: body.into(),
         });
+        Ok(())
+    }
+
+    async fn create_pr_review(
+        &self,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewCommentDraft],
+    ) -> Result<()> {
+        if self.create_pr_review_errors.lock().unwrap().contains(&pr) {
+            bail!("create_pr_review on PR #{pr} rejected (fake)");
+        }
+        self.pr_reviews.lock().unwrap().push((pr, body.into()));
+        let mut threads = self.threads.lock().unwrap();
+        for draft in comments {
+            let id = format!("fake-thread-{}", threads.len() + 1);
+            threads.push((
+                pr,
+                ReviewThread {
+                    id,
+                    resolved: false,
+                    path: Some(draft.path.clone()),
+                    line: Some(draft.line as i64),
+                    comments: vec![ReviewComment {
+                        author: "meguri".into(),
+                        body: draft.body.clone(),
+                    }],
+                },
+            ));
+        }
         Ok(())
     }
 }
