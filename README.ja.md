@@ -192,7 +192,10 @@ language = "日本語"
 
 [mux]
 kind = "auto"          # auto | herdr | tmux
-session = "meguri"     # herdr workspace label / tmux session name
+session = "meguri"     # ベースラベル。プロジェクトごとに専用 workspace
+                       # `meguri:<project>`（herdr）/ `meguri-<project>`（tmux）を
+                       # 使い、issue タブが混ざらないようにします。接尾辞なしの
+                       # `meguri` は横断ビュー `meguri top` 用です。
 # pane は issue 単位（author pane 1 枚 + review pane 1 枚）で保持され、issue が
 # close されると回収されます。回収前にエージェントのネイティブ session id を保存
 # （claude --resume <id>）。"never" は run 終了と同時に pane を閉じます（高速大量
