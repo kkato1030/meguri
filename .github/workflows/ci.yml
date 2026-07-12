@@ -16,6 +16,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # サプライチェーンゲート(issue #77): RustSec advisories / 供給元 crates.io 固定 /
+  # ライセンス / wildcard 依存を deny.toml に基づき検査。Renovate PR の必須チェック前提。
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
