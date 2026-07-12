@@ -59,6 +59,8 @@ Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
 
 Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback).
 
+Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
+
 ```bash
 cargo install --path .   # or: cargo build --release
 meguri init              # writes ~/.meguri/config.toml, creates the db
@@ -356,6 +358,11 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 ## Status / roadmap
 
 Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
+
+## Contributing
+
+Bug reports and PRs from humans are welcome — normal fork & PR flow, no
+`meguri:*` labels to worry about. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
