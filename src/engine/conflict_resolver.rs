@@ -17,6 +17,12 @@
 //! successfully resolved [`MAX_RESOLVE_RUNS`] times stops being rediscovered
 //! (a base that keeps re-conflicting that often deserves a human;
 //! `meguri run --issue N` can force another round).
+//!
+//! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
+//! (recovered from the `meguri/<issue>-…` head branch), so conflicts are
+//! resolved in the issue's author lane — same pane, same live session as
+//! the run that wrote the branch. The worktree attaches to the PR head; the
+//! pane is kept and reclaimed when the issue closes.
 
 use std::path::Path;
 
@@ -25,7 +31,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target};
+use super::{Deps, Target, canonical_key, open_pr_for_issue};
 use crate::forge::{self, MergeableState, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
@@ -83,9 +89,10 @@ impl super::Loop for ConflictResolverLoop {
             {
                 continue;
             }
+            let issue = canonical_key(&pr);
             if deps
                 .store
-                .succeeded_run_count(&deps.project.id, KIND, pr.number)?
+                .succeeded_run_count(&deps.project.id, KIND, issue)?
                 >= MAX_RESOLVE_RUNS
             {
                 continue;
@@ -94,7 +101,7 @@ impl super::Loop for ConflictResolverLoop {
                 continue;
             }
             targets.push(Target {
-                issue_number: pr.number,
+                issue_number: issue,
                 title: pr.title,
             });
         }
@@ -120,17 +127,23 @@ impl Flavor for ConflictResolverFlavor {
         ""
     }
 
-    /// Claim the PR (labels live on the PR, not an issue) and pin the base
-    /// tip the agent must merge. Any change that makes the PR untouchable —
-    /// or mergeable again — between discovery and claim is a benign race:
-    /// skip, don't escalate.
+    /// Re-resolve the PR from the run's canonical issue, claim it (labels
+    /// live on the PR, not the issue) and pin the base tip the agent must
+    /// merge. Any change that makes the PR untouchable — or mergeable again
+    /// — between discovery and claim is a benign race: skip, don't
+    /// escalate.
     async fn prepare_work(
         &self,
         deps: &Deps,
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        let pr = deps.forge.get_pr(run.issue_number).await?;
+        let Some(pr) = open_pr_for_issue(deps, run.issue_number).await? else {
+            return Ok(PreparedWork::Skip(format!(
+                "no single open PR resolves to issue #{} (changed since discovery?)",
+                run.issue_number
+            )));
+        };
         if let Some(reason) = pr_is_resolvable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
@@ -211,7 +224,7 @@ impl Flavor for ConflictResolverFlavor {
              - Do NOT push; meguri handles that.\n\
              - Do NOT rebase, do NOT force anything, do NOT switch branches, \
                and do NOT touch other worktrees.{lang_section}",
-            number = run.issue_number,
+            number = cp.pr_number.unwrap_or(run.issue_number),
             title = cp.issue_title,
             branch = run.branch.as_deref().unwrap_or("?"),
             base_branch = deps.project.default_branch,
@@ -304,15 +317,22 @@ impl Flavor for ConflictResolverFlavor {
     }
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
-            .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
+        if let Some(pr) = flow::claimed_pr(deps, &run.id) {
+            deps.forge
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
     }
 
-    /// Escalation lands on the PR (the resolver's target), not an issue.
+    /// Escalation lands on the claimed PR (the resolver's target); before
+    /// the checkpoint knows the PR (prepare-work failed), the canonical
+    /// issue gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let pr = run.issue_number;
+        let Some(pr) = flow::claimed_pr(deps, &run.id) else {
+            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            return;
+        };
         let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
         let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
@@ -495,6 +515,7 @@ mod tests {
             store: crate::store::Store::open_in_memory().unwrap(),
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: Arc::new(crate::forge::fake::FakeForge::default()),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: crate::config::Config::default(),
             project: crate::config::ProjectConfig {
                 id: "proj".into(),
@@ -505,6 +526,7 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
+                clean: None,
             },
         }
     }

@@ -2,11 +2,11 @@
 //! resumes runs orphaned by a dead orchestrator.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::scheduler::Scheduler;
+use meguri::engine::scheduler::{Reload, Scheduler};
 use meguri::engine::{Deps, Loop, Target, WorkerOutcome, default_loops};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
@@ -40,11 +40,30 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 
 async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
+
+    // Quiesce the cleaner loop: a report issue whose marker already covers
+    // the current head keeps these tests about worker discovery
+    // (cleaner_test drives the cleaner itself).
+    let head = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
+    let scanned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    forge
+        .create_issue(
+            meguri::engine::cleaner::REPORT_TITLE,
+            &meguri::engine::cleaner::clean_marker(&head, scanned),
+            &[meguri::forge::LABEL_CLEAN_REPORT],
+        )
+        .await
+        .unwrap();
+
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
     Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: Arc::new(FakeMux::new(false)),
         forge,
         config,
@@ -57,6 +76,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             check_command: None,
             worktree_root: Some(root.join("worktrees")),
             pr: None,
+            clean: None,
         },
     }
 }
@@ -131,6 +151,7 @@ async fn watch_discovers_and_completes_labeled_issue() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -184,6 +205,7 @@ async fn watch_skips_working_and_hold_issues() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -215,6 +237,7 @@ async fn watch_gates_on_open_blocker_until_closed_as_completed() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -278,6 +301,7 @@ async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -318,6 +342,7 @@ async fn watch_does_not_refile_issue_with_succeeded_run() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -371,6 +396,7 @@ async fn recovery_resumes_interrupted_run_to_success() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -422,6 +448,7 @@ async fn watch_dispatches_multiple_ready_issues_concurrently() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -470,6 +497,7 @@ async fn watch_reclaims_worktree_after_issue_closes() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -633,6 +661,7 @@ async fn watch_prioritizes_loops_in_list_order() {
         ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -659,6 +688,7 @@ async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
         })],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 3).await;
@@ -694,6 +724,7 @@ async fn watch_prioritizes_loop_order_over_project_order() {
         ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -716,6 +747,7 @@ async fn watch_ticks_write_a_heartbeat() {
         loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -732,6 +764,183 @@ async fn watch_ticks_write_a_heartbeat() {
     watch.abort();
 }
 
+/// A scripted loop for dispatch-priority tests: discovers fixed
+/// (project, issue) targets and records drive order in a shared log.
+struct RecordingLoop {
+    kind: &'static str,
+    /// (project_id, issue_number) pairs this loop discovers.
+    targets: Vec<(&'static str, i64)>,
+    /// (loop kind, project_id, issue_number) in drive order.
+    log: Arc<Mutex<Vec<(String, String, i64)>>>,
+}
+
+#[async_trait::async_trait]
+impl Loop for RecordingLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for (project, issue) in &self.targets {
+            if *project != deps.project.id
+                || deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, self.kind, *issue)?
+            {
+                continue;
+            }
+            targets.push(Target {
+                issue_number: *issue,
+                title: format!("target {issue}"),
+            });
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        let run = deps.store.get_run(run_id)?.expect("run exists");
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.kind.into(), run.project_id, run.issue_number));
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "fake://pr".into(),
+        })
+    }
+}
+
+/// Run a single-slot scheduler with `loops` over `projects` until `expected`
+/// drives are logged, then return the log in drive order.
+async fn drive_order(
+    projects: Vec<Deps>,
+    loops: Vec<Arc<dyn Loop>>,
+    log: Arc<Mutex<Vec<(String, String, i64)>>>,
+    expected: usize,
+) -> Vec<(String, String, i64)> {
+    let scheduler = Scheduler {
+        projects,
+        loops,
+        poll_interval: Duration::from_millis(100),
+        // One slot at a time so drive order mirrors dispatch priority.
+        max_concurrent: 1,
+        reload: None,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if log.lock().unwrap().len() >= expected {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("only {:?} of {expected} drives ran", log.lock().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+    log.lock().unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_dispatches_loops_in_priority_order() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // The worker target has the smaller issue number; only loop priority
+    // (fixer listed first) can put the fixer target ahead of it.
+    let order = drive_order(
+        vec![deps],
+        vec![
+            Arc::new(RecordingLoop {
+                kind: "fixer",
+                targets: vec![("proj", 201)],
+                log: log.clone(),
+            }),
+            Arc::new(RecordingLoop {
+                kind: "worker",
+                targets: vec![("proj", 101)],
+                log: log.clone(),
+            }),
+        ],
+        log,
+        2,
+    )
+    .await;
+
+    assert_eq!(
+        order,
+        vec![
+            ("fixer".into(), "proj".into(), 201),
+            ("worker".into(), "proj".into(), 101),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_orders_targets_within_a_loop_by_issue_number() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // discover() returns the targets unsorted; the scheduler normalizes
+    // to oldest-first (FIFO).
+    let order = drive_order(
+        vec![deps],
+        vec![Arc::new(RecordingLoop {
+            kind: "fixer",
+            targets: vec![("proj", 305), ("proj", 301), ("proj", 303)],
+            log: log.clone(),
+        })],
+        log,
+        3,
+    )
+    .await;
+
+    let issues: Vec<i64> = order.iter().map(|(_, _, n)| *n).collect();
+    assert_eq!(issues, vec![301, 303, 305]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_prefers_loop_priority_over_project_order() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    // Two projects sharing one store; "alpha" is listed first.
+    let mut deps_a = setup(&root.path().join("alpha"), forge.clone()).await;
+    deps_a.project.id = "alpha".into();
+    let mut deps_b = setup(&root.path().join("beta"), forge).await;
+    deps_b.store = deps_a.store.clone();
+    deps_b.project.id = "beta".into();
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // Project beta only has fixer work, project alpha only planner work;
+    // the fixer loop must win even though alpha comes first.
+    let order = drive_order(
+        vec![deps_a, deps_b],
+        vec![
+            Arc::new(RecordingLoop {
+                kind: "fixer",
+                targets: vec![("beta", 501)],
+                log: log.clone(),
+            }),
+            Arc::new(RecordingLoop {
+                kind: "planner",
+                targets: vec![("alpha", 401)],
+                log: log.clone(),
+            }),
+        ],
+        log,
+        2,
+    )
+    .await;
+
+    assert_eq!(order[0], ("fixer".into(), "beta".into(), 501));
+    assert_eq!(order[1], ("planner".into(), "alpha".into(), 401));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_dispatches_any_registered_loop_by_kind() {
     let root = tempfile::tempdir().unwrap();
@@ -744,6 +953,7 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
         loops: vec![Arc::new(FixedLoop)],
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
+        reload: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -769,4 +979,95 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
     let runs = store.list_runs(false).unwrap();
     assert_eq!(runs.len(), 1, "one run per discovered target: {runs:?}");
     assert_eq!(runs[0].loop_kind, "fixed");
+}
+
+/// A loop that records the `config.language` each of its drives sees:
+/// issues 71 and 72, driven straight to success.
+struct LanguageRecordingLoop {
+    log: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Loop for LanguageRecordingLoop {
+    fn kind(&self) -> &'static str {
+        "lang"
+    }
+
+    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        let mut targets = Vec::new();
+        for n in [71, 72] {
+            if !deps
+                .store
+                .issue_has_succeeded_run(&deps.project.id, self.kind(), n)?
+            {
+                targets.push(Target {
+                    issue_number: n,
+                    title: format!("lang {n}"),
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        self.log.lock().unwrap().push(deps.config.language.clone());
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "lang://pr".into(),
+        })
+    }
+}
+
+/// Config hot reload (issue #73): a swap delivered by the reload hook reaches
+/// the runs spawned after it, while the run already driven keeps the startup
+/// config.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_applies_reloaded_config_to_new_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let log: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Simulated config edit: once the first run has driven, the hook starts
+    // returning Deps whose config carries a language.
+    let mut reloaded = deps.clone();
+    reloaded.config.language = Some("日本語".into());
+    let hook_log = log.clone();
+    let reload = Box::new(move || {
+        (hook_log.lock().unwrap().len() == 1).then(|| Reload {
+            projects: vec![reloaded.clone()],
+            poll_interval: Duration::from_millis(100),
+            max_concurrent: 1,
+        })
+    });
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(LanguageRecordingLoop { log: log.clone() })],
+        poll_interval: Duration::from_millis(100),
+        // One slot: issue 71 drives before the "edit", issue 72 after it.
+        max_concurrent: 1,
+        reload: Some(reload),
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if log.lock().unwrap().len() >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("both runs never drove: {:?}", log.lock().unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    let languages = log.lock().unwrap().clone();
+    assert_eq!(languages[0], None, "the first run uses the startup config");
+    assert_eq!(
+        languages[1].as_deref(),
+        Some("日本語"),
+        "runs spawned after the reload see the new config"
+    );
 }

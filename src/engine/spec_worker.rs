@@ -10,6 +10,18 @@
 //! so run bookkeeping, dedup, and escalation match the worker's exactly.
 //! Success consumes the PR's `meguri:spec-ready` label — from then on the
 //! PR is a normal in-flight meguri implementation PR (fixer territory).
+//!
+//! The spec is transient review scaffolding: this loop prunes it as part of
+//! the implementation (the prompt asks for the deletion, [`Flavor::verify_work`]
+//! enforces it), so `docs/specs/` never accumulates on the default branch
+//! (issue #48). Durable knowledge lives in ADRs / domain docs instead — the
+//! planner's prompt routes it there.
+//!
+//! Lifetime (issue #92): keyed by the issue (branch-encoded), worktree
+//! attached to the spec PR's existing branch, pane in the issue's author
+//! lane — normally the planner's own pane, adopted live or resumed via the
+//! saved session id, so the plan's context carries into implementation;
+//! kept after success, reclaimed when the issue closes.
 
 use std::path::Path;
 
@@ -18,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 pub use super::WorkerOutcome;
-use super::flow::{self, Checkpoint, Flavor, PreparedWork};
+use super::flow::{self, Checkpoint, Flavor, PreparedWork, claimed_pr};
 use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
@@ -89,15 +101,6 @@ async fn spec_ready_pr(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
         .await?
         .into_iter()
         .find(|pr| pr.state == "open" && gitops::issue_from_branch(&pr.head_branch) == Some(issue)))
-}
-
-/// The PR this run claimed, from its persisted checkpoint (release/escalate
-/// hooks get the run record as of drive start, so re-read the store).
-fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
-    let run = deps.store.get_run(run_id).ok().flatten()?;
-    serde_json::from_str::<Checkpoint>(&run.checkpoint_json)
-        .ok()
-        .and_then(|cp| cp.pr_number)
 }
 
 struct SpecWorkerFlavor;
@@ -191,29 +194,48 @@ impl Flavor for SpecWorkerFlavor {
              - Implement the issue completely, including tests where the \
                project has them.\n\
              - Run the relevant tests/checks yourself before declaring success.\n\
+             - The spec above is disposable review scaffolding. Once the \
+               implementation is complete, delete `{spec_path}` and commit \
+               the deletion — the spec must not survive onto the default \
+               branch.\n\
              - COMMIT all your work to the current branch with clear messages. \
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; the PR already \
                exists and meguri pushes to it.\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
-               worktrees.{lang_section}",
+               worktrees.\n\n\
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
+            pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
-        // The completion contract is appended by prepare_turn. No PR-body
-        // section: the PR already exists, nothing consumes `pr_body` here.
+        // The completion contract is appended by prepare_turn. The PR already
+        // exists, but the takeover still authors `pr_body`: settle rewrites
+        // the PR's body from the planner's spec description to this one
+        // (issue #98).
     }
 
+    /// The planner's "spec must exist" check, inverted: the spec is
+    /// disposable scaffolding, so a spec that survived implementation gets a
+    /// corrective turn asking for its deletion.
     fn verify_work(
         &self,
-        _run: &RunRecord,
+        run: &RunRecord,
         _cp: &Checkpoint,
-        _worktree: &Path,
+        worktree: &Path,
     ) -> std::result::Result<(), String> {
-        Ok(()) // committed implementation work is all the takeover requires
+        let spec = super::planner::spec_rel_path(run.issue_number);
+        if worktree.join(&spec).is_file() {
+            Err(format!(
+                "- spec file `{spec}` still exists (it is disposable review \
+                 scaffolding: delete it and commit the deletion)"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// New commits are counted against the spec PR branch's pushed tip, not
@@ -224,9 +246,42 @@ impl Flavor for SpecWorkerFlavor {
             .unwrap_or_else(|| deps.project.default_branch.clone())
     }
 
-    /// Unused: the PR already exists, so open-pr never creates one.
+    /// open-pr never *creates* the PR (it already exists), but
+    /// [`Flavor::settle_presentation`] retitles it to this: the planner opened
+    /// the PR as `Spec: X (#N)`, and once implementation lands the `Spec:`
+    /// prefix is dropped so the title reads as an implementation PR (issue #98).
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
         format!("{} (#{})", cp.issue_title, run.issue_number)
+    }
+
+    /// Transition the takeover PR's presentation from spec to implementation.
+    /// The planner authored it as `Spec: X (#N)` with a spec-premised body;
+    /// now that the implementation is committed, retitle it `X (#N)` and
+    /// replace the body with the implementation description the agent wrote
+    /// (issue #98). Idempotent: re-running sets the same values. This is the
+    /// spec-worker-only half of the presentation the normal worker sets at PR
+    /// creation, so the two paths converge instead of diverging.
+    async fn settle_presentation(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &Checkpoint,
+    ) -> Result<()> {
+        let pr = cp
+            .pr_number
+            .context("spec-worker checkpoint has no PR number")?;
+        deps.forge
+            .update_pr_title(pr, &self.pr_title(run, cp))
+            .await?;
+        deps.forge
+            .update_pr_body(pr, &flow::compose_pr_body(run, cp))
+            .await?;
+        deps.store.emit(
+            Some(&run.id),
+            "pr.presentation_settled",
+            json!({ "pr": pr }),
+        )?;
+        Ok(())
     }
 
     /// Label transition on the PR: the takeover consumed `meguri:spec-ready`;
@@ -295,10 +350,41 @@ mod tests {
         assert!(prompt.contains("the PR already exists"));
         assert!(prompt.contains("Do NOT push"));
         assert!(
-            !prompt.contains("# Pull request description"),
-            "the PR exists; nothing consumes pr_body"
+            prompt.contains("# Pull request description"),
+            "settle rewrites the takeover PR's body, so pr_body is consumed"
         );
         assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn prompt_tells_the_agent_to_prune_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let prompt =
+            SpecWorkerFlavor.execute_prompt(&fake_deps(), &run, &Checkpoint::default(), dir.path());
+        assert!(prompt.contains("disposable review scaffolding"));
+        assert!(prompt.contains("delete `docs/specs/issue-7.md` and commit"));
+        assert!(prompt.contains("must not survive onto the default branch"));
+    }
+
+    #[test]
+    fn verify_work_rejects_a_surviving_spec_and_accepts_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+
+        assert!(
+            SpecWorkerFlavor
+                .verify_work(&run, &Checkpoint::default(), dir.path())
+                .is_ok()
+        );
+
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
+        let err = SpecWorkerFlavor
+            .verify_work(&run, &Checkpoint::default(), dir.path())
+            .unwrap_err();
+        assert!(err.contains("docs/specs/issue-7.md"), "{err}");
+        assert!(err.contains("delete it"), "{err}");
     }
 
     #[test]
@@ -350,6 +436,7 @@ mod tests {
             store: crate::store::Store::open_in_memory().unwrap(),
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: Arc::new(crate::forge::fake::FakeForge::default()),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: crate::config::Config::default(),
             project: crate::config::ProjectConfig {
                 id: "proj".into(),
@@ -360,6 +447,7 @@ mod tests {
                 check_command: None,
                 worktree_root: None,
                 pr: None,
+                clean: None,
             },
         }
     }

@@ -9,6 +9,13 @@
 //! addressed, which parks the thread until the reviewer either resolves it
 //! (done) or answers again (next fixer round). Spec-ready and merged PRs are
 //! the spec worker's and the humans' territory — the fixer never touches them.
+//!
+//! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
+//! (recovered from the `meguri/<issue>-…` head branch), so the fixer joins
+//! the issue's author lane — same pane, same live session as the worker or
+//! planner that wrote the branch — and the review-fix context continues
+//! where the implementation left off. The worktree attaches to the PR head;
+//! the pane is kept and reclaimed when the issue closes.
 
 use std::path::Path;
 
@@ -17,7 +24,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target};
+use super::{Deps, Target, canonical_key, open_pr_for_issue};
 use crate::forge::{self, PullRequest, ReviewThread};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -29,9 +36,9 @@ pub const KIND: &str = "fixer";
 /// Discovery treats a thread whose last comment starts with this as parked.
 pub const FIXER_REPLY_MARKER: &str = "🔁 meguri";
 
-/// Head-branch prefix identifying meguri's own PRs (the fixer only amends
-/// work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
+/// Head-branch prefix identifying meguri's own PRs (the fixer only amends —
+/// and the impl-reviewer only reviews — work meguri opened).
+pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 /// A thread the fixer still owes a fix: unresolved, and the ball is in
 /// meguri's court (the last comment is not meguri's reply).
@@ -80,6 +87,8 @@ impl super::Loop for FixerLoop {
     /// multiple succeeded fixer runs — every reviewer round is a new run.
     /// The active-run unique index still dedups concurrent rounds, and the
     /// thread reply marker keeps a pushed-but-not-re-reviewed PR quiet.
+    /// Targets are keyed by the PR's canonical issue (the head branch always
+    /// encodes it — meguri branches only).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
         let mut targets = Vec::new();
         for pr in deps.forge.list_open_prs().await? {
@@ -89,7 +98,7 @@ impl super::Loop for FixerLoop {
             let threads = deps.forge.list_review_threads(pr.number).await?;
             if threads.iter().any(thread_awaits_fixer) {
                 targets.push(Target {
-                    issue_number: pr.number,
+                    issue_number: canonical_key(&pr),
                     title: pr.title,
                 });
             }
@@ -138,16 +147,22 @@ impl Flavor for FixerFlavor {
         ""
     }
 
-    /// Claim the PR (labels live on the PR, not an issue). Any change that
-    /// makes the PR unfixable between discovery and claim is a benign race —
-    /// skip, don't escalate.
+    /// Re-resolve the PR from the run's canonical issue, then claim it
+    /// (labels live on the PR, not the issue). Any change that makes the PR
+    /// unfixable between discovery and claim is a benign race — skip, don't
+    /// escalate.
     async fn prepare_work(
         &self,
         deps: &Deps,
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        let pr = deps.forge.get_pr(run.issue_number).await?;
+        let Some(pr) = open_pr_for_issue(deps, run.issue_number).await? else {
+            return Ok(PreparedWork::Skip(format!(
+                "no single open PR resolves to issue #{} (changed since discovery?)",
+                run.issue_number
+            )));
+        };
         if let Some(reason) = pr_is_fixable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
@@ -217,7 +232,7 @@ impl Flavor for FixerFlavor {
                handles both.\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
                worktrees.",
-            number = run.issue_number,
+            number = cp.pr_number.unwrap_or(run.issue_number),
             title = cp.issue_title,
             branch = run.branch.as_deref().unwrap_or("?"),
             threads = cp.issue_body,
@@ -279,15 +294,22 @@ impl Flavor for FixerFlavor {
     }
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
-            .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
+        if let Some(pr) = flow::claimed_pr(deps, &run.id) {
+            deps.forge
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
     }
 
-    /// Escalation lands on the PR (the fixer's target), not an issue.
+    /// Escalation lands on the claimed PR (the fixer's target); before the
+    /// checkpoint knows the PR (prepare-work failed), the canonical issue
+    /// gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let pr = run.issue_number;
+        let Some(pr) = flow::claimed_pr(deps, &run.id) else {
+            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            return;
+        };
         let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
         let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
@@ -425,6 +447,7 @@ mod tests {
             store: crate::store::Store::open_in_memory().unwrap(),
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: Arc::new(crate::forge::fake::FakeForge::default()),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: crate::config::Config::default(),
             project: crate::config::ProjectConfig {
                 id: "proj".into(),
@@ -435,6 +458,7 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
+                clean: None,
             },
         }
     }

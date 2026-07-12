@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+mod panes;
 mod runs;
+pub use panes::*;
 pub use runs::*;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -16,6 +18,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_agent_session",
         include_str!("migrations/0003_agent_session.sql"),
+    ),
+    ("0004_panes", include_str!("migrations/0004_panes.sql")),
+    (
+        "0005_agent_profile",
+        include_str!("migrations/0005_agent_profile.sql"),
+    ),
+    (
+        "0006_pane_role",
+        include_str!("migrations/0006_pane_role.sql"),
     ),
 ];
 

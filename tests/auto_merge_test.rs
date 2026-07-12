@@ -18,6 +18,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
     config.pr.auto_merge.enabled = true;
     Deps {
         store: meguri::store::Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: Arc::new(meguri::mux::fake::FakeMux::new(false)),
         forge,
         config,
@@ -30,6 +31,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
             check_command: None,
             worktree_root: None,
             pr: None,
+            clean: None,
         },
     }
 }
