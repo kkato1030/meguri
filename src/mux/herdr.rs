@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::{
-    AgentState, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId, PaneSpec,
+    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
+    PaneSpec, Split,
     herdr_socket::{self, EventStream},
 };
 
@@ -633,6 +634,71 @@ impl Multiplexer for HerdrMux {
     fn attach_command(&self, pane: &PaneId) -> String {
         let ws = pane.0.split(':').next().unwrap_or("").to_string();
         format!("herdr workspace focus {ws} >/dev/null 2>&1; herdr")
+    }
+
+    /// Reuse the dashboard tab with this label if one already exists in the
+    /// meguri workspace, else create it. The tab's root pane doubles as the
+    /// status header row (`meguri top` writes into the terminal it runs in).
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
+        let ws = self.workspace_id().await?;
+        let tabs = self
+            .herdr_json(&["tab", "list", "--workspace", &ws])
+            .await?;
+        if let Some(arr) = tabs.get("tabs").and_then(Value::as_array) {
+            for tab in arr {
+                if tab.get("label").and_then(Value::as_str) == Some(label)
+                    && let Some(id) = tab.get("tab_id").and_then(Value::as_str)
+                {
+                    return Ok(DashboardId(id.to_string()));
+                }
+            }
+        }
+        let result = self
+            .herdr_json(&[
+                "tab",
+                "create",
+                "--workspace",
+                &ws,
+                "--label",
+                label,
+                "--no-focus",
+            ])
+            .await?;
+        result
+            .pointer("/tab/tab_id")
+            .and_then(Value::as_str)
+            .map(|s| DashboardId(s.to_string()))
+            .ok_or_else(|| MuxError::CommandFailed {
+                kind: "herdr",
+                detail: format!("tab create returned no tab id: {result}"),
+            })
+    }
+
+    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
+        let split = match dir {
+            Split::Right => "right",
+            Split::Down => "down",
+        };
+        self.herdr_ok(&[
+            "pane",
+            "move",
+            &pane.0,
+            "--tab",
+            &into.0,
+            "--split",
+            split,
+            "--no-focus",
+        ])
+        .await
+    }
+
+    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
+        let ws = dashboard.0.split(':').next().unwrap_or("");
+        format!(
+            "herdr workspace focus {ws} >/dev/null 2>&1; \
+             herdr tab focus {tab} >/dev/null 2>&1; herdr",
+            tab = dashboard.0
+        )
     }
 }
 
