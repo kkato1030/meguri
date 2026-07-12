@@ -125,6 +125,14 @@ pub async fn cmd_watch() -> Result<()> {
     for project in &cfg.projects {
         projects.push(build_deps(&cfg, project, None)?);
     }
+
+    // Auto-merge fail-fast (ADR 0003): if a project enabled auto-merge but its
+    // repository can't honor it, refuse to start rather than degrade silently
+    // at merge time.
+    for deps in &projects {
+        auto_merge_preflight(deps).await?;
+    }
+
     println!(
         "watching {} project(s) for {}/{} issues and {}/{} PRs (poll {}s, slots {})",
         projects.len(),
@@ -144,6 +152,37 @@ pub async fn cmd_watch() -> Result<()> {
     let result = scheduler.watch().await;
     daemon::clear_state(&home);
     result
+}
+
+/// Startup fail-fast for one project's auto-merge config (ADR 0003): if
+/// enabled, the repository must allow auto-merge, permit the configured
+/// strategy, and (when required) carry required-checks branch protection.
+/// A miss bails with every reason so the operator fixes them at once.
+async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
+    let am = &deps.config.pr_for(&deps.project).auto_merge;
+    if !am.enabled {
+        return Ok(());
+    }
+    let policy = deps
+        .forge
+        .merge_policy(&deps.project.default_branch)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot read merge settings for {} to validate auto-merge",
+                deps.project.repo_slug
+            )
+        })?;
+    if let Err(problems) = crate::engine::auto_merger::validate_policy(am, &policy) {
+        bail!(
+            "auto-merge is enabled for project `{}` ({}) but the repository cannot \
+             honor it:\n  - {}",
+            deps.project.id,
+            deps.project.repo_slug,
+            problems.join("\n  - "),
+        );
+    }
+    Ok(())
 }
 
 pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {

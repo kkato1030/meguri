@@ -174,6 +174,11 @@ pub struct Checkpoint {
     /// after the push.
     #[serde(default)]
     pub thread_ids: Vec<String>,
+    /// The tracked issue carries `meguri:automerge` (auto-merge 1/3, #41):
+    /// open the PR non-draft and copy the label onto it so the auto-merger
+    /// sweep can arm it. Recorded at claim time.
+    #[serde(default)]
+    pub automerge: bool,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -495,6 +500,9 @@ async fn claim_issue(
         "issue.claimed",
         json!({ "issue": issue.number }),
     )?;
+    // Carry the auto-merge opt-in from the issue to the PR (auto-merge 1/3,
+    // #41): recorded now, applied in open-pr (non-draft + label copy).
+    cp.automerge = issue.has_label(forge::LABEL_AUTOMERGE);
     cp.issue_title = issue.title;
     cp.issue_body = issue.body;
     Ok(PreparedWork::Claimed)
@@ -1015,7 +1023,10 @@ async fn open_pr(
              from an interactive agent session (run `{}`).",
             run.issue_number, description, run.id
         );
-        let draft = deps.config.pr_for(&deps.project).draft;
+        // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
+        // a draft would waste the required-checks run the arm is waiting on
+        // (auto-merge 1/3, #41).
+        let draft = deps.config.pr_for(&deps.project).draft && !cp.automerge;
         let pr = deps
             .forge
             .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
@@ -1025,6 +1036,15 @@ async fn open_pr(
         save_step(deps, run, STEP_OPEN_PR, cp)?;
         deps.store
             .emit(Some(&run.id), "pr.created", json!({ "url": pr.url }))?;
+        // Copy the opt-in label onto the PR so the sweep can arm it without
+        // re-reading the issue (the sweep keeps the issue-label fallback for
+        // any copy that does not land).
+        if cp.automerge {
+            deps.forge
+                .add_pr_label(pr.number, forge::LABEL_AUTOMERGE)
+                .await
+                .ok();
+        }
         pr.url
     };
 

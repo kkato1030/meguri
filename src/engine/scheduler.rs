@@ -63,6 +63,12 @@ impl Scheduler {
                 if let Err(e) = super::reaper::sweep(deps).await {
                     tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Ride the poll: arm GitHub-native auto-merge on eligible PRs
+                // (auto-merge 1/3, #41). Like the reaper, a light API sweep —
+                // no run record, no pane.
+                if let Err(e) = super::auto_merger::sweep(deps).await {
+                    tracing::warn!("auto-merge sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {

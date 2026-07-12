@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
-    ReviewThread,
+    ArmOutcome, Blocker, CreatedPr, Forge, Issue, IssueState, MergePolicy, MergeStrategy,
+    MergeableState, PullRequest, ReviewComment, ReviewThread,
 };
 
 pub struct GhForge {
@@ -36,6 +36,84 @@ impl GhForge {
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+        }
+    }
+
+    /// Run `gh`, returning `Ok(stdout)` on success and `Err(stderr)` on a
+    /// non-zero exit (spawn failures still bubble up as `Err(anyhow)`). Lets
+    /// callers branch on the error text / HTTP status instead of a flat bail.
+    async fn gh_try(&self, args: &[&str]) -> Result<std::result::Result<String, String>> {
+        let out = tokio::process::Command::new("gh")
+            .args(args)
+            .output()
+            .await
+            .context("spawning gh (is the GitHub CLI installed?)")?;
+        if out.status.success() {
+            Ok(Ok(String::from_utf8_lossy(&out.stdout)
+                .trim_end()
+                .to_string()))
+        } else {
+            Ok(Err(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        }
+    }
+
+    /// The `gh pr merge` argument vector, shared by arm (`--auto`) and the
+    /// clean-status finalize (no `--auto`). Pinned to the confirmed head via
+    /// `--match-head-commit` in both cases (ADR 0003).
+    fn merge_args<'a>(
+        pr: &'a str,
+        repo: &'a str,
+        strategy: MergeStrategy,
+        head_sha: &'a str,
+        auto: bool,
+    ) -> Vec<&'a str> {
+        let mut args = vec!["pr", "merge", pr, "--repo", repo];
+        if auto {
+            args.push("--auto");
+        }
+        args.push(strategy.flag());
+        args.push("--match-head-commit");
+        args.push(head_sha);
+        args
+    }
+
+    /// Read an arm attempt's stderr: `Some(Armed)` when auto-merge was already
+    /// enabled (idempotent success), `Some(AlreadyClean)` when GitHub reports
+    /// the PR already in clean status (no block to reserve → caller finalizes),
+    /// `None` for a genuine failure (e.g. the head moved) the caller returns.
+    fn classify_arm_stderr(stderr: &str) -> Option<ArmOutcome> {
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("clean status") {
+            Some(ArmOutcome::AlreadyClean)
+        } else if lower.contains("already enabled")
+            || lower.contains("auto-merge is already")
+            || lower.contains("pull request is already")
+        {
+            Some(ArmOutcome::Armed)
+        } else {
+            None
+        }
+    }
+
+    /// Interpret the required-checks protection endpoint's failure: 404 means
+    /// no classic protection (`Ok(false)`); 403 means the token lacks admin
+    /// rights to read protection and we must not degrade to "unprotected"
+    /// (ADR 0003) — surface it with the admin-token remedy.
+    fn protection_from_stderr(&self, base: &str, stderr: &str) -> Result<bool> {
+        if stderr.contains("HTTP 404") {
+            Ok(false)
+        } else if stderr.contains("HTTP 403") {
+            bail!(
+                "cannot read branch protection on {}/{base}: the token lacks \
+                 admin rights (HTTP 403). Use an admin-scoped token, or set \
+                 `require_branch_protection = false` if you are not an admin: {stderr}",
+                self.repo
+            )
+        } else {
+            bail!(
+                "cannot read branch protection on {}/{base}: {stderr}",
+                self.repo
+            )
         }
     }
 
@@ -104,6 +182,7 @@ impl GhForge {
                 .and_then(Value::as_str)
                 .unwrap_or("open")
                 .to_lowercase(),
+            is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             labels: Self::labels_from_json(v),
         })
     }
@@ -351,7 +430,7 @@ impl Forge for GhForge {
                 "--repo",
                 &self.repo,
                 "--json",
-                "number,title,body,labels,headRefName,headRefOid,state,url",
+                "number,title,body,labels,headRefName,headRefOid,state,url,isDraft",
             ])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr view output")?;
@@ -398,7 +477,7 @@ impl Forge for GhForge {
                 "--limit",
                 "50",
                 "--json",
-                "number,title,body,labels,headRefName,headRefOid,state,url",
+                "number,title,body,labels,headRefName,headRefOid,state,url,isDraft",
             ])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr list output")?;
@@ -522,7 +601,7 @@ impl Forge for GhForge {
                 "--limit",
                 "50",
                 "--json",
-                "number,title,body,url,headRefName,headRefOid,state,labels",
+                "number,title,body,url,headRefName,headRefOid,state,labels,isDraft",
             ])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh pr list output")?;
@@ -615,11 +694,160 @@ impl Forge for GhForge {
         .await?;
         Ok(())
     }
+
+    async fn enable_auto_merge(
+        &self,
+        pr: i64,
+        strategy: MergeStrategy,
+        head_sha: &str,
+    ) -> Result<ArmOutcome> {
+        let pr = pr.to_string();
+        let args = Self::merge_args(&pr, &self.repo, strategy, head_sha, true);
+        match self.gh_try(&args).await? {
+            Ok(_) => Ok(ArmOutcome::Armed),
+            Err(stderr) => match Self::classify_arm_stderr(&stderr) {
+                Some(outcome) => Ok(outcome),
+                // A moved head (or any other failure) is returned as-is; the
+                // sweep warns and re-evaluates the new head next poll.
+                None => bail!("gh pr merge --auto failed for #{pr}: {stderr}"),
+            },
+        }
+    }
+
+    async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()> {
+        let pr = pr.to_string();
+        let args = Self::merge_args(&pr, &self.repo, strategy, head_sha, false);
+        self.gh(&args).await?;
+        Ok(())
+    }
+
+    async fn mark_pr_ready(&self, pr: i64) -> Result<()> {
+        self.gh(&["pr", "ready", &pr.to_string(), "--repo", &self.repo])
+            .await?;
+        Ok(())
+    }
+
+    async fn merge_policy(&self, base_branch: &str) -> Result<MergePolicy> {
+        let raw = self.gh(&["api", &format!("repos/{}", self.repo)]).await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh api repos output")?;
+        let flag = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
+        let mut allowed_strategies = Vec::new();
+        if flag("allow_squash_merge") {
+            allowed_strategies.push(MergeStrategy::Squash);
+        }
+        if flag("allow_merge_commit") {
+            allowed_strategies.push(MergeStrategy::Merge);
+        }
+        if flag("allow_rebase_merge") {
+            allowed_strategies.push(MergeStrategy::Rebase);
+        }
+
+        // Classic branch protection only: 200 = required checks present,
+        // 404 = no protection, 403 = admin required (ADR 0003 — never
+        // silently "unprotected").
+        let protected_with_required_checks = match self
+            .gh_try(&[
+                "api",
+                &format!(
+                    "repos/{}/branches/{base_branch}/protection/required_status_checks",
+                    self.repo
+                ),
+            ])
+            .await?
+        {
+            Ok(_) => true,
+            Err(stderr) => self.protection_from_stderr(base_branch, &stderr)?,
+        };
+
+        Ok(MergePolicy {
+            auto_merge_allowed: flag("allow_auto_merge"),
+            allowed_strategies,
+            protected_with_required_checks,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_args_pin_head_and_toggle_auto() {
+        let armed = GhForge::merge_args("7", "me/repo", MergeStrategy::Squash, "abc", true);
+        assert_eq!(
+            armed,
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "me/repo",
+                "--auto",
+                "--squash",
+                "--match-head-commit",
+                "abc",
+            ]
+        );
+        // The clean-status finalize drops --auto but keeps the head pin.
+        let finalize = GhForge::merge_args("7", "me/repo", MergeStrategy::Rebase, "abc", false);
+        assert_eq!(
+            finalize,
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "me/repo",
+                "--rebase",
+                "--match-head-commit",
+                "abc",
+            ]
+        );
+    }
+
+    #[test]
+    fn arm_stderr_maps_idempotent_and_clean() {
+        assert_eq!(
+            GhForge::classify_arm_stderr("Pull request is in clean status"),
+            Some(ArmOutcome::AlreadyClean)
+        );
+        assert_eq!(
+            GhForge::classify_arm_stderr("auto-merge is already enabled for this PR"),
+            Some(ArmOutcome::Armed)
+        );
+        // A moved head is a genuine failure the caller must surface.
+        assert_eq!(
+            GhForge::classify_arm_stderr(
+                "Head branch was modified. Review and try the merge again."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn protection_stderr_maps_status_codes() {
+        let forge = GhForge::new("me/repo");
+        assert!(
+            !forge
+                .protection_from_stderr("main", "gh: Not Found (HTTP 404)")
+                .unwrap()
+        );
+        let admin = forge
+            .protection_from_stderr("main", "gh: Must have admin rights (HTTP 403)")
+            .unwrap_err()
+            .to_string();
+        assert!(admin.contains("admin"), "{admin}");
+        assert!(
+            admin.contains("require_branch_protection = false"),
+            "{admin}"
+        );
+        // An unexpected error is neither "unprotected" nor swallowed.
+        assert!(
+            forge
+                .protection_from_stderr("main", "gh: boom (HTTP 500)")
+                .is_err()
+        );
+    }
 
     #[test]
     fn merged_pr_state_is_closed() {

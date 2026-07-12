@@ -1,3 +1,4 @@
+pub mod auto_merger;
 pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;

@@ -134,6 +134,7 @@ systemd user unit は後続予定です。
 | `meguri:working` | meguri がクレーム済み（PR が開くと外れる） |
 | `meguri:hold` | discovery がこの issue をスキップする |
 | `meguri:needs-human` | meguri が断念。理由はコメントで説明される |
+| `meguri:automerge` | GitHub ネイティブ auto-merge にオプトインする（issue にも PR にも貼れる） |
 
 discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004）も尊重します: 他の issue に *blocked by* されている issue は、すべてのブロッカーが **completed** で close されるまでスキップされます — ラベルもコメントも付けない、静かなスキップです。*not planned* / *duplicate* で close されたブロッカーは解決扱いになりません（依存元 issue は人間の再検討待ち）。ブロッカーが読めない場合も「未解決」として扱われます。
 
@@ -142,6 +143,22 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 `meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。
 
 GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 watch 中は issue が close されると対応する worktree（とマージ済みローカルブランチ）も自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
+
+### 自動マージ（オプトイン）
+
+meguri は「マージして安全か」を自前で判定しません — 条件の揃った PR に GitHub ネイティブの auto-merge を arm する（`gh pr merge --auto`）だけで、いつマージするかの最終判断は GitHub（branch protection + required checks）に委ねます（`docs/adr/0003-auto-merge-github-native-arm-only.md` 参照）。デフォルトは無効で、二段のオプトインでゲートします: マスタースイッチ `[pr.auto_merge].enabled` と、（`opt_in = "all"` でない限り）`meguri:automerge` ラベルです。ラベルを *issue* に貼ると worker が PR へコピーします（その PR は最初から non-draft で開きます）。PR に直接貼っても効きます。
+
+watch のポーリングに相乗りする sweep が、**すべて**満たした PR を arm します: `meguri/` ブランチで `Closes #N.` により issue に紐づいている / `meguri:hold`・`meguri:needs-human`・`meguri:working`・`meguri:spec-reviewing`・`meguri:spec-ready` のいずれも付いていない（spec フェーズ中は絶対に arm しない）/ 未解決 review thread がゼロ / リポジトリが auto-merge と設定した strategy を許可している（必要なら required checks 付き branch protection もある）。arm はレビュー済み head に `--match-head-commit` で固定され、マーカーコメント（`<!-- meguri:automerge armed head=<sha> -->`）が冪等性と人間の上書き尊重を担います — 人間が後で auto-merge を解除した head は再 arm しません（新しい push で再判定）。arm しようとした時点で GitHub が既に「マージ可能」と判定していた場合は、meguri がその判定に従ってマージを確定します。
+
+```toml
+[pr.auto_merge]
+enabled = false                  # マスタースイッチ
+strategy = "squash"              # squash | merge | rebase(リポジトリで不許可なら fallback せず拒否)
+require_branch_protection = true # required checks 付き protection がなければ arm しない
+opt_in = "label"                 # label(meguri:automerge が必要) | all(全 meguri PR が対象)
+```
+
+`enabled = true` なのにリポジトリが auto-merge を honor できない（auto-merge 不許可・strategy 不許可・protection なし）場合、`meguri watch` 起動時と `meguri doctor` で **fail-fast** します（マージ時に静かに劣化させない）。逃げ道は同じ `require_branch_protection = false` で、注意点が二つ: protection 検出は **classic branch protection API のみ**（rulesets は検出できない）で、その参照には **admin 権限のトークン**が必要です（admin でないトークンは HTTP 403 になり、meguri はそれを「protection なし」に倒さずエラーとして返します）。また auto-merge 3/3 まではレビューギャップがあります: meguri 自身のレビューが clean であることを arm 条件に足す reviewer ゲート（`require_clean_review`）は後段の issue で入るため、それまではオプトイン PR が meguri のレビュー前でも required checks さえ通れば merge され得ます — 求める品質バーは branch protection 側で担保してください。
 
 ## 設定
 
@@ -187,7 +204,15 @@ bind = "127.0.0.1"     # 認証なしのため loopback 推奨
 
 [pr]
 draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き
+
+[pr.auto_merge]        # GitHub ネイティブ auto-merge、オプトイン（上の「自動マージ」参照）
+enabled = false
+strategy = "squash"    # squash | merge | rebase
+require_branch_protection = true
+opt_in = "label"       # label | all
 ```
+
+`[projects.pr]` は `[pr]` セクションを（キー単位ではなく)丸ごと上書きします: `[projects.pr]` を書いたプロジェクトは、省略したキーはデフォルトになり、`[pr.auto_merge]` も含めてそうなります。
 
 ## 開発
 

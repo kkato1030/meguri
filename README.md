@@ -135,6 +135,7 @@ detached — fails loudly instead of double-driving runs.
 | `meguri:working` | meguri claimed it (removed when the PR opens) |
 | `meguri:hold` | discovery skips this issue |
 | `meguri:needs-human` | meguri gave up; a comment explains why |
+| `meguri:automerge` | opt in to GitHub-native auto-merge (on the issue or the PR) |
 
 Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an issue *blocked by* another is skipped — silently, no label or comment — until every blocker is closed as **completed**. Blockers closed as *not planned* / *duplicate* don't count as resolved (the dependent issue awaits human re-triage), and unreadable blockers are treated as unresolved.
 
@@ -143,6 +144,22 @@ Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an i
 Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together.
 
 Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. While watching, meguri also reclaims the worktree (and merged local branch) of every issue that closes; `meguri prune` does the same on demand for one-shot usage.
+
+### Auto-merge (opt-in)
+
+meguri never decides "safe to merge" — it arms GitHub-native auto-merge (`gh pr merge --auto`) on eligible PRs and lets GitHub (branch protection + required checks) decide when to merge (see `docs/adr/0003-auto-merge-github-native-arm-only.md`). It is off by default and gated behind two opt-ins: the master switch `[pr.auto_merge].enabled`, and (unless `opt_in = "all"`) the `meguri:automerge` label. Put the label on an *issue* and the worker copies it onto the PR (opening that PR non-draft); put it straight on a PR and it works too.
+
+Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meguri/` branch linked to its issue via `Closes #N.`; it carries no `meguri:hold` / `meguri:needs-human` / `meguri:working` / `meguri:spec-reviewing` / `meguri:spec-ready` label (auto-merge never fires mid-spec); it has zero unresolved review threads; and the repository allows auto-merge with the configured strategy (and, when required, required-checks branch protection). The arm is pinned to the reviewed head with `--match-head-commit`, and a marker comment (`<!-- meguri:automerge armed head=<sha> -->`) makes it idempotent and respects a human who later disables auto-merge — that head is never re-armed (a new push re-evaluates). If GitHub already reports the PR mergeable when meguri goes to arm it, meguri finalizes the merge on GitHub's own verdict instead.
+
+```toml
+[pr.auto_merge]
+enabled = false                  # master switch
+strategy = "squash"              # squash | merge | rebase (no fallback if the repo forbids it)
+require_branch_protection = true # refuse to arm without required-checks branch protection
+opt_in = "label"                 # label (needs meguri:automerge) | all (every eligible meguri PR)
+```
+
+When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). Note also the review gap until auto-merge 3/3: the reviewer gate (`require_clean_review`) that makes meguri's own review a precondition arrives in a later issue, so until then an opt-in PR can merge on green required checks before meguri has reviewed it — rely on branch protection for the bar you want.
 
 ## Configuration
 
@@ -188,7 +205,15 @@ bind = "127.0.0.1"     # no auth — keep it loopback unless you know your netwo
 
 [pr]
 draft = true   # open PRs as drafts; override per project with [projects.pr]
+
+[pr.auto_merge]        # GitHub-native auto-merge, opt-in (see "Auto-merge" above)
+enabled = false
+strategy = "squash"    # squash | merge | rebase
+require_branch_protection = true
+opt_in = "label"       # label | all
 ```
+
+`[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
 
 ## Development
 
