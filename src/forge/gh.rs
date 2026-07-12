@@ -467,6 +467,34 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--title",
+            title,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()> {
+        self.gh(&[
+            "pr",
+            "edit",
+            &pr.to_string(),
+            "--repo",
+            &self.repo,
+            "--body",
+            body,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn get_pr(&self, number: i64) -> Result<PullRequest> {
         let raw = self
             .gh(&[

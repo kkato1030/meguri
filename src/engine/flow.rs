@@ -86,6 +86,22 @@ pub trait Flavor: Send + Sync {
     /// idempotent.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()>;
 
+    /// Settle the PR's presentation (title/body) once it exists. Default:
+    /// no-op — new-PR loops set both at create time (via [`Flavor::pr_title`]
+    /// and [`compose_pr_body`]), so there is nothing to transition. Branch
+    /// takeovers whose PR was authored by another loop (the spec worker)
+    /// override this to move the PR from that loop's presentation to their
+    /// own. Re-run on resume, so keep it idempotent.
+    async fn settle_presentation(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &Checkpoint,
+    ) -> Result<()> {
+        let _ = (deps, run, cp);
+        Ok(())
+    }
+
     /// Release the claim marker on `meguri stop`. Default: the issue's
     /// `meguri:working` label.
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
@@ -1018,17 +1034,7 @@ async fn open_pr(
         url.clone() // resumed after PR creation
     } else {
         let title = flavor.pr_title(run, cp);
-        let description = cp
-            .pr_body
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| cp.summary.trim());
-        let body = format!(
-            "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
-             from an interactive agent session (run `{}`).",
-            run.issue_number, description, run.id
-        );
+        let body = compose_pr_body(run, cp);
         let draft = deps.config.pr_for(&deps.project).draft;
         let pr = deps
             .forge
@@ -1042,8 +1048,28 @@ async fn open_pr(
         pr.url
     };
 
+    flavor.settle_presentation(deps, run, cp).await?;
     flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
+}
+
+/// The PR body meguri wraps around the agent's description: a `Closes #N`
+/// header, the agent-authored description (its `pr_body`, or the execute
+/// turn's summary as a fallback), and the meguri footer. Shared by new-PR
+/// creation and the spec worker's spec→implementation body transition so the
+/// two paths render an identical shape (issue #98).
+pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint) -> String {
+    let description = cp
+        .pr_body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cp.summary.trim());
+    format!(
+        "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+         from an interactive agent session (run `{}`).",
+        run.issue_number, description, run.id
+    )
 }
 
 /// Where repositories keep their PR template, in priority order.

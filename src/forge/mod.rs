@@ -221,6 +221,12 @@ pub trait Forge: Send + Sync {
     /// space but need different edit commands).
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()>;
+    /// Overwrite a pull request's title (the spec worker retitles a takeover
+    /// PR from `Spec: X` to `X` once implementation lands, issue #98).
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()>;
+    /// Overwrite a pull request's body wholesale (the spec worker replaces the
+    /// planner's spec description with the implementation one, issue #98).
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()>;
     /// Open pull requests carrying `label` (candidates for review discovery).
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>>;
     /// The PR's full unified diff against its base.

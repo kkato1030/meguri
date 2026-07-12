@@ -296,6 +296,25 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     assert_eq!(prs.len(), 1, "the takeover must never open a new PR");
     assert_eq!(prs[0].number, 1);
 
+    // Presentation transitioned from spec to implementation (issue #98): the
+    // planner opened it as `Spec: Add caching layer (#5)` with a `Closes #5.`
+    // body; settle dropped the `Spec:` prefix and rewrote the body to the
+    // implementation description the agent authored.
+    assert_eq!(
+        prs[0].title, "Add caching layer (#5)",
+        "the `Spec:` prefix must be gone"
+    );
+    assert!(
+        prs[0].body.contains("scripted implementation"),
+        "body must reflect the implementation, not the spec: {}",
+        prs[0].body
+    );
+    assert!(
+        prs[0].body.contains("Opened by [meguri]"),
+        "body keeps the meguri footer: {}",
+        prs[0].body
+    );
+
     // The execute prompt carried the issue AND the reviewed spec's contents.
     let wt = find_worktree(&env.worktree_root).unwrap();
     let prompts = prompts_in(&wt);
@@ -314,6 +333,10 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     assert!(
         execute_prompt.contains("delete `docs/specs/issue-5.md`"),
         "the prune instruction must be in the prompt: {execute_prompt}"
+    );
+    assert!(
+        execute_prompt.contains("# Pull request description"),
+        "the takeover authors pr_body so settle can rewrite the PR body: {execute_prompt}"
     );
 
     // Label transition on the PR: spec-ready consumed, claim released, no
