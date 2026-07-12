@@ -3,6 +3,7 @@
 //! implementation commits stacked onto its existing branch — no second PR.
 //! A scripted "agent" plays the pane side (same protocol as worker_test).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,24 +203,26 @@ fn prompts_in(worktree: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Scripted pane-side agent: for each new prompt turn, run `action`.
+/// Scripted pane-side agent: `action` runs exactly once per new prompt turn
+/// (deduplicated by turn id, so slow actions aren't re-fired by the poll).
 fn spawn_scripted_agent<F>(worktree_root: PathBuf, mut action: F) -> tokio::task::JoinHandle<u32>
 where
     F: FnMut(u32, &Path, &str) + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut turns = 0u32;
+        let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let Some(wt) = find_worktree(&worktree_root) else {
                 continue;
             };
-            if let Some(turn_id) = pending_turn(&wt) {
-                turns += 1;
-                action(turns, &wt, &turn_id);
+            if let Some(turn_id) = pending_turn(&wt)
+                && seen.insert(turn_id.clone())
+            {
+                action(seen.len() as u32, &wt, &turn_id);
             }
         }
-        turns
+        seen.len() as u32
     })
 }
 

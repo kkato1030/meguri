@@ -79,7 +79,6 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
-meguri serve              # 読み取り専用 web ダッシュボード (http://127.0.0.1:8607)
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -118,10 +117,6 @@ systemd user unit は後続予定です。
 どのモードでも watch プロセスは排他ロック（`~/.meguri/daemon/watch.lock`）を保持するので、
 2 つ目のスケジューラ — フォアグラウンドでも detached でも — は二重駆動せず明示エラーで
 落ちます。
-
-### web ダッシュボード
-
-`meguri serve` で読み取り専用ダッシュボードが `http://127.0.0.1:8607` に立ちます（`--port` / `--bind` または config の `[server]` セクションで変更可）。`meguri ps` 相当の runs テーブル（`awaiting_human` の run を最上部で強調表示）に加え、run ごとの詳細ページでイベントトレイル、端末風のペインテール、turn 履歴、コピー可能な attach コマンドが見られます。同じ sqlite を読む独立プロセスなので `meguri watch` が動いていなくても使え、watch の生死は scheduler が tick ごとに書くハートビートから表示されます。認証はないためデフォルトは loopback バインドです（それ以外を指定すると警告が出ます）。
 
 ### ラベル
 
@@ -196,10 +191,6 @@ max_concurrent_runs = 2
 [daemon]
 restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
 throttle_secs = 10             # launchd ThrottleInterval（再起動の最短間隔・秒）
-
-[server]
-port = 8607            # meguri serve のリッスンポート
-bind = "127.0.0.1"     # 認証なしのため loopback 推奨
 
 [notifications]
 macos = true           # awaiting_human を macOS 通知 (osascript) で知らせる

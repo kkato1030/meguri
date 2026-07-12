@@ -79,7 +79,6 @@ meguri watch
 
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
-meguri serve              # read-only web dashboard on http://127.0.0.1:8607
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
@@ -119,10 +118,6 @@ fallback); systemd user units are planned.
 Whatever the mode, the watch process holds an exclusive lock
 (`~/.meguri/daemon/watch.lock`), so a second scheduler — foreground or
 detached — fails loudly instead of double-driving runs.
-
-### Web dashboard
-
-`meguri serve` starts a read-only dashboard at `http://127.0.0.1:8607` (override with `--port` / `--bind` or the `[server]` config section): a runs table like `meguri ps` with `awaiting_human` runs highlighted front and center, plus a per-run page with the event trail, a terminal-style pane tail, turn history, and the attach command ready to copy. It is an independent process that reads the same sqlite database — it works even when `meguri watch` is not running, and shows watch liveness from the heartbeat the scheduler writes each tick. There is no authentication, so it binds loopback by default; binding anything else prints a warning.
 
 ### Labels
 
@@ -197,10 +192,6 @@ max_concurrent_runs = 2
 [daemon]
 restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
 throttle_secs = 10             # launchd ThrottleInterval (secs between restarts)
-
-[server]
-port = 8607            # meguri serve listen port
-bind = "127.0.0.1"     # no auth — keep it loopback unless you know your network
 
 [notifications]
 macos = true           # page awaiting_human via a macOS notification (osascript)
