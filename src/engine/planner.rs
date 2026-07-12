@@ -16,6 +16,11 @@
 //! #48). Anything with durable value is routed out of the spec by the prompt
 //! — design decisions to ADRs, domain rules to permanent domain documents.
 //!
+//! Lifetime (issue #92): keyed by the issue, new branch and worktree, pane
+//! in the issue's author lane — kept after the spec PR opens, so the spec
+//! worker (and later fixer rounds) continue in the same live session; the
+//! reaper reclaims it when the issue closes.
+//!
 //! Second normal ending — decompose (issue #24): when the agent finds the
 //! issue too big for one spec, it ends the turn with `status: decompose` and
 //! a `children` list; meguri (not the agent) files the sub-issues, wires

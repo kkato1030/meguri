@@ -80,7 +80,8 @@ meguri watch
 meguri ps                 # runs, interaction state, panes
 meguri top                # tile live agent panes into one mux tab — a dashboard
 meguri logs <run>         # event trail + live pane tail
-meguri attach <run>       # jump into the agent's pane
+meguri attach <issue>     # jump into the issue's agent pane (or pass a run id)
+meguri attach <issue> --review  # the reviewer's independent pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -147,7 +148,20 @@ meguri's AI review covers **both the spec PR and the implementation diff**. Once
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes and worktrees live per issue (1 issue = 1 pane; later runs on the same issue reuse the live session): while watching, meguri reclaims the pane, worktree, and merged local branch of every issue that closes, saving the agent's native session id first so `claude --resume <id>` can restore the context. `meguri prune` does the same on demand for one-shot usage.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the reviewer. After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
+
+Per-loop lifetimes at a glance:
+
+| loop | trigger | key | worktree | normal end | pane |
+|---|---|---|---|---|---|
+| planner (author) | `meguri:plan` issue | issue | new branch | spec PR → `spec-reviewing` | kept |
+| reviewer (review) | `spec-reviewing` PR, head unreviewed | issue + `review` | read-only detached, fixed at `review-<issue>` | clean → `spec-ready` / findings → wait for push | kept (independent) |
+| spec worker (author) | `spec-ready` PR | issue (from branch) | takes over the PR branch | implementation → same PR | kept — continues the author pane |
+| worker (author) | `meguri:ready` issue | issue | new branch | PR `Closes #N` | kept |
+| fixer (author) | unresolved PR threads | issue (from branch) | attached to the PR head | replies on threads for re-review | kept — continues the author pane |
+| ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
+| conflict resolver (author) | CONFLICTING meguri PR | issue (from branch) | attached to the PR head | base merged & pushed (≤3) | kept — continues the author pane |
+| cleaner (standalone) | report issue + default-branch movement | report issue | read-only detached | report issue rewritten | self-reclaimed |
 
 ## Configuration
 
@@ -166,9 +180,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-# Panes live per issue (1 issue = 1 pane) and are reclaimed when the issue
-# closes; the agent's native session id is saved first (claude --resume <id>).
-# "never" kills the pane as soon as its run ends (high-throughput operation).
+# Panes live per issue (one author pane + one review pane) and are reclaimed
+# when the issue closes; the agent's native session id is saved first
+# (claude --resume <id>). "never" kills the pane as soon as its run ends
+# (high-throughput operation). Any other value is rejected at load.
 keep_pane = "until-issue-closed"  # also: never
 
 [agent]
