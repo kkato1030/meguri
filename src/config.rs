@@ -80,7 +80,39 @@ pub struct Config {
     #[serde(default)]
     pub clean: CleanConfig,
     #[serde(default)]
+    pub review: ReviewConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+/// Settings for the impl-reviewer loop (AI review of implementation PRs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Kill switch: false silences the impl-reviewer loop entirely
+    /// (e.g. when an external review bot already covers implementation PRs).
+    #[serde(default = "default_impl_review_enabled")]
+    pub impl_enabled: bool,
+    /// Max impl-review rounds per PR, counted as head markers in the PR's
+    /// comments — the cap that keeps the AI review→fix ping-pong finite.
+    /// Once reached, the loop quietly leaves the PR to the humans.
+    #[serde(default = "default_impl_max_rounds")]
+    pub impl_max_rounds: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            impl_enabled: default_impl_review_enabled(),
+            impl_max_rounds: default_impl_max_rounds(),
+        }
+    }
+}
+
+fn default_impl_review_enabled() -> bool {
+    true
+}
+fn default_impl_max_rounds() -> u32 {
+    3
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -612,6 +644,20 @@ mod tests {
         assert!(back.notifications.macos);
         assert_eq!(back.notifications.webhook_url, None);
         assert_eq!(back.notifications.throttle_secs, 60);
+        assert!(back.review.impl_enabled);
+        assert_eq!(back.review.impl_max_rounds, 3);
+    }
+
+    #[test]
+    fn review_section_overrides_defaults() {
+        let raw = r#"
+[review]
+impl_enabled = false
+impl_max_rounds = 1
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.review.impl_enabled);
+        assert_eq!(cfg.review.impl_max_rounds, 1);
     }
 
     #[test]
