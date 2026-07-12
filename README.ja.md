@@ -78,6 +78,7 @@ meguri run --project myproj --issue 42
 meguri watch
 
 meguri ps                 # runs, interaction state, panes
+meguri top                # 稼働中の agent ペインを 1 タブにタイル表示するダッシュボード
 meguri logs <run>         # event trail + live pane tail
 meguri attach <issue>     # issue の agent pane に入る（run id も可）
 meguri attach <issue> --review  # reviewer の独立 pane

@@ -69,6 +69,24 @@ impl std::fmt::Display for PaneId {
     }
 }
 
+/// Opaque handle to a dashboard container that tiles several live agent panes
+/// (herdr tab id like "wD:t4", tmux window id like "@5"). Used by `meguri top`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardId(pub String);
+
+impl std::fmt::Display for DashboardId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Direction to grow a tile when placing a pane into a dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Split {
+    Right,
+    Down,
+}
+
 #[derive(Debug, Clone)]
 pub struct PaneSpec {
     /// Human-facing title/label for the pane.
@@ -151,6 +169,25 @@ pub trait Multiplexer: Send + Sync {
 
     /// Shell command a human runs to attach to this pane.
     fn attach_command(&self, pane: &PaneId) -> String;
+
+    // --- Dashboard layout (`meguri top`, issue #96) -----------------------
+    //
+    // These only move panes between containers; they never touch the agent
+    // process, so meguri keeps driving each pane by its `PaneId` regardless of
+    // which tab/window it lives in.
+
+    /// Ensure a dashboard container labeled `label` exists in the meguri
+    /// session, returning its handle. Idempotent: an existing container with
+    /// the same label is reused rather than duplicated.
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId>;
+
+    /// Move a live agent pane into the dashboard, tiling it in `dir`. The
+    /// pane's process is preserved (herdr `pane move`, tmux `join-pane`), so
+    /// the orchestrator keeps driving it by id.
+    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()>;
+
+    /// Shell command a human runs to view the dashboard container.
+    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String;
 }
 
 /// Pick a multiplexer: explicit kind, else herdr if its socket is live, else tmux.

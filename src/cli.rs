@@ -42,6 +42,15 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Tile live agent panes into one mux tab — a terminal dashboard
+    Top {
+        /// Multiplexer override: herdr | tmux
+        #[arg(long)]
+        mux: Option<String>,
+        /// Status refresh interval in seconds
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
     /// Show events (and recent pane output) for a run
     Logs { run: String },
     /// Attach your terminal to an issue's pane (or a run's)

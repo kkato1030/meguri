@@ -21,8 +21,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("0004_panes", include_str!("migrations/0004_panes.sql")),
     (
-        "0005_pane_role",
-        include_str!("migrations/0005_pane_role.sql"),
+        "0005_agent_profile",
+        include_str!("migrations/0005_agent_profile.sql"),
+    ),
+    (
+        "0006_pane_role",
+        include_str!("migrations/0006_pane_role.sql"),
     ),
 ];
 
