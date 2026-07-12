@@ -1007,7 +1007,11 @@ pub fn render_report(
         body.push_str("\n### Phase-label anomalies _(high confidence)_\n");
         for a in &phase_anomalies {
             let detail = if a.phases.len() >= 2 {
-                format!("carries {} phase labels ({})", a.phases.len(), a.phases.join(", "))
+                format!(
+                    "carries {} phase labels ({})",
+                    a.phases.len(),
+                    a.phases.join(", ")
+                )
             } else {
                 "has a ball label but no phase label".to_string()
             };

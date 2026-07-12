@@ -972,7 +972,10 @@ mod tests {
         assert_eq!(label_scheme(super::super::LABEL_NEEDS_HUMAN).0, "B60205");
         assert_eq!(label_scheme(super::super::LABEL_HOLD).0, "CFD3D7");
         // An unknown label falls back to the generic blue.
-        assert_eq!(label_scheme("random:label"), (DEFAULT_LABEL_COLOR, "managed by meguri"));
+        assert_eq!(
+            label_scheme("random:label"),
+            (DEFAULT_LABEL_COLOR, "managed by meguri")
+        );
     }
 
     #[test]

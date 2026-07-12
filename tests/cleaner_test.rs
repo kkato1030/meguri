@@ -578,7 +578,10 @@ async fn machine_checks_report_phase_label_anomalies() {
         number: 22,
         title: "healthy implementing".into(),
         body: String::new(),
-        labels: vec![LABEL_IMPLEMENTING.to_string(), LABEL_NEEDS_HUMAN.to_string()],
+        labels: vec![
+            LABEL_IMPLEMENTING.to_string(),
+            LABEL_NEEDS_HUMAN.to_string(),
+        ],
     });
     // Untriaged — no labels at all is legitimately unlabeled, not an anomaly.
     env.forge.issues.lock().unwrap().push(meguri::forge::Issue {

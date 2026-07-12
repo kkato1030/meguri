@@ -13,7 +13,7 @@ use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPECCING, LABEL_SPEC_READY,
+    Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_SPECCING,
     LABEL_WORKING,
 };
 use meguri::gitops::run_git;

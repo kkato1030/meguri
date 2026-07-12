@@ -16,8 +16,8 @@ use meguri::engine::worker;
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_SPECCING,
-    LABEL_SPEC_REVIEWING, LABEL_WORKING,
+    Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_SPEC_REVIEWING,
+    LABEL_SPECCING, LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
