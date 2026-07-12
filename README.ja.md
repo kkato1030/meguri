@@ -59,6 +59,8 @@ meguri 自体の脆弱性を見つけた場合は [SECURITY.md](SECURITY.md) を
 
 前提: `git`、[`gh`](https://cli.github.com)（認証済み）、エージェント CLI（デフォルトは `claude`）、そしてマルチプレクサ — 起動中の [herdr](https://herdr.dev)（推奨。エージェント状態のネイティブ検出）または `tmux`（画面ヒューリスティックのフォールバック）。
 
+対応プラットフォーム: meguri のコア（CLI・`watch`・全ループ）は macOS / Linux で動作します。`meguri daemon install`（`launchd` supervisor、「[常駐させる（daemon）](#常駐させるdaemon)」参照）は macOS 専用です。
+
 ```bash
 cargo install --path .   # or: cargo build --release
 meguri init              # writes ~/.meguri/config.toml, creates the db
@@ -320,6 +322,12 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 ## ステータス / ロードマップ
 
 GitHub 上で 8 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → self-review → PR）、**planner**（`meguri:plan` issue → spec PR）、**spec reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。実装 diff の AI レビューはもうループではなく worker の内部フェーズ（**self-review**、ADR 0006）です: run の worktree の中で回り、forge には一切触れません。
+
+## コントリビューション
+
+人間からのバグ報告・PR を歓迎します — 通常の fork & PR フローで、`meguri:*`
+ラベルを気にする必要はありません。詳細は [CONTRIBUTING.md](CONTRIBUTING.md)
+（英語）を参照してください。
 
 ## ライセンス
 
