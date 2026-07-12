@@ -1,6 +1,9 @@
+pub mod ci_fixer;
+pub mod cleaner;
 pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
+pub mod impl_reviewer;
 pub mod planner;
 pub mod reaper;
 pub mod reviewer;
@@ -16,6 +19,7 @@ use async_trait::async_trait;
 use crate::config::{Config, ProjectConfig};
 use crate::forge::Forge;
 use crate::mux::Multiplexer;
+use crate::notify::{Notification, Notifier};
 use crate::store::{DesiredState, InteractionState, Store};
 use crate::turn::TurnControl;
 
@@ -25,6 +29,9 @@ pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
     pub forge: Arc<dyn Forge>,
+    /// Shared across every run of the project so the per-run notification
+    /// throttle survives turn boundaries.
+    pub notifier: Arc<Notifier>,
     pub config: Config,
     pub project: ProjectConfig,
 }
@@ -80,19 +87,24 @@ pub trait Loop: Send + Sync {
 pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     vec![
         Arc::new(conflict_resolver::ConflictResolverLoop),
+        Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
+        Arc::new(impl_reviewer::ImplReviewerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(reviewer::ReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
+        Arc::new(cleaner::CleanerLoop),
     ]
 }
 
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
-/// live turns converge to it and report state/events back.
+/// live turns converge to it and report state/events back. Additionally
+/// pages a human (via the throttled notifier) on `turn.awaiting_human`.
 pub struct StoreControl {
     pub store: Store,
     pub run_id: String,
+    pub notifier: Arc<Notifier>,
 }
 
 #[async_trait]
@@ -108,6 +120,19 @@ impl TurnControl for StoreControl {
     }
 
     async fn event(&self, kind: &str, data: serde_json::Value) {
+        let awaiting = (kind == "turn.awaiting_human").then(|| {
+            let run = self.store.get_run(&self.run_id).ok().flatten();
+            Notification {
+                run_id: self.run_id.clone(),
+                issue_number: run.as_ref().map_or(0, |r| r.issue_number),
+                issue_title: run.and_then(|r| r.issue_title),
+                reason: data["reason"].as_str().unwrap_or("unknown").to_string(),
+                attach: data["attach"].as_str().unwrap_or_default().to_string(),
+            }
+        });
         let _ = self.store.emit(Some(&self.run_id), kind, data);
+        if let Some(n) = awaiting {
+            self.notifier.notify_awaiting_human(&n).await;
+        }
     }
 }

@@ -494,6 +494,7 @@ mod tests {
             store: crate::store::Store::open_in_memory().unwrap(),
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: Arc::new(crate::forge::fake::FakeForge::default()),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: crate::config::Config::default(),
             project: crate::config::ProjectConfig {
                 id: "proj".into(),
@@ -504,6 +505,7 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
+                clean: None,
             },
         }
     }

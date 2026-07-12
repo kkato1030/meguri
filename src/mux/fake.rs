@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 
 use super::{
-    AgentState, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId, PaneSpec,
+    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
+    PaneSpec, Split,
 };
 
 #[derive(Debug)]
@@ -31,6 +32,8 @@ pub struct FakeMux {
     /// Spawns whose command contains this string come up already dead
     /// (emulates e.g. `claude --resume <unknown-id>` exiting immediately).
     dead_spawn_matching: Mutex<Option<String>>,
+    /// Panes tiled into a dashboard, in tile order (for `meguri top` tests).
+    tiled: Mutex<Vec<(PaneId, DashboardId, Split)>>,
 }
 
 impl FakeMux {
@@ -41,6 +44,7 @@ impl FakeMux {
             panes: Mutex::new(HashMap::new()),
             spawn_log: Mutex::new(Vec::new()),
             dead_spawn_matching: Mutex::new(None),
+            tiled: Mutex::new(Vec::new()),
         }
     }
 
@@ -94,6 +98,11 @@ impl FakeMux {
     /// Every spawned command, in spawn order.
     pub fn spawned_commands(&self) -> Vec<Vec<String>> {
         self.spawn_log.lock().unwrap().clone()
+    }
+
+    /// Panes that were tiled into a dashboard, in tile order.
+    pub fn tiled_panes(&self) -> Vec<(PaneId, DashboardId, Split)> {
+        self.tiled.lock().unwrap().clone()
     }
 }
 
@@ -201,5 +210,31 @@ impl Multiplexer for FakeMux {
 
     fn attach_command(&self, pane: &PaneId) -> String {
         format!("echo fake pane {pane}")
+    }
+
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
+        Ok(DashboardId(format!("fake-dash:{label}")))
+    }
+
+    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
+        if !self
+            .panes
+            .lock()
+            .unwrap()
+            .get(pane)
+            .map(|p| p.alive)
+            .unwrap_or(false)
+        {
+            return Err(MuxError::PaneNotFound(pane.clone()));
+        }
+        self.tiled
+            .lock()
+            .unwrap()
+            .push((pane.clone(), into.clone(), dir));
+        Ok(())
+    }
+
+    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
+        format!("echo fake dashboard {dashboard}")
     }
 }

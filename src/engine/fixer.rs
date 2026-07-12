@@ -29,9 +29,9 @@ pub const KIND: &str = "fixer";
 /// Discovery treats a thread whose last comment starts with this as parked.
 pub const FIXER_REPLY_MARKER: &str = "🔁 meguri";
 
-/// Head-branch prefix identifying meguri's own PRs (the fixer only amends
-/// work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
+/// Head-branch prefix identifying meguri's own PRs (the fixer only amends —
+/// and the impl-reviewer only reviews — work meguri opened).
+pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 /// A thread the fixer still owes a fix: unresolved, and the ball is in
 /// meguri's court (the last comment is not meguri's reply).
@@ -424,6 +424,7 @@ mod tests {
             store: crate::store::Store::open_in_memory().unwrap(),
             mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge: Arc::new(crate::forge::fake::FakeForge::default()),
+            notifier: crate::notify::fake::recording_notifier().0,
             config: crate::config::Config::default(),
             project: crate::config::ProjectConfig {
                 id: "proj".into(),
@@ -434,6 +435,7 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
+                clean: None,
             },
         }
     }

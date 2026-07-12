@@ -197,9 +197,11 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
     let deps = Deps {
         store: Store::open_in_memory().unwrap(),
+        notifier: meguri::notify::fake::recording_notifier().0,
         mux: mux.clone(),
         forge,
         config: routing_config(),

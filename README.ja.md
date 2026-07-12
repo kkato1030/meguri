@@ -78,15 +78,15 @@ meguri run --project myproj --issue 42
 meguri watch
 
 meguri ps                 # runs, interaction state, panes
+meguri top                # 稼働中の agent ペインを 1 タブにタイル表示するダッシュボード
 meguri logs <run>         # event trail + live pane tail
-meguri serve              # 読み取り専用 web ダッシュボード (http://127.0.0.1:8607)
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
 meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
-meguri prune              # reclaim worktrees of closed issues (--dry-run / --force)
+meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
 ### 常駐させる（daemon）
@@ -119,10 +119,6 @@ systemd user unit は後続予定です。
 2 つ目のスケジューラ — フォアグラウンドでも detached でも — は二重駆動せず明示エラーで
 落ちます。
 
-### web ダッシュボード
-
-`meguri serve` で読み取り専用ダッシュボードが `http://127.0.0.1:8607` に立ちます（`--port` / `--bind` または config の `[server]` セクションで変更可）。`meguri ps` 相当の runs テーブル（`awaiting_human` の run を最上部で強調表示）に加え、run ごとの詳細ページでイベントトレイル、端末風のペインテール、turn 履歴、コピー可能な attach コマンドが見られます。同じ sqlite を読む独立プロセスなので `meguri watch` が動いていなくても使え、watch の生死は scheduler が tick ごとに書くハートビートから表示されます。認証はないためデフォルトは loopback バインドです（それ以外を指定すると警告が出ます）。
-
 ### ラベル
 
 | ラベル | 意味 |
@@ -134,18 +130,31 @@ systemd user unit は後続予定です。
 | `meguri:working` | meguri がクレーム済み（PR が開くと外れる） |
 | `meguri:hold` | discovery がこの issue をスキップする |
 | `meguri:needs-human` | meguri が断念。理由はコメントで説明される |
+| `meguri:clean-report` | cleaner ループのプロジェクト別レポート issue（`meguri:hold` を付けると巡回が止まる） |
 
 discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004）も尊重します: 他の issue に *blocked by* されている issue は、すべてのブロッカーが **completed** で close されるまでスキップされます — ラベルもコメントも付けない、静かなスキップです。*not planned* / *duplicate* で close されたブロッカーは解決扱いになりません（依存元 issue は人間の再検討待ち）。ブロッカーが読めない場合も「未解決」として扱われます。
 
 ### spec 先行フロー（オプトイン）
 
-`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。
+`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。続いて **reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 watch 中は issue が close されると対応する worktree（とマージ済みローカルブランチ）も自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
+### 実装レビュー（実装 diff の AI レビュー）
+
+meguri の AI レビューは **spec PR と実装 diff の両方** を対象にします。meguri の実装 PR が静かになったら — CI が green、spec 系ラベルなし、fixer 待ちのレビュースレッドなし — **impl reviewer** ループが head を read-only でチェックアウトして diff をレビューします: 指摘は **inline のレビュースレッド**（+ マーカー入りサマリコメント）として投稿されます。これはまさに fixer の入力そのものなので、既存の review→fix の往復（ping-pong）が新しい機構なしでそのまま拾います。指摘なしならマーカー入りコメントだけが投稿され、何も反応しません。このループはラベルレスで、収束は三重に栓がされています（ADR 0004）: 同じ head は 1 回しかレビューされない（PR 上の隠し head-sha マーカー）、PR ごとのラウンド数に上限がある（`review.impl_max_rounds`）、そして clean 判定はスレッドを作りません。AI は approve も request-changes も決してしません — レビューは常に COMMENT のみで、**マージは人間の判断のまま**です。外部のレビュー bot を使っている場合は `review.impl_enabled = false` で止められます。
+
+### cleaner（read-only のリポジトリ巡回）
+
+**cleaner** ループは default branch の head を定期的に歩いて回り、蓄積した乖離 — spec と実装のずれ、dead code の候補、規約からの逸脱、置き去りの TODO、stale なリモートブランチ、孤児化した `meguri:working` ラベル — を `meguri:clean-report` ラベル付きの **1 本のレポート issue**（1 project = 1 issue）に書き留めます。修正は一切しません: 書き込みはこの issue の作成・更新だけで、push もブランチ操作も、他の issue / PR へのラベルやコメントもしません。本文は巡回のたびに完全に書き直されるスナップショットで、隠しマーカーの head sha により同じ head が二度走査されることはなく、head が進んでも `clean.interval_hours` を過ぎるまで次の巡回は走りません。検出項目を採用するなら通常の issue を切って `meguri:plan` / `meguri:ready` を付け、誤検知なら `clean.ignore` に部分文字列を足し、ループを止めたければレポート issue に `meguri:hold` を貼ってください。
+
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 pane と worktree は issue 単位で生きます（1 issue = 1 pane。同じ issue の後続 run は生きている session を再利用）: watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。回収前にエージェントのネイティブ session id が保存されるので、`claude --resume <id>` で文脈ごと復帰できます。一発実行運用では `meguri prune` で同じ掃除ができます。
 
 ## 設定
 
-すべての項目に既定値があるため、`config.toml` には `[[projects]]` と上書きしたい項目だけを書けば残りは既定値で埋まります — `meguri init` はその前提の最小テンプレートを書き出します。既定値の一覧:
+すべての項目に既定値があるため、`config.toml` には `[[projects]]` と上書きしたい項目だけを書けば残りは既定値で埋まります — `meguri init` はその前提の最小テンプレートを書き出します。
+
+`meguri watch` はポーリングのたびに `config.toml` を読み直すので、編集はそれ以降に spawn される run から反映されます — デーモン再起動は不要です（実行中の run は開始時点の設定を保持します）。不正な編集（TOML の構文エラー、projects が空）はログに警告を出して拒否され、直前の有効な設定で動き続けます。プロセスの寿命に紐づく 2 つだけは例外で、再起動が必要です（ログでもその旨を警告します）: `mux.kind` / `mux.session`（`meguri watch` を再起動）と `[daemon]` セクション（`meguri daemon install` を再実行）。
+
+既定値の一覧:
 
 ```toml
 # エージェントが書く成果物（PR 説明・summary・spec・レビュー）の言語。自由記述
@@ -156,7 +165,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-keep_pane = "on-failure"  # also: always | never
+# pane は issue 単位（1 issue = 1 pane）で保持され、issue が close されると回収
+# されます。回収前にエージェントのネイティブ session id を保存（claude --resume <id>）。
+# "never" は run 終了と同時に pane を閉じます（高速大量運転向け）。
+keep_pane = "until-issue-closed"  # also: never
 
 [agent]
 command = "claude"
@@ -181,12 +193,22 @@ max_concurrent_runs = 2
 restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
 throttle_secs = 10             # launchd ThrottleInterval（再起動の最短間隔・秒）
 
-[server]
-port = 8607            # meguri serve のリッスンポート
-bind = "127.0.0.1"     # 認証なしのため loopback 推奨
+[notifications]
+macos = true           # awaiting_human を macOS 通知 (osascript) で知らせる
+# webhook_url = "https://example.com/hook"  # JSON POST: run id / issue / reason / attach
+throttle_secs = 60     # 同一 run の連続通知の最短間隔(秒)
 
 [pr]
 draft = true   # PR をドラフトで作成。プロジェクト単位は [projects.pr] で上書き
+
+[clean]
+interval_hours = 24     # cleaner の巡回間隔の下限（head が進んだだけでは走らない）
+stale_branch_days = 30  # 最終コミットがこれより古いリモートブランチを stale として報告
+ignore = []             # 誤検知を黙らせる部分文字列。プロジェクト単位は [projects.clean] で上書き
+
+[review]
+impl_enabled = true    # impl-reviewer ループ（実装 PR の AI レビュー）のキルスイッチ
+impl_max_rounds = 3    # PR ごとの impl レビューのラウンド上限。超えたら人間に委ねる
 ```
 
 ## 開発
@@ -200,7 +222,7 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 ## ステータス / ロードマップ
 
-GitHub 上で 6 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）。
+GitHub 上で 9 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → PR）、**planner**（`meguri:plan` issue → spec PR）、**reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**impl reviewer**（静かで green な meguri の実装 PR → inline レビュースレッドとして AI レビューを投稿し fixer に流す）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。
 
 ## ライセンス
 

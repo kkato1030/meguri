@@ -26,6 +26,9 @@ pub const LABEL_WORKING: &str = "meguri:working";
 pub const LABEL_HOLD: &str = "meguri:hold";
 /// meguri gave up and a human needs to look (a comment explains why).
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
+/// The cleaner loop's per-project report issue (one per project; its body is
+/// a snapshot of the current divergence, rewritten on every sweep).
+pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
 
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
@@ -45,6 +48,58 @@ pub enum MergeableState {
     Mergeable,
     Conflicting,
     Unknown,
+}
+
+/// Verdict of one CI check on a PR head, reduced to the axis the ci-fixer
+/// cares about: done-and-green, done-and-red, or still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Success,
+    Failure,
+    Pending,
+}
+
+/// One CI check on the PR's head commit (a GitHub Actions check run or a
+/// classic commit status).
+#[derive(Debug, Clone)]
+pub struct CheckRun {
+    pub name: String,
+    pub state: CheckState,
+    /// Detail page of the check; on GitHub Actions this carries the workflow
+    /// run id the failed-log fetch needs. Empty when the forge has none.
+    pub url: String,
+}
+
+/// The check/status rollup of a PR's head commit — the trigger for the
+/// ci-fixer loop.
+#[derive(Debug, Clone, Default)]
+pub struct CheckRollup {
+    pub checks: Vec<CheckRun>,
+}
+
+impl CheckRollup {
+    /// Aggregate verdict. Pending wins over Failure: while anything is still
+    /// running the picture is incomplete — the ci-fixer must not start on a
+    /// head whose CI could still change under it (and whose failed logs may
+    /// not exist yet). No checks at all is Success: a project without CI has
+    /// nothing to fix.
+    pub fn state(&self) -> CheckState {
+        if self.checks.iter().any(|c| c.state == CheckState::Pending) {
+            CheckState::Pending
+        } else if self.checks.iter().any(|c| c.state == CheckState::Failure) {
+            CheckState::Failure
+        } else {
+            CheckState::Success
+        }
+    }
+
+    /// The failing checks (prompt rendering, failed-log fetching).
+    pub fn failed(&self) -> Vec<&CheckRun> {
+        self.checks
+            .iter()
+            .filter(|c| c.state == CheckState::Failure)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +186,17 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewComment>,
 }
 
+/// Draft of one inline review comment (a thread anchor). The line is
+/// mandatory: GitHub's review REST API only anchors comments to a line of
+/// the diff — anchor-less remarks belong in the review body instead.
+#[derive(Debug, Clone)]
+pub struct ReviewCommentDraft {
+    pub path: String,
+    /// Line on the NEW side of the diff (side=RIGHT).
+    pub line: u64,
+    pub body: String,
+}
+
 #[async_trait]
 pub trait Forge: Send + Sync {
     async fn get_issue(&self, number: i64) -> Result<Issue>;
@@ -142,17 +208,25 @@ pub trait Forge: Send + Sync {
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
     /// File a new issue; returns its number (planner decomposition,
-    /// issue #24).
+    /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
     /// Record `issue` as blocked by `blocker` in the forge-native dependency
     /// graph (the same graph [`Forge::blocked_by`] reads).
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
+    /// Overwrite an issue's body wholesale (snapshot-style report updates).
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number
     /// space but need different edit commands).
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()>;
+    /// Overwrite a pull request's title (the spec worker retitles a takeover
+    /// PR from `Spec: X` to `X` once implementation lands, issue #98).
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()>;
+    /// Overwrite a pull request's body wholesale (the spec worker replaces the
+    /// planner's spec description with the implementation one, issue #98).
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()>;
     /// Open pull requests carrying `label` (candidates for review discovery).
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>>;
     /// The PR's full unified diff against its base.
@@ -173,14 +247,34 @@ pub trait Forge: Send + Sync {
         draft: bool,
     ) -> Result<CreatedPr>;
     async fn get_pr(&self, number: i64) -> Result<PullRequest>;
+    /// The PR whose head is `branch`, if any — open PRs win over closed or
+    /// merged ones. The reaper uses the merged state to recognize squash and
+    /// rebase merges, whose branch tips never become ancestors of the base.
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
+    /// The check/status rollup of the PR's head commit (ci-fixer discovery).
+    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup>;
+    /// Failed-job logs of the PR's failing checks, pre-trimmed for a prompt.
+    /// Best-effort per check: a check whose logs cannot be fetched
+    /// contributes a note instead of failing the whole call.
+    async fn pr_failed_check_logs(&self, number: i64) -> Result<String>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
     /// All review threads on a PR, resolved or not.
     async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>>;
     /// Reply inside an existing review thread.
     async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()>;
+    /// Post a PR review with inline comments — each draft becomes a review
+    /// thread the fixer can pick up. Always event=COMMENT: meguri never
+    /// approves or requests changes; the human merge gate stays human
+    /// (ADR 0004).
+    async fn create_pr_review(
+        &self,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewCommentDraft],
+    ) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -193,6 +287,50 @@ mod tests {
             state: state.into(),
             state_reason: state_reason.map(str::to_string),
         }
+    }
+
+    fn check(state: CheckState) -> CheckRun {
+        CheckRun {
+            name: "ci".into(),
+            state,
+            url: String::new(),
+        }
+    }
+
+    #[test]
+    fn rollup_state_is_pending_over_failure_over_success() {
+        // No checks: nothing to fix, never a trigger.
+        assert_eq!(CheckRollup::default().state(), CheckState::Success);
+
+        let green = CheckRollup {
+            checks: vec![check(CheckState::Success), check(CheckState::Success)],
+        };
+        assert_eq!(green.state(), CheckState::Success);
+
+        let red = CheckRollup {
+            checks: vec![check(CheckState::Success), check(CheckState::Failure)],
+        };
+        assert_eq!(red.state(), CheckState::Failure);
+
+        // A failure with anything still running stays Pending: the picture
+        // is incomplete until CI settles.
+        let mixed = CheckRollup {
+            checks: vec![check(CheckState::Failure), check(CheckState::Pending)],
+        };
+        assert_eq!(mixed.state(), CheckState::Pending);
+    }
+
+    #[test]
+    fn rollup_failed_lists_only_failing_checks() {
+        let rollup = CheckRollup {
+            checks: vec![
+                check(CheckState::Success),
+                check(CheckState::Failure),
+                check(CheckState::Pending),
+            ],
+        };
+        assert_eq!(rollup.failed().len(), 1);
+        assert_eq!(rollup.failed()[0].state, CheckState::Failure);
     }
 
     #[test]

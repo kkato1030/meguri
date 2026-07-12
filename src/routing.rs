@@ -58,6 +58,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             ],
             resume_args: vec!["--resume".into()],
             herdr_agent_hint: None,
+            session_dir: None,
         },
     );
     m.insert(
@@ -71,6 +72,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             ],
             resume_args: vec!["--resume".into()],
             herdr_agent_hint: None,
+            session_dir: None,
         },
     );
     m.insert(
@@ -80,6 +82,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             args: vec!["--yolo".into()],
             resume_args: vec!["resume".into()],
             herdr_agent_hint: None,
+            session_dir: None,
         },
     );
     m

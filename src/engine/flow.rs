@@ -86,6 +86,22 @@ pub trait Flavor: Send + Sync {
     /// idempotent.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()>;
 
+    /// Settle the PR's presentation (title/body) once it exists. Default:
+    /// no-op — new-PR loops set both at create time (via [`Flavor::pr_title`]
+    /// and [`compose_pr_body`]), so there is nothing to transition. Branch
+    /// takeovers whose PR was authored by another loop (the spec worker)
+    /// override this to move the PR from that loop's presentation to their
+    /// own. Re-run on resume, so keep it idempotent.
+    async fn settle_presentation(
+        &self,
+        deps: &Deps,
+        run: &RunRecord,
+        cp: &Checkpoint,
+    ) -> Result<()> {
+        let _ = (deps, run, cp);
+        Ok(())
+    }
+
     /// Release the claim marker on `meguri stop`. Default: the issue's
     /// `meguri:working` label.
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
@@ -326,14 +342,14 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
             StepFlow::NeedsPlan(reason) => {
                 let outcome = flavor.on_needs_plan(deps, &run, &worktree, &reason).await?;
-                cleanup_pane(deps, &run, true).await;
+                finish_pane(deps, &run).await;
                 return Ok(outcome);
             }
             StepFlow::Decompose(result) => {
                 let outcome = flavor
                     .on_decompose(deps, &run, &checkpoint, &result)
                     .await?;
-                cleanup_pane(deps, &run, true).await;
+                finish_pane(deps, &run).await;
                 return Ok(outcome);
             }
         }
@@ -369,7 +385,7 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
 
     if step == STEP_OPEN_PR {
         let pr_url = open_pr(deps, &run, &mut checkpoint, &worktree, flavor).await?;
-        cleanup_pane(deps, &run, true).await;
+        finish_pane(deps, &run).await;
         return Ok(WorkerOutcome::Succeeded { pr_url });
     }
 
@@ -389,38 +405,23 @@ pub(crate) enum StepFlow {
     Decompose(TurnResultFile),
 }
 
-/// Apply the keep_pane policy after a run reaches a terminal state.
-pub(crate) async fn cleanup_pane(deps: &Deps, run: &RunRecord, success: bool) {
-    // The caller's record may predate the pane spawn (execute updates the
-    // store, not the in-memory run) — read the current pane id.
-    let pane_id = deps
-        .store
-        .get_run(&run.id)
-        .ok()
-        .flatten()
-        .and_then(|r| r.mux_pane_id)
-        .or_else(|| run.mux_pane_id.clone());
-    let Some(pane_id) = &pane_id else {
-        return;
-    };
-    let keep = match deps.config.mux.keep_pane.as_str() {
-        "always" => true,
-        "never" => false,
-        _ => !success, // "on-failure": keep only when something went wrong
-    };
-    if !keep {
-        let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
+/// Apply the keep_pane policy when a run succeeds. The default
+/// ("until-issue-closed") keeps the pane for the reaper, which reclaims it
+/// once the issue closes on the forge; "never" releases it right away
+/// (high-throughput operation).
+pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
+    if deps.config.mux.keep_pane == "never" {
+        super::reaper::release_pane(deps, run.issue_number, "keep_pane = never").await;
     }
 }
 
-/// `meguri stop`: cancel the run, release the claim, kill the pane.
+/// `meguri stop`: cancel the run, release the claim, release the pane (its
+/// session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
     flavor.release_claim(deps, run).await;
-    if let Some(pane_id) = &run.mux_pane_id {
-        let _ = deps.mux.kill_pane(&PaneId(pane_id.clone())).await;
-    }
+    super::reaper::release_pane(deps, run.issue_number, "stopped by user").await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }
@@ -581,27 +582,46 @@ struct EnsuredPane {
     resumed: bool,
 }
 
-/// Get the run's pane, spawning it (with the trigger as the agent's initial
-/// prompt argument) if it doesn't exist or died. When a native agent session
-/// id is on record, the spawn resumes it (`claude --resume <id> <trigger>`)
-/// so the agent keeps its conversation context; a resume that dies on the
-/// spot falls back to the plain full-prompt spawn.
+/// Get the issue's pane, spawning it (with the trigger as the agent's
+/// initial prompt argument) if it doesn't exist or died. 1 issue = 1 pane:
+/// the pane is keyed by `(project, issue)` and outlives runs, so a later run
+/// on the same issue (fixer after worker, resumed runs) reuses the live
+/// session instead of stacking a new pane. When a native agent session id is
+/// on record, a fresh spawn resumes it (`claude --resume <id> <trigger>`) so
+/// the agent keeps its conversation context; a resume that dies on the spot
+/// falls back to the plain full-prompt spawn.
 async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     initial_trigger: &str,
 ) -> Result<EnsuredPane> {
-    if let Some(id) = &run.mux_pane_id {
+    let worktree_str = worktree.to_string_lossy();
+    if let Some(record) = deps.store.get_pane(&deps.project.id, run.issue_number)?
+        && let Some(id) = &record.mux_pane_id
+    {
         let pane = PaneId(id.clone());
-        if run.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
+        if record.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            return Ok(EnsuredPane {
-                pane,
-                freshly_spawned: false,
-                resumed: false,
-            });
+            if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
+                // Adopt the issue's live pane for this run.
+                deps.store.update_run_mux(
+                    &run.id,
+                    deps.mux.kind().as_str(),
+                    &deps.config.mux.session,
+                    &pane.0,
+                )?;
+                return Ok(EnsuredPane {
+                    pane,
+                    freshly_spawned: false,
+                    resumed: false,
+                });
+            }
+            // The issue moved to another worktree (e.g. a fresh branch): the
+            // old pane can't see it. Retire it — session id saved — and
+            // respawn below.
+            super::reaper::release_pane(deps, run.issue_number, "worktree moved").await;
         }
     }
 
@@ -661,6 +681,7 @@ async fn spawn_agent_pane(
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
     let (profile_name, profile) = resolve_run_profile(deps, run)?;
+    let worktree_str = worktree.to_string_lossy();
 
     let mut command = vec![profile.command.clone()];
     command.extend(profile.args.iter().cloned());
@@ -689,6 +710,14 @@ async fn spawn_agent_pane(
         deps.mux.kind().as_str(),
         &deps.config.mux.session,
         &pane.0,
+    )?;
+    deps.store.upsert_pane(
+        &deps.project.id,
+        run.issue_number,
+        deps.mux.kind().as_str(),
+        &deps.config.mux.session,
+        &pane.0,
+        &worktree_str,
     )?;
     deps.store.emit(
         Some(&run.id),
@@ -787,6 +816,7 @@ pub(crate) async fn run_turn(
     let control = StoreControl {
         store: deps.store.clone(),
         run_id: run.id.clone(),
+        notifier: deps.notifier.clone(),
     };
     let engine = turn_engine(deps);
     let outcome = engine
@@ -1052,17 +1082,7 @@ async fn open_pr(
         url.clone() // resumed after PR creation
     } else {
         let title = flavor.pr_title(run, cp);
-        let description = cp
-            .pr_body
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| cp.summary.trim());
-        let body = format!(
-            "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
-             from an interactive agent session (run `{}`).",
-            run.issue_number, description, run.id
-        );
+        let body = compose_pr_body(run, cp);
         let draft = deps.config.pr_for(&deps.project).draft;
         let pr = deps
             .forge
@@ -1076,8 +1096,28 @@ async fn open_pr(
         pr.url
     };
 
+    flavor.settle_presentation(deps, run, cp).await?;
     flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
+}
+
+/// The PR body meguri wraps around the agent's description: a `Closes #N`
+/// header, the agent-authored description (its `pr_body`, or the execute
+/// turn's summary as a fallback), and the meguri footer. Shared by new-PR
+/// creation and the spec worker's spec→implementation body transition so the
+/// two paths render an identical shape (issue #98).
+pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint) -> String {
+    let description = cp
+        .pr_body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cp.summary.trim());
+    format!(
+        "Closes #{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+         from an interactive agent session (run `{}`).",
+        run.issue_number, description, run.id
+    )
 }
 
 /// Where repositories keep their PR template, in priority order.
