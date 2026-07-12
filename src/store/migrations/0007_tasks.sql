@@ -21,7 +21,9 @@ CREATE TABLE tasks (
 -- runs gains task_id and makes issue_number nullable: a github run keeps its
 -- issue_number (task_id NULL), a local run its task_id (issue_number NULL), a
 -- silent run both. sqlite cannot relax a column in place, so recreate the
--- table and copy the data over (the standard sqlite pattern).
+-- table and copy the data over (the standard sqlite pattern). This runs last
+-- (0007), so the recreated table must carry every column earlier migrations
+-- added to runs — notably `agent_profile` from 0005 (issue #64 routing).
 ALTER TABLE runs RENAME TO runs_old;
 
 CREATE TABLE runs (
@@ -44,6 +46,7 @@ CREATE TABLE runs (
   turn_no INTEGER NOT NULL DEFAULT 0,
   current_turn_id TEXT,
   agent_session_id TEXT,
+  agent_profile TEXT,                          -- launch profile (0005, issue #64)
   error TEXT,
   started_at TEXT,
   finished_at TEXT,
@@ -53,13 +56,13 @@ CREATE TABLE runs (
 INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title, branch,
                   worktree_path, step, checkpoint_json, status, interaction_state,
                   desired_state, mux_kind, mux_session, mux_pane_id, turn_no,
-                  current_turn_id, agent_session_id, error, started_at, finished_at,
-                  created_at)
+                  current_turn_id, agent_session_id, agent_profile, error,
+                  started_at, finished_at, created_at)
   SELECT id, project_id, loop_kind, issue_number, issue_title, branch,
          worktree_path, step, checkpoint_json, status, interaction_state,
          desired_state, mux_kind, mux_session, mux_pane_id, turn_no,
-         current_turn_id, agent_session_id, error, started_at, finished_at,
-         created_at
+         current_turn_id, agent_session_id, agent_profile, error,
+         started_at, finished_at, created_at
   FROM runs_old;
 
 DROP TABLE runs_old;

@@ -4,6 +4,7 @@
 //! and the head-sha marker prevents double reviews of the same head. A
 //! scripted "agent" plays the pane side (same protocol as planner_test).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +20,11 @@ use meguri::forge::{
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{RunStatus, Store};
+use meguri::store::{ROLE_REVIEW, RunStatus, Store};
 
 const PR: i64 = 12;
+/// The canonical issue the PR's head branch encodes — runs are keyed by it.
+const ISSUE: i64 = 5;
 const PR_BRANCH: &str = "meguri/5-add-caching-layer-abc123";
 
 async fn init_origin_and_clone(root: &Path) -> (PathBuf, PathBuf) {
@@ -111,6 +114,7 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let deps = Deps::with_label_source(
@@ -132,7 +136,12 @@ async fn setup() -> TestEnv {
 fn create_reviewer_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", reviewer::KIND, PR, "Spec: Add caching layer (#5)")
+        .create_run_for_loop(
+            "proj",
+            reviewer::KIND,
+            ISSUE,
+            "Spec: Add caching layer (#5)",
+        )
         .unwrap()
 }
 
@@ -203,24 +212,26 @@ fn prompts_in(worktree: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Scripted pane-side agent: for each new prompt turn, run `action`.
+/// Scripted pane-side agent: `action` runs exactly once per new prompt turn
+/// (deduplicated by turn id, so slow actions aren't re-fired by the poll).
 fn spawn_scripted_agent<F>(worktree_root: PathBuf, mut action: F) -> tokio::task::JoinHandle<u32>
 where
     F: FnMut(u32, &Path, &str) + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut turns = 0u32;
+        let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let Some(wt) = find_worktree(&worktree_root) else {
                 continue;
             };
-            if let Some(turn_id) = pending_turn(&wt) {
-                turns += 1;
-                action(turns, &wt, &turn_id);
+            if let Some(turn_id) = pending_turn(&wt)
+                && seen.insert(turn_id.clone())
+            {
+                action(seen.len() as u32, &wt, &turn_id);
             }
         }
-        turns
+        seen.len() as u32
     })
 }
 
@@ -335,7 +346,8 @@ async fn reviewer_findings_comment_then_re_review_after_push() {
     let targets = ReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![PR]
+        vec![ISSUE],
+        "targets are keyed by the canonical issue, not the PR"
     );
 }
 
@@ -507,6 +519,85 @@ async fn reviewer_discovery_filters_hold_working_and_reviewed_heads() {
     let targets = ReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![PR]
+        vec![ISSUE]
+    );
+}
+
+/// Acceptance (issue #92): the reviewer's pane and worktree are keyed by the
+/// issue's review lane and survive rounds — the second review of a new head
+/// reuses both, with the checkout re-pointed to the new sha.
+#[tokio::test(flavor = "multi_thread")]
+async fn reviewer_second_round_reuses_pane_and_worktree() {
+    let env = setup().await;
+    let clone = env.deps.project.repo_path.clone();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_review(wt, "findings", "- still missing acceptance criteria");
+        write_result(wt, turn_id, "success");
+    });
+
+    // Round 1: findings at the first head.
+    let run1 = create_reviewer_run(&env);
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run1.id))
+        .await
+        .expect("reviewer timed out")
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let pane1 = env
+        .deps
+        .store
+        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .unwrap()
+        .unwrap();
+    let pane1_id = pane1.mux_pane_id.expect("review pane registered");
+    let wt = PathBuf::from(pane1.worktree_path.expect("worktree recorded"));
+    assert!(
+        wt.ends_with(format!("review-{ISSUE}")),
+        "worktree fixed per issue: {}",
+        wt.display()
+    );
+
+    // The author pushes a fix: the PR head moves to a real new commit.
+    run_git(&clone, &["checkout", PR_BRANCH]).await.unwrap();
+    std::fs::write(clone.join("docs/specs/issue-5.md"), "# Spec v2\n").unwrap();
+    run_git(&clone, &["commit", "-am", "address findings"])
+        .await
+        .unwrap();
+    run_git(&clone, &["push", "origin", PR_BRANCH])
+        .await
+        .unwrap();
+    let head2 = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
+    run_git(&clone, &["checkout", "main"]).await.unwrap();
+    env.forge.set_pr_head(PR, &head2);
+
+    // Round 2: same pane, same worktree, new head checked out.
+    let run2 = create_reviewer_run(&env);
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_reviewer(&env.deps, &run2.id))
+        .await
+        .expect("reviewer timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    let pane2 = env
+        .deps
+        .store
+        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pane2.mux_pane_id.as_deref(),
+        Some(pane1_id.as_str()),
+        "round 2 reuses the review pane"
+    );
+    assert_eq!(
+        pane2.worktree_path.as_deref(),
+        Some(wt.to_string_lossy().as_ref()),
+        "round 2 reuses the review worktree"
+    );
+    assert_eq!(
+        run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(),
+        head2,
+        "the standing checkout was re-pointed to the new head"
     );
 }

@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,14 +8,15 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, ProjectConfig, ProjectMode};
 use crate::daemon;
-use crate::engine::Deps;
 use crate::engine::reaper;
-use crate::engine::scheduler::Scheduler;
+use crate::engine::scheduler::{Reload, Scheduler};
 use crate::engine::worker::{WorkerOutcome, run_worker};
+use crate::engine::{self, Deps};
 use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
-use crate::store::{DesiredState, RunRecord, RunStatus, Store};
+use crate::notify::Notifier;
+use crate::store::{DesiredState, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
 use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
@@ -60,6 +62,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         mux,
         forge,
         task_source,
+        notifier: Arc::new(Notifier::from_config(&cfg.notifications)),
         config: cfg.clone(),
         project: project.clone(),
     })
@@ -83,6 +86,7 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
     if project.mode == ProjectMode::Local {
         bail!(
@@ -143,7 +147,9 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
 }
 
 pub async fn cmd_watch() -> Result<()> {
-    let cfg = Config::load()?;
+    let mut reloader = config::ConfigReloader::load(&config::config_path())?;
+    let cfg = reloader.current().clone();
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
@@ -175,36 +181,50 @@ pub async fn cmd_watch() -> Result<()> {
         cfg.scheduler.poll_interval_secs,
         cfg.scheduler.max_concurrent_runs,
     );
+
+    // Hot reload (issue #73): every tick re-reads config.toml, so edits reach
+    // the runs spawned after them without a daemon restart. Notifiers carry
+    // per-run throttle state across turn boundaries, so each project keeps
+    // its notifier through a reload unless [notifications] itself changed.
+    let mut notifiers: HashMap<String, Arc<Notifier>> = projects
+        .iter()
+        .map(|d| (d.project.id.clone(), d.notifier.clone()))
+        .collect();
+    let reload = Box::new(move || {
+        let next = reloader.poll(|prev, next| {
+            let keep_notifiers = next.notifications == prev.notifications;
+            let mut fresh = Vec::new();
+            for project in &next.projects {
+                let mut deps = build_deps(next, project, None)?;
+                if keep_notifiers && let Some(notifier) = notifiers.get(&project.id) {
+                    deps.notifier = notifier.clone();
+                }
+                fresh.push(deps);
+            }
+            Ok(Reload {
+                projects: fresh,
+                poll_interval: Duration::from_secs(next.scheduler.poll_interval_secs),
+                max_concurrent: next.scheduler.max_concurrent_runs as usize,
+            })
+        })?;
+        notifiers = next
+            .projects
+            .iter()
+            .map(|d| (d.project.id.clone(), d.notifier.clone()))
+            .collect();
+        Some(next)
+    });
+
     let scheduler = Scheduler {
         projects,
         loops: crate::engine::default_loops(),
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
+        reload: Some(reload),
     };
     let result = scheduler.watch().await;
     daemon::clear_state(&home);
     result
-}
-
-pub async fn cmd_serve(port: Option<u16>, bind: Option<&str>) -> Result<()> {
-    let cfg = Config::load()?;
-    let store = open_store()?;
-    let bind = bind.unwrap_or(&cfg.server.bind);
-    let port = port.unwrap_or(cfg.server.port);
-    let addr: std::net::IpAddr = bind
-        .parse()
-        .with_context(|| format!("invalid bind address {bind:?}"))?;
-    if !addr.is_loopback() {
-        eprintln!(
-            "⚠️  binding {bind} — the dashboard has no authentication; \
-             anyone who can reach this address can read run data"
-        );
-    }
-    let listener = tokio::net::TcpListener::bind((addr, port))
-        .await
-        .with_context(|| format!("cannot bind {bind}:{port}"))?;
-    println!("meguri dashboard on http://{}", listener.local_addr()?);
-    crate::server::serve(store, cfg, listener).await
 }
 
 pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {
@@ -222,13 +242,45 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
 
     for project in projects {
         let deps = build_deps(&cfg, project, None)?;
-        let candidates = reaper::plan(&deps).await?;
+        let mut states = reaper::IssueStates::default();
+        let pane_candidates = reaper::plan_panes(&deps, &mut states).await?;
+
+        // Panes go first so their worktrees become reclaimable in this same
+        // pass (a closed issue's live pane no longer protects its worktree).
+        if !pane_candidates.is_empty() {
+            println!("{}:", project.id);
+            println!("  {:<9} {:<18} PANE", "ISSUE", "STATE");
+            for c in &pane_candidates {
+                let state = match c.verdict {
+                    reaper::Verdict::Reclaim => "reclaim".to_string(),
+                    other => format!("{} (skip)", other.as_str()),
+                };
+                println!("  {:<9} {:<18} {}", format!("#{}", c.issue), state, c.pane);
+            }
+        }
+        if !dry_run {
+            let reclaimed = reaper::reclaim_panes(&deps, &pane_candidates).await?;
+            if !reclaimed.is_empty() {
+                println!("  reclaimed {} pane(s)", reclaimed.len());
+                for p in &reclaimed {
+                    if let Some(id) = &p.agent_session_id {
+                        println!("  saved session for #{}: claude --resume {id}", p.issue);
+                    }
+                }
+            }
+        }
+
+        let candidates = reaper::plan_with(&deps, &mut states).await?;
         if candidates.is_empty() {
-            println!("{}: no meguri worktrees", project.id);
+            if pane_candidates.is_empty() {
+                println!("{}: no meguri panes or worktrees", project.id);
+            }
             continue;
         }
 
-        println!("{}:", project.id);
+        if pane_candidates.is_empty() {
+            println!("{}:", project.id);
+        }
         println!("  {:<9} {:<18} {:>9}  PATH", "ISSUE", "STATE", "SIZE");
         for c in &candidates {
             let state = match c.verdict {
@@ -393,8 +445,8 @@ pub fn cmd_ps(all: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} PANE",
-        "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP"
+        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
+        "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE"
     );
     for run in runs {
         // A github run is keyed by its issue (`#7`), a local run by its task
@@ -404,17 +456,183 @@ pub fn cmd_ps(all: bool) -> Result<()> {
             crate::tasks::TaskKey::Local(id) => format!("t{id}"),
         };
         println!(
-            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {}",
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {}",
             run.id,
             run.project_id,
             target,
             run.status.as_str(),
             run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             run.step,
+            run.agent_profile.as_deref().unwrap_or("-"),
             run.mux_pane_id.as_deref().unwrap_or("-"),
         );
     }
     Ok(())
+}
+
+/// Label of the herdr tab / tmux window `meguri top` tiles panes into.
+const TOP_DASHBOARD_LABEL: &str = "meguri:top";
+
+/// One row of the `meguri top` status header — one active run and its pane.
+struct TopRow {
+    run_id: String,
+    project: String,
+    issue: i64,
+    interaction: &'static str,
+    agent: &'static str,
+    pane: String,
+    awaiting_human: bool,
+}
+
+/// A rendered snapshot of the dashboard for one refresh tick.
+struct TopStatus {
+    watch_alive: bool,
+    rows: Vec<TopRow>,
+}
+
+/// Freshness window for the watch heartbeat: two poll ticks plus slack, so a
+/// single slow tick doesn't flap the liveness indicator. Mirrors the retired
+/// `serve` dashboard (ADR 0002) — the heartbeat's only reader now.
+fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
+    let Some(then) = crate::store::parse_ts(ts) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    now.saturating_sub(then) < poll_interval_secs * 2 + 30
+}
+
+/// One refresh: tile any newly-appeared live run panes into the dashboard and
+/// collect the status rows. `tiled` remembers panes already moved so each is
+/// joined exactly once; dead/finished panes are pruned so a reused pane id
+/// re-tiles cleanly. Runs on a different mux than the one we drive are skipped.
+async fn top_refresh(
+    store: &Store,
+    mux: &Arc<dyn mux::Multiplexer>,
+    dashboard: &mux::DashboardId,
+    tiled: &mut std::collections::HashSet<String>,
+    poll_interval_secs: u64,
+) -> Result<TopStatus> {
+    let runs = store.list_runs(true)?;
+    let kind = mux.kind().as_str();
+    let mut rows = Vec::new();
+    let mut live_panes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for run in &runs {
+        let (Some(rk), Some(pid)) = (run.mux_kind.as_deref(), run.mux_pane_id.as_deref()) else {
+            continue;
+        };
+        if rk != kind {
+            continue;
+        }
+        live_panes.insert(pid.to_string());
+        let pane = mux::PaneId(pid.to_string());
+        let alive = mux.pane_alive(&pane).await.unwrap_or(false);
+        if alive
+            && !tiled.contains(pid)
+            && mux
+                .tile_pane(&pane, dashboard, mux::Split::Down)
+                .await
+                .is_ok()
+        {
+            tiled.insert(pid.to_string());
+        }
+        let agent = if alive {
+            mux.agent_state(&pane)
+                .await
+                .unwrap_or(mux::AgentState::Unknown)
+        } else {
+            mux::AgentState::Unknown
+        };
+        let awaiting_human =
+            run.interaction_state == Some(crate::store::InteractionState::AwaitingHuman);
+        rows.push(TopRow {
+            run_id: run.id.clone(),
+            project: run.project_id.clone(),
+            issue: run.issue_number,
+            interaction: run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
+            agent: agent.as_str(),
+            pane: pid.to_string(),
+            awaiting_human,
+        });
+    }
+
+    // Forget panes whose run is no longer active: herdr/tmux reflow on close,
+    // and a later reuse of the id must tile again.
+    tiled.retain(|id| live_panes.contains(id));
+
+    let watch_alive = store
+        .latest_heartbeat("watch")?
+        .map(|ts| heartbeat_alive(&ts, poll_interval_secs))
+        .unwrap_or(false);
+    Ok(TopStatus { watch_alive, rows })
+}
+
+/// Render the status header printed above the tiled panes each tick.
+fn render_top(status: &TopStatus, attach_hint: &str) -> String {
+    let awaiting = status.rows.iter().filter(|r| r.awaiting_human).count();
+    let mut out = String::new();
+    // Clear screen + home cursor so the header refreshes in place.
+    out.push_str("\x1b[2J\x1b[H");
+    out.push_str(&format!(
+        "meguri top — {} run(s) · {} awaiting human · watch {}\n",
+        status.rows.len(),
+        awaiting,
+        if status.watch_alive {
+            "live"
+        } else {
+            "stale ⚠"
+        },
+    ));
+    if status.rows.is_empty() {
+        out.push_str("\nno active runs — start one with `meguri watch` or `meguri run`\n");
+    } else {
+        out.push_str(&format!(
+            "\n{:<14} {:<8} {:>6}  {:<16} {:<9} PANE\n",
+            "RUN", "PROJECT", "ISSUE", "INTERACTION", "AGENT"
+        ));
+        for r in &status.rows {
+            // Flag awaiting-human runs so a human eye lands on them first.
+            let marker = if r.awaiting_human { "▶ " } else { "  " };
+            out.push_str(&format!(
+                "{marker}{:<12} {:<8} {:>6}  {:<16} {:<9} {}\n",
+                r.run_id,
+                r.project,
+                format!("#{}", r.issue),
+                r.interaction,
+                r.agent,
+                r.pane,
+            ));
+        }
+    }
+    out.push_str(&format!("\nview tiles: {attach_hint}\n"));
+    out
+}
+
+/// `meguri top` — tile the live agent panes into one mux tab and keep a status
+/// header refreshed above them. The layout commands only move panes between
+/// containers, so the orchestrator keeps driving each pane by id and the watch
+/// loop's prompt injection / result verification continue uninterrupted.
+pub async fn cmd_top(mux_override: Option<&str>, interval_secs: u64) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let mux = mux::detect(mux_override.unwrap_or(&cfg.mux.kind), &cfg.mux.session)?;
+    mux.ensure_session().await?;
+    let dashboard = mux.ensure_dashboard(TOP_DASHBOARD_LABEL).await?;
+    let attach_hint = mux.dashboard_attach_command(&dashboard);
+
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let poll = cfg.scheduler.poll_interval_secs;
+    let mut tiled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let status = top_refresh(&store, &mux, &dashboard, &mut tiled, poll).await?;
+        print!("{}", render_top(&status, &attach_hint));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        tokio::time::sleep(interval).await;
+    }
 }
 
 pub async fn cmd_logs(needle: &str) -> Result<()> {
@@ -441,15 +659,12 @@ pub async fn cmd_logs(needle: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_attach(needle: &str) -> Result<()> {
+pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
-    let run = require_run(&store, needle)?;
-    let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id) else {
-        bail!("run {} has no pane yet", run.id);
-    };
-    let mux = mux::from_kind(kind, &cfg.mux.session)?;
-    let command = mux.attach_command(&mux::PaneId(pane.clone()));
+    let (kind, pane) = resolve_attach_pane(&store, needle, review)?;
+    let mux = mux::from_kind(&kind, &cfg.mux.session)?;
+    let command = mux.attach_command(&mux::PaneId(pane));
     println!("attaching: {command}");
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new("sh")
@@ -457,6 +672,56 @@ pub fn cmd_attach(needle: &str) -> Result<()> {
         .arg(&command)
         .exec();
     bail!("exec failed: {err}");
+}
+
+/// Resolve what `meguri attach <needle> [--review]` should attach to. Panes
+/// belong to the issue's lanes (author + review, kept until the issue
+/// closes), so the issue's persistent lane pane wins over whatever pane id
+/// a run once recorded — and a bare issue number keeps working after its
+/// runs finished. A run id derives its lane from the run's loop kind;
+/// `--review` picks the review lane for issue numbers.
+fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
+    let wanted_role = if review { ROLE_REVIEW } else { ROLE_AUTHOR };
+    if let Some(run) = store.find_run(needle)? {
+        let role = engine::role_for_loop(&run.loop_kind);
+        if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
+            && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
+        {
+            return Ok((kind, id));
+        }
+        if let (Some(kind), Some(id)) = (&run.mux_kind, &run.mux_pane_id) {
+            return Ok((kind.clone(), id.clone()));
+        }
+        bail!("run {} has no pane yet", run.id);
+    }
+    if let Ok(issue) = needle.parse::<i64>() {
+        let panes: Vec<_> = store
+            .panes_for_issue(issue)?
+            .into_iter()
+            .filter(|p| p.role == wanted_role)
+            .collect();
+        match panes.as_slice() {
+            [] => {
+                if review {
+                    bail!("issue #{issue} has no live review pane");
+                }
+            }
+            [p] => {
+                if let (Some(kind), Some(id)) = (&p.mux_kind, &p.mux_pane_id) {
+                    return Ok((kind.clone(), id.clone()));
+                }
+            }
+            many => {
+                let projects: Vec<&str> = many.iter().map(|p| p.project_id.as_str()).collect();
+                bail!(
+                    "issue #{issue} has {wanted_role} panes in multiple projects ({}) — \
+                     pass a run id instead",
+                    projects.join(", ")
+                );
+            }
+        }
+    }
+    bail!("no run or pane matches {needle:?} (try `meguri ps --all`)")
 }
 
 fn set_desired(needle: &str, desired: Option<DesiredState>, verb: &str) -> Result<()> {
@@ -517,18 +782,96 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
 
     // No driver is running this (queued/interrupted): finalize here.
     store.update_run_status(&run.id, RunStatus::Cancelled, Some("stopped by user"))?;
-    if let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
+    let released = match cfg.project(&run.project_id) {
+        Some(project) => match build_deps(&cfg, project, None) {
+            Ok(deps) => {
+                // Session id is saved before the kill — resumable later.
+                let released = reaper::release_pane(
+                    &deps,
+                    run.issue_number,
+                    engine::role_for_loop(&run.loop_kind),
+                    "stopped by user",
+                )
+                .await;
+                // Drop the claim through the coordination layer, keyed by
+                // whatever this run targets (github: the working label; local:
+                // back to queued).
+                let _ = deps.task_source.release(&run.task_key()).await;
+                released.is_some()
+            }
+            Err(_) => false,
+        },
+        None => false,
+    };
+    if !released
+        && let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
         && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session)
     {
+        // Fallback for panes that predate the pane registry.
         let _ = mux.kill_pane(&mux::PaneId(pane.clone())).await;
-    }
-    if let Some(project) = cfg.project(&run.project_id) {
-        // Drop the claim (github: the working label; local: back to queued)
-        // through the coordination layer, keyed by whatever this run targets.
-        let (_forge, task_source) = build_coordination(project, &store)?;
-        let _ = task_source.release(&run.task_key()).await;
     }
     store.emit(Some(&run.id), "run.cancelled", serde_json::json!({}))?;
     println!("run {} cancelled", run.id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::now;
+
+    #[test]
+    fn heartbeat_freshness_window() {
+        // Fresh beat within two poll ticks + slack reads live.
+        assert!(heartbeat_alive(&now(), 60));
+        // Ancient and unparseable both read stale, never live.
+        assert!(!heartbeat_alive("2000-01-01T00:00:00Z", 60));
+        assert!(!heartbeat_alive("garbage", 60));
+    }
+
+    #[test]
+    fn render_top_flags_awaiting_and_watch_liveness() {
+        let status = TopStatus {
+            watch_alive: false,
+            rows: vec![
+                TopRow {
+                    run_id: "run-aaaa".into(),
+                    project: "demo".into(),
+                    issue: 42,
+                    interaction: "agent_working",
+                    agent: "working",
+                    pane: "wD:p1".into(),
+                    awaiting_human: false,
+                },
+                TopRow {
+                    run_id: "run-bbbb".into(),
+                    project: "demo".into(),
+                    issue: 43,
+                    interaction: "awaiting_human",
+                    agent: "blocked",
+                    pane: "wD:p2".into(),
+                    awaiting_human: true,
+                },
+            ],
+        };
+        let out = render_top(&status, "herdr tab focus wD:t9; herdr");
+        assert!(out.contains("2 run(s)"));
+        assert!(out.contains("1 awaiting human"));
+        assert!(out.contains("stale"), "watch liveness must show stale");
+        assert!(out.contains("▶ run-bbbb"), "awaiting run gets a marker");
+        assert!(out.contains("#42"));
+        assert!(out.contains("herdr tab focus wD:t9"));
+    }
+
+    #[test]
+    fn render_top_handles_no_runs() {
+        let status = TopStatus {
+            watch_alive: true,
+            rows: vec![],
+        };
+        let out = render_top(&status, "echo attach");
+        assert!(out.contains("0 run(s)"));
+        assert!(out.contains("no active runs"));
+        assert!(out.contains("watch live"));
+    }
 }

@@ -4,6 +4,7 @@
 //! ping-pong converges. A scripted "agent" plays the pane side (same
 //! protocol as worker_test / planner_test).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
+        clean: None,
     };
 
     let deps = Deps::with_label_source(
@@ -112,7 +114,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
 fn create_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", fixer::KIND, 1, "Add feature (#9)")
+        .create_run_for_loop("proj", fixer::KIND, 9, "Add feature (#9)")
         .unwrap()
 }
 
@@ -165,24 +167,26 @@ fn write_result(worktree: &Path, turn_id: &str, status: &str) {
     std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
 }
 
-/// Scripted pane-side agent: for each new prompt turn, run `action`.
+/// Scripted pane-side agent: `action` runs exactly once per new prompt turn
+/// (deduplicated by turn id, so slow actions aren't re-fired by the poll).
 fn spawn_scripted_agent<F>(worktree_root: PathBuf, mut action: F) -> tokio::task::JoinHandle<u32>
 where
     F: FnMut(u32, &Path, &str) + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut turns = 0u32;
+        let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let Some(wt) = find_worktree(&worktree_root) else {
                 continue;
             };
-            if let Some(turn_id) = pending_turn(&wt) {
-                turns += 1;
-                action(turns, &wt, &turn_id);
+            if let Some(turn_id) = pending_turn(&wt)
+                && seen.insert(turn_id.clone())
+            {
+                action(seen.len() as u32, &wt, &turn_id);
             }
         }
-        turns
+        seen.len() as u32
     })
 }
 
@@ -298,7 +302,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![1]
+        vec![9]
     );
     let run1 = create_fixer_run(&env);
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_fixer(&env.deps, &run1.id))
@@ -385,7 +389,7 @@ async fn fixer_discovery_skips_spec_ready_merged_held_and_foreign_prs() {
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![1],
+        vec![9],
         "only the open, unclaimed meguri PR with an awaiting thread is actionable"
     );
 }

@@ -218,24 +218,36 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
     exclude_meguri(worktree).await
 }
 
-/// Create (or reuse) a review worktree detached at `head_sha` (a PR head).
-/// Detached HEAD avoids colliding with whichever worktree still has the PR
-/// branch checked out (e.g. the planner's on the same host).
+/// Create (or re-point) a review worktree detached at `head_sha` (a PR
+/// head). Detached HEAD avoids colliding with whichever worktree still has
+/// the PR branch checked out (e.g. the planner's on the same host). The
+/// worktree is issue-scoped and survives review rounds (issue #92): when it
+/// already exists — resuming an interrupted run, or reviewing the next push
+/// — it is reset hard onto the new head instead of being recreated, so the
+/// pane standing in it stays valid.
 pub async fn create_review_worktree(
     repo_path: &Path,
     worktree: &Path,
     head_branch: &str,
     head_sha: &str,
 ) -> Result<()> {
+    // Best-effort: the head may already be local (pushed from this host).
+    let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
+
     if worktree.join(".git").exists() {
-        return Ok(()); // resuming an interrupted run
+        run_git(worktree, &["reset", "--hard", head_sha])
+            .await
+            .context("git reset --hard (review re-point)")?;
+        // Stray untracked files from the previous round would taint the
+        // read-only checkout; `.meguri/` is excluded, so it survives.
+        run_git(worktree, &["clean", "-fd"])
+            .await
+            .context("git clean (review re-point)")?;
+        return Ok(());
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    // Best-effort: the head may already be local (pushed from this host).
-    let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
 
     let wt = worktree.to_string_lossy().to_string();
     run_git(
@@ -354,6 +366,63 @@ pub async fn delete_branch(
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     run_git(repo_path, &["worktree", "prune"]).await?;
     Ok(())
+}
+
+/// Current head sha of the default branch, preferring the remote's view.
+/// Fetch is best-effort; offline or remote-less repos fall back to the local
+/// branch.
+pub async fn default_branch_head(repo_path: &Path, default_branch: &str) -> Result<String> {
+    let _ = run_git(repo_path, &["fetch", "origin", default_branch]).await;
+    if let Ok(sha) = run_git(
+        repo_path,
+        &["rev-parse", &format!("origin/{default_branch}")],
+    )
+    .await
+    {
+        return Ok(sha);
+    }
+    run_git(repo_path, &["rev-parse", default_branch]).await
+}
+
+/// A branch on origin as the cleaner's stale-branch check sees it.
+#[derive(Debug, Clone)]
+pub struct RemoteBranch {
+    /// Branch name without the `origin/` prefix.
+    pub name: String,
+    /// Committer time (unix epoch seconds) of the branch tip.
+    pub committer_unix: i64,
+}
+
+/// Branches on origin with their tip committer times. Fetches with `--prune`
+/// first (best-effort) so deleted branches drop out of the listing.
+pub async fn list_remote_branches(repo_path: &Path) -> Result<Vec<RemoteBranch>> {
+    let _ = run_git(repo_path, &["fetch", "--prune", "origin"]).await;
+    let out = run_git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(committerdate:unix)",
+            "refs/remotes/origin",
+        ],
+    )
+    .await?;
+    let mut branches = Vec::new();
+    for line in out.lines() {
+        let Some((refname, date)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/remotes/origin/") else {
+            continue;
+        };
+        if name == "HEAD" {
+            continue; // symbolic ref, not a branch
+        }
+        branches.push(RemoteBranch {
+            name: name.to_string(),
+            committer_unix: date.parse().unwrap_or(0),
+        });
+    }
+    Ok(branches)
 }
 
 /// True when nothing is uncommitted (untracked counts as dirty).

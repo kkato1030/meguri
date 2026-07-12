@@ -1,0 +1,31 @@
+# cargo-deny 設定 — issue #77 (supply-chain 2/4)
+#
+# 目的: Renovate((1/4))が開く更新 PR に混入した「汚染 / 脆弱 / ライセンス違反」を
+# 取り込みの手前で機械的にブロックする CI ゲート。
+# https://embarkstudios.github.io/cargo-deny/
+
+# RustSec advisory DB と照合し、既知脆弱性・yank 済みバージョンを落とす
+[advisories]
+yanked = "deny"
+
+# 供給元を crates.io のみに固定。野良 git 依存・タイポスクワット registry を弾く
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+wildcards = "deny"
+multiple-versions = "warn"
+
+# 実依存ツリー(143 crate)を `cargo deny check` に通して確定した allow リスト
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause", # matchit (MIT AND BSD-3-Clause)
+    "Zlib",         # foldhash
+    "Unicode-3.0",  # unicode-ident
+    "MPL-2.0",      # option-ext(dirs 経由)。弱いコピーレフトでソース改変時のみ開示義務
+]
+confidence-threshold = 0.8

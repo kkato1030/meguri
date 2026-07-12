@@ -1,5 +1,5 @@
-//! Reaper tests: `meguri prune` classification and reclamation of worktrees
-//! whose issue closed on the forge.
+//! Reaper tests: `meguri prune` / watch-sweep classification and reclamation
+//! of panes and worktrees whose issue closed on the forge.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneSpec;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{RunStatus, Store};
+use meguri::store::{ROLE_AUTHOR, RunStatus, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -50,6 +50,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         check_command: None,
         worktree_root: Some(root.join("worktrees")),
         pr: None,
+        clean: None,
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),
@@ -239,6 +240,99 @@ async fn unmerged_branch_is_kept_without_force() {
         .expect("unmerged branch survives without --force");
 }
 
+/// Simulate a squash merge of `branch`: main gains an equivalent commit with
+/// a different sha, so the branch tip is *not* an ancestor of origin/main.
+async fn squash_merge_onto_main(deps: &Deps, issue: i64) {
+    let repo = &deps.project.repo_path;
+    std::fs::write(repo.join("work.txt"), format!("issue {issue}\n")).unwrap();
+    run_git(repo, &["add", "work.txt"]).await.unwrap();
+    run_git(
+        repo,
+        &[
+            "-c",
+            "user.email=a@a",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            "squashed",
+        ],
+    )
+    .await
+    .unwrap();
+    run_git(repo, &["push", "origin", "main"]).await.unwrap();
+}
+
+#[tokio::test]
+async fn squash_merged_branch_is_deleted_via_forge_pr_state() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(11, "Squashed", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 11, "Squashed").await;
+    squash_merge_onto_main(&deps, 11).await;
+    forge.add_pr(41, "Squashed", "", &[], &branch, "sha41");
+    forge.set_pr_state(41, "merged");
+    forge.close_issue(11);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists());
+    assert!(
+        reclaimed[0].branch_deleted,
+        "merged PR state deletes the squash-merged branch"
+    );
+    assert!(
+        run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+            .await
+            .is_err(),
+        "squash-merged local branch is deleted"
+    );
+}
+
+#[tokio::test]
+async fn open_pr_branch_is_kept_without_force() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(12, "Still open PR", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 12, "Still open PR").await;
+    forge.add_pr(42, "Still open PR", "", &[], &branch, "sha42");
+    forge.close_issue(12); // issue closed, but the PR never merged
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(!wt.exists());
+    assert!(!reclaimed[0].branch_deleted);
+    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+        .await
+        .expect("branch with an open PR survives without --force");
+}
+
+#[tokio::test]
+async fn forge_lookup_failure_keeps_branch_but_reclaims_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(13, "Forge down", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 13, "Forge down").await;
+    forge.add_pr(43, "Forge down", "", &[], &branch, "sha43");
+    forge.set_pr_state(43, "merged"); // merged, but the lookup will fail
+    forge.fail_pr_for_branch(&branch);
+    forge.close_issue(13);
+
+    let candidates = reaper::plan(&deps).await.unwrap();
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert_eq!(reclaimed.len(), 1, "worktree reclamation still succeeds");
+    assert!(!wt.exists());
+    assert!(!reclaimed[0].branch_deleted);
+    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
+        .await
+        .expect("branch survives when the forge cannot answer");
+}
+
 #[tokio::test]
 async fn dirty_worktree_needs_force() {
     let root = tempfile::tempdir().unwrap();
@@ -306,6 +400,151 @@ async fn live_pane_protects_closed_issue_worktree() {
     assert_eq!(verdict_of(&candidates, 8).verdict, Verdict::Reclaim);
     reaper::reclaim(&deps, &candidates, false).await.unwrap();
     assert!(!wt.exists());
+}
+
+/// Register a live pane for the issue the way ensure_pane does.
+async fn register_pane(deps: &Deps, issue: i64, wt: &Path) -> meguri::mux::PaneId {
+    let pane = deps
+        .mux
+        .spawn_pane(&PaneSpec {
+            title: format!("meguri#{issue}"),
+            cwd: wt.to_path_buf(),
+            command: vec!["agent".into()],
+            env: vec![],
+        })
+        .await
+        .unwrap();
+    deps.store
+        .upsert_pane(
+            "proj",
+            issue,
+            ROLE_AUTHOR,
+            deps.mux.kind().as_str(),
+            "meguri",
+            &pane.0,
+            &wt.to_string_lossy(),
+        )
+        .unwrap();
+    pane
+}
+
+/// Claude Code's directory name for a project cwd (mirrors agent_session).
+fn munged(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+#[tokio::test]
+async fn sweep_reclaims_pane_then_worktree_of_closed_issue() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(11, "Shipped", "", &[]));
+    let mut deps = setup(root.path(), forge.clone()).await;
+    let session_root = root.path().join("claude");
+    deps.config.agent.session_dir = Some(session_root.clone());
+
+    let (_, wt) = add_worktree(&deps, 11, "Shipped").await;
+    let pane = register_pane(&deps, 11, &wt).await;
+    // The agent's native session transcript exists for the worktree.
+    let dir = session_root.join("projects").join(munged(&wt));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("sess-11.jsonl"), "{}\n").unwrap();
+
+    forge.close_issue(11);
+    // The plan carries the real reclamation reason into the emitted event.
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].verdict, Verdict::Reclaim);
+    assert_eq!(candidates[0].reason, reaper::REASON_ISSUE_CLOSED);
+    reaper::sweep(&deps).await.unwrap();
+
+    // Pane killed and detached; the session id survived the kill.
+    assert!(!deps.mux.pane_alive(&pane).await.unwrap());
+    let record = deps
+        .store
+        .get_pane("proj", 11, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.mux_pane_id, None);
+    assert_eq!(record.agent_session_id.as_deref(), Some("sess-11"));
+    // And the worktree fell in the same sweep (no PaneAlive protection left).
+    assert!(!wt.exists());
+}
+
+#[tokio::test]
+async fn sweep_keeps_pane_of_open_issue_and_active_run() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(12, "Open", "", &[]));
+    forge.issues.lock().unwrap().push(meguri::forge::Issue {
+        number: 13,
+        title: "Closed but active".into(),
+        body: String::new(),
+        labels: vec![],
+    });
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (_, open_wt) = add_worktree(&deps, 12, "Open").await;
+    let open_pane = register_pane(&deps, 12, &open_wt).await;
+
+    let (branch, active_wt) = add_worktree(&deps, 13, "Closed but active").await;
+    let active_pane = register_pane(&deps, 13, &active_wt).await;
+    let run = deps
+        .store
+        .create_run("proj", 13, "Closed but active")
+        .unwrap();
+    deps.store
+        .update_run_worktree(&run.id, &branch, &active_wt.to_string_lossy())
+        .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Running, None)
+        .unwrap();
+    forge.close_issue(13);
+
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    let verdict = |issue: i64| {
+        candidates
+            .iter()
+            .find(|c| c.issue == issue)
+            .unwrap()
+            .verdict
+    };
+    assert_eq!(verdict(12), Verdict::Open);
+    assert_eq!(verdict(13), Verdict::ActiveRun);
+
+    reaper::sweep(&deps).await.unwrap();
+    assert!(deps.mux.pane_alive(&open_pane).await.unwrap());
+    assert!(deps.mux.pane_alive(&active_pane).await.unwrap());
+    assert!(open_wt.exists());
+    assert!(active_wt.exists());
+}
+
+#[tokio::test]
+async fn sweep_clears_stale_mapping_of_dead_pane() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(14, "Open, pane crashed", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (_, wt) = add_worktree(&deps, 14, "Open, pane crashed").await;
+    let pane = register_pane(&deps, 14, &wt).await;
+    deps.mux.kill_pane(&pane).await.unwrap(); // crashed outside meguri
+
+    // A dead mapping is reclaimed for what it is — not "issue closed".
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].verdict, Verdict::Reclaim);
+    assert_eq!(candidates[0].reason, reaper::REASON_PANE_DEAD);
+    reaper::sweep(&deps).await.unwrap();
+    let record = deps
+        .store
+        .get_pane("proj", 14, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.mux_pane_id, None, "stale mapping cleared");
+    assert!(wt.exists(), "open issue's worktree untouched");
 }
 
 #[tokio::test]

@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    Blocker, CreatedPr, Forge, Issue, IssueState, MergeableState, PullRequest, ReviewComment,
-    ReviewThread,
+    Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
+    MergeableState, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,19 @@ pub struct FakeForge {
     /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
     /// before it finished computing).
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
+    /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
+    pub pr_for_branch_errors: Mutex<HashSet<String>>,
+    /// CI checks per PR number (ci-fixer tests); unset PRs report an empty
+    /// rollup (Success — no CI configured).
+    pub checks: Mutex<HashMap<i64, Vec<CheckRun>>>,
+    /// What pr_failed_check_logs returns, per PR number.
+    pub failed_check_logs: Mutex<HashMap<i64, String>>,
+    /// Bodies of PR reviews posted via create_pr_review, per PR number
+    /// (the inline comments land in `threads`).
+    pub pr_reviews: Mutex<Vec<(i64, String)>>,
+    /// PRs whose create_pr_review call fails (inline-anchor-rejected
+    /// scenarios; the impl-reviewer falls back to a summary comment).
+    pub create_pr_review_errors: Mutex<HashSet<i64>>,
 }
 
 impl FakeForge {
@@ -85,6 +98,31 @@ impl FakeForge {
         self.blocked_by_errors.lock().unwrap().insert(issue);
     }
 
+    /// Make pr_for_branch lookups for `branch` fail (forge outage).
+    pub fn fail_pr_for_branch(&self, branch: &str) {
+        self.pr_for_branch_errors
+            .lock()
+            .unwrap()
+            .insert(branch.to_string());
+    }
+
+    /// Make create_pr_review fail for `pr` (e.g. GitHub rejecting an inline
+    /// anchor that is not part of the diff).
+    pub fn fail_create_pr_review(&self, pr: i64) {
+        self.create_pr_review_errors.lock().unwrap().insert(pr);
+    }
+
+    /// Review bodies posted on `pr` via create_pr_review.
+    pub fn pr_reviews_of(&self, pr: i64) -> Vec<String> {
+        self.pr_reviews
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == pr)
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+
     /// Seed a pull request as if it already existed on the forge (reviewer
     /// tests; `create_pr` records worker/planner-created ones).
     pub fn add_pr(
@@ -116,6 +154,35 @@ impl FakeForge {
     /// Simulate the forge's mergeability verdict (conflict-resolver tests).
     pub fn set_pr_mergeable(&self, number: i64, state: MergeableState) {
         self.mergeable.lock().unwrap().insert(number, state);
+    }
+
+    /// Record one CI check's verdict on a PR head (ci-fixer tests). Calls
+    /// accumulate, like checks on a real head.
+    pub fn set_pr_check(&self, number: i64, name: &str, state: CheckState) {
+        self.checks
+            .lock()
+            .unwrap()
+            .entry(number)
+            .or_default()
+            .push(CheckRun {
+                name: name.into(),
+                state,
+                url: format!("https://fake.example/actions/runs/{number}/job/1"),
+            });
+    }
+
+    /// Simulate CI resetting on a new head (a fresh push clears the old
+    /// head's checks).
+    pub fn clear_pr_checks(&self, number: i64) {
+        self.checks.lock().unwrap().remove(&number);
+    }
+
+    /// What the fake returns as the PR's failed-job logs.
+    pub fn set_pr_failed_check_logs(&self, number: i64, logs: &str) {
+        self.failed_check_logs
+            .lock()
+            .unwrap()
+            .insert(number, logs.into());
     }
 
     /// Simulate a new push to the PR branch (head moves, review marker for
@@ -390,6 +457,15 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        let mut issues = self.issues.lock().unwrap();
+        let Some(i) = issues.iter_mut().find(|i| i.number == number) else {
+            bail!("issue #{number} not found");
+        };
+        i.body = body.to_string();
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         let mut issues = self.issues.lock().unwrap();
         let Some(i) = issues.iter_mut().find(|i| i.number == issue) else {
@@ -430,6 +506,24 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.title = title.to_string();
+        Ok(())
+    }
+
+    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.body = body.to_string();
+        Ok(())
+    }
+
     async fn get_pr(&self, number: i64) -> Result<PullRequest> {
         self.prs
             .lock()
@@ -440,6 +534,20 @@ impl Forge for FakeForge {
             .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
     }
 
+    async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        if self.pr_for_branch_errors.lock().unwrap().contains(branch) {
+            bail!("forge lookup of branch {branch} is unavailable");
+        }
+        let prs = self.prs.lock().unwrap();
+        let matching: Vec<&RecordedPr> = prs.iter().filter(|p| p.head == branch).collect();
+        // Like `gh pr view <branch>`: an open PR wins over closed/merged ones.
+        Ok(matching
+            .iter()
+            .find(|p| p.state == "open")
+            .or(matching.last())
+            .map(|p| Self::pr_to_public(p)))
+    }
+
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
         Ok(self
             .mergeable
@@ -448,6 +556,28 @@ impl Forge for FakeForge {
             .get(&number)
             .copied()
             .unwrap_or(MergeableState::Unknown))
+    }
+
+    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup> {
+        Ok(CheckRollup {
+            checks: self
+                .checks
+                .lock()
+                .unwrap()
+                .get(&number)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn pr_failed_check_logs(&self, number: i64) -> Result<String> {
+        Ok(self
+            .failed_check_logs
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>> {
@@ -544,6 +674,36 @@ impl Forge for FakeForge {
             author: "meguri".into(),
             body: body.into(),
         });
+        Ok(())
+    }
+
+    async fn create_pr_review(
+        &self,
+        pr: i64,
+        body: &str,
+        comments: &[ReviewCommentDraft],
+    ) -> Result<()> {
+        if self.create_pr_review_errors.lock().unwrap().contains(&pr) {
+            bail!("create_pr_review on PR #{pr} rejected (fake)");
+        }
+        self.pr_reviews.lock().unwrap().push((pr, body.into()));
+        let mut threads = self.threads.lock().unwrap();
+        for draft in comments {
+            let id = format!("fake-thread-{}", threads.len() + 1);
+            threads.push((
+                pr,
+                ReviewThread {
+                    id,
+                    resolved: false,
+                    path: Some(draft.path.clone()),
+                    line: Some(draft.line as i64),
+                    comments: vec![ReviewComment {
+                        author: "meguri".into(),
+                        body: draft.body.clone(),
+                    }],
+                },
+            ));
+        }
         Ok(())
     }
 }

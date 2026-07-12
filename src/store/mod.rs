@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+mod panes;
 mod runs;
 mod tasks;
+pub use panes::*;
 pub use runs::*;
 pub use tasks::*;
 
@@ -19,7 +21,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_agent_session",
         include_str!("migrations/0003_agent_session.sql"),
     ),
-    ("0004_tasks", include_str!("migrations/0004_tasks.sql")),
+    ("0004_panes", include_str!("migrations/0004_panes.sql")),
+    (
+        "0005_agent_profile",
+        include_str!("migrations/0005_agent_profile.sql"),
+    ),
+    (
+        "0006_pane_role",
+        include_str!("migrations/0006_pane_role.sql"),
+    ),
+    // Renumbered from 0004 after the merge with main (which claimed 0004–0006):
+    // this migration recreates the `runs` table, so it must run *after* every
+    // other runs-touching migration (0005 adds `agent_profile`) to carry those
+    // columns forward.
+    ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).
@@ -186,15 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_0004_preserves_runs_and_splits_the_active_index() {
-        // Acceptance criterion 7: a DB already at 0003 with runs data survives
-        // 0004 with its data and active-run exclusion intact.
+    fn migration_tasks_preserves_runs_and_splits_the_active_index() {
+        // Acceptance criterion 7: a DB already at the prior migration with runs
+        // data survives the tasks migration with its data and active-run
+        // exclusion intact. (0007 after the merge with main, which took 0004–0006.)
         let conn = Connection::open_in_memory().unwrap();
-        let idx_0004 = MIGRATIONS
+        let idx_tasks = MIGRATIONS
             .iter()
-            .position(|(n, _)| *n == "0004_tasks")
+            .position(|(n, _)| *n == "0007_tasks")
             .unwrap();
-        apply_migrations(&conn, idx_0004); // through 0003
+        apply_migrations(&conn, idx_tasks); // everything before the tasks migration
 
         // A pre-existing github run.
         conn.execute(
@@ -205,8 +221,8 @@ mod tests {
         )
         .unwrap();
 
-        // Apply 0004 (recreates runs, adds tasks + partial indexes).
-        conn.execute_batch(MIGRATIONS[idx_0004].1).unwrap();
+        // Apply the tasks migration (recreates runs, adds tasks + partial indexes).
+        conn.execute_batch(MIGRATIONS[idx_tasks].1).unwrap();
 
         // Data survived, and issue_number maps through with task_id NULL.
         let (issue, task): (i64, Option<i64>) = conn

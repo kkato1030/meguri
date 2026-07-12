@@ -3,6 +3,7 @@
 //! implementation commits stacked onto its existing branch — no second PR.
 //! A scripted "agent" plays the pane side (same protocol as worker_test).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,6 +116,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        clean: None,
     };
 
     let deps = Deps::with_label_source(
@@ -202,30 +204,35 @@ fn prompts_in(worktree: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Scripted pane-side agent: for each new prompt turn, run `action`.
+/// Scripted pane-side agent: `action` runs exactly once per new prompt turn
+/// (deduplicated by turn id, so slow actions aren't re-fired by the poll).
 fn spawn_scripted_agent<F>(worktree_root: PathBuf, mut action: F) -> tokio::task::JoinHandle<u32>
 where
     F: FnMut(u32, &Path, &str) + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut turns = 0u32;
+        let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let Some(wt) = find_worktree(&worktree_root) else {
                 continue;
             };
-            if let Some(turn_id) = pending_turn(&wt) {
-                turns += 1;
-                action(turns, &wt, &turn_id);
+            if let Some(turn_id) = pending_turn(&wt)
+                && seen.insert(turn_id.clone())
+            {
+                action(seen.len() as u32, &wt, &turn_id);
             }
         }
-        turns
+        seen.len() as u32
     })
 }
 
 async fn commit_implementation(wt: &Path) {
     std::fs::write(wt.join("cache.txt"), "cached\n").unwrap();
-    run_git(wt, &["add", "cache.txt"]).await.unwrap();
+    // The spec is disposable scaffolding: implementation prunes it. Idempotent
+    // on purpose — a fix-validation turn may run after the spec is already gone.
+    let _ = std::fs::remove_file(wt.join("docs/specs/issue-5.md"));
+    run_git(wt, &["add", "-A"]).await.unwrap();
     run_git(
         wt,
         &[
@@ -244,8 +251,8 @@ async fn commit_implementation(wt: &Path) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
-    // The check command also proves the spec survives on the branch.
-    let env = setup(Some("test -f cache.txt && test -f docs/specs/issue-5.md")).await;
+    // The check command also proves the spec was pruned from the branch.
+    let env = setup(Some("test -f cache.txt && test ! -f docs/specs/issue-5.md")).await;
 
     // Discovery keys the run to the issue the branch encodes, not the PR.
     let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
@@ -290,6 +297,25 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     assert_eq!(prs.len(), 1, "the takeover must never open a new PR");
     assert_eq!(prs[0].number, 1);
 
+    // Presentation transitioned from spec to implementation (issue #98): the
+    // planner opened it as `Spec: Add caching layer (#5)` with a `Closes #5.`
+    // body; settle dropped the `Spec:` prefix and rewrote the body to the
+    // implementation description the agent authored.
+    assert_eq!(
+        prs[0].title, "Add caching layer (#5)",
+        "the `Spec:` prefix must be gone"
+    );
+    assert!(
+        prs[0].body.contains("scripted implementation"),
+        "body must reflect the implementation, not the spec: {}",
+        prs[0].body
+    );
+    assert!(
+        prs[0].body.contains("Opened by [meguri]"),
+        "body keeps the meguri footer: {}",
+        prs[0].body
+    );
+
     // The execute prompt carried the issue AND the reviewed spec's contents.
     let wt = find_worktree(&env.worktree_root).unwrap();
     let prompts = prompts_in(&wt);
@@ -305,6 +331,14 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
         "spec contents must be embedded: {execute_prompt}"
     );
     assert!(execute_prompt.contains("the PR already exists"));
+    assert!(
+        execute_prompt.contains("delete `docs/specs/issue-5.md`"),
+        "the prune instruction must be in the prompt: {execute_prompt}"
+    );
+    assert!(
+        execute_prompt.contains("# Pull request description"),
+        "the takeover authors pr_body so settle can rewrite the PR body: {execute_prompt}"
+    );
 
     // Label transition on the PR: spec-ready consumed, claim released, no
     // escalation — the PR is now ordinary fixer territory.
@@ -332,13 +366,16 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
         .await
         .unwrap();
     assert_eq!(ahead, "2", "spec commit + implementation commit");
-    let spec_still_there = run_git(
+    let specs_in_tree = run_git(
         clone,
         &["ls-tree", "--name-only", "FETCH_HEAD", "docs/specs/"],
     )
     .await
     .unwrap();
-    assert!(spec_still_there.contains("issue-5.md"));
+    assert!(
+        !specs_in_tree.contains("issue-5.md"),
+        "the spec must be pruned by the implementation commit: {specs_in_tree}"
+    );
 
     // Success dedups discovery even while the fake label state lingers
     // elsewhere: a second takeover of the same issue is never queued.
@@ -484,9 +521,11 @@ async fn spec_worker_validation_failure_feeds_back_then_passes() {
         let turn_id = turn_id.to_string();
         tokio::spawn(async move {
             if turn == 1 {
-                // Committed work, but not what validation wants.
+                // Committed work with the spec pruned (so execute-verify
+                // passes), but not what validation wants: no cache.txt yet.
                 std::fs::write(wt.join("notes.txt"), "wip\n").unwrap();
-                run_git(&wt, &["add", "notes.txt"]).await.unwrap();
+                std::fs::remove_file(wt.join("docs/specs/issue-5.md")).unwrap();
+                run_git(&wt, &["add", "-A"]).await.unwrap();
                 run_git(
                     &wt,
                     &[

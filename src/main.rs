@@ -30,7 +30,6 @@ async fn main() -> Result<()> {
             DaemonCommand::Install { mode } => daemon::launchd::cmd_install(&mode),
             DaemonCommand::Uninstall => daemon::launchd::cmd_uninstall(),
         },
-        Command::Serve { port, bind } => app::cmd_serve(port, bind.as_deref()).await,
         Command::Run {
             project,
             issue,
@@ -44,8 +43,9 @@ async fn main() -> Result<()> {
         } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
         Command::Ps { all } => app::cmd_ps(all),
+        Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::Logs { run } => app::cmd_logs(&run).await,
-        Command::Attach { run } => app::cmd_attach(&run),
+        Command::Attach { run, review } => app::cmd_attach(&run, review),
         Command::Pause { run } => app::cmd_pause(&run),
         Command::Resume { run } => app::cmd_resume(&run),
         Command::Takeover { run } => app::cmd_takeover(&run),
@@ -159,12 +159,7 @@ fn cmd_doctor() -> Result<()> {
 
     match &cfg {
         Ok(cfg) => {
-            let agent = run_capture(&cfg.agent.command, &["--version"]);
-            ok &= check(
-                &format!("agent ({})", cfg.agent.command),
-                agent.is_ok(),
-                agent.unwrap_or_else(|e| e),
-            );
+            ok &= doctor_agents(cfg);
             let n = cfg.projects.len();
             println!(
                 "{} projects: {n} configured{}",
@@ -187,6 +182,81 @@ fn cmd_doctor() -> Result<()> {
     } else {
         bail!("doctor found problems");
     }
+}
+
+/// Doctor's routing section: list every defined profile (default + builtin +
+/// user) with its detection result, then — when `[routing]` is active — the
+/// final role→profile resolution. Returns whether the mandatory `default`
+/// profile CLI is present and explicit routing validates.
+fn doctor_agents(cfg: &Config) -> bool {
+    use meguri::routing;
+
+    // Merged profile set: builtins first, user profiles override same names.
+    // `default` (the [agent] section) is listed separately and is mandatory.
+    let mut names: Vec<String> = routing::builtin_profiles().into_keys().collect();
+    if let Some(agents) = &cfg.agents {
+        for name in agents.profiles.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names.sort();
+
+    println!("\nagent profiles:");
+    // The default profile is required: a missing CLI here breaks every legacy
+    // and fall-through run.
+    let default_detail = run_capture(&cfg.agent.command, &["--version"])
+        .map(|v| v.lines().next().unwrap_or_default().to_string());
+    let default_ok = default_detail.is_ok();
+    println!(
+        "  {} default ({}): {}",
+        if default_ok { "✅" } else { "❌" },
+        cfg.agent.command,
+        default_detail.clone().unwrap_or_else(|e| e),
+    );
+    // Named profiles are optional — a missing CLI just prunes it from the auto
+    // chain; only report their detection, don't fail doctor.
+    for name in &names {
+        let profile = routing::profile_by_name(cfg, name).expect("listed profile resolves");
+        let detail = run_capture(&profile.command, &["--version"])
+            .map(|v| v.lines().next().unwrap_or_default().to_string());
+        println!(
+            "  {} {name} ({}): {}",
+            if detail.is_ok() { "✅" } else { "⚠️ " },
+            profile.command,
+            detail.unwrap_or_else(|e| e),
+        );
+    }
+
+    let mut ok = default_ok;
+    match &cfg.routing {
+        None => {
+            println!("routing: legacy — every role runs `default` ([agent])");
+        }
+        Some(routing_cfg) => {
+            let mode = match routing_cfg.mode {
+                meguri::config::RoutingMode::Auto => "auto",
+                meguri::config::RoutingMode::Manual => "manual",
+            };
+            // Explicit routing errors are startup errors: surface them here.
+            if let Err(e) = routing::validate(cfg, &routing::detect_command) {
+                println!("  ❌ routing config: {e:#}");
+                ok = false;
+            }
+            println!("routing ({mode}, table {}):", routing::GENERATED_AT);
+            for role in routing::KNOWN_ROLES {
+                match routing::resolve(cfg, role, &routing::detect_command) {
+                    Ok(profile) => println!("  {role:<18} → {profile}"),
+                    Err(e) => {
+                        println!("  {role:<18} → ❌ {e:#}");
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+    ok
 }
 
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {

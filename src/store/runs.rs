@@ -148,6 +148,10 @@ pub struct RunRecord {
     /// (reported via the turn contract or the mux); used to `--resume`
     /// the conversation when the pane dies.
     pub agent_session_id: Option<String>,
+    /// Launch profile pinned at the run's first pane spawn (role-based
+    /// routing, issue #64). NULL until the first spawn resolves it; once set,
+    /// every later spawn and resume of this run reuses it.
+    pub agent_profile: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -192,6 +196,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         turn_no: row.get("turn_no")?,
         current_turn_id: row.get("current_turn_id")?,
         agent_session_id: row.get("agent_session_id")?,
+        agent_profile: row.get("agent_profile")?,
         error: row.get("error")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
@@ -448,6 +453,18 @@ impl Store {
             c.execute(
                 "UPDATE runs SET mux_kind = ?2, mux_session = ?3, mux_pane_id = ?4 WHERE id = ?1",
                 params![id, kind, session, pane],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Pin the run's launch profile (role-based routing). Written once, at the
+    /// first pane spawn; later spawns and resumes read it back.
+    pub fn update_run_agent_profile(&self, id: &str, profile: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET agent_profile = ?2 WHERE id = ?1",
+                params![id, profile],
             )?;
             Ok(())
         })
@@ -749,6 +766,20 @@ mod tests {
         store.update_run_agent_session(&run.id, None).unwrap();
         let got = store.get_run(&run.id).unwrap().unwrap();
         assert_eq!(got.agent_session_id, None);
+    }
+
+    #[test]
+    fn agent_profile_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("demo", 1, "t").unwrap();
+        // Runs start with no pinned profile (migration 0004 backfills NULL).
+        assert_eq!(run.agent_profile, None);
+
+        store
+            .update_run_agent_profile(&run.id, "claude-sonnet")
+            .unwrap();
+        let got = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(got.agent_profile.as_deref(), Some("claude-sonnet"));
     }
 
     #[test]

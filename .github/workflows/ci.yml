@@ -16,11 +16,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # サプライチェーンゲート(issue #77): RustSec advisories / 供給元 crates.io 固定 /
+  # ライセンス / wildcard 依存を deny.toml に基づき検査。Renovate PR の必須チェック前提。
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # egress を監査(issue #78)。まず audit で観測し、通信先が安定したら block へ移行する
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
@@ -28,7 +54,12 @@ jobs:
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+        with:
+          tool: cargo-nextest
 
       - name: cargo fmt
         run: cargo fmt --check
@@ -36,5 +67,31 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: cargo nextest
+        run: cargo nextest run --profile ci
+
+      # nextest は doctest を実行しないため別途カバーする(現状 0 件、ほぼ即時)
+      - name: cargo test --doc
+        run: cargo test --doc
+
+  # ワークフロー静的解析(issue #78): 危険な権限 / pull_request_target / 式インジェクション /
+  # 未ピン action 等を検出。指摘があれば job が fail し PR をブロックする。
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # zizmor 本体は action 内で ghcr digest 固定されており、Renovate の action 更新に追従する。
+      # Advanced Security(SARIF)は使わず annotations 出力にして権限を contents: read のままにする
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+        with:
+          advanced-security: false
+          annotations: true
