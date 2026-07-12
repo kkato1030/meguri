@@ -42,12 +42,16 @@ $ gh api -X PATCH repos/kkato1030/meguri \
     -f security_and_analysis[secret_scanning_push_protection][status]=enabled
 
 # 3. branch protection(main)を required status checks 付きで設定
+#    required_status_checks[strict] は boolean 必須フィールドなので -F(typed)で送る。
+#    required_pull_request_reviews は null にすると PR 必須自体が無効化されるため、
+#    「PR は必須・承認数は要求しない」を表す required_approving_review_count=0 の
+#    object を渡す(null ではない)。
 $ gh api -X PUT repos/kkato1030/meguri/branches/main/protection \
-    -f required_status_checks[strict]=true \
+    -F required_status_checks[strict]=true \
     -f 'required_status_checks[checks][][context]=test' \
     -f 'required_status_checks[checks][][context]=cargo-deny' \
     -f 'required_status_checks[checks][][context]=zizmor' \
-    -F required_pull_request_reviews=null \
+    -F required_pull_request_reviews[required_approving_review_count]=0 \
     -F enforce_admins=true \
     -F restrictions=null
 
