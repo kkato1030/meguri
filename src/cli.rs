@@ -68,8 +68,14 @@ pub enum Command {
     },
     /// Show events (and recent pane output) for a run
     Logs { run: String },
-    /// Attach your terminal to the run's pane
-    Attach { run: String },
+    /// Attach your terminal to an issue's pane (or a run's)
+    Attach {
+        /// Issue number or run id
+        run: String,
+        /// Attach the issue's review-lane pane instead of the author pane
+        #[arg(long)]
+        review: bool,
+    },
     /// Stop injecting prompts; keep the pane alive
     Pause { run: String },
     /// Resume a paused run

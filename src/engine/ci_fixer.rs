@@ -16,6 +16,12 @@
 //! can force another round). Rate limits ride the same brakes: the rollup
 //! poll (one forge call per PR per sweep, like the conflict resolver's
 //! mergeability poll) is only spent on unclaimed, unescalated meguri PRs.
+//!
+//! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
+//! (recovered from the `meguri/<issue>-…` head branch), so CI fixes happen
+//! in the issue's author lane — same pane, same live session as the run
+//! that wrote the failing code. The worktree attaches to the PR head; the
+//! pane is kept and reclaimed when the issue closes.
 
 use std::path::Path;
 
@@ -24,7 +30,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target};
+use super::{Deps, Target, canonical_key, open_pr_for_issue};
 use crate::forge::{self, CheckRollup, CheckState, PullRequest};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -94,16 +100,17 @@ impl super::Loop for CiFixerLoop {
             if deps.forge.pr_check_rollup(pr.number).await?.state() != CheckState::Failure {
                 continue;
             }
+            let issue = canonical_key(&pr);
             if deps
                 .store
-                .succeeded_run_count(&deps.project.id, KIND, pr.number)?
+                .succeeded_run_count(&deps.project.id, KIND, issue)?
                 >= MAX_CI_FIX_RUNS
             {
                 escalate_budget_exhausted(deps, &pr).await;
                 continue;
             }
             targets.push(Target {
-                issue_number: pr.number,
+                issue_number: issue,
                 title: pr.title,
             });
         }
@@ -181,17 +188,23 @@ impl Flavor for CiFixerFlavor {
         ""
     }
 
-    /// Claim the PR (labels live on the PR, not an issue) and snapshot the
-    /// failing checks and their logs into the checkpoint. Any change that
-    /// makes the PR untouchable — or its CI green or pending again —
-    /// between discovery and claim is a benign race: skip, don't escalate.
+    /// Re-resolve the PR from the run's canonical issue, claim it (labels
+    /// live on the PR, not the issue) and snapshot the failing checks and
+    /// their logs into the checkpoint. Any change that makes the PR
+    /// untouchable — or its CI green or pending again — between discovery
+    /// and claim is a benign race: skip, don't escalate.
     async fn prepare_work(
         &self,
         deps: &Deps,
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        let pr = deps.forge.get_pr(run.issue_number).await?;
+        let Some(pr) = open_pr_for_issue(deps, run.issue_number).await? else {
+            return Ok(PreparedWork::Skip(format!(
+                "no single open PR resolves to issue #{} (changed since discovery?)",
+                run.issue_number
+            )));
+        };
         if let Some(reason) = pr_is_ci_fixable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
@@ -279,7 +292,7 @@ impl Flavor for CiFixerFlavor {
              - Do NOT push; meguri handles that (the push re-runs CI).\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch \
                other worktrees.{lang_section}",
-            number = run.issue_number,
+            number = cp.pr_number.unwrap_or(run.issue_number),
             title = cp.issue_title,
             branch = run.branch.as_deref().unwrap_or("?"),
             failures = cp.issue_body,
@@ -341,15 +354,22 @@ impl Flavor for CiFixerFlavor {
     }
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
-            .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
+        if let Some(pr) = flow::claimed_pr(deps, &run.id) {
+            deps.forge
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
     }
 
-    /// Escalation lands on the PR (the ci-fixer's target), not an issue.
+    /// Escalation lands on the claimed PR (the ci-fixer's target); before
+    /// the checkpoint knows the PR (prepare-work failed), the canonical
+    /// issue gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let pr = run.issue_number;
+        let Some(pr) = flow::claimed_pr(deps, &run.id) else {
+            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            return;
+        };
         let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
         let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps

@@ -11,7 +11,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneSpec;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{RunStatus, Store};
+use meguri::store::{ROLE_AUTHOR, RunStatus, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -416,6 +416,7 @@ async fn register_pane(deps: &Deps, issue: i64, wt: &Path) -> meguri::mux::PaneI
         .upsert_pane(
             "proj",
             issue,
+            ROLE_AUTHOR,
             deps.mux.kind().as_str(),
             "meguri",
             &pane.0,
@@ -449,11 +450,21 @@ async fn sweep_reclaims_pane_then_worktree_of_closed_issue() {
     std::fs::write(dir.join("sess-11.jsonl"), "{}\n").unwrap();
 
     forge.close_issue(11);
+    // The plan carries the real reclamation reason into the emitted event.
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].verdict, Verdict::Reclaim);
+    assert_eq!(candidates[0].reason, reaper::REASON_ISSUE_CLOSED);
     reaper::sweep(&deps).await.unwrap();
 
     // Pane killed and detached; the session id survived the kill.
     assert!(!deps.mux.pane_alive(&pane).await.unwrap());
-    let record = deps.store.get_pane("proj", 11).unwrap().unwrap();
+    let record = deps
+        .store
+        .get_pane("proj", 11, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
     assert_eq!(record.mux_pane_id, None);
     assert_eq!(record.agent_session_id.as_deref(), Some("sess-11"));
     // And the worktree fell in the same sweep (no PaneAlive protection left).
@@ -518,8 +529,18 @@ async fn sweep_clears_stale_mapping_of_dead_pane() {
     let pane = register_pane(&deps, 14, &wt).await;
     deps.mux.kill_pane(&pane).await.unwrap(); // crashed outside meguri
 
+    // A dead mapping is reclaimed for what it is — not "issue closed".
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].verdict, Verdict::Reclaim);
+    assert_eq!(candidates[0].reason, reaper::REASON_PANE_DEAD);
     reaper::sweep(&deps).await.unwrap();
-    let record = deps.store.get_pane("proj", 14).unwrap().unwrap();
+    let record = deps
+        .store
+        .get_pane("proj", 14, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
     assert_eq!(record.mux_pane_id, None, "stale mapping cleared");
     assert!(wt.exists(), "open issue's worktree untouched");
 }

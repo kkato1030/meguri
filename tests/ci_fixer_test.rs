@@ -116,7 +116,7 @@ async fn setup() -> TestEnv {
 fn create_ci_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", ci_fixer::KIND, 1, "Add feature (#9)")
+        .create_run_for_loop("proj", ci_fixer::KIND, 9, "Add feature (#9)")
         .unwrap()
 }
 
@@ -345,8 +345,9 @@ async fn ci_fixer_discovery_wants_red_unclaimed_meguri_prs_only() {
     let targets = CiFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
-        vec![1],
-        "only the open, unclaimed, unescalated meguri PR whose CI settled red is actionable"
+        vec![9],
+        "only the open, unclaimed, unescalated meguri PR whose CI settled red is actionable \
+         — keyed by its canonical issue"
     );
 }
 

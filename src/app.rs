@@ -8,14 +8,14 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, ProjectConfig};
 use crate::daemon;
-use crate::engine::Deps;
 use crate::engine::reaper;
 use crate::engine::scheduler::{Reload, Scheduler};
 use crate::engine::worker::{WorkerOutcome, run_worker};
+use crate::engine::{self, Deps};
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
-use crate::store::{DesiredState, RunRecord, RunStatus, Store};
+use crate::store::{DesiredState, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
 
 pub fn open_store() -> Result<Store> {
     Store::open(&config::db_path())
@@ -52,6 +52,7 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
     let deps = build_deps(&cfg, project, mux_override)?;
 
@@ -108,6 +109,7 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
 pub async fn cmd_watch() -> Result<()> {
     let mut reloader = config::ConfigReloader::load(&config::config_path())?;
     let cfg = reloader.current().clone();
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
@@ -310,18 +312,19 @@ pub fn cmd_ps(all: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} PANE",
-        "RUN", "PROJECT", "ISSUE", "STATUS", "INTERACTION", "STEP"
+        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
+        "RUN", "PROJECT", "ISSUE", "STATUS", "INTERACTION", "STEP", "PROFILE"
     );
     for run in runs {
         println!(
-            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {}",
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {}",
             run.id,
             run.project_id,
             format!("#{}", run.issue_number),
             run.status.as_str(),
             run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             run.step,
+            run.agent_profile.as_deref().unwrap_or("-"),
             run.mux_pane_id.as_deref().unwrap_or("-"),
         );
     }
@@ -367,11 +370,14 @@ fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
 }
 
 /// Resolve the pane an active run drives, following the same precedence as
-/// [`resolve_attach_pane`]: the issue's persistent pane (panes table) wins over
-/// the pane id a run once recorded, which can be a stale start-of-run snapshot.
-/// Returns `(mux_kind, pane_id)`, or `None` when the run has no pane yet.
+/// [`resolve_attach_pane`]: the issue's persistent lane pane (panes table) wins
+/// over the pane id a run once recorded, which can be a stale start-of-run
+/// snapshot. The lane comes from the run's loop kind (the reviewer keeps its
+/// own `review` lane). Returns `(mux_kind, pane_id)`, or `None` when the run
+/// has no pane yet.
 fn run_pane(store: &Store, run: &RunRecord) -> Result<Option<(String, String)>> {
-    if let Some(p) = store.get_pane(&run.project_id, run.issue_number)?
+    let role = engine::role_for_loop(&run.loop_kind);
+    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
         && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
     {
         return Ok(Some((kind, id)));
@@ -600,10 +606,10 @@ pub async fn cmd_logs(needle: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_attach(needle: &str) -> Result<()> {
+pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
-    let (kind, pane) = resolve_attach_pane(&store, needle)?;
+    let (kind, pane) = resolve_attach_pane(&store, needle, review)?;
     let mux = mux::from_kind(&kind, &cfg.mux.session)?;
     let command = mux.attach_command(&mux::PaneId(pane));
     println!("attaching: {command}");
@@ -615,21 +621,35 @@ pub fn cmd_attach(needle: &str) -> Result<()> {
     bail!("exec failed: {err}");
 }
 
-/// Resolve what `meguri attach <needle>` should attach to. The pane belongs
-/// to the issue (1 issue = 1 pane, kept until the issue closes), so the
-/// issue's persistent pane wins over whatever pane id a run once recorded —
-/// and a bare issue number keeps working after its runs finished.
-fn resolve_attach_pane(store: &Store, needle: &str) -> Result<(String, String)> {
+/// Resolve what `meguri attach <needle> [--review]` should attach to. Panes
+/// belong to the issue's lanes (author + review, kept until the issue
+/// closes), so the issue's persistent lane pane wins over whatever pane id
+/// a run once recorded — and a bare issue number keeps working after its
+/// runs finished. A run id derives its lane from the run's loop kind;
+/// `--review` picks the review lane for issue numbers.
+fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
+    let wanted_role = if review { ROLE_REVIEW } else { ROLE_AUTHOR };
     if let Some(run) = store.find_run(needle)? {
+        // `run_pane` derives the run's lane from its loop kind, so a review-lane
+        // run resolves its review pane and everything else the author pane —
+        // `--review` only matters for the bare-issue-number path below.
         if let Some(pane) = run_pane(store, &run)? {
             return Ok(pane);
         }
         bail!("run {} has no pane yet", run.id);
     }
     if let Ok(issue) = needle.parse::<i64>() {
-        let panes = store.panes_for_issue(issue)?;
+        let panes: Vec<_> = store
+            .panes_for_issue(issue)?
+            .into_iter()
+            .filter(|p| p.role == wanted_role)
+            .collect();
         match panes.as_slice() {
-            [] => {}
+            [] => {
+                if review {
+                    bail!("issue #{issue} has no live review pane");
+                }
+            }
             [p] => {
                 if let (Some(kind), Some(id)) = (&p.mux_kind, &p.mux_pane_id) {
                     return Ok((kind.clone(), id.clone()));
@@ -638,7 +658,7 @@ fn resolve_attach_pane(store: &Store, needle: &str) -> Result<(String, String)> 
             many => {
                 let projects: Vec<&str> = many.iter().map(|p| p.project_id.as_str()).collect();
                 bail!(
-                    "issue #{issue} has panes in multiple projects ({}) — \
+                    "issue #{issue} has {wanted_role} panes in multiple projects ({}) — \
                      pass a run id instead",
                     projects.join(", ")
                 );
@@ -710,8 +730,13 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
         Some(project) => match build_deps(&cfg, project, None) {
             Ok(deps) => {
                 // Session id is saved before the kill — resumable later.
-                let released =
-                    reaper::release_pane(&deps, run.issue_number, "stopped by user").await;
+                let released = reaper::release_pane(
+                    &deps,
+                    run.issue_number,
+                    engine::role_for_loop(&run.loop_kind),
+                    "stopped by user",
+                )
+                .await;
                 let _ = deps
                     .forge
                     .remove_label(run.issue_number, crate::forge::LABEL_WORKING)
@@ -804,7 +829,7 @@ mod tests {
             .update_run_mux(&r2.id, "tmux", "meguri", "wD:pStale2")
             .unwrap();
         store
-            .upsert_pane("demo", 7, "tmux", "meguri", "wD:pN", "/wt/demo/7")
+            .upsert_pane("demo", 7, ROLE_AUTHOR, "tmux", "meguri", "wD:pN", "/wt/demo/7")
             .unwrap();
 
         // Issue 8: one run, also stale snapshot vs the table's live pane.
@@ -813,7 +838,7 @@ mod tests {
             .update_run_mux(&r3.id, "tmux", "meguri", "wD:pStale3")
             .unwrap();
         store
-            .upsert_pane("demo", 8, "tmux", "meguri", "wD:pR", "/wt/demo/8")
+            .upsert_pane("demo", 8, ROLE_AUTHOR, "tmux", "meguri", "wD:pR", "/wt/demo/8")
             .unwrap();
 
         let dashboard = mux::DashboardId("dash".into());

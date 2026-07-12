@@ -80,7 +80,8 @@ meguri watch
 meguri ps                 # runs, interaction state, panes
 meguri top                # build a dashboard workspace of tiled agent panes & attach
 meguri logs <run>         # event trail + live pane tail
-meguri attach <run>       # jump into the agent's pane
+meguri attach <issue>     # jump into the issue's agent pane (or pass a run id)
+meguri attach <issue> --review  # the reviewer's independent pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -147,7 +148,20 @@ meguri's AI review covers **both the spec PR and the implementation diff**. Once
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes and worktrees live per issue (1 issue = 1 pane; later runs on the same issue reuse the live session): while watching, meguri reclaims the pane, worktree, and merged local branch of every issue that closes, saving the agent's native session id first so `claude --resume <id>` can restore the context. `meguri prune` does the same on demand for one-shot usage.
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the reviewer. After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
+
+Per-loop lifetimes at a glance:
+
+| loop | trigger | key | worktree | normal end | pane |
+|---|---|---|---|---|---|
+| planner (author) | `meguri:plan` issue | issue | new branch | spec PR → `spec-reviewing` | kept |
+| reviewer (review) | `spec-reviewing` PR, head unreviewed | issue + `review` | read-only detached, fixed at `review-<issue>` | clean → `spec-ready` / findings → wait for push | kept (independent) |
+| spec worker (author) | `spec-ready` PR | issue (from branch) | takes over the PR branch | implementation → same PR | kept — continues the author pane |
+| worker (author) | `meguri:ready` issue | issue | new branch | PR `Closes #N` | kept |
+| fixer (author) | unresolved PR threads | issue (from branch) | attached to the PR head | replies on threads for re-review | kept — continues the author pane |
+| ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
+| conflict resolver (author) | CONFLICTING meguri PR | issue (from branch) | attached to the PR head | base merged & pushed (≤3) | kept — continues the author pane |
+| cleaner (standalone) | report issue + default-branch movement | report issue | read-only detached | report issue rewritten | self-reclaimed |
 
 ## Configuration
 
@@ -166,9 +180,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-# Panes live per issue (1 issue = 1 pane) and are reclaimed when the issue
-# closes; the agent's native session id is saved first (claude --resume <id>).
-# "never" kills the pane as soon as its run ends (high-throughput operation).
+# Panes live per issue (one author pane + one review pane) and are reclaimed
+# when the issue closes; the agent's native session id is saved first
+# (claude --resume <id>). "never" kills the pane as soon as its run ends
+# (high-throughput operation). Any other value is rejected at load.
 keep_pane = "until-issue-closed"  # also: never
 
 [agent]
@@ -211,6 +226,40 @@ ignore = []             # substrings that silence false positives; override per 
 impl_enabled = true    # kill switch for the impl-reviewer loop (AI review of implementation PRs)
 impl_max_rounds = 3    # max impl-review rounds per PR; past the cap the PR is left to the humans
 ```
+
+### Role-based agent routing (optional)
+
+By default every loop — planner, reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+
+```toml
+# A profile is one CLI's launch bundle — same shape as [agent].
+[agents.profiles.claude-opus]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "opus"]
+resume_args = ["--resume"]
+
+[agents.profiles.claude-sonnet]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "sonnet"]
+
+[agents.profiles.codex]
+command = "codex"
+args = ["--yolo"]
+resume_args = ["resume"]
+
+[routing]
+mode = "auto"        # auto | manual (default auto once [routing] exists)
+
+[routing.roles]      # explicit picks always beat auto; per-role overrides
+reviewer = "codex"
+# worker = "claude-sonnet"
+```
+
+- **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
+- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, reviewer → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **manual** turns the table off: roles you don't list run `default`.
+- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
+- The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
 
 ## Development
 
