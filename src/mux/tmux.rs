@@ -20,7 +20,12 @@ struct ScreenObservation {
     changed_at: Instant,
 }
 
-/// tmux-backed multiplexer. One meguri session; one window per run.
+/// tmux-backed multiplexer. One session per project (`<session>-<project>`,
+/// the bare `<session>` for `meguri top`); one window per run. The session is
+/// chosen at construction (`mux::detect`, per project); `spawn_pane` and
+/// `ensure_dashboard` create windows in it. Pane ids (`%N`) are tmux-server
+/// global, so `pane_alive`/`kill`/`read` on an existing pane are
+/// session-independent — only creation and attach care about the session.
 ///
 /// Agent state is a screen-stability heuristic — callers must treat it as a
 /// hint (capabilities.native_agent_state == false) and rely on the result
@@ -228,10 +233,15 @@ impl Multiplexer for TmuxMux {
     }
 
     fn attach_command(&self, pane: &PaneId) -> String {
+        // Resolve the owning session from the pane itself, not `self.session`:
+        // per-project sessions mean this mux's label may not be the pane's
+        // session (e.g. a mux built with no project attaching a project pane,
+        // or a pane that predates the per-project split). Pane ids are
+        // server-global, so `#{session_name}` always names the right session.
         format!(
-            "tmux select-window -t {pane} \\; attach -t {session}",
+            "tmux select-window -t {pane} \\; \
+             attach -t \"$(tmux display-message -p -t {pane} '#{{session_name}}')\"",
             pane = pane.0,
-            session = self.session
         )
     }
 
@@ -303,6 +313,9 @@ impl Multiplexer for TmuxMux {
     }
 
     fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
+        // The dashboard is a dedicated session and `dashboard.0` is that
+        // session's name (created by `dashboard_session`), so it names the
+        // right target directly — no window→session resolution needed.
         format!("tmux attach -t {}", dashboard.0)
     }
 }

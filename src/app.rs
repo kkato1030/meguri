@@ -23,7 +23,9 @@ pub fn open_store() -> Result<Store> {
 
 fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>) -> Result<Deps> {
     let kind = mux_override.unwrap_or(&cfg.mux.kind);
-    let mux = mux::detect(kind, &cfg.mux.session)?;
+    // Per-project workspace: this project's panes live in `<session>:<project>`
+    // (herdr) / `<session>-<project>` (tmux), not the shared base workspace.
+    let mux = mux::detect(kind, &cfg.mux.session, Some(&project.id))?;
     Ok(Deps {
         store: open_store()?,
         mux,
@@ -531,8 +533,14 @@ fn top_status_argv(
 /// by id and the watch loop continues uninterrupted.
 pub async fn cmd_top(mux_override: Option<&str>, interval_secs: u64) -> Result<()> {
     let cfg = Config::load()?;
-    let mux = mux::detect(mux_override.unwrap_or(&cfg.mux.kind), &cfg.mux.session)?;
-    // The agent workspace must exist first (the dashboard is separate).
+    // Cross-project view: build on the base workspace (no project); the
+    // dashboard is a separate dedicated workspace/session either way.
+    let mux = mux::detect(
+        mux_override.unwrap_or(&cfg.mux.kind),
+        &cfg.mux.session,
+        None,
+    )?;
+    // The base workspace must exist first (the dashboard is separate).
     mux.ensure_session().await?;
     let label = top_label(&cfg.mux.session);
     let dashboard = mux.ensure_dashboard(&label).await?;
@@ -566,7 +574,15 @@ pub async fn cmd_top_status(
 ) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
-    let mux = mux::detect(mux_override.unwrap_or(&cfg.mux.kind), &cfg.mux.session)?;
+    // `meguri top` is the cross-project view: build on the base workspace (no
+    // project) so `tile_pane` can move every project's panes into the dashboard
+    // by id, reaching across the per-project workspaces/sessions. The dashboard
+    // itself was created by the outer `cmd_top`; here we only tile into it.
+    let mux = mux::detect(
+        mux_override.unwrap_or(&cfg.mux.kind),
+        &cfg.mux.session,
+        None,
+    )?;
     let dashboard = mux::DashboardId(dashboard.to_string());
     let attach_hint = mux.dashboard_attach_command(&dashboard);
 
@@ -592,7 +608,8 @@ pub async fn cmd_logs(needle: &str) -> Result<()> {
     }
 
     if let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
-        && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session)
+        // Addresses an existing pane by id; no project-scoped label needed.
+        && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session, None)
     {
         let pane = mux::PaneId(pane.clone());
         if mux.pane_alive(&pane).await.unwrap_or(false) {
@@ -610,7 +627,9 @@ pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
     let (kind, pane) = resolve_attach_pane(&store, needle, review)?;
-    let mux = mux::from_kind(&kind, &cfg.mux.session)?;
+    // Attach addresses an existing pane by id; the tmux attach command resolves
+    // the pane's own session, so no project-scoped label is needed here.
+    let mux = mux::from_kind(&kind, &cfg.mux.session, None)?;
     let command = mux.attach_command(&mux::PaneId(pane));
     println!("attaching: {command}");
     use std::os::unix::process::CommandExt;
@@ -749,9 +768,10 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
     };
     if !released
         && let (Some(kind), Some(pane)) = (&run.mux_kind, &run.mux_pane_id)
-        && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session)
+        && let Ok(mux) = mux::from_kind(kind, &cfg.mux.session, None)
     {
-        // Fallback for panes that predate the pane registry.
+        // Fallback for panes that predate the pane registry. Kills by pane id,
+        // so the base label is fine — no project-scoped workspace needed.
         let _ = mux.kill_pane(&mux::PaneId(pane.clone())).await;
     }
     store.emit(Some(&run.id), "run.cancelled", serde_json::json!({}))?;

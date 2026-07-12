@@ -47,16 +47,21 @@ impl Drop for PaneWatch {
 /// herdr-backed multiplexer, driven through the local socket API where
 /// possible (no subprocess per call) with the `herdr` CLI as fallback.
 ///
-/// Layout: one workspace labeled with the configured session name, one tab
-/// per run. The agent is launched *inside the tab's shell* (`pane run`), so
-/// the pane and its final screen survive agent exit.
+/// Layout: one workspace per project, labeled `<session>:<project>` (the bare
+/// `<session>` — no project — is the cross-project `meguri top` view). Issue
+/// tabs land in their project's workspace; the label is chosen at construction
+/// (`mux::detect`, per project). One tab per run. The agent is launched
+/// *inside the tab's shell* (`pane run`), so the pane and its final screen
+/// survive agent exit. Operations on an existing pane address it by its id
+/// (`wN:pM`, which carries the workspace), so they never need the label.
 ///
 /// Agent state is served from a per-pane cache fed by a
 /// `pane.agent_status_changed` subscription, so the turn engine's poll loop
 /// costs no subprocess spawns and `wait_state` reacts within milliseconds of
 /// a transition instead of a poll interval.
 pub struct HerdrMux {
-    /// Workspace label that groups all meguri panes.
+    /// Workspace label this mux creates panes in — `<session>:<project>` for a
+    /// project, or the bare `<session>` for the cross-project `meguri top` view.
     session: String,
     /// Unix socket for direct requests and event subscriptions.
     socket: PathBuf,

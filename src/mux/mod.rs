@@ -212,16 +212,52 @@ pub trait Multiplexer: Send + Sync {
     fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String;
 }
 
-/// Pick a multiplexer: explicit kind, else herdr if its socket is live, else tmux.
-pub fn detect(kind_hint: &str, session: &str) -> anyhow::Result<std::sync::Arc<dyn Multiplexer>> {
+/// herdr workspace label for a project. Each project gets its own workspace
+/// `<session>:<project>` so issue tabs don't intermingle; the bare `<session>`
+/// (`project = None`) is reserved for the cross-project `meguri top` view.
+/// The `<session>` prefix is fixed for the daemon's lifetime (see config.rs),
+/// so only the project suffix varies — consistent with that pin.
+pub fn herdr_label(session: &str, project: Option<&str>) -> String {
+    match project {
+        Some(p) => format!("{session}:{p}"),
+        None => session.to_string(),
+    }
+}
+
+/// tmux session name for a project. `:` is reserved in tmux target syntax, so
+/// the per-project separator is `-` (not `:` as herdr uses).
+pub fn tmux_label(session: &str, project: Option<&str>) -> String {
+    match project {
+        Some(p) => format!("{session}-{p}"),
+        None => session.to_string(),
+    }
+}
+
+/// Pick a multiplexer: explicit kind, else herdr if its socket is live, else
+/// tmux. `project` scopes the workspace/session to a project (`Some`) or uses
+/// the base label reserved for `meguri top` (`None`); the label is composed
+/// here, where the concrete kind — and thus the right separator — is known.
+pub fn detect(
+    kind_hint: &str,
+    session: &str,
+    project: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<dyn Multiplexer>> {
     match kind_hint {
-        "herdr" => Ok(std::sync::Arc::new(herdr::HerdrMux::new(session))),
-        "tmux" => Ok(std::sync::Arc::new(tmux::TmuxMux::new(session))),
+        "herdr" => Ok(std::sync::Arc::new(herdr::HerdrMux::new(&herdr_label(
+            session, project,
+        )))),
+        "tmux" => Ok(std::sync::Arc::new(tmux::TmuxMux::new(&tmux_label(
+            session, project,
+        )))),
         "auto" => {
             if herdr::HerdrMux::socket_live() {
-                Ok(std::sync::Arc::new(herdr::HerdrMux::new(session)))
+                Ok(std::sync::Arc::new(herdr::HerdrMux::new(&herdr_label(
+                    session, project,
+                ))))
             } else if which_ok("tmux") {
-                Ok(std::sync::Arc::new(tmux::TmuxMux::new(session)))
+                Ok(std::sync::Arc::new(tmux::TmuxMux::new(&tmux_label(
+                    session, project,
+                ))))
             } else {
                 anyhow::bail!("no usable multiplexer: start `herdr` or install tmux")
             }
@@ -230,10 +266,17 @@ pub fn detect(kind_hint: &str, session: &str) -> anyhow::Result<std::sync::Arc<d
     }
 }
 
-/// Resolve a mux by the kind string persisted on a run record.
-pub fn from_kind(kind: &str, session: &str) -> anyhow::Result<std::sync::Arc<dyn Multiplexer>> {
+/// Resolve a mux by the kind string persisted on a run record. Callers that
+/// only address existing panes pass `project = None`: pane ids carry their own
+/// workspace/session (herdr `wN:pM`, tmux server-global `%N`), so operations on
+/// a live pane never need the project-scoped label.
+pub fn from_kind(
+    kind: &str,
+    session: &str,
+    project: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<dyn Multiplexer>> {
     match kind {
-        "herdr" | "tmux" => detect(kind, session),
+        "herdr" | "tmux" => detect(kind, session, project),
         other => anyhow::bail!("run has unknown mux kind {other:?}"),
     }
 }
@@ -265,4 +308,19 @@ pub(crate) const BLOCKED_PATTERNS: &[&str] = &[
 pub(crate) fn tail_looks_blocked(tail: &[String]) -> bool {
     tail.iter()
         .any(|line| BLOCKED_PATTERNS.iter().any(|p| line.contains(p)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_labels_scope_by_project() {
+        // No project → the bare session label (reserved for `meguri top`).
+        assert_eq!(herdr_label("meguri", None), "meguri");
+        assert_eq!(tmux_label("meguri", None), "meguri");
+        // A project → its own workspace/session, with the kind's separator.
+        assert_eq!(herdr_label("meguri", Some("foo")), "meguri:foo");
+        assert_eq!(tmux_label("meguri", Some("foo")), "meguri-foo");
+    }
 }
