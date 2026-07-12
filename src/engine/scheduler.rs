@@ -70,7 +70,7 @@ impl Scheduler {
                 );
             }
 
-            // Liveness beacon for external readers (`meguri serve`).
+            // Liveness beacon for external readers (future `meguri top`).
             if let Err(e) = store.heartbeat("watch") {
                 tracing::warn!("heartbeat failed: {e:#}");
             }

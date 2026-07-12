@@ -30,7 +30,6 @@ async fn main() -> Result<()> {
             DaemonCommand::Install { mode } => daemon::launchd::cmd_install(&mode),
             DaemonCommand::Uninstall => daemon::launchd::cmd_uninstall(),
         },
-        Command::Serve { port, bind } => app::cmd_serve(port, bind.as_deref()).await,
         Command::Run {
             project,
             issue,

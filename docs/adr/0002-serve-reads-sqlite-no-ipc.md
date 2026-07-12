@@ -1,8 +1,10 @@
 # ADR 0002: web ダッシュボードは SQLite 直読みの独立プロセス、watch 生死は DB ハートビートで判定
 
-- Status: accepted
-- Date: 2026-07-11
-- Issue: #36
+- Status: superseded — `meguri serve` は issue #95 で撤去。将来のダッシュボードは
+  mux ネイティブな `meguri top`（別 issue）に寄せる。heartbeat 機構（heartbeats
+  テーブル + `Store::latest_heartbeat`）は `meguri top` の watch 生死表示のため温存。
+- Date: 2026-07-11 (superseded: 2026-07-12)
+- Issue: #36 (superseded by #95)
 
 (採番メモ: 0001 は issue #25 の spec PR で採番済み・未マージのため 0002 を使う)
 

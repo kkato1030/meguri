@@ -9,7 +9,6 @@ pub mod forge;
 pub mod gitops;
 pub mod mux;
 pub mod notify;
-pub mod server;
 pub mod store;
 pub mod turn;
 
