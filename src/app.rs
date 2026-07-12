@@ -52,6 +52,7 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
     let deps = build_deps(&cfg, project, mux_override)?;
 
@@ -108,6 +109,7 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
 pub async fn cmd_watch() -> Result<()> {
     let mut reloader = config::ConfigReloader::load(&config::config_path())?;
     let cfg = reloader.current().clone();
+    crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
@@ -310,18 +312,19 @@ pub fn cmd_ps(all: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} PANE",
-        "RUN", "PROJECT", "ISSUE", "STATUS", "INTERACTION", "STEP"
+        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
+        "RUN", "PROJECT", "ISSUE", "STATUS", "INTERACTION", "STEP", "PROFILE"
     );
     for run in runs {
         println!(
-            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {}",
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {}",
             run.id,
             run.project_id,
             format!("#{}", run.issue_number),
             run.status.as_str(),
             run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             run.step,
+            run.agent_profile.as_deref().unwrap_or("-"),
             run.mux_pane_id.as_deref().unwrap_or("-"),
         );
     }

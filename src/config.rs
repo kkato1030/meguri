@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -63,8 +64,18 @@ pub struct Config {
     pub language: Option<String>,
     #[serde(default)]
     pub mux: MuxConfig,
+    /// The `default` profile: the CLI launched when no routing steers a role
+    /// elsewhere. Keeps the historical `[agent]` section shape and semantics.
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub agent: AgentProfile,
+    /// Named launch profiles (`[agents.profiles.<name>]`). Inert until a
+    /// `[routing]` section references them — see [`crate::routing`].
+    #[serde(default)]
+    pub agents: Option<AgentsConfig>,
+    /// Role→profile routing (`[routing]`). Absent = legacy behavior: every
+    /// loop runs the `default` profile, no detection.
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -202,8 +213,11 @@ fn default_keep_pane() -> String {
     "until-issue-closed".into()
 }
 
+/// A launch profile: the bundle of "how to start (and resume) one agent CLI".
+/// The `default` profile lives in `[agent]`; named ones in
+/// `[agents.profiles.<name>]`. Both share this shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
+pub struct AgentProfile {
     /// Interactive agent CLI launched inside the pane.
     #[serde(default = "default_agent_command")]
     pub command: String,
@@ -231,7 +245,7 @@ pub struct AgentConfig {
     pub session_dir: Option<PathBuf>,
 }
 
-impl Default for AgentConfig {
+impl Default for AgentProfile {
     fn default() -> Self {
         Self {
             command: default_agent_command(),
@@ -243,12 +257,48 @@ impl Default for AgentConfig {
     }
 }
 
+/// `[agents]`: the named-profile registry. Its own section so `[routing]` can
+/// stay a sibling of `[agents]` rather than nesting under it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentsConfig {
+    /// `[agents.profiles.<name>]`. A user entry named the same as a builtin
+    /// (`claude-opus` / `claude-sonnet` / `codex`) overrides that builtin.
+    #[serde(default)]
+    pub profiles: HashMap<String, AgentProfile>,
+}
+
+/// How `[routing]` steers a loop's role to a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Roles absent from `[routing.roles]` resolve through the built-in
+    /// recommendation table, filtered by CLI detection.
+    #[default]
+    Auto,
+    /// Roles absent from `[routing.roles]` resolve to `default`; the
+    /// recommendation table is off.
+    Manual,
+}
+
+/// `[routing]`: role→profile resolution. Present = routing is active (auto or
+/// manual); absent = legacy (every role runs `default`, no detection).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub mode: RoutingMode,
+    /// Explicit per-role overrides. Keys are loop kinds (`planner`,
+    /// `reviewer`, `worker`, `spec-worker`, `fixer`, `conflict-resolver`);
+    /// values are profile names. An explicit entry always beats auto.
+    #[serde(default)]
+    pub roles: HashMap<String, String>,
+}
+
 fn default_agent_command() -> String {
     "claude".into()
 }
 
 fn default_agent_args() -> Vec<String> {
-    // Yolo by default; see AgentConfig::args for the rationale and opt-out.
+    // Yolo by default; see AgentProfile::args for the rationale and opt-out.
     vec!["--dangerously-skip-permissions".into()]
 }
 
@@ -962,6 +1012,69 @@ ignore = ["docs/legacy"]
         // the built-in defaults, not the global section.
         assert_eq!(cfg.clean_for(quiet).stale_branch_days, 30);
         assert_eq!(cfg.clean_for(quiet).ignore, vec!["docs/legacy"]);
+    }
+
+    #[test]
+    fn agents_and_routing_default_to_none() {
+        // Back-compat: an empty config (and any config without the new
+        // sections) leaves both `agents` and `routing` absent — the legacy
+        // "everything runs [agent]" path.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.agents.is_none());
+        assert!(cfg.routing.is_none());
+    }
+
+    #[test]
+    fn parses_profiles_and_routing() {
+        let raw = r#"
+[agents.profiles.claude-opus]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "opus"]
+resume_args = ["--resume"]
+
+[agents.profiles.codex]
+command = "codex"
+args = ["--yolo"]
+resume_args = ["resume"]
+
+[routing]
+mode = "auto"
+
+[routing.roles]
+reviewer = "codex"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let profiles = &cfg.agents.as_ref().unwrap().profiles;
+        assert_eq!(profiles["claude-opus"].command, "claude");
+        assert_eq!(
+            profiles["claude-opus"].args,
+            vec!["--dangerously-skip-permissions", "--model", "opus"]
+        );
+        assert_eq!(profiles["codex"].resume_args, vec!["resume"]);
+        let routing = cfg.routing.as_ref().unwrap();
+        assert_eq!(routing.mode, RoutingMode::Auto);
+        assert_eq!(routing.roles["reviewer"], "codex");
+    }
+
+    #[test]
+    fn routing_mode_defaults_to_auto_when_section_present() {
+        let cfg: Config = toml::from_str("[routing]\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().mode, RoutingMode::Auto);
+        let cfg: Config = toml::from_str("[routing]\nmode = \"manual\"\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().mode, RoutingMode::Manual);
+    }
+
+    #[test]
+    fn profiles_without_routing_still_parse() {
+        // `[agents.profiles]` alone is legal; it stays inert (no routing).
+        let raw = r#"
+[agents.profiles.codex]
+command = "codex"
+args = ["--yolo"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.agents.is_some());
+        assert!(cfg.routing.is_none());
     }
 
     #[test]

@@ -212,6 +212,40 @@ impl_enabled = true    # kill switch for the impl-reviewer loop (AI review of im
 impl_max_rounds = 3    # max impl-review rounds per PR; past the cap the PR is left to the humans
 ```
 
+### Role-based agent routing (optional)
+
+By default every loop — planner, reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+
+```toml
+# A profile is one CLI's launch bundle — same shape as [agent].
+[agents.profiles.claude-opus]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "opus"]
+resume_args = ["--resume"]
+
+[agents.profiles.claude-sonnet]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "sonnet"]
+
+[agents.profiles.codex]
+command = "codex"
+args = ["--yolo"]
+resume_args = ["resume"]
+
+[routing]
+mode = "auto"        # auto | manual (default auto once [routing] exists)
+
+[routing.roles]      # explicit picks always beat auto; per-role overrides
+reviewer = "codex"
+# worker = "claude-sonnet"
+```
+
+- **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
+- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, reviewer → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **manual** turns the table off: roles you don't list run `default`.
+- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
+- The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
+
 ## Development
 
 ```bash

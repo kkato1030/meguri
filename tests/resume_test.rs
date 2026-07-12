@@ -261,6 +261,79 @@ async fn session_id_from_the_mux_is_recorded_when_result_omits_it() {
     assert_eq!(record.agent_session_id.as_deref(), Some("sess-mux"));
 }
 
+/// Manual-routing config: the worker role maps to a profile whose
+/// `resume_args` differ from the default, so a resume proves the run's pinned
+/// profile — not `[agent]` — drives the respawn.
+fn routing_config() -> Config {
+    let toml = r#"
+[agents.profiles.p-worker]
+command = "worker-cli"
+args = ["--go"]
+resume_args = ["resume", "--continue-session"]
+
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "p-worker"
+"#;
+    let mut config: Config = toml::from_str(toml).unwrap();
+    config.limits.idle_grace_secs = 3600;
+    config.limits.result_grace_secs = 1;
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_uses_the_pinned_profile_resume_args() {
+    let mut env = setup().await;
+    env.deps.config = routing_config();
+    let run = env
+        .deps
+        .store
+        .create_run_for_loop("proj", "worker", 7, "Add greeting file")
+        .unwrap();
+    // A pane died mid-run: the profile is already pinned and the agent's
+    // native session is on record.
+    env.deps
+        .store
+        .update_run_agent_profile(&run.id, "p-worker")
+        .unwrap();
+    env.deps
+        .store
+        .update_run_agent_session(&run.id, Some("sess-123"))
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result_with_session(&wt, &turn_id, "success", Some("sess-123"));
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let cmd = &env.mux.spawned_commands()[0];
+    // The profile's command and resume_args, not the default `--resume`.
+    assert_eq!(cmd[0], "worker-cli", "profile command: {cmd:?}");
+    let resume_at = cmd
+        .iter()
+        .position(|a| a == "resume")
+        .unwrap_or_else(|| panic!("profile resume_args missing: {cmd:?}"));
+    assert_eq!(cmd[resume_at + 1], "--continue-session", "{cmd:?}");
+    assert_eq!(cmd[resume_at + 2], "sess-123", "{cmd:?}");
+    assert!(
+        !cmd.iter().any(|a| a == "--resume"),
+        "default resume_args must not leak in: {cmd:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_respawns_with_resume_when_session_is_on_record() {
     let env = setup().await;
