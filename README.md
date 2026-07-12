@@ -45,6 +45,16 @@ meguri never parses the agent's screen to decide success. Each turn writes a pro
 
 Stale turn ids are ignored; results claiming success are **independently verified** (clean tree, commits ahead of the base branch, project check command passes) before meguri moves on. Verification failures come back to the agent as corrective turns.
 
+## Security
+
+meguri's core trade-off is unattended execution, and that's worth understanding before you point it at a repo.
+
+- **The agent gets real shell access.** The default `[agent].args` includes `--dangerously-skip-permissions`, so once a loop picks up an issue, the agent runs arbitrary commands in its worktree — git, cargo, network calls, anything the CLI allows — with no per-command confirmation. That's what makes an unattended loop possible; it also means you should only run meguri somewhere you're fine with an agent having that level of access (a disposable VM or container, or a machine/account whose blast radius you accept). If you'd rather gate every command, set `args = ["--permission-mode", "acceptEdits"]` (see [Configuration](#configuration)) and answer dialogs by attaching to the pane.
+- **Issue bodies are prompt input.** The full issue body (and comments a loop reads) is injected into the agent's prompt verbatim, so on a repo where anyone can open issues, a malicious one is a prompt-injection attempt against an agent with shell access. The mitigation is the [label gate](#labels): a loop only acts on an issue that already carries a `meguri:*` phase label (`meguri:plan` / `meguri:ready`), and applying labels needs collaborator (write) access — so "who can get an agent to execute" reduces to "who has write access to this repo," not "who can open an issue." Weigh that when granting collaborator access, and don't label untrusted issues `meguri:ready` yourself.
+- **Completion is verified independently, not screen-scraped.** As described in [The completion contract](#the-completion-contract) above, meguri never takes the agent's own "success" claim at face value — it re-checks git state, commits ahead of base, and the project's `check_command` before treating a run as done. This bounds (but doesn't eliminate) the damage a compromised or misled agent can do: it can still act inside the worktree during a run, but it can't talk meguri into merging bad state just by writing "success" to the result file.
+
+Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
+
 ## Install & set up
 
 Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback).
