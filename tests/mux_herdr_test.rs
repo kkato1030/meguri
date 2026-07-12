@@ -220,9 +220,12 @@ async fn herdr_tile_pane_preserves_live_process() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(mux.pane_alive(&pane).await.unwrap());
 
-    // Move the live pane into the dashboard tab.
-    let dashboard = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
-    mux.tile_pane(&pane, &dashboard, Split::Down)
+    // Move the live pane into the dashboard tab (dedicated dashboard workspace,
+    // scoped to this test so it is cleaned up).
+    let dash_label = format!("{label}:top");
+    let dashboard = mux.ensure_dashboard(&dash_label).await.expect("dashboard");
+    assert!(dashboard.fresh, "first ensure_dashboard must be fresh");
+    mux.tile_pane(&pane, &dashboard.tile, Split::Down)
         .await
         .expect("tile pane");
 
@@ -239,11 +242,17 @@ async fn herdr_tile_pane_preserves_live_process() {
         "moved pane no longer responds to input: {tail:?}"
     );
 
-    // Idempotent dashboard: a second ensure returns the same tab.
-    let again = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
-    assert_eq!(again, dashboard, "ensure_dashboard must reuse the tab");
+    // Idempotent dashboard: a second ensure reuses the same tile tab and does
+    // not report a fresh status pane (so the render loop is not restarted).
+    let again = mux.ensure_dashboard(&dash_label).await.expect("dashboard");
+    assert_eq!(
+        again.tile, dashboard.tile,
+        "ensure_dashboard must reuse the tab"
+    );
+    assert!(!again.fresh, "second ensure_dashboard must not be fresh");
 
     mux.kill_pane(&pane).await.unwrap();
+    cleanup_workspace(&dash_label).await;
     cleanup_workspace(&label).await;
 }
 
