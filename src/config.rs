@@ -147,7 +147,7 @@ pub struct MuxConfig {
     /// Pane lifetime policy: "until-issue-closed" (default — the reaper
     /// reclaims the pane when the issue closes on the forge) | "never"
     /// (kill the pane as soon as its run ends; high-throughput operation).
-    /// Any other value is treated as "until-issue-closed".
+    /// Any other value is rejected at config load.
     #[serde(default = "default_keep_pane")]
     pub keep_pane: String,
 }
@@ -452,7 +452,20 @@ impl Config {
     fn parse(raw: &str, path: &Path) -> Result<Self> {
         let cfg: Config =
             toml::from_str(raw).with_context(|| format!("invalid config at {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Reject values that would otherwise no-op silently (issue #92:
+    /// `keep_pane = "on-failure"` used to be treated as the default).
+    fn validate(&self) -> Result<()> {
+        match self.mux.keep_pane.as_str() {
+            "until-issue-closed" | "never" => Ok(()),
+            other => anyhow::bail!(
+                "mux.keep_pane = {other:?} is not supported (use \"until-issue-closed\" or \"never\")"
+            ),
+        }
     }
 
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
@@ -612,6 +625,19 @@ mod tests {
         assert!(back.notifications.macos);
         assert_eq!(back.notifications.webhook_url, None);
         assert_eq!(back.notifications.throttle_secs, 60);
+    }
+
+    #[test]
+    fn unknown_keep_pane_is_rejected_at_load() {
+        let path = Path::new("test.toml");
+        for value in ["until-issue-closed", "never"] {
+            let raw = format!("[mux]\nkeep_pane = \"{value}\"\n");
+            assert!(Config::parse(&raw, path).is_ok(), "value: {value}");
+        }
+        // "on-failure" used to silently behave like the default (issue #92);
+        // now it fails loudly instead of no-opping.
+        let err = Config::parse("[mux]\nkeep_pane = \"on-failure\"\n", path).unwrap_err();
+        assert!(format!("{err:#}").contains("keep_pane"), "{err:#}");
     }
 
     #[test]

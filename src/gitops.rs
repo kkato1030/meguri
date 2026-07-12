@@ -196,24 +196,36 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
     exclude_meguri(worktree).await
 }
 
-/// Create (or reuse) a review worktree detached at `head_sha` (a PR head).
-/// Detached HEAD avoids colliding with whichever worktree still has the PR
-/// branch checked out (e.g. the planner's on the same host).
+/// Create (or re-point) a review worktree detached at `head_sha` (a PR
+/// head). Detached HEAD avoids colliding with whichever worktree still has
+/// the PR branch checked out (e.g. the planner's on the same host). The
+/// worktree is issue-scoped and survives review rounds (issue #92): when it
+/// already exists — resuming an interrupted run, or reviewing the next push
+/// — it is reset hard onto the new head instead of being recreated, so the
+/// pane standing in it stays valid.
 pub async fn create_review_worktree(
     repo_path: &Path,
     worktree: &Path,
     head_branch: &str,
     head_sha: &str,
 ) -> Result<()> {
+    // Best-effort: the head may already be local (pushed from this host).
+    let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
+
     if worktree.join(".git").exists() {
-        return Ok(()); // resuming an interrupted run
+        run_git(worktree, &["reset", "--hard", head_sha])
+            .await
+            .context("git reset --hard (review re-point)")?;
+        // Stray untracked files from the previous round would taint the
+        // read-only checkout; `.meguri/` is excluded, so it survives.
+        run_git(worktree, &["clean", "-fd"])
+            .await
+            .context("git clean (review re-point)")?;
+        return Ok(());
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    // Best-effort: the head may already be local (pushed from this host).
-    let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
 
     let wt = worktree.to_string_lossy().to_string();
     run_git(

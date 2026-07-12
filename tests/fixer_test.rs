@@ -112,7 +112,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
 fn create_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", fixer::KIND, 1, "Add feature (#9)")
+        .create_run_for_loop("proj", fixer::KIND, 9, "Add feature (#9)")
         .unwrap()
 }
 
@@ -298,7 +298,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
-        vec![1]
+        vec![9]
     );
     let run1 = create_fixer_run(&env);
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_fixer(&env.deps, &run1.id))
@@ -385,7 +385,7 @@ async fn fixer_discovery_skips_spec_ready_merged_held_and_foreign_prs() {
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
-        vec![1],
+        vec![9],
         "only the open, unclaimed meguri PR with an awaiting thread is actionable"
     );
 }

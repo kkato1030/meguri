@@ -12,11 +12,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, Target, WorkerOutcome};
+use super::{Deps, StoreControl, Target, WorkerOutcome, role_for_loop};
+use crate::agent_session;
 use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
-use crate::store::{RunRecord, RunStatus};
+use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
 pub const STEP_PREPARE_WORK: &str = "prepare-work";
@@ -392,11 +393,28 @@ pub(crate) enum StepFlow {
 /// Apply the keep_pane policy when a run succeeds. The default
 /// ("until-issue-closed") keeps the pane for the reaper, which reclaims it
 /// once the issue closes on the forge; "never" releases it right away
-/// (high-throughput operation).
+/// (high-throughput operation). Unknown values are rejected at config load.
 pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
     if deps.config.mux.keep_pane == "never" {
-        super::reaper::release_pane(deps, run.issue_number, "keep_pane = never").await;
+        super::reaper::release_pane(
+            deps,
+            run.issue_number,
+            role_for_loop(&run.loop_kind),
+            "keep_pane = never",
+        )
+        .await;
     }
+}
+
+/// The PR this run claimed, from its persisted checkpoint (release/escalate
+/// hooks get the run record as of drive start, so re-read the store). None
+/// before prepare-work filled it — escalation then falls back to the
+/// canonical issue.
+pub(crate) fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
+    let run = deps.store.get_run(run_id).ok().flatten()?;
+    serde_json::from_str::<Checkpoint>(&run.checkpoint_json)
+        .ok()
+        .and_then(|cp| cp.pr_number)
 }
 
 /// `meguri stop`: cancel the run, release the claim, release the pane (its
@@ -405,7 +423,13 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
     flavor.release_claim(deps, run).await;
-    super::reaper::release_pane(deps, run.issue_number, "stopped by user").await;
+    super::reaper::release_pane(
+        deps,
+        run.issue_number,
+        role_for_loop(&run.loop_kind),
+        "stopped by user",
+    )
+    .await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }
@@ -566,22 +590,26 @@ struct EnsuredPane {
     resumed: bool,
 }
 
-/// Get the issue's pane, spawning it (with the trigger as the agent's
-/// initial prompt argument) if it doesn't exist or died. 1 issue = 1 pane:
-/// the pane is keyed by `(project, issue)` and outlives runs, so a later run
-/// on the same issue (fixer after worker, resumed runs) reuses the live
-/// session instead of stacking a new pane. When a native agent session id is
-/// on record, a fresh spawn resumes it (`claude --resume <id> <trigger>`) so
-/// the agent keeps its conversation context; a resume that dies on the spot
-/// falls back to the plain full-prompt spawn.
+/// Get the lane's pane, spawning it (with the trigger as the agent's
+/// initial prompt argument) if it doesn't exist or died. The pane is keyed
+/// by `(project, issue, role)` and outlives runs (issue #92): every
+/// branch-editing loop of the issue (planner, worker, fixer, …) shares the
+/// author lane's live session, while the reviewer keeps its own review
+/// lane. When the lane has a native agent session id on record, a fresh
+/// spawn resumes it (`claude --resume <id> <trigger>`) so the agent keeps
+/// its conversation context; a resume that dies on the spot falls back to
+/// the plain full-prompt spawn.
 async fn ensure_pane(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     initial_trigger: &str,
 ) -> Result<EnsuredPane> {
+    let role = role_for_loop(&run.loop_kind);
     let worktree_str = worktree.to_string_lossy();
-    if let Some(record) = deps.store.get_pane(&deps.project.id, run.issue_number)?
+    if let Some(record) = deps
+        .store
+        .get_pane(&deps.project.id, run.issue_number, role)?
         && let Some(id) = &record.mux_pane_id
     {
         let pane = PaneId(id.clone());
@@ -589,7 +617,7 @@ async fn ensure_pane(
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
             if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
-                // Adopt the issue's live pane for this run.
+                // Adopt the lane's live pane for this run.
                 deps.store.update_run_mux(
                     &run.id,
                     deps.mux.kind().as_str(),
@@ -602,21 +630,23 @@ async fn ensure_pane(
                     resumed: false,
                 });
             }
-            // The issue moved to another worktree (e.g. a fresh branch): the
+            // The lane moved to another worktree (e.g. a fresh branch): the
             // old pane can't see it. Retire it — session id saved — and
-            // respawn below.
-            super::reaper::release_pane(deps, run.issue_number, "worktree moved").await;
+            // respawn below (the saved id makes the respawn a resume, so the
+            // context follows the lane into the new worktree).
+            super::reaper::release_pane(deps, run.issue_number, role, "worktree moved").await;
         }
     }
 
     deps.mux.ensure_session().await?;
 
-    // Re-read: a completed turn records the session id on the store, not on
-    // the caller's (possibly stale) run snapshot.
+    // The lane's resumable context lives on the pane row (issue lifetime),
+    // not the ephemeral run: written after every completed turn and before
+    // every reclamation.
     let session_id = deps
         .store
-        .get_run(&run.id)?
-        .and_then(|r| r.agent_session_id);
+        .get_pane(&deps.project.id, run.issue_number, role)?
+        .and_then(|p| p.agent_session_id);
     if let Some(session_id) = session_id {
         let resumed =
             match spawn_agent_pane(deps, run, worktree, initial_trigger, Some(&session_id)).await {
@@ -639,6 +669,8 @@ async fn ensure_pane(
             });
         }
         // Forget the id and fall back to full re-injection.
+        deps.store
+            .save_pane_session(&deps.project.id, run.issue_number, role, None)?;
         deps.store.update_run_agent_session(&run.id, None)?;
         deps.store.emit(
             Some(&run.id),
@@ -664,6 +696,7 @@ async fn spawn_agent_pane(
     initial_trigger: &str,
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
+    let role = role_for_loop(&run.loop_kind);
     let worktree_str = worktree.to_string_lossy();
     let mut command = vec![deps.config.agent.command.clone()];
     command.extend(deps.config.agent.args.iter().cloned());
@@ -678,10 +711,15 @@ async fn spawn_agent_pane(
         env.push(("HERDR_AGENT".to_string(), hint.clone()));
     }
 
+    let title = if role == ROLE_AUTHOR {
+        format!("meguri#{}", run.issue_number)
+    } else {
+        format!("meguri#{}:{role}", run.issue_number)
+    };
     let pane = deps
         .mux
         .spawn_pane(&PaneSpec {
-            title: format!("meguri#{}", run.issue_number),
+            title,
             cwd: worktree.to_path_buf(),
             command,
             env,
@@ -696,6 +734,7 @@ async fn spawn_agent_pane(
     deps.store.upsert_pane(
         &deps.project.id,
         run.issue_number,
+        role,
         deps.mux.kind().as_str(),
         &deps.config.mux.session,
         &pane.0,
@@ -759,7 +798,7 @@ pub(crate) async fn run_turn(
         .await_completion(&pane, worktree, &prepared.turn_id, &control)
         .await?;
 
-    record_agent_session(deps, run, &pane, &ensured, &outcome).await?;
+    record_agent_session(deps, run, worktree, &pane, &ensured, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -776,32 +815,51 @@ pub(crate) async fn run_turn(
     Ok((outcome, prepared.turn_id))
 }
 
-/// Keep `runs.agent_session_id` in sync with what the turn taught us: a
-/// completed turn reports the id (result file first, mux second — herdr
-/// carries it on `pane get`); a resumed pane dying without a result means
-/// the stored id no longer restores a working session, so drop it rather
-/// than resume-loop on it forever.
+/// Keep the lane's resumable session id in sync with what the turn taught
+/// us. The truth lives on the pane row (`panes.agent_session_id`, issue
+/// lifetime) — the resume path reads only that. After every completed turn
+/// the primary source is a file scan of the worktree's transcripts
+/// (`agent_session::latest_session_id`, reliable and independent of agent
+/// self-reporting); the result file's self-report and the mux (herdr
+/// carries it on `pane get`) are fallbacks. `runs.agent_session_id` is
+/// still written for observability. A resumed pane dying without a result
+/// means the stored id no longer restores a working session, so drop it
+/// rather than resume-loop on it forever.
 async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
+    worktree: &Path,
     pane: &PaneId,
     ensured: &EnsuredPane,
     outcome: &TurnOutcome,
 ) -> Result<()> {
+    let role = role_for_loop(&run.loop_kind);
     match outcome {
         TurnOutcome::Completed(r) => {
-            let session_id = match &r.agent_session_id {
-                Some(id) => Some(id.clone()),
-                None => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+            let session_root = agent_session::session_root(&deps.config.agent);
+            let session_id = match agent_session::latest_session_id(&session_root, worktree) {
+                Some(id) => Some(id),
+                None => match &r.agent_session_id {
+                    Some(id) => Some(id.clone()),
+                    None => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+                },
             };
             if let Some(id) = session_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
             {
+                deps.store.save_pane_session(
+                    &deps.project.id,
+                    run.issue_number,
+                    role,
+                    Some(&id),
+                )?;
                 deps.store.update_run_agent_session(&run.id, Some(&id))?;
             }
         }
         TurnOutcome::PaneDied if ensured.resumed => {
+            deps.store
+                .save_pane_session(&deps.project.id, run.issue_number, role, None)?;
             deps.store.update_run_agent_session(&run.id, None)?;
             deps.store.emit(
                 Some(&run.id),

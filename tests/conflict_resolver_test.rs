@@ -128,7 +128,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
 fn create_resolver_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", conflict_resolver::KIND, 1, "Add feature (#9)")
+        .create_run_for_loop("proj", conflict_resolver::KIND, 9, "Add feature (#9)")
         .unwrap()
 }
 
@@ -357,7 +357,7 @@ async fn resolver_discovery_wants_conflicting_unclaimed_meguri_prs_only() {
     let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
-        vec![1],
+        vec![9],
         "only the open, unclaimed, unescalated meguri PR that conflicts is actionable"
     );
 }

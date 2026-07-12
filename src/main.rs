@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
         Command::Logs { run } => app::cmd_logs(&run).await,
-        Command::Attach { run } => app::cmd_attach(&run),
+        Command::Attach { run, review } => app::cmd_attach(&run, review),
         Command::Pause { run } => app::cmd_pause(&run),
         Command::Resume { run } => app::cmd_resume(&run),
         Command::Takeover { run } => app::cmd_takeover(&run),

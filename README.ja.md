@@ -80,7 +80,8 @@ meguri watch
 meguri ps                 # runs, interaction state, panes
 meguri logs <run>         # event trail + live pane tail
 meguri serve              # 読み取り専用 web ダッシュボード (http://127.0.0.1:8607)
-meguri attach <run>       # jump into the agent's pane
+meguri attach <issue>     # issue の agent pane に入る（run id も可）
+meguri attach <issue> --review  # reviewer の独立 pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -146,7 +147,20 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 **cleaner** ループは default branch の head を定期的に歩いて回り、蓄積した乖離 — spec と実装のずれ、dead code の候補、規約からの逸脱、置き去りの TODO、stale なリモートブランチ、孤児化した `meguri:working` ラベル — を `meguri:clean-report` ラベル付きの **1 本のレポート issue**（1 project = 1 issue）に書き留めます。修正は一切しません: 書き込みはこの issue の作成・更新だけで、push もブランチ操作も、他の issue / PR へのラベルやコメントもしません。本文は巡回のたびに完全に書き直されるスナップショットで、隠しマーカーの head sha により同じ head が二度走査されることはなく、head が進んでも `clean.interval_hours` を過ぎるまで次の巡回は走りません。検出項目を採用するなら通常の issue を切って `meguri:plan` / `meguri:ready` を付け、誤検知なら `clean.ignore` に部分文字列を足し、ループを止めたければレポート issue に `meguri:hold` を貼ってください。
 
-GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。 pane と worktree は issue 単位で生きます（1 issue = 1 pane。同じ issue の後続 run は生きている session を再利用）: watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。回収前にエージェントのネイティブ session id が保存されるので、`claude --resume <id>` で文脈ごと復帰できます。一発実行運用では `meguri prune` で同じ掃除ができます。
+GitHub 上のラベルとコメントが永続的なワークフロー状態です（looper の「Authority」原則）。ローカルの sqlite（`~/.meguri/meguri.sqlite`）は実行（run）の進行のみを追跡します。meguri はいつ kill しても構いません — `meguri watch` が復旧します: 生きている pane は再アダプトされ、死んだ run は最後にチェックポイントされたステップから再開されます。pane・claude session・worktree は **issue が寿命の単位**です — branch を編集するループ全員が共有する **author** pane が 1 枚（planner → worker/spec worker → fixer/ci fixer/conflict resolver が同じ live session で文脈を継ぐ）と、reviewer 専用の独立した **review** pane が 1 枚。turn が完了するたびにエージェントのネイティブ session id が issue の lane に保存されるので、idle 中に pane が死んでも次の run は同じ会話に `claude --resume <id>` で復帰します。watch 中は issue が close されると対応する pane・worktree・マージ済みローカルブランチが自動回収されます。一発実行運用では `meguri prune` で同じ掃除ができます。
+
+ループ別の寿命の一覧:
+
+| loop | trigger | 鍵 | worktree | 正常終了 | pane 後始末 |
+|---|---|---|---|---|---|
+| planner (author) | `meguri:plan` issue | issue | 新 branch | spec PR 作成 → `spec-reviewing` | keep |
+| reviewer (review) | `spec-reviewing` PR / head 未レビュー | issue + `review` | read-only detached（`review-<issue>` 固定） | clean → `spec-ready` / findings → 据置 | keep（独立） |
+| spec worker (author) | `spec-ready` PR | issue（branch 復元） | 既存 branch を継ぐ | 実装 → PR 更新 | keep・author pane を継ぐ |
+| worker (author) | `meguri:ready` issue | issue | 新 branch | PR `Closes #N` | keep |
+| fixer (author) | PR の未解決スレッド | issue（branch 復元） | PR head に attach | スレッドに再 review 依頼返信 | keep・author pane を継ぐ |
+| ci fixer (author) | meguri PR の CI 赤 | issue（branch 復元） | PR head に attach | fix push（≤3 round） | keep・author pane を継ぐ |
+| conflict resolver (author) | PR が Conflicting（≤3） | issue（branch 復元） | PR head に attach | base merge & 解消 → push | keep・author pane を継ぐ |
+| cleaner (standalone) | レポート issue + 既定 branch 前進 | レポート issue | read-only detached | 単一レポート issue 再生成 | 自前回収 |
 
 ## 設定
 
@@ -165,9 +179,10 @@ language = "日本語"
 [mux]
 kind = "auto"          # auto | herdr | tmux
 session = "meguri"     # herdr workspace label / tmux session name
-# pane は issue 単位（1 issue = 1 pane）で保持され、issue が close されると回収
-# されます。回収前にエージェントのネイティブ session id を保存（claude --resume <id>）。
-# "never" は run 終了と同時に pane を閉じます（高速大量運転向け）。
+# pane は issue 単位（author pane 1 枚 + review pane 1 枚）で保持され、issue が
+# close されると回収されます。回収前にエージェントのネイティブ session id を保存
+# （claude --resume <id>）。"never" は run 終了と同時に pane を閉じます（高速大量
+# 運転向け）。それ以外の値は設定読込時にエラーになります。
 keep_pane = "until-issue-closed"  # also: never
 
 [agent]

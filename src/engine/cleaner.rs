@@ -10,6 +10,12 @@
 //! dedup enough). Humans triage the report: real findings become regular
 //! issues for the existing loops, false positives go on the `clean.ignore`
 //! list, and `meguri:hold` on the report issue pauses the sweep.
+//!
+//! Lifetime (issue #92): standalone — keyed by the report issue (whose
+//! author lane no other loop ever touches), read-only detached worktree,
+//! and self-reclaiming: the report issue never closes, so the cleaner
+//! releases its own pane and worktree at the end of every sweep instead of
+//! leaving them to the reaper.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +30,7 @@ use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
-use crate::store::{RunRecord, RunStatus};
+use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for cleaner runs.
@@ -365,7 +371,13 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 // marker's `scanned` so retries are paced by the interval
                 // instead of the poll, then reclaim the pane and worktree (D9).
                 settle_skip(deps, &run, &cp).await;
-                super::reaper::release_pane(deps, run.issue_number, "cleaner sweep gave up").await;
+                super::reaper::release_pane(
+                    deps,
+                    run.issue_number,
+                    ROLE_AUTHOR,
+                    "cleaner sweep gave up",
+                )
+                .await;
                 remove_worktree_best_effort(deps, &run, &worktree).await;
                 return Ok(WorkerOutcome::Skipped(reason));
             }
@@ -378,7 +390,13 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         // The report issue never closes, so the reaper would keep this
         // pane and detached worktree forever — the cleaner reclaims them
         // itself (D9).
-        super::reaper::release_pane(deps, run.issue_number, "cleaner sweep finished").await;
+        super::reaper::release_pane(
+            deps,
+            run.issue_number,
+            ROLE_AUTHOR,
+            "cleaner sweep finished",
+        )
+        .await;
         remove_worktree_best_effort(deps, &run, &worktree).await;
         return Ok(WorkerOutcome::Succeeded {
             pr_url: format!("issue #{issue}"),

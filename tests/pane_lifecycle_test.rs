@@ -1,7 +1,8 @@
-//! Pane lifecycle tests (#13): 1 issue = 1 pane. Later runs on the same
-//! issue reuse the live pane, a moved worktree retires-and-respawns it (the
-//! session id saved first), and `keep_pane = "never"` releases it as soon as
-//! the run succeeds.
+//! Pane lifecycle tests (#13, #92): the issue is the unit of lifetime — one
+//! author pane shared by every branch-editing loop. Later runs on the same
+//! issue (same loop or a fixer-family one) reuse the live pane, a moved
+//! worktree retires-and-respawns it (the session id saved first), and
+//! `keep_pane = "never"` releases it as soon as the run succeeds.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneId;
 use meguri::mux::fake::FakeMux;
-use meguri::store::Store;
+use meguri::store::{ROLE_AUTHOR, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -284,7 +285,12 @@ async fn second_run_on_same_issue_reuses_live_pane() {
 
     // keep_pane default (until-issue-closed): the pane survives success.
     assert_eq!(env.mux.pane_count(), 1);
-    let pane = env.deps.store.get_pane("proj", 7).unwrap().unwrap();
+    let pane = env
+        .deps
+        .store
+        .get_pane("proj", 7, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
     let pane_id = PaneId(pane.mux_pane_id.clone().unwrap());
     assert!(env.deps.mux.pane_alive(&pane_id).await.unwrap());
 
@@ -323,7 +329,12 @@ async fn keep_pane_never_releases_pane_after_success() {
     drive_to_success(&env, &flavor).await;
     agent.abort();
 
-    let pane = env.deps.store.get_pane("proj", 7).unwrap().unwrap();
+    let pane = env
+        .deps
+        .store
+        .get_pane("proj", 7, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
     assert_eq!(pane.mux_pane_id, None, "pane released at run end");
     assert_eq!(
         pane.agent_session_id.as_deref(),
@@ -350,7 +361,7 @@ async fn moved_worktree_retires_old_pane_and_respawns() {
     let first_pane = PaneId(
         env.deps
             .store
-            .get_pane("proj", 7)
+            .get_pane("proj", 7, ROLE_AUTHOR)
             .unwrap()
             .unwrap()
             .mux_pane_id
@@ -369,7 +380,12 @@ async fn moved_worktree_retires_old_pane_and_respawns() {
 
     assert_eq!(env.mux.pane_count(), 2, "old retired, new spawned");
     assert!(!env.deps.mux.pane_alive(&first_pane).await.unwrap());
-    let pane = env.deps.store.get_pane("proj", 7).unwrap().unwrap();
+    let pane = env
+        .deps
+        .store
+        .get_pane("proj", 7, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
     let new_id = pane.mux_pane_id.expect("new pane registered");
     assert_ne!(new_id, first_pane.0);
     assert!(
@@ -380,5 +396,53 @@ async fn moved_worktree_retires_old_pane_and_respawns() {
         pane.agent_session_id.as_deref(),
         Some("sess-first"),
         "old pane's session saved on retirement"
+    );
+}
+
+/// Acceptance (issue #92): a fixer-family run on the same issue joins the
+/// author lane — it adopts the worker's live pane instead of spawning its
+/// own, so the implementation session continues.
+#[tokio::test(flavor = "multi_thread")]
+async fn fixer_family_run_adopts_the_workers_author_pane() {
+    let env = setup().await;
+    let flavor = FixedBranchFlavor {
+        branch: "meguri/7-fixed".into(),
+    };
+    let agent = spawn_scripted_agent(env.worktree_root.clone());
+
+    // Round 1: the worker ships the issue (create_run → loop_kind "worker").
+    drive_to_success(&env, &flavor).await;
+    let pane = env
+        .deps
+        .store
+        .get_pane("proj", 7, ROLE_AUTHOR)
+        .unwrap()
+        .unwrap();
+    let pane_id = pane.mux_pane_id.expect("worker pane registered");
+
+    // Round 2: review feedback arrives — a fixer run on the same issue and
+    // branch (the flow under test is ensure_pane's lane key, so the
+    // worker-shaped flavor stands in for the fixer's).
+    let run = env
+        .deps
+        .store
+        .create_run_for_loop("proj", "fixer", 7, "Add greeting file")
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        flow::run_flow(&env.deps, &run.id, &flavor),
+    )
+    .await
+    .expect("fixer run timed out")
+    .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    assert_eq!(env.mux.pane_count(), 1, "no second pane for the same lane");
+    let rec = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(
+        rec.mux_pane_id.as_deref(),
+        Some(pane_id.as_str()),
+        "the fixer run adopted the worker's pane"
     );
 }
