@@ -89,7 +89,8 @@ impl Scheduler {
             }
 
             // Ride the poll: reclaim panes and worktrees whose issue closed
-            // (1 issue = 1 pane; both live until the issue closes, #13).
+            // (the issue is the unit of lifetime — one author pane plus one
+            // review pane per issue, kept until it closes; #13, #92).
             // Runs on the first tick too, i.e. as startup recovery.
             for deps in &self.projects {
                 if let Err(e) = super::reaper::sweep(deps).await {

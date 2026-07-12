@@ -17,7 +17,7 @@ use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_SPEC_REVIEWING,
-    LABEL_WORKING,
+    LABEL_SPECCING, LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -277,8 +277,8 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
         prs[0].labels
     );
 
-    // Label transition on the issue: plan (and the claim) are gone, no
-    // escalation.
+    // Phase transition on the issue (ADR 0005): plan (and the claim) are gone,
+    // the phase moved to speccing (a spec PR is now open), no escalation.
     let labels = env.forge.labels_of(5);
     assert!(
         !labels.contains(&LABEL_PLAN.to_string()),
@@ -286,6 +286,10 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
+    assert!(
+        labels.contains(&LABEL_SPECCING.to_string()),
+        "issue must carry {LABEL_SPECCING} after the spec PR opens: {labels:?}"
+    );
 
     // The prompt asked for a spec, not an implementation.
     let wt = find_worktree(&env.worktree_root).unwrap();

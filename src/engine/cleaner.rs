@@ -10,6 +10,12 @@
 //! dedup enough). Humans triage the report: real findings become regular
 //! issues for the existing loops, false positives go on the `clean.ignore`
 //! list, and `meguri:hold` on the report issue pauses the sweep.
+//!
+//! Lifetime (issue #92): standalone — keyed by the report issue (whose
+//! author lane no other loop ever touches), read-only detached worktree,
+//! and self-reclaiming: the report issue never closes, so the cleaner
+//! releases its own pane and worktree at the end of every sweep instead of
+//! leaving them to the reaper.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +30,7 @@ use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
-use crate::store::{RunRecord, RunStatus};
+use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for cleaner runs.
@@ -176,11 +182,28 @@ pub struct OrphanWorking {
     pub title: String,
 }
 
+/// An open issue that violates the ADR 0005 phase-label invariant (a
+/// meguri-engaged open issue carries exactly one phase label): either it has
+/// two or more phase labels (a swap that dropped the old one), or it has a
+/// ball label (`working` / `needs-human`) with no phase label at all (engaged
+/// but its phase went missing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseLabelAnomaly {
+    pub number: i64,
+    pub title: String,
+    /// The phase labels found on the issue (0, or 2+ for an anomaly).
+    pub phases: Vec<String>,
+    /// Whether a ball label is present (only meaningful when `phases` is empty).
+    pub has_ball: bool,
+}
+
 /// Results of the settle-step machine checks (no agent involved).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MachineFindings {
     pub stale_branches: Vec<StaleBranch>,
     pub orphan_working: Vec<OrphanWorking>,
+    #[serde(default)]
+    pub phase_label_anomaly: Vec<PhaseLabelAnomaly>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -365,7 +388,13 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 // marker's `scanned` so retries are paced by the interval
                 // instead of the poll, then reclaim the pane and worktree (D9).
                 settle_skip(deps, &run, &cp).await;
-                super::reaper::release_pane(deps, run.issue_number, "cleaner sweep gave up").await;
+                super::reaper::release_pane(
+                    deps,
+                    run.issue_number,
+                    ROLE_AUTHOR,
+                    "cleaner sweep gave up",
+                )
+                .await;
                 remove_worktree_best_effort(deps, &run, &worktree).await;
                 return Ok(WorkerOutcome::Skipped(reason));
             }
@@ -378,7 +407,13 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         // The report issue never closes, so the reaper would keep this
         // pane and detached worktree forever — the cleaner reclaims them
         // itself (D9).
-        super::reaper::release_pane(deps, run.issue_number, "cleaner sweep finished").await;
+        super::reaper::release_pane(
+            deps,
+            run.issue_number,
+            ROLE_AUTHOR,
+            "cleaner sweep finished",
+        )
+        .await;
         remove_worktree_best_effort(deps, &run, &worktree).await;
         return Ok(WorkerOutcome::Succeeded {
             pr_url: format!("issue #{issue}"),
@@ -750,7 +785,69 @@ async fn machine_findings(deps: &Deps, head_sha: &str, cfg: &CleanConfig) -> Mac
         Ok(orphans) => machine.orphan_working = orphans,
         Err(e) => tracing::warn!("orphan-working check failed: {e:#}"),
     }
+    match phase_label_anomaly(deps).await {
+        Ok(anomalies) => machine.phase_label_anomaly = anomalies,
+        Err(e) => tracing::warn!("phase-label anomaly check failed: {e:#}"),
+    }
     machine
+}
+
+/// The four phase labels (ADR 0005, axis 1). A meguri-engaged open issue must
+/// carry exactly one of them.
+const PHASE_LABELS: [&str; 4] = [
+    forge::LABEL_PLAN,
+    forge::LABEL_SPECCING,
+    forge::LABEL_READY,
+    forge::LABEL_IMPLEMENTING,
+];
+
+/// The ball labels (ADR 0005, axis 2) that imply meguri is engaged, so a
+/// phase label should be present.
+const BALL_LABELS: [&str; 2] = [forge::LABEL_WORKING, forge::LABEL_NEEDS_HUMAN];
+
+/// Open issues violating the ADR 0005 phase-label invariant: two or more phase
+/// labels (a swap that dropped the old one), or a ball label with no phase
+/// label (engaged but the phase went missing). Report-only, like every cleaner
+/// check (write boundary = the report issue, ADR 0003). Unlike `orphan_working`
+/// this is NOT an "active run behind it" check: phase labels are not claim
+/// markers — they live until the issue closes — so the orphan logic would
+/// always misfire; the invariant itself is inspected instead. `hold` is a ball
+/// label like the others (`hold` alone with no phase reads as "engaged but
+/// phase missing"), so it is deliberately excluded — a human-held issue with no
+/// phase is a legitimate pause, not a swap bug.
+async fn phase_label_anomaly(deps: &Deps) -> Result<Vec<PhaseLabelAnomaly>> {
+    // Gather every open issue carrying any phase or ball label. Each returned
+    // Issue carries its full label set, so one pass per label suffices to
+    // classify it — and the ball-label passes are what surface an issue that
+    // has a ball but zero phase labels (it appears under no phase query).
+    let mut seen: std::collections::HashMap<i64, forge::Issue> = std::collections::HashMap::new();
+    for label in PHASE_LABELS.iter().chain(BALL_LABELS.iter()) {
+        for issue in deps.forge.list_issues_with_label(label).await? {
+            seen.entry(issue.number).or_insert(issue);
+        }
+    }
+
+    let mut anomalies: Vec<PhaseLabelAnomaly> = seen
+        .into_values()
+        .filter_map(|issue| {
+            let phases: Vec<String> = PHASE_LABELS
+                .iter()
+                .filter(|p| issue.has_label(p))
+                .map(|p| p.to_string())
+                .collect();
+            let has_ball = BALL_LABELS.iter().any(|b| issue.has_label(b));
+            let anomalous = phases.len() >= 2 || (phases.is_empty() && has_ball);
+            anomalous.then_some(PhaseLabelAnomaly {
+                number: issue.number,
+                title: issue.title,
+                phases,
+                has_ball,
+            })
+        })
+        .collect();
+    // Deterministic order for a stable report body across sweeps.
+    anomalies.sort_by_key(|a| a.number);
+    Ok(anomalies)
 }
 
 /// Remote branches that are merged into the swept head or whose last commit
@@ -861,6 +958,11 @@ pub fn render_report(
         .iter()
         .filter(|o| !ignored(ignore, &[&format!("#{}", o.number)]))
         .collect();
+    let phase_anomalies: Vec<&PhaseLabelAnomaly> = machine
+        .phase_label_anomaly
+        .iter()
+        .filter(|a| !ignored(ignore, &[&format!("#{}", a.number)]))
+        .collect();
 
     let short = head.get(..12).unwrap_or(head);
     let mut body = format!(
@@ -895,7 +997,7 @@ pub fn render_report(
     }
 
     body.push_str("\n## Machine checks\n");
-    if stale.is_empty() && orphans.is_empty() {
+    if stale.is_empty() && orphans.is_empty() && phase_anomalies.is_empty() {
         body.push_str("\n_Nothing flagged._\n");
     }
     if !stale.is_empty() {
@@ -917,6 +1019,21 @@ pub fn render_report(
         for o in &orphans {
             let kind = if o.is_pr { "PR" } else { "issue" };
             body.push_str(&format!("- {kind} #{} — {}\n", o.number, o.title));
+        }
+    }
+    if !phase_anomalies.is_empty() {
+        body.push_str("\n### Phase-label anomalies _(high confidence)_\n");
+        for a in &phase_anomalies {
+            let detail = if a.phases.len() >= 2 {
+                format!(
+                    "carries {} phase labels ({})",
+                    a.phases.len(),
+                    a.phases.join(", ")
+                )
+            } else {
+                "has a ball label but no phase label".to_string()
+            };
+            body.push_str(&format!("- issue #{} — {detail}: {}\n", a.number, a.title));
         }
     }
 
@@ -1079,6 +1196,23 @@ mod tests {
                 is_pr: false,
                 title: "left behind".into(),
             }],
+            phase_label_anomaly: vec![
+                PhaseLabelAnomaly {
+                    number: 30,
+                    title: "double phase".into(),
+                    phases: vec![
+                        forge::LABEL_SPECCING.to_string(),
+                        forge::LABEL_IMPLEMENTING.to_string(),
+                    ],
+                    has_ball: false,
+                },
+                PhaseLabelAnomaly {
+                    number: 31,
+                    title: "ball no phase".into(),
+                    phases: Vec::new(),
+                    has_ball: true,
+                },
+            ],
         }
     }
 
@@ -1101,6 +1235,9 @@ mod tests {
         assert!(body.contains("### Stale branches"));
         assert!(body.contains("`meguri/old-thing` — last commit 45 days ago"));
         assert!(body.contains("issue #12 — left behind"));
+        assert!(body.contains("### Phase-label anomalies"));
+        assert!(body.contains("issue #30 — carries 2 phase labels"));
+        assert!(body.contains("issue #31 — has a ball label but no phase label"));
         assert!(body.contains("clean.ignore"));
         // Empty categories render no heading.
         assert!(!body.contains("### Dead-code"));
@@ -1156,6 +1293,7 @@ mod tests {
                 merged: true,
             }],
             orphan_working: Vec::new(),
+            phase_label_anomaly: Vec::new(),
         };
         let body = render_report("h", 1, "now", &[], &machine, &[]);
         assert!(body.contains("`merged-one` — merged into the default branch"));

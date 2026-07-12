@@ -9,7 +9,7 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::scheduler::{Reload, Scheduler};
 use meguri::engine::{Deps, Loop, Target, WorkerOutcome, default_loops};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
+use meguri::forge::{Forge, LABEL_IMPLEMENTING, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -177,9 +177,15 @@ async fn watch_discovers_and_completes_labeled_issue() {
     agent.abort();
 
     assert_eq!(forge.prs().len(), 1);
+    // Phase transition (ADR 0005): ready/working gone, implementing applied —
+    // the issue is no longer untriaged, it is "implementation PR open".
     let labels = forge.labels_of(11);
     assert!(!labels.contains(&LABEL_READY.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(
+        labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "issue must carry {LABEL_IMPLEMENTING} after the PR opens: {labels:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

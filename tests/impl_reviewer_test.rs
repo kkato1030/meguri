@@ -282,14 +282,16 @@ async fn findings_create_inline_threads_that_feed_the_fixer() {
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
 
     // The ping-pong connection: the fixer discovers this PR from the
-    // AI-created thread, exactly as it would from a human's.
+    // AI-created thread, exactly as it would from a human's. Its target is
+    // keyed by the PR's canonical issue (recovered from the `meguri/7-…`
+    // head branch, issue #7), not the PR number.
     let fixer_targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         fixer_targets
             .iter()
             .map(|t| t.issue_number)
             .collect::<Vec<_>>(),
-        vec![PR]
+        vec![7]
     );
 
     // The agent reviewed the PR head: detached checkout at the head sha,

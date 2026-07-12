@@ -20,6 +20,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("migrations/0003_agent_session.sql"),
     ),
     ("0004_panes", include_str!("migrations/0004_panes.sql")),
+    (
+        "0005_agent_profile",
+        include_str!("migrations/0005_agent_profile.sql"),
+    ),
+    (
+        "0006_pane_role",
+        include_str!("migrations/0006_pane_role.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

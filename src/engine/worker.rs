@@ -2,6 +2,12 @@
 //! turns in a mux pane → verified commits → implementation PR. The heavy
 //! lifting lives in [`super::flow`]; this module only plugs in the
 //! worker-specific label, prompt, and PR shape.
+//!
+//! Lifetime (issue #92): keyed by the issue, new branch and worktree, pane
+//! in the issue's author lane — kept after success and shared with every
+//! later loop on the same branch (fixer, ci-fixer, conflict resolver), so
+//! the implementation context continues; the reaper reclaims it when the
+//! issue closes.
 
 use std::path::Path;
 
@@ -99,7 +105,16 @@ impl Flavor for WorkerFlavor {
         format!("{} (#{})", cp.issue_title, run.issue_number)
     }
 
+    /// Phase transition (ADR 0005): the issue's `meguri:ready` becomes
+    /// `meguri:implementing` — the implementation PR is now open. The
+    /// `implementing` label is load-bearing (it backs the "unlabeled =
+    /// untriaged" invariant), so failing to apply it fails the run instead of
+    /// dropping the issue to unlabeled; the `ready` / `working` removals stay
+    /// best-effort like every other claim release.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
+        deps.forge
+            .add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
+            .await?;
         deps.forge
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await

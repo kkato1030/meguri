@@ -16,6 +16,12 @@
 //! enforces it), so `docs/specs/` never accumulates on the default branch
 //! (issue #48). Durable knowledge lives in ADRs / domain docs instead — the
 //! planner's prompt routes it there.
+//!
+//! Lifetime (issue #92): keyed by the issue (branch-encoded), worktree
+//! attached to the spec PR's existing branch, pane in the issue's author
+//! lane — normally the planner's own pane, adopted live or resumed via the
+//! saved session id, so the plan's context carries into implementation;
+//! kept after success, reclaimed when the issue closes.
 
 use std::path::Path;
 
@@ -24,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 pub use super::WorkerOutcome;
-use super::flow::{self, Checkpoint, Flavor, PreparedWork};
+use super::flow::{self, Checkpoint, Flavor, PreparedWork, claimed_pr};
 use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
@@ -97,15 +103,6 @@ async fn spec_ready_pr(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
         .find(|pr| pr.state == "open" && gitops::issue_from_branch(&pr.head_branch) == Some(issue)))
 }
 
-/// The PR this run claimed, from its persisted checkpoint (release/escalate
-/// hooks get the run record as of drive start, so re-read the store).
-fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
-    let run = deps.store.get_run(run_id).ok().flatten()?;
-    serde_json::from_str::<Checkpoint>(&run.checkpoint_json)
-        .ok()
-        .and_then(|cp| cp.pr_number)
-}
-
 struct SpecWorkerFlavor;
 
 #[async_trait]
@@ -154,6 +151,22 @@ impl Flavor for SpecWorkerFlavor {
             "pr.claimed",
             json!({ "pr": pr.number, "issue": run.issue_number }),
         )?;
+
+        // Phase flip on the issue (ADR 0005): implementation has begun, so the
+        // issue moves from `meguri:speccing` to `meguri:implementing`. Flipping
+        // at claim time (not at settle) means an in-implementation escalation
+        // leaves `implementing` + `needs-human` — "stuck in implementation" —
+        // instead of `speccing`, which would read as "stuck in spec". add/
+        // remove are idempotent, so a resumed run re-running this is safe. The
+        // add is load-bearing (the unlabeled = untriaged invariant); the remove
+        // is best-effort.
+        deps.forge
+            .add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
+            .await?;
+        deps.forge
+            .remove_label(run.issue_number, forge::LABEL_SPECCING)
+            .await
+            .ok();
 
         // The prompt carries the issue (what to build) plus the spec (how).
         let issue = deps.forge.get_issue(run.issue_number).await?;

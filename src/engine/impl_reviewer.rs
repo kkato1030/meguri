@@ -336,7 +336,13 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
         .remove_pr_label(run.issue_number, forge::LABEL_WORKING)
         .await
         .ok();
-    super::reaper::release_pane(deps, run.issue_number, "stopped by user").await;
+    super::reaper::release_pane(
+        deps,
+        run.issue_number,
+        super::role_for_loop(&run.loop_kind),
+        "stopped by user",
+    )
+    .await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }

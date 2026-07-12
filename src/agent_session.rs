@@ -8,11 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::AgentConfig;
+use crate::config::AgentProfile;
 
 /// Where the agent keeps its session transcripts: the configured override,
 /// else `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-pub fn session_root(agent: &AgentConfig) -> PathBuf {
+pub fn session_root(agent: &AgentProfile) -> PathBuf {
     if let Some(dir) = &agent.session_dir {
         return dir.clone();
     }
@@ -93,9 +93,9 @@ mod tests {
 
     #[test]
     fn session_root_prefers_configured_override() {
-        let agent = AgentConfig {
+        let agent = AgentProfile {
             session_dir: Some(PathBuf::from("/custom/claude")),
-            ..AgentConfig::default()
+            ..AgentProfile::default()
         };
         assert_eq!(session_root(&agent), PathBuf::from("/custom/claude"));
     }
