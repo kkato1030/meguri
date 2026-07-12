@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::{
-    AgentState, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId, PaneSpec,
-    tail_looks_blocked,
+    AgentState, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult, PaneId,
+    PaneSpec, Split, tail_looks_blocked,
 };
 
 /// How long the screen must stay unchanged before we call the agent Idle/Blocked.
@@ -231,6 +231,63 @@ impl Multiplexer for TmuxMux {
         format!(
             "tmux select-window -t {pane} \\; attach -t {session}",
             pane = pane.0,
+            session = self.session
+        )
+    }
+
+    /// Reuse the dashboard window with this name if one already exists in the
+    /// meguri session, else create it. `join-pane` + `select-layout tiled`
+    /// gives the same tiled view as herdr's `pane move`.
+    async fn ensure_dashboard(&self, label: &str) -> MuxResult<DashboardId> {
+        self.ensure_session().await?;
+        let list = self
+            .tmux(&[
+                "list-windows",
+                "-t",
+                &self.session,
+                "-F",
+                "#{window_name}\t#{window_id}",
+            ])
+            .await?;
+        for line in list.lines() {
+            if let Some((name, id)) = line.split_once('\t')
+                && name == label
+            {
+                return Ok(DashboardId(id.to_string()));
+            }
+        }
+        let id = self
+            .tmux(&[
+                "new-window",
+                "-t",
+                &self.session,
+                "-n",
+                label,
+                "-P",
+                "-F",
+                "#{window_id}",
+            ])
+            .await?;
+        Ok(DashboardId(id))
+    }
+
+    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
+        // -h/-v pick the initial split; `select-layout tiled` then reflows all
+        // panes uniformly, so repeated joins stay readable.
+        let flag = match dir {
+            Split::Right => "-h",
+            Split::Down => "-v",
+        };
+        self.tmux(&["join-pane", flag, "-s", &pane.0, "-t", &into.0])
+            .await?;
+        let _ = self.tmux(&["select-layout", "-t", &into.0, "tiled"]).await;
+        Ok(())
+    }
+
+    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
+        format!(
+            "tmux select-window -t {win} \\; attach -t {session}",
+            win = dashboard.0,
             session = self.session
         )
     }

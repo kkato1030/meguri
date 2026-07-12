@@ -328,6 +328,171 @@ pub fn cmd_ps(all: bool) -> Result<()> {
     Ok(())
 }
 
+/// Label of the herdr tab / tmux window `meguri top` tiles panes into.
+const TOP_DASHBOARD_LABEL: &str = "meguri:top";
+
+/// One row of the `meguri top` status header — one active run and its pane.
+struct TopRow {
+    run_id: String,
+    project: String,
+    issue: i64,
+    interaction: &'static str,
+    agent: &'static str,
+    pane: String,
+    awaiting_human: bool,
+}
+
+/// A rendered snapshot of the dashboard for one refresh tick.
+struct TopStatus {
+    watch_alive: bool,
+    rows: Vec<TopRow>,
+}
+
+/// Freshness window for the watch heartbeat: two poll ticks plus slack, so a
+/// single slow tick doesn't flap the liveness indicator. Mirrors the retired
+/// `serve` dashboard (ADR 0002) — the heartbeat's only reader now.
+fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
+    let Some(then) = crate::store::parse_ts(ts) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    now.saturating_sub(then) < poll_interval_secs * 2 + 30
+}
+
+/// One refresh: tile any newly-appeared live run panes into the dashboard and
+/// collect the status rows. `tiled` remembers panes already moved so each is
+/// joined exactly once; dead/finished panes are pruned so a reused pane id
+/// re-tiles cleanly. Runs on a different mux than the one we drive are skipped.
+async fn top_refresh(
+    store: &Store,
+    mux: &Arc<dyn mux::Multiplexer>,
+    dashboard: &mux::DashboardId,
+    tiled: &mut std::collections::HashSet<String>,
+    poll_interval_secs: u64,
+) -> Result<TopStatus> {
+    let runs = store.list_runs(true)?;
+    let kind = mux.kind().as_str();
+    let mut rows = Vec::new();
+    let mut live_panes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for run in &runs {
+        let (Some(rk), Some(pid)) = (run.mux_kind.as_deref(), run.mux_pane_id.as_deref()) else {
+            continue;
+        };
+        if rk != kind {
+            continue;
+        }
+        live_panes.insert(pid.to_string());
+        let pane = mux::PaneId(pid.to_string());
+        let alive = mux.pane_alive(&pane).await.unwrap_or(false);
+        if alive
+            && !tiled.contains(pid)
+            && mux
+                .tile_pane(&pane, dashboard, mux::Split::Down)
+                .await
+                .is_ok()
+        {
+            tiled.insert(pid.to_string());
+        }
+        let agent = if alive {
+            mux.agent_state(&pane)
+                .await
+                .unwrap_or(mux::AgentState::Unknown)
+        } else {
+            mux::AgentState::Unknown
+        };
+        let awaiting_human =
+            run.interaction_state == Some(crate::store::InteractionState::AwaitingHuman);
+        rows.push(TopRow {
+            run_id: run.id.clone(),
+            project: run.project_id.clone(),
+            issue: run.issue_number,
+            interaction: run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
+            agent: agent.as_str(),
+            pane: pid.to_string(),
+            awaiting_human,
+        });
+    }
+
+    // Forget panes whose run is no longer active: herdr/tmux reflow on close,
+    // and a later reuse of the id must tile again.
+    tiled.retain(|id| live_panes.contains(id));
+
+    let watch_alive = store
+        .latest_heartbeat("watch")?
+        .map(|ts| heartbeat_alive(&ts, poll_interval_secs))
+        .unwrap_or(false);
+    Ok(TopStatus { watch_alive, rows })
+}
+
+/// Render the status header printed above the tiled panes each tick.
+fn render_top(status: &TopStatus, attach_hint: &str) -> String {
+    let awaiting = status.rows.iter().filter(|r| r.awaiting_human).count();
+    let mut out = String::new();
+    // Clear screen + home cursor so the header refreshes in place.
+    out.push_str("\x1b[2J\x1b[H");
+    out.push_str(&format!(
+        "meguri top — {} run(s) · {} awaiting human · watch {}\n",
+        status.rows.len(),
+        awaiting,
+        if status.watch_alive {
+            "live"
+        } else {
+            "stale ⚠"
+        },
+    ));
+    if status.rows.is_empty() {
+        out.push_str("\nno active runs — start one with `meguri watch` or `meguri run`\n");
+    } else {
+        out.push_str(&format!(
+            "\n{:<14} {:<8} {:>6}  {:<16} {:<9} PANE\n",
+            "RUN", "PROJECT", "ISSUE", "INTERACTION", "AGENT"
+        ));
+        for r in &status.rows {
+            // Flag awaiting-human runs so a human eye lands on them first.
+            let marker = if r.awaiting_human { "▶ " } else { "  " };
+            out.push_str(&format!(
+                "{marker}{:<12} {:<8} {:>6}  {:<16} {:<9} {}\n",
+                r.run_id,
+                r.project,
+                format!("#{}", r.issue),
+                r.interaction,
+                r.agent,
+                r.pane,
+            ));
+        }
+    }
+    out.push_str(&format!("\nview tiles: {attach_hint}\n"));
+    out
+}
+
+/// `meguri top` — tile the live agent panes into one mux tab and keep a status
+/// header refreshed above them. The layout commands only move panes between
+/// containers, so the orchestrator keeps driving each pane by id and the watch
+/// loop's prompt injection / result verification continue uninterrupted.
+pub async fn cmd_top(mux_override: Option<&str>, interval_secs: u64) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let mux = mux::detect(mux_override.unwrap_or(&cfg.mux.kind), &cfg.mux.session)?;
+    mux.ensure_session().await?;
+    let dashboard = mux.ensure_dashboard(TOP_DASHBOARD_LABEL).await?;
+    let attach_hint = mux.dashboard_attach_command(&dashboard);
+
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let poll = cfg.scheduler.poll_interval_secs;
+    let mut tiled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let status = top_refresh(&store, &mux, &dashboard, &mut tiled, poll).await?;
+        print!("{}", render_top(&status, &attach_hint));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        tokio::time::sleep(interval).await;
+    }
+}
+
 pub async fn cmd_logs(needle: &str) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
@@ -489,4 +654,65 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
     store.emit(Some(&run.id), "run.cancelled", serde_json::json!({}))?;
     println!("run {} cancelled", run.id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::now;
+
+    #[test]
+    fn heartbeat_freshness_window() {
+        // Fresh beat within two poll ticks + slack reads live.
+        assert!(heartbeat_alive(&now(), 60));
+        // Ancient and unparseable both read stale, never live.
+        assert!(!heartbeat_alive("2000-01-01T00:00:00Z", 60));
+        assert!(!heartbeat_alive("garbage", 60));
+    }
+
+    #[test]
+    fn render_top_flags_awaiting_and_watch_liveness() {
+        let status = TopStatus {
+            watch_alive: false,
+            rows: vec![
+                TopRow {
+                    run_id: "run-aaaa".into(),
+                    project: "demo".into(),
+                    issue: 42,
+                    interaction: "agent_working",
+                    agent: "working",
+                    pane: "wD:p1".into(),
+                    awaiting_human: false,
+                },
+                TopRow {
+                    run_id: "run-bbbb".into(),
+                    project: "demo".into(),
+                    issue: 43,
+                    interaction: "awaiting_human",
+                    agent: "blocked",
+                    pane: "wD:p2".into(),
+                    awaiting_human: true,
+                },
+            ],
+        };
+        let out = render_top(&status, "herdr tab focus wD:t9; herdr");
+        assert!(out.contains("2 run(s)"));
+        assert!(out.contains("1 awaiting human"));
+        assert!(out.contains("stale"), "watch liveness must show stale");
+        assert!(out.contains("▶ run-bbbb"), "awaiting run gets a marker");
+        assert!(out.contains("#42"));
+        assert!(out.contains("herdr tab focus wD:t9"));
+    }
+
+    #[test]
+    fn render_top_handles_no_runs() {
+        let status = TopStatus {
+            watch_alive: true,
+            rows: vec![],
+        };
+        let out = render_top(&status, "echo attach");
+        assert!(out.contains("0 run(s)"));
+        assert!(out.contains("no active runs"));
+        assert!(out.contains("watch live"));
+    }
 }

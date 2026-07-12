@@ -78,6 +78,7 @@ meguri run --project myproj --issue 42
 meguri watch
 
 meguri ps                 # runs, interaction state, panes
+meguri top                # tile live agent panes into one mux tab — a dashboard
 meguri logs <run>         # event trail + live pane tail
 meguri attach <run>       # jump into the agent's pane
 meguri pause <run>        # stop injecting prompts; pane stays alive

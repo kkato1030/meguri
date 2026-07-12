@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use meguri::mux::{AgentState, Multiplexer, MuxError, PaneId, PaneSpec, herdr::HerdrMux};
+use meguri::mux::{AgentState, Multiplexer, MuxError, PaneId, PaneSpec, Split, herdr::HerdrMux};
 
 fn herdr_enabled() -> bool {
     std::env::var("MEGURI_TEST_HERDR").as_deref() == Ok("1") && HerdrMux::socket_live()
@@ -185,6 +185,63 @@ async fn herdr_wait_state_detects_transition_faster_than_poll_interval() {
 
     // The event-fed cache now serves agent_state without a round trip.
     assert_eq!(mux.agent_state(&pane).await.unwrap(), AgentState::Working);
+
+    mux.kill_pane(&pane).await.unwrap();
+    cleanup_workspace(&label).await;
+}
+
+/// Acceptance (#96): tiling a pane into a `meguri top` dashboard tab must keep
+/// its process live and driveable — herdr `pane move` relocates the pane, it
+/// does not restart it. Confirms the D1 premise on real herdr.
+#[tokio::test]
+async fn herdr_tile_pane_preserves_live_process() {
+    if !herdr_enabled() {
+        eprintln!("skipping: set MEGURI_TEST_HERDR=1 with a live herdr server");
+        return;
+    }
+    let label = format!("meguri-test-top-{}", std::process::id());
+    let mux = HerdrMux::new(&label);
+    let dir = tempfile::tempdir().unwrap();
+
+    let pane = mux
+        .spawn_pane(&PaneSpec {
+            title: "tile".into(),
+            cwd: dir.path().to_path_buf(),
+            command: vec![
+                "bash".into(),
+                fake_agent_path().to_string_lossy().to_string(),
+            ],
+            env: vec![],
+        })
+        .await
+        .expect("spawn pane");
+
+    // Banner appears in the pane's original tab.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(mux.pane_alive(&pane).await.unwrap());
+
+    // Move the live pane into the dashboard tab.
+    let dashboard = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
+    mux.tile_pane(&pane, &dashboard, Split::Down)
+        .await
+        .expect("tile pane");
+
+    // The process survived the move: still alive and still driveable by id.
+    assert!(
+        mux.pane_alive(&pane).await.unwrap(),
+        "pane died on move — pane move must preserve the process"
+    );
+    mux.send_line(&pane, "work 1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let tail = mux.read_tail(&pane, 30).await.unwrap();
+    assert!(
+        tail.iter().any(|l| l.contains("working... step")),
+        "moved pane no longer responds to input: {tail:?}"
+    );
+
+    // Idempotent dashboard: a second ensure returns the same tab.
+    let again = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
+    assert_eq!(again, dashboard, "ensure_dashboard must reuse the tab");
 
     mux.kill_pane(&pane).await.unwrap();
     cleanup_workspace(&label).await;

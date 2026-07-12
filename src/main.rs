@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
             mux,
         } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
+        Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::Logs { run } => app::cmd_logs(&run).await,
         Command::Attach { run } => app::cmd_attach(&run),
         Command::Pause { run } => app::cmd_pause(&run),
