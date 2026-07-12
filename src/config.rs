@@ -238,7 +238,10 @@ pub struct MuxConfig {
     /// "auto" | "herdr" | "tmux"
     #[serde(default = "default_mux_kind")]
     pub kind: String,
-    /// mux session name that holds all meguri panes
+    /// Base mux label. Each project's panes live in a per-project workspace
+    /// derived from it — `<session>:<project>` (herdr) / `<session>-<project>`
+    /// (tmux) — while the bare `<session>` is the cross-project `meguri top`
+    /// view. Fixed for the daemon's lifetime (see `ConfigReloader`).
     #[serde(default = "default_session")]
     pub session: String,
     /// Pane lifetime policy: "until-issue-closed" (default — the reaper

@@ -207,7 +207,9 @@ impl Scheduler {
             }
             let pane_alive = match (&run.mux_kind, &run.mux_pane_id) {
                 (Some(kind), Some(pane)) => {
-                    match crate::mux::from_kind(kind, &self.projects[0].config.mux.session) {
+                    // Only checks liveness by pane id — session-independent, so
+                    // the base label (project = None) is sufficient.
+                    match crate::mux::from_kind(kind, &self.projects[0].config.mux.session, None) {
                         Ok(mux) => mux.pane_alive(&PaneId(pane.clone())).await.unwrap_or(false),
                         Err(_) => false,
                     }

@@ -17,6 +17,35 @@ use super::{
 /// megabytes; the failure is almost always at the tail).
 const FAILED_LOG_TAIL_LINES: usize = 200;
 
+/// The generic color for a meguri label with no scheme entry.
+const DEFAULT_LABEL_COLOR: &str = "1D76DB";
+
+/// Scheme color (hex, no `#`) and description for a known meguri label — the
+/// color encodes the two-axis model (ADR 0005): phase labels by stage
+/// (plan/ready = blue, speccing = purple, implementing = green) and ball
+/// labels by who holds it (working = yellow, needs-human = red, hold = grey).
+/// Unknown labels fall back to [`DEFAULT_LABEL_COLOR`].
+fn label_scheme(label: &str) -> (&'static str, &'static str) {
+    use super::*;
+    match label {
+        // Axis 1 — phase.
+        LABEL_PLAN => ("1D76DB", "meguri phase: awaiting spec planning"),
+        LABEL_READY => ("1D76DB", "meguri phase: awaiting implementation"),
+        LABEL_SPECCING => ("6F42C1", "meguri phase: spec PR open"),
+        LABEL_IMPLEMENTING => ("0E8A16", "meguri phase: implementation PR open"),
+        // Axis 2 — ball / who holds it.
+        LABEL_WORKING => ("FBCA04", "meguri: an agent is working on it"),
+        LABEL_NEEDS_HUMAN => ("B60205", "meguri: a human needs to look (see comment)"),
+        LABEL_HOLD => ("CFD3D7", "meguri: intentionally paused by a human"),
+        // PR-side spec review labels.
+        LABEL_SPEC_REVIEWING => ("6F42C1", "meguri: spec PR awaiting review"),
+        LABEL_SPEC_READY => ("0E8A16", "meguri: spec approved; implementation continues"),
+        // Bookkeeping.
+        LABEL_CLEAN_REPORT => (DEFAULT_LABEL_COLOR, "meguri: cleaner report issue"),
+        _ => (DEFAULT_LABEL_COLOR, "managed by meguri"),
+    }
+}
+
 pub struct GhForge {
     /// "owner/repo"
     repo: String,
@@ -312,8 +341,15 @@ impl GhForge {
     }
 
     /// --edit doesn't create missing labels — ensure it exists first
-    /// (idempotent; ignore "already exists" failures).
+    /// (idempotent; ignore "already exists" failures). Known meguri labels are
+    /// created with their scheme color (ADR 0005: the label color carries the
+    /// two-axis meaning), so a fresh repository gets the right palette without
+    /// any manual step; unknown labels fall back to the generic blue. Existing
+    /// labels are never recolored here — that is a one-time ops step
+    /// (`gh label edit <name> --color <hex>`), documented in the README, so
+    /// meguri does not keep overwriting a color a human deliberately set.
     async fn ensure_label(&self, label: &str) {
+        let (color, description) = label_scheme(label);
         let _ = self
             .gh(&[
                 "label",
@@ -322,9 +358,9 @@ impl GhForge {
                 "--repo",
                 &self.repo,
                 "--color",
-                "1D76DB",
+                color,
                 "--description",
-                "managed by meguri",
+                description,
             ])
             .await;
     }
@@ -1164,6 +1200,23 @@ mod tests {
             forge
                 .protection_from_stderr("main", "gh: boom (HTTP 500)")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn phase_labels_carry_their_scheme_colors() {
+        // The color encodes the two-axis meaning (ADR 0005), so lock it here.
+        assert_eq!(label_scheme(super::super::LABEL_SPECCING).0, "6F42C1");
+        assert_eq!(label_scheme(super::super::LABEL_IMPLEMENTING).0, "0E8A16");
+        assert_eq!(label_scheme(super::super::LABEL_READY).0, "1D76DB");
+        assert_eq!(label_scheme(super::super::LABEL_PLAN).0, "1D76DB");
+        assert_eq!(label_scheme(super::super::LABEL_WORKING).0, "FBCA04");
+        assert_eq!(label_scheme(super::super::LABEL_NEEDS_HUMAN).0, "B60205");
+        assert_eq!(label_scheme(super::super::LABEL_HOLD).0, "CFD3D7");
+        // An unknown label falls back to the generic blue.
+        assert_eq!(
+            label_scheme("random:label"),
+            (DEFAULT_LABEL_COLOR, "managed by meguri")
         );
     }
 
