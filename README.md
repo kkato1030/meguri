@@ -316,6 +316,24 @@ max_rounds = 3    # max self-review rounds per run; past the cap the PR is publi
 
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
 
+### Workspaces — related projects, cross-repo decomposition (optional)
+
+A **workspace** is a static grouping of related projects (a repo split/merge, an API + its client, a repo-designed greenfield). It is purely declarative — no runtime state, and it **never appears in the execution path** (worktree, pane, branch, and verification are unchanged; a `run` stays single-repo). Opt-in: a config with no `[[workspaces]]` behaves exactly as before.
+
+```toml
+[[workspaces]]
+id = "shop"
+projects = ["shop-api", "shop-web", "shop-infra"]   # each must be a defined [[projects]] id; a project joins at most one workspace
+```
+
+A workspace does exactly three things:
+
+1. **Decompose scope** — the planner's decompose ending ([spec-first flow](#spec-first-flow-opt-in)) may file a child issue into a workspace sibling by setting `"project": "<sibling id>"` on the child (default: the parent's own repo). The parent (tracking) issue always stays in its own repo. A child that names a repo outside the workspace is rejected — issue-filing scope lives in config (the host operator), never in the issue body (a write-privileged input), which keeps "who runs work" and "who decides scope" separate (ADR 0009).
+2. **Cross-repo ordering** — meguri wires GitHub-native `blocked_by` across sibling repos, so a child in one repo can block a child in another; discovery's existing dependency gate then sequences them (an unreadable blocker stays blocking, the safe side).
+3. **Display grouping** — `meguri ps` / `meguri top` group their rows by workspace.
+
+For a step meguri cannot perform itself (creating a repo, changing visibility, rewriting history, …), a decompose child with `"kind": "human"` is filed with **no trigger label**: discovery never drives it, and a human closes it — unblocking its dependents. `meguri doctor` lists each workspace and its members. See ADR 0009 for the rationale.
+
 ### Worktree setup hook (optional)
 
 `[projects.worktree_setup]` runs a project's own commands every time meguri prepares a worktree — not just the first time, but every create/attach/re-point, since `attach_worktree`/`create_review_worktree` can wipe untracked files via `reset --hard` + `clean -fd` on reuse. meguri stays agnostic to what runs here (ADR 0003); apm (see [Agent instructions (apm)](#agent-instructions-apm)) is one example use case, not a built-in integration:

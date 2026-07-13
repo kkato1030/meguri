@@ -30,6 +30,7 @@
 //! child asking to decompose again escalates to `meguri:needs-human`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ use serde_json::json;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
 use super::{Deps, Target};
-use crate::forge;
+use crate::forge::{self, Forge};
 use crate::store::RunRecord;
 use crate::tasks::TaskKind;
 use crate::turn::{ChildIssue, TurnResultFile};
@@ -56,10 +57,18 @@ pub fn spec_rel_path(issue: i64) -> String {
 pub const DECOMPOSED_MARKER: &str = "<!-- meguri:decomposed-child -->";
 
 /// Footer appended to every child issue's body: the human-visible parent
-/// reference plus the machine marker.
+/// reference plus the machine marker. Same-repo convenience over
+/// [`decompose_child_footer_ref`].
 pub fn decompose_child_footer(parent: i64) -> String {
+    decompose_child_footer_ref(&format!("#{parent}"))
+}
+
+/// Footer with an already-formatted parent reference — `#N` within the parent's
+/// repo, or `owner/repo#N` when the child lives in a workspace sibling so the
+/// link resolves across repos (issue #154).
+pub fn decompose_child_footer_ref(parent_ref: &str) -> String {
     format!(
-        "\n\n---\nParent issue: #{parent} (split out by meguri's planner)\n\n{DECOMPOSED_MARKER}"
+        "\n\n---\nParent issue: {parent_ref} (split out by meguri's planner)\n\n{DECOMPOSED_MARKER}"
     )
 }
 
@@ -157,7 +166,7 @@ impl Flavor for PlannerFlavor {
             body = cp.issue_body,
             spec = spec_rel_path(run.issue_number),
             depth_section = adaptive_depth_instruction(&cp.issue_body),
-            decompose_section = decompose_instruction(&cp.issue_body),
+            decompose_section = decompose_instruction(deps, &cp.issue_body),
             pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
@@ -238,7 +247,17 @@ impl Flavor for PlannerFlavor {
             ))
             .into());
         }
-        if let Err(problem) = validate_children(&result.children) {
+
+        // Issue-filing scope (issue #154 / ADR 0009): a child may target the
+        // parent's own project or any of its workspace siblings — nothing
+        // else. Keeping the scope in config (not the issue body) preserves the
+        // "who decides scope = host operator" boundary.
+        let parent_id = deps.project.id.clone();
+        let siblings = deps.config.workspace_siblings(&parent_id);
+        let mut allowed: Vec<&str> = vec![parent_id.as_str()];
+        allowed.extend(siblings.iter().map(|p| p.id.as_str()));
+
+        if let Err(problem) = validate_children(&result.children, &allowed) {
             return Err(NeedsHuman(format!(
                 "agent returned an invalid decomposition for issue #{}: {problem}",
                 run.issue_number
@@ -246,41 +265,68 @@ impl Flavor for PlannerFlavor {
             .into());
         }
 
+        let parent_slug = deps.project.repo_slug.clone().ok_or_else(|| {
+            anyhow::Error::from(NeedsHuman(format!(
+                "project {parent_id:?} has no repo_slug, so issue #{} cannot be decomposed",
+                run.issue_number
+            )))
+        })?;
+
         // File the children in order so dependency indices resolve to
         // numbers; every child body carries the parent reference + marker.
+        // `numbers`/`slugs` are parallel to `result.children` so a cross-repo
+        // `blocked_by` can name the exact repo each blocker lives in.
         let mut numbers: Vec<i64> = Vec::with_capacity(result.children.len());
+        let mut slugs: Vec<String> = Vec::with_capacity(result.children.len());
         for child in &result.children {
-            let label = child_label(child);
+            let (forge, slug) = resolve_child_target(deps, &parent_slug, child)?;
+            let labels: Vec<&str> = child_label(child).into_iter().collect();
+            // Qualify the parent reference for a cross-repo child so its link
+            // resolves back to the parent's repo, not a same-numbered issue in
+            // the child's repo.
+            let parent_ref = if slug == parent_slug {
+                format!("#{}", run.issue_number)
+            } else {
+                format!("{parent_slug}#{}", run.issue_number)
+            };
             let body = format!(
                 "{}{}",
                 child.body.trim(),
-                decompose_child_footer(run.issue_number)
+                decompose_child_footer_ref(&parent_ref)
             );
-            let number = deps
-                .forge()
-                .create_issue(&child.title, &body, &[label])
-                .await?;
+            let number = forge.create_issue(&child.title, &body, &labels).await?;
             // Sibling dependencies: the dependency gate (issue #23) keys off
-            // these, so they decide the implementation order.
+            // these, so they decide the implementation order. The blocker may
+            // live in another repo, so name it by its slug.
             for &dep in &child.blocked_by {
-                deps.forge().add_blocked_by(number, numbers[dep]).await?;
+                forge
+                    .add_blocked_by_in(number, &slugs[dep], numbers[dep])
+                    .await?;
             }
-            // Parent-child dependency: the parent visibly waits for every
-            // child on the forge's graph.
+            // Parent-child dependency: the parent (always in its own repo)
+            // visibly waits for every child on the forge's graph.
             deps.forge()
-                .add_blocked_by(run.issue_number, number)
+                .add_blocked_by_in(run.issue_number, &slug, number)
                 .await?;
             numbers.push(number);
+            slugs.push(slug);
         }
 
         // Rationale on the parent ("Authority": the durable record of why —
-        // and into what — the issue was split lives on the forge).
+        // and into what — the issue was split lives on the forge). Cross-repo
+        // children are rendered `owner/repo#N` so the reference resolves.
         let listing = result
             .children
             .iter()
             .zip(&numbers)
-            .map(|(child, number)| {
-                format!("- #{number} (`{}`) {}", child_label(child), child.title)
+            .zip(&slugs)
+            .map(|((child, number), slug)| {
+                let reference = if *slug == parent_slug {
+                    format!("#{number}")
+                } else {
+                    format!("{slug}#{number}")
+                };
+                format!("- {reference} (`{}`) {}", child.kind, child.title)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -318,18 +364,56 @@ impl Flavor for PlannerFlavor {
     }
 }
 
-/// The trigger label a child enters the loops with, by declared size.
-/// [`validate_children`] has already rejected anything else.
-fn child_label(child: &ChildIssue) -> &'static str {
+/// The trigger label a child enters the loops with, by declared kind.
+/// `None` for a `human` node: it is filed with no trigger label, so discovery
+/// never drives it and a human closes it (issue #154).
+/// [`validate_children`] has already rejected any other kind.
+fn child_label(child: &ChildIssue) -> Option<&'static str> {
     match child.kind.as_str() {
-        "plan" => forge::LABEL_PLAN,
-        _ => forge::LABEL_READY,
+        "human" => None,
+        "plan" => Some(forge::LABEL_PLAN),
+        _ => Some(forge::LABEL_READY),
+    }
+}
+
+/// The forge and repo slug a child issue is filed into: the parent's own repo
+/// when `project` is omitted (or names the parent), else a workspace sibling
+/// resolved through [`Deps::forge_factory`] (issue #154). `validate_children`
+/// has already confirmed the project is in scope; this additionally rejects a
+/// sibling with no GitHub repo to file into (local mode).
+fn resolve_child_target(
+    deps: &Deps,
+    parent_slug: &str,
+    child: &ChildIssue,
+) -> Result<(Arc<dyn Forge>, String)> {
+    match child.project.as_deref() {
+        None => Ok((deps.forge().clone(), parent_slug.to_string())),
+        Some(pid) if pid == deps.project.id => Ok((deps.forge().clone(), parent_slug.to_string())),
+        Some(pid) => {
+            let sibling = deps.config.project(pid).ok_or_else(|| {
+                anyhow::Error::from(NeedsHuman(format!(
+                    "decomposition targets project {pid:?}, which is not defined"
+                )))
+            })?;
+            let slug = sibling.repo_slug.clone().ok_or_else(|| {
+                anyhow::Error::from(NeedsHuman(format!(
+                    "decomposition targets project {pid:?}, but it is local-mode \
+                     (no repository to file issues in)"
+                )))
+            })?;
+            Ok((deps.forge_factory.for_slug(&slug), slug))
+        }
     }
 }
 
 /// Reject malformed decompositions before touching the forge; the Err text
-/// reaches the human via the escalation comment.
-fn validate_children(children: &[ChildIssue]) -> std::result::Result<(), String> {
+/// reaches the human via the escalation comment. `allowed_projects` is the
+/// parent's own project id plus its workspace sibling ids — the only repos a
+/// child may target (issue #154 / ADR 0009).
+fn validate_children(
+    children: &[ChildIssue],
+    allowed_projects: &[&str],
+) -> std::result::Result<(), String> {
     if children.is_empty() {
         return Err("`children` is empty".into());
     }
@@ -337,10 +421,19 @@ fn validate_children(children: &[ChildIssue]) -> std::result::Result<(), String>
         if child.title.trim().is_empty() {
             return Err(format!("child {i} has an empty title"));
         }
-        if !matches!(child.kind.as_str(), "ready" | "plan") {
+        if !matches!(child.kind.as_str(), "ready" | "plan" | "human") {
             return Err(format!(
-                "child {i} has unknown kind `{}` (must be \"ready\" or \"plan\")",
+                "child {i} has unknown kind `{}` (must be \"ready\", \"plan\" or \"human\")",
                 child.kind
+            ));
+        }
+        if let Some(pid) = &child.project
+            && !allowed_projects.contains(&pid.as_str())
+        {
+            return Err(format!(
+                "child {i} targets project `{pid}`, which is not the parent's \
+                 project or a workspace sibling ({})",
+                allowed_projects.join(", ")
             ));
         }
         for &dep in &child.blocked_by {
@@ -423,8 +516,10 @@ fn adaptive_depth_instruction(issue_body: &str) -> String {
 
 /// Prompt section inviting the decompose ending — except on issues that are
 /// themselves decomposition children, where only one level is allowed and
-/// the agent is told to hand a still-too-big issue to a human instead.
-fn decompose_instruction(issue_body: &str) -> String {
+/// the agent is told to hand a still-too-big issue to a human instead. When
+/// the project belongs to a workspace, the cross-repo scope (which sibling
+/// repos a child may target) is spelled out from config (issue #154).
+fn decompose_instruction(deps: &Deps, issue_body: &str) -> String {
     if is_decomposed_child(issue_body) {
         return "# Too big for one spec?\n\
                 This issue was itself split out of a bigger issue by a previous \
@@ -434,7 +529,8 @@ fn decompose_instruction(issue_body: &str) -> String {
                 why in `summary`.\n\n"
             .to_string();
     }
-    "# Too big for one spec?\n\
+    format!(
+        "# Too big for one spec?\n\
      If your investigation shows the issue cannot converge on one spec and \
      must be split into sub-issues, do NOT write a spec and do NOT create \
      any issues yourself. Instead end the turn with `\"status\": \"decompose\"` \
@@ -443,14 +539,57 @@ fn decompose_instruction(issue_body: &str) -> String {
      - `summary`: one paragraph on why you split it this way (it becomes a \
        comment on the issue).\n\
      - `children`: the sub-issues to file, in dependency order. Each entry is \
-       {\"title\": \"...\", \"body\": \"<minimal body>\", \"kind\": \"ready\"|\"plan\", \
-       \"blocked_by\": [<zero-based indices of earlier entries it depends on>]}. \
-       Use kind \"ready\" for children small enough to implement directly and \
-       \"plan\" for children that still need their own design pass.\n\
+       {{\"title\": \"...\", \"body\": \"<minimal body>\", \"kind\": \
+       \"ready\"|\"plan\"|\"human\", \"blocked_by\": [<zero-based indices of \
+       earlier entries it depends on>]{project_field}}}. \
+       Use kind \"ready\" for children small enough to implement directly, \
+       \"plan\" for children that still need their own design pass, and \
+       \"human\" for a step meguri cannot perform itself (creating a \
+       repository, changing visibility, rewriting history, and other \
+       irreversible operations) — a `human` child is filed with no trigger \
+       label, so meguri never runs it and a person closes it once done, \
+       unblocking its dependents.\n\
+     {scope}\
      meguri files the sub-issues, wires the `blocked_by` dependencies, and \
      labels them. Decomposition is one level only: sub-issues cannot be \
-     decomposed again.\n\n"
-        .to_string()
+     decomposed again.\n\n",
+        project_field = if deps.config.workspace_of(&deps.project.id).is_some() {
+            ", \"project\": \"<sibling project id, optional>\""
+        } else {
+            ""
+        },
+        scope = decompose_scope_clause(deps),
+    )
+}
+
+/// The cross-repo scope paragraph injected into the decompose instruction:
+/// present only when the project belongs to a workspace, listing the sibling
+/// project ids a child may target. Absent (empty) otherwise, so a project with
+/// no workspace sees exactly the single-repo instruction as before.
+fn decompose_scope_clause(deps: &Deps) -> String {
+    let siblings = deps.config.workspace_siblings(&deps.project.id);
+    if siblings.is_empty() {
+        return String::new();
+    }
+    let ws = deps
+        .config
+        .workspace_of(&deps.project.id)
+        .map(|w| w.id.as_str())
+        .unwrap_or_default();
+    let ids = siblings
+        .iter()
+        .map(|p| format!("`{}`", p.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "     - Cross-repo scope: this issue's project (`{project}`) is part of \
+       workspace `{ws}`. A child may be filed into a sibling repository by \
+       setting `\"project\"` to one of: {ids}. Omit `project` (the default) to \
+       file the child in this same repository. The parent (tracking) issue \
+       always stays in its own repository — only children may target siblings. \
+       Do NOT target any repository outside this list.\n",
+        project = deps.project.id,
+    )
 }
 
 #[cfg(test)]
@@ -621,27 +760,64 @@ mod tests {
             body: String::new(),
             kind: kind.into(),
             blocked_by,
+            project: None,
         };
-        assert!(validate_children(&[]).unwrap_err().contains("empty"));
+        let allowed = ["proj"];
         assert!(
-            validate_children(&[child("  ", "ready", vec![])])
+            validate_children(&[], &allowed)
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            validate_children(&[child("  ", "ready", vec![])], &allowed)
                 .unwrap_err()
                 .contains("empty title")
         );
         assert!(
-            validate_children(&[child("a", "huge", vec![])])
+            validate_children(&[child("a", "huge", vec![])], &allowed)
                 .unwrap_err()
                 .contains("unknown kind")
         );
         // Dependencies may only point backwards (no self/forward references).
         assert!(
-            validate_children(&[child("a", "ready", vec![0])])
+            validate_children(&[child("a", "ready", vec![0])], &allowed)
                 .unwrap_err()
                 .contains("earlier")
         );
+        // "human" is a valid kind (the human-node ending, issue #154).
+        assert!(validate_children(&[child("a", "human", vec![])], &allowed).is_ok());
         assert!(
-            validate_children(&[child("a", "ready", vec![]), child("b", "plan", vec![0]),]).is_ok()
+            validate_children(
+                &[child("a", "ready", vec![]), child("b", "plan", vec![0])],
+                &allowed
+            )
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_children_rejects_out_of_scope_project() {
+        let child = ChildIssue {
+            title: "x".into(),
+            body: String::new(),
+            kind: "ready".into(),
+            blocked_by: vec![],
+            project: Some("stranger".into()),
+        };
+        let err = validate_children(&[child], &["proj", "sibling"]).unwrap_err();
+        assert!(
+            err.contains("stranger") && err.contains("workspace sibling"),
+            "{err}"
+        );
+
+        let ok = ChildIssue {
+            title: "x".into(),
+            body: String::new(),
+            kind: "ready".into(),
+            blocked_by: vec![],
+            project: Some("sibling".into()),
+        };
+        assert!(validate_children(&[ok], &["proj", "sibling"]).is_ok());
     }
 
     #[test]
