@@ -17,7 +17,7 @@ meguri の loop についての説明は今まで2系統に散らばっていた
 
 ## 1. パイプライン全体図
 
-入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。**この2つは実装 diff の担保が非対称**: 直行(`meguri:ready`)経路は worker の内部 self-review(ADR 0006)を経てから PR を開くが、spec 先行経路は spec PR が(planner によって)既に open な状態で `spec_worker` が実装 commit を積むだけで完了し、`SpecWorkerFlavor` は `Flavor::self_reviews()` を override していない(既定 `false`)ため worker と同じ内部 self-review フェーズを通らない。spec 先行経路での実装 diff のレビューは、GitHub 上の `spec_reviewer`(spec 内容そのものが対象)と、PR が open した後の fixer 系ループ・人間レビューに委ねられる。両経路とも最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。cleaner だけはこのパイプラインの外で独立に回る。
+入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。**この2つは実装 diff の担保が非対称**: 直行(`meguri:ready`)経路は worker の内部 self-review(ADR 0006)を経てから PR を開くが、spec 先行経路は spec PR が(planner によって)既に open な状態で `spec_worker` が実装 commit を積むだけで完了し、`SpecWorkerFlavor` は `Flavor::self_reviews()` を override していない(既定 `false`)ため worker と同じ内部 self-review フェーズを通らない。`spec_reviewer` がレビューするのは `meguri:spec-reviewing` の spec PR head(=spec の内容)だけで、discovery は `meguri:spec-reviewing` ラベルの付いた PR に限られるため、`spec_worker` が実装 commit を積んで PR がそのラベルを離れた後は再び走らない — spec 先行経路には実装 diff に対する worker 相当の内部/GitHub レビューが無く、PR 公開後の人間・外部 bot のレビューと fixer 系ループだけがそれを担う。両経路とも最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。cleaner だけはこのパイプラインの外で独立に回る。
 
 ```
 GitHub issue(未トリアージ、無ラベル)
