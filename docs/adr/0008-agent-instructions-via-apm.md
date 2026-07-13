@@ -28,20 +28,34 @@ merge のたびに conflict とレビューノイズを生む。
    codex]` — `src/routing.rs` の built-in 推奨テーブルがルーティング先として使う2つの CLI)と
    `.apm/instructions/*.instructions.md` をコミットする。`apm.lock.yaml` も固定のためコミットする
    (apm は v0.x で破壊的変更が起きうるため、ロックなしでは `apm install` の再現性が保証できない)。
+   ただしコミットするのは `apm lock`(依存解決のみ、ローカル展開はしない)で生成した最小形
+   (`dependencies: []` のみ)に限る — 詳細は 2. で述べる理由により、実際に `apm install` を
+   ローカルで走らせた直後の状態(`local_deployed_files` 付き)はコミットしない。
 
-2. **コンパイル成果物はコミットしない。** 実際に `apm install && apm compile` を実行して検証した
-   ところ、この apm.yml / instructions からは以下が生成される:
+2. **コンパイル成果物はコミットしない。** 実際に `apm install` → `apm compile` の順で実行して
+   検証したところ、この apm.yml / instructions からは以下が生成される:
    - `.claude/rules/{overview,rust,docs}.md`(`apm install` が `.apm/instructions/` の内容を
      Claude Code のネイティブ配置に展開したもの)
    - `AGENTS.md`(ルート、`overview.instructions.md` の内容)と `src/AGENTS.md`
      (`rust.instructions.md` の `applyTo: src/**/*.rs` に基づく配置。Codex はスコープ付き
      instructions を単一の `AGENTS.md`/`src/AGENTS.md` に畳み込む形で読む)
    - `apm_modules/`(依存キャッシュ。現状 apm 依存は0件だが `apm install` が作る)
-   - `CLAUDE.md` は生成されない(`.claude/rules/` が既にあるので Claude Code はそちらを直接
-     読み、apm 側が重複コンテキストとして自動的にスキップする)。`.agents/` も、skill
-     パッケージを依存に持たない現状の構成では生成されない。
+   - `CLAUDE.md` は生成されない — ただしこれは **直前の `apm install` が `.claude/rules/` を
+     先に展開しているから**であり(Claude Code はそちらを直接読むので、apm が重複コンテキスト
+     として `CLAUDE.md` を自動的にスキップする)、無条件の挙動ではない。先に `apm compile` を
+     実行した場合や、`.claude/rules/` が存在しない隔離環境(`apm compile --root <scratch-dir>`
+     での検証など)では `CLAUDE.md`/`src/CLAUDE.md` も生成されることを確認済み。`.agents/` も、
+     skill パッケージを依存に持たない現状の構成では生成されない。
    - これらすべて(`CLAUDE.md` / `AGENTS.md` / `.claude/rules/` / `.codex/` / `apm_modules/` /
      `.agents/`)を `.gitignore` に追加し、worktree ローカルの生成物として扱う。
+   - **副作用として `apm.lock.yaml` も書き換わる。** 実際に `apm install` を走らせると
+     `local_deployed_files` / `local_deployed_file_hashes` にディスク上の展開結果(ハッシュ込み)
+     が書き込まれる。これらは gitignore 対象のコンパイル成果物そのものを指しているので、
+     コミットしてしまうと今度は「成果物を置かない worktree で `apm audit --ci` /
+     `apm install --frozen` が missing-files エラーになる」という 1. の逆向きの矛盾を起こす。
+     したがってこの diff は常にコミット対象外とし(`git checkout apm.lock.yaml` で戻すか、
+     コミット前に `apm lock` で最小形に作り直す)、リポジトリに残す `apm.lock.yaml` は
+     `dependencies: []` のみの形に保つ。
    - 生成する仕組みは worktree 準備時のフック(#138 の `worktree_setup`)に持たせる。この issue
      (#137)ではソースの整備までを範囲とし、フック自体は実装しない。
 
@@ -70,3 +84,7 @@ merge のたびに conflict とレビューノイズを生む。
 - apm は v0.x で API/生成物の形が変わりうる。挙動が変わった場合は `apm.lock.yaml` の
   `apm_version` で検出できるが、`apm.yml` の書式自体が壊れる変更が来た場合は
   この ADR の前提(生成される成果物の一覧)を見直す必要がある。
+- ローカルで `apm install` を実行すると `apm.lock.yaml` に `local_deployed_files` が付いた
+  状態に一時的に書き換わる(意図した挙動)。`git status` で `apm.lock.yaml` の変更が見えても
+  それはコミット対象ではない — コミット前に `apm lock` で最小形に戻す一手間が要る。この手順を
+  忘れないよう README / README.ja に明記した。

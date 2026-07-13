@@ -365,7 +365,9 @@ apm install                      # deploys .apm/instructions/ -> .claude/rules/
 apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Codex
 ```
 
-Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A `worktree_setup` hook that runs this automatically for meguri's own loops is tracked separately (#138).
+Order matters: `apm compile` skips `CLAUDE.md` only because the preceding `apm install` already populated `.claude/rules/` (Claude Code reads that directly, so `apm` dedupes `CLAUDE.md` out). Compile first, or compile against an empty tree (e.g. `--root <scratch-dir>` for isolated verification), and it generates `CLAUDE.md`/`src/CLAUDE.md` too, since there's nothing to dedupe against yet. `apm install --dry-run` doesn't preview this step either — dry-run only reports on `apm`/`mcp` package dependencies (this repo has none), not the local `.apm/instructions/` integration; a real (non-dry-run) `apm install` is what actually deploys `.claude/rules/`.
+
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff (`git checkout apm.lock.yaml`, or regenerate a clean lockfile with `apm lock` before committing). A `worktree_setup` hook that runs the build automatically for meguri's own loops is tracked separately (#138).
 
 ## Status / roadmap
 
