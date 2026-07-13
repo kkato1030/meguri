@@ -1,0 +1,154 @@
+name: Release
+
+# タグ駆動リリース(issue #118 / ADR 0007): `vX.Y.Z` タグの push を起点に、
+# 2 ターゲットのバイナリをビルドして GitHub Release に添付し、git-cliff で
+# リリースノートを生成し、crates.io に OIDC Trusted Publishing で publish する。
+# 司令塔は release-plz でも cargo-dist でもなく、この自前ワークフロー。
+# ci.yml と同じ衛生(SHA ピン / 最小 permissions / harden-runner / persist-credentials:false)を全ジョブに適用する。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 既定は read。書き込みが要るジョブだけが個別に昇格する(最小 permissions)。
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # バイナリを 2 ターゲットでビルドし、tar.gz + sha256 をアーティファクトに上げる。
+  # 書き込み権限は持たない(contents: read)。Release への添付は release ジョブが行う。
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # meguri-<tag>-<target>.tar.gz(中身は単一バイナリ meguri)と .sha256 を作る。
+      # shasum は macOS / Ubuntu 双方で利用可能。
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="meguri-${TAG}-${TARGET}.tar.gz"
+          tar czf "$archive" -C "target/${TARGET}/release" meguri
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: meguri-${{ matrix.target }}
+          path: |
+            meguri-*.tar.gz
+            meguri-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # GitHub Release を作成し、build のアーティファクトを添付する。
+  # git-cliff で当該タグ分のリリースノートを生成して本文にする。
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # Release 作成 + アセット添付
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      # git-cliff がタグ間の履歴を読めるよう全履歴を取得する。
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+        with:
+          tool: git-cliff
+
+      - name: Generate release notes
+        run: git cliff --latest --strip header --output RELEASE_NOTES.md
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      # タグは既に存在するので --verify-tag。本文は git-cliff 生成のノート。
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            dist/*
+
+  # crates.io に publish(分離ジョブ、段階投入可能)。
+  # OIDC Trusted Publishing で short-lived token を得る(長期 secret を持たない)。
+  # 前提: crate `meguri` が一度 publish 済みで Trusted Publisher が登録済みであること。
+  # crates.io は初回 publish 前に Trusted Publisher を作れない(PyPI の pending publisher 相当が無い)ため、
+  # 初回はメンテナが手動 `cargo publish` で crate を確保する。登録が済むまでは
+  # リポジトリ変数 CRATES_IO_TRUSTED_PUBLISHING を未設定にしてこのジョブを skip し、他ジョブを回す。
+  publish-crate:
+    needs: build
+    if: vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # OIDC トークン交換に必須
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      # OIDC → 一時的な crates.io token(steps.auth.outputs.token)を発行する。
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

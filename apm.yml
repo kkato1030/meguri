@@ -1,0 +1,19 @@
+name: meguri
+version: 0.1.0
+description: meguri repository agent instructions (source for CLAUDE.md / AGENTS.md)
+license: MIT
+
+# claude (worker/planner/etc. loops) と codex (src/routing.rs の推奨テーブルが
+# ルーティング先に使う) 向けにコンパイルする。auto-detect には頼らず明示する — CI や
+# クリーンな worktree には .claude/ や .codex/ がまだ存在せず検出できないため。
+targets:
+  - claude
+  - codex
+
+includes: auto
+
+dependencies:
+  apm: []
+  mcp: []
+
+scripts: {}
