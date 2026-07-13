@@ -597,6 +597,8 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
     };
     let sibling_project = ProjectConfig {
