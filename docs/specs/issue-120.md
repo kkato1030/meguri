@@ -1,6 +1,6 @@
 # issue-120 spec — `meguri add`: 雑メモ一言で即 issue を立て、AI が後追いで整形する(capture-first)
 
-投入の摩擦をシステムのスループット上限にしないために、投入(capture)を LLM から切り離す。`meguri add <project> "<雑な一言>"` を足す: 即座に無ラベル issue を作成して番号 + URL を返し(capture — LLM を経由しない)、その後 headless の agent がリポジトリを読んでタイトル・本文を整形して書き戻す(refine — best-effort)。
+投入の摩擦をシステムのスループット上限にしないために、投入(capture)を LLM から切り離す。`meguri add [--project <id>] "<雑な一言>"` を足す: 即座に無ラベル issue を作成して番号 + URL を返し(capture — LLM を経由しない)、その後 headless の agent がリポジトリを読んでタイトル・本文を整形して書き戻す(refine — best-effort)。
 
 この spec の設計判断(capture-first、原文 verbatim の主権、refine は寿命モデル外の one-shot)は spec より長生きするので **ADR 0006**(本 PR 同梱)に置いた。以下は実装を収束させるための足場。
 
@@ -12,7 +12,7 @@ issue の「論点(planning で詰める)」への答え:
 
 2. **refiner の routing — role `refiner` を routing に乗せる。** `routing::KNOWN_ROLES` に `"refiner"` を追加し、`recommended_chain("refiner")` を安価側(`["claude-sonnet", DEFAULT_PROFILE]`)に倒す。これで `[routing.roles] refiner = "..."` が `validate` を通り、`routing::resolve(cfg, "refiner", detect)` で解決できる。`[routing]` 無しなら default、の既存規律に従う。KNOWN_ROLES はこれ以降「loop_kind + one-shot コマンドの役割」を含む(ADR 0006 の帰結。doc コメントを更新する)。
 
-3. **project 引数の省略 — v1 で実装する(推奨どおり)。** `<project>` を省略でき、cwd が登録済み project の `repo_path` 配下なら推定する。曖昧(複数 project にマッチ、または cwd がどの repo_path 配下でもなく project が複数)なら明示エラー。
+3. **project の指定と省略 — `--project <id>` オプションで受け、v1 で省略(推定)も実装する。** project を位置引数にすると、位置引数が 1 つだけの `meguri add "雑な一言"` で clap がそれを project と text のどちらとも判定できず曖昧になる。既存 CLI の規約(`meguri run --project` 等、project は常に `--project` オプション)に寄せ、**text を唯一の位置引数、project を `#[arg(long)]` の `Option<String>`** とする。`--project` 省略時は cwd が登録済み project の `repo_path` 配下なら推定する。曖昧(複数 project にマッチ、または cwd がどの repo_path 配下でもなく project が複数)なら明示エラー。
 
 4. **refine の読み取り範囲 — `repo_path` を read-only。** worktree は作らない。cwd = `repo_path` で headless agent を起動し、書き込み・コミットはさせない(refine のプロンプトは「出力のみ・ファイルを書くな・コミットするな」)。yolo フラグ(`--dangerously-skip-permissions`)は headless 呼び出しには渡さない。
 
@@ -24,7 +24,7 @@ issue の「論点(planning で詰める)」への答え:
 
 `meguri add` は run/pane/store を作らない(ADR 0006: 寿命モデルの外)。必要なのは config と forge だけ — `build_deps` は使わず、`GhForge::new(&project.repo_slug)` を直に組む。
 
-1. **project 解決** — 明示 `<project>` が最優先。無ければ cwd を各 `project.repo_path` と正規化して前方一致で推定。1 個に定まらなければ明示エラー。
+1. **project 解決** — 明示 `--project` が最優先。無ければ cwd を各 `project.repo_path` と正規化して前方一致で推定。1 個に定まらなければ明示エラー。
 2. **ラベル決定** — `--plan` → `[LABEL_PLAN]`、`--ready` → `[LABEL_READY]`、どちらも無し → `[]`(無ラベル = 未トリアージ)。`--plan` と `--ready` は排他(両方でエラー)。
 3. **capture** — `create_issue(title, body, labels)`。初期 title = 原文(長ければ 1 行分に切り詰め)、初期 body = 原文メモ verbatim(refine が一度も走らなくても原文は body に在る = 受け入れ基準 3)。
 4. **即時出力** — `issue #N created: <url>`。`create_issue` は番号のみ返す(確認済み)ので、**URL は `repo_slug` から合成**する(`https://github.com/{slug}/issues/{number}`)。trait シグネチャは変えない。
@@ -48,26 +48,26 @@ issue の「論点(planning で詰める)」への答え:
 
 ## 触るファイル
 
-- `src/cli.rs` — `Add { project: Option<String>, text: String, plan: bool, ready: bool, raw: bool }` バリアント(`--plan`/`--ready`/`--raw`)。
+- `src/cli.rs` — `Add { project: Option<String>, text: String, plan: bool, ready: bool, raw: bool }` バリアント。`text` が唯一の位置引数で、`project` は `#[arg(long)]`(`meguri run` と同じ規約)、他は `--plan`/`--ready`/`--raw` フラグ。
 - `src/main.rs` — ディスパッチ追加。
 - `src/app.rs` — `cmd_add`。project 推定ヘルパ(cwd → repo_path)、capture→即時出力→(raw/非対応でなければ)refine→書き戻し。URL は repo_slug から合成。
 - `src/forge/mod.rs` / `gh.rs` / `fake.rs` — **`update_issue_title(number, title)` を新設**(`Forge` trait に title 更新が無いことを確認済み。gh 実装は `gh issue edit <n> --title`)。`create_issue` / `update_issue_body` / `add_label` は既存で足りる。
 - `src/config.rs` — `AgentProfile` に `headless_args: Option<Vec<String>>`(default `None`)。
 - `src/routing.rs` — `KNOWN_ROLES` に `"refiner"`、`recommended_chain` に `refiner` の安価チェーン、builtin claude プロファイルに `headless_args = Some(["-p"])`。doc コメント更新(役割 = loop_kind + one-shot)。
 - refiner のプロンプトと headless 起動(`src/app.rs` 内、または小さな `src/refine.rs`)。
-- `README.md` / `README.ja.md` — 「投入口」の節を追加(現状「GitHub で issue を立ててラベルを貼る」しか無い)。`meguri add` の紹介と capture-first の要点、`--raw`/`--plan`/`--ready`、project 省略。
+- `README.md` / `README.ja.md` — 「投入口」の節を追加(現状「GitHub で issue を立ててラベルを貼る」しか無い)。`meguri add` の紹介と capture-first の要点、`--raw`/`--plan`/`--ready`、`--project` 省略。
 - `docs/adr/0006-capture-first-issue-intake.md` — 決定の記録(本 PR 同梱済み)。
 - `tests/add_test.rs`(新規)— FakeForge ベース。
 
 ## 受け入れ基準
 
-1. `meguri add myproj "雑な一言"` → LLM を待たずに issue 番号 + URL が表示され、GitHub に無ラベル issue が存在する。
+1. `meguri add --project myproj "雑な一言"` → LLM を待たずに issue 番号 + URL が表示され、GitHub に無ラベル issue が存在する。
 2. refine 完了後、title が要約され body に構造が付き、**原文メモが verbatim で body 内に残っている**。
 3. agent CLI 不在・refine 失敗・途中 Ctrl-C・headless 非対応プロファイルのいずれでも issue は raw のまま存在し、コマンドは capture 成功を報告する(silent に issue が消えない)。
 4. `--plan` / `--ready` 付きなら対応ラベルが付き、watch が通常どおり拾う。`--plan` と `--ready` の同時指定はエラー。
 5. 無ラベルで作った issue を watch が拾わないことは既存どおり(回帰確認)。
 6. `--raw` は LLM を一切呼ばない。
-7. `<project>` 省略時、cwd が単一 project の `repo_path` 配下なら推定し、曖昧なら明示エラー。
+7. `--project` 省略時、cwd が単一 project の `repo_path` 配下なら推定し、曖昧なら明示エラー(`meguri add "雑な一言"` だけで cwd の project に投入できる)。
 8. refine の update 前に人間が body を編集していたら、その編集を上書きしない(論点5 の guard)。
 9. README(en/ja)に「投入口」の節があり `meguri add` と capture-first を説明している。
 
