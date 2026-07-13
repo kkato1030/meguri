@@ -520,6 +520,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) ->
         &wt,
         &deps.project.default_branch,
         &cp.head_sha,
+        &deps.project.worktree_setup.exclude,
     )
     .await?;
     deps.store
@@ -529,7 +530,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) ->
         "worktree.created",
         json!({ "head": cp.head_sha, "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    flow::run_worktree_setup(deps, run, &wt).await
 }
 
 fn execute_prompt(cp: &CleanCheckpoint, language: Option<&str>) -> String {

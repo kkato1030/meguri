@@ -548,6 +548,7 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

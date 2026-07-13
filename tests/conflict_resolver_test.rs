@@ -110,6 +110,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         language: None,
         pr: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
 
     let deps = Deps::with_label_source(

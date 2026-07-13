@@ -97,6 +97,7 @@ async fn setup() -> TestEnv {
         clean: None,
         mode: Default::default(),
         deliver: None,
+        worktree_setup: Default::default(),
     };
 
     let deps = Deps::with_label_source(
