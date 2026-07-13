@@ -45,9 +45,21 @@ meguri never parses the agent's screen to decide success. Each turn writes a pro
 
 Stale turn ids are ignored; results claiming success are **independently verified** (clean tree, commits ahead of the base branch, project check command passes) before meguri moves on. Verification failures come back to the agent as corrective turns.
 
+## Security
+
+meguri's core trade-off is unattended execution, and that's worth understanding before you point it at a repo.
+
+- **The agent gets real shell access.** The default `[agent].args` includes `--dangerously-skip-permissions`, so once a loop picks up an issue, the agent runs arbitrary commands in its worktree — git, cargo, network calls, anything the CLI allows — with no per-command confirmation. That's what makes an unattended loop possible; it also means you should only run meguri somewhere you're fine with an agent having that level of access (a disposable VM or container, or a machine/account whose blast radius you accept). If you'd rather gate every command, set `args = ["--permission-mode", "acceptEdits"]` (see [Configuration](#configuration)) and answer dialogs by attaching to the pane.
+- **Issue bodies are prompt input.** The full issue body (and comments a loop reads) is injected into the agent's prompt verbatim, so on a repo where anyone can open issues, a malicious one is a prompt-injection attempt against an agent with shell access. The mitigation is the [label gate](#labels): a loop only acts on an issue that already carries a `meguri:*` phase label (`meguri:plan` / `meguri:ready`), and applying labels needs collaborator (write) access — so "who can get an agent to execute" reduces to "who has write access to this repo," not "who can open an issue." Weigh that when granting collaborator access, and don't label untrusted issues `meguri:ready` yourself.
+- **Completion is verified independently, not screen-scraped.** As described in [The completion contract](#the-completion-contract) above, meguri never takes the agent's own "success" claim at face value — it re-checks git state, commits ahead of base, and the project's `check_command` before treating a run as done. This bounds (but doesn't eliminate) the damage a compromised or misled agent can do: it can still act inside the worktree during a run, but it can't talk meguri into merging bad state just by writing "success" to the result file.
+
+Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
+
 ## Install & set up
 
 Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback).
+
+Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
 
 ```bash
 cargo install --path .   # or: cargo build --release
@@ -89,6 +101,34 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
+
+### Local mode (no GitHub, no labels)
+
+For repos whose labels you can't (or won't) touch, run a project **entirely locally**: the task queue, claim, escalation, and completion live in meguri's sqlite instead of GitHub labels, and the deliverable is a verified local branch instead of a PR. Set `mode = "local"` — `repo_slug` becomes optional and `meguri doctor` stops requiring `gh`:
+
+```toml
+[[projects]]
+id = "work"
+repo_path = "/abs/path/to/repo"
+mode = "local"          # "github" (default) | "local"
+default_branch = "main"
+check_command = "cargo test"
+# deliver = "branch"    # local default: verified commits on a local branch (no push, no PR)
+```
+
+Queue and track work with the local task commands instead of labels:
+
+```bash
+meguri add "Add a --json flag to the export command"   # queue a task
+meguri add --file task.md                              # first heading → title, rest → body
+meguri add --plan "Design the export format"           # queue for the planner instead of the worker
+meguri tasks                                           # list open tasks (needs_human highlighted)
+meguri watch                                           # picks tasks up within one poll interval
+```
+
+A local run works on a `meguri/t<task-id>-<slug>-<hash>` branch; on success it leaves the verified commits there and flips the task to `done` — nothing is pushed. A failed run marks the task `needs_human` with a reason (shown by `meguri tasks` / `meguri ps`), and the next run re-claims it and clears the flag. Review the branch yourself and merge when happy (`meguri review` / `accept` land in a later phase).
+
+> **Single machine only (through Phase 3).** Local mode's local sqlite is the *single source of truth*, so run exactly one meguri host per repo. Coordinating several hosts against a shared task queue is Phase 4 (a remote-DB `TaskSource` with leases); the vocabulary and contract are fixed in [ADR 0003](docs/adr/0003-tasksource-task-moves-run-pins.md). The `silent` mode (read issues, never write labels), `deliver = "patch"`, and `meguri review`/`accept`/`reject` are later phases too.
 
 ### Keep it running (daemon)
 
@@ -318,6 +358,11 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 ## Status / roadmap
 
 Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
+
+## Contributing
+
+Bug reports and PRs from humans are welcome — normal fork & PR flow, no
+`meguri:*` labels to worry about. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

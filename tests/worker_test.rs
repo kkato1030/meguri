@@ -74,7 +74,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: check_command.map(str::to_string),
@@ -84,14 +86,13 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: mux.clone(),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,

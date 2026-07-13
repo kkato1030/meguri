@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use super::{Deps, Loop};
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
+use crate::tasks::TaskKey;
 
 /// A fresh view of everything the watch derives from the config, produced by
 /// the `reload` hook when `config.toml` changed on disk.
@@ -136,26 +137,40 @@ impl Scheduler {
                     return Ok(());
                 }
                 let mut targets = lp.discover(deps).await?;
-                targets.sort_by_key(|t| t.issue_number);
+                // Sort by the coordination key: issue_number is no longer the
+                // only identity (local tasks have none), so the key gives a
+                // stable order across Issue/Local targets.
+                targets.sort_by_key(|t| t.key);
                 for target in targets {
                     if active.len() >= self.max_concurrent {
                         return Ok(());
                     }
-                    // Unique active run per (project, loop, issue) — enforced
-                    // by the DB index; a violation just means someone raced us.
-                    let run = match deps.store.create_run_for_loop(
-                        &deps.project.id,
-                        lp.kind(),
-                        target.issue_number,
-                        &target.title,
-                    ) {
+                    // Unique active run per (project, loop, target) — enforced
+                    // by the partial DB indexes; a violation just means
+                    // someone raced us. Run creation branches on the key so
+                    // the target travels from discovery through claim.
+                    let created = match target.key {
+                        TaskKey::Issue(n) => deps.store.create_run_for_loop(
+                            &deps.project.id,
+                            lp.kind(),
+                            n,
+                            &target.title,
+                        ),
+                        TaskKey::Local(id) => deps.store.create_run_for_task(
+                            &deps.project.id,
+                            lp.kind(),
+                            id,
+                            &target.title,
+                        ),
+                    };
+                    let run = match created {
                         Ok(run) => run,
                         Err(_) => continue,
                     };
                     deps.store.emit(
                         Some(&run.id),
                         "run.discovered",
-                        json!({ "issue": target.issue_number, "title": target.title,
+                        json!({ "key": format!("{:?}", target.key), "title": target.title,
                                 "loop": lp.kind() }),
                     )?;
                     self.dispatch(&run, running, active);

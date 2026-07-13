@@ -75,6 +75,28 @@ pub fn branch_name(issue: i64, title: &str, run_id: &str) -> String {
     format!("meguri/{issue}-{slug}-{hash}", slug = slugify(title))
 }
 
+/// `meguri/t<task_id>-<slug>-<runhash>`: the local-task counterpart of
+/// [`branch_name`]. The `t` prefix keeps local branches out of
+/// [`issue_from_branch`]'s number space, and Phase 4 detects a re-claim by
+/// matching the `meguri/t<id>-` prefix on the remote.
+pub fn task_branch_name(task_id: i64, title: &str, run_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(&Sha256::digest(run_id.as_bytes())[..3]);
+    format!("meguri/t{task_id}-{slug}-{hash}", slug = slugify(title))
+}
+
+/// The task id a [`task_branch_name`]-style branch encodes
+/// (`meguri/t<id>-<slug>-<runhash>`); `None` for anything else, including
+/// issue branches (`meguri/<issue>-…`).
+pub fn task_from_branch(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix("meguri/t")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -560,6 +582,17 @@ mod tests {
         assert_eq!(issue_from_branch("meguri/-no-number"), None);
         assert_eq!(issue_from_branch("feature/28-something"), None);
         assert_eq!(issue_from_branch("main"), None);
+    }
+
+    #[test]
+    fn task_branches_carry_the_t_prefix_and_stay_out_of_issue_space() {
+        let b = task_branch_name(5, "Local task", "run-1");
+        assert!(b.starts_with("meguri/t5-local-task-"));
+        assert_eq!(task_from_branch(&b), Some(5));
+        // Task branches never parse as issue branches, and vice versa.
+        assert_eq!(issue_from_branch(&b), None);
+        assert_eq!(task_from_branch("meguri/7-fix-bug-abc"), None);
+        assert_eq!(task_from_branch("main"), None);
     }
 
     #[test]

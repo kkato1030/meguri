@@ -12,12 +12,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, Target, WorkerOutcome, role_for_loop};
+use super::{Deps, StoreControl, WorkerOutcome, role_for_loop};
 use crate::agent_session;
+use crate::config::Deliver;
 use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
 use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
 pub const STEP_PREPARE_WORK: &str = "prepare-work";
@@ -48,15 +50,16 @@ pub trait Flavor: Send + Sync {
         false
     }
 
-    /// Claim the run's target and fill the checkpoint. Default: re-verify
-    /// the trigger label on the issue, then claim it with `meguri:working`.
+    /// Claim the run's target and fill the checkpoint. Default: the
+    /// coordination layer's atomic claim (label re-verification + working
+    /// label in github mode, an atomic DB update in local mode).
     async fn prepare_work(
         &self,
         deps: &Deps,
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        claim_issue(deps, run, self.trigger_label(), cp).await
+        claim_task(deps, run, cp).await
     }
 
     /// Set up the run's worktree and persist branch/path. Default: a new
@@ -114,19 +117,18 @@ pub trait Flavor: Send + Sync {
         Ok(())
     }
 
-    /// Release the claim marker on `meguri stop`. Default: the issue's
-    /// `meguri:working` label.
+    /// Release the claim marker on `meguri stop`. Default: the coordination
+    /// layer's release (drop `meguri:working` / requeue the task).
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
-            .remove_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
+        let _ = deps.task_source.release(&run.task_key()).await;
     }
 
     /// Failure escalation ("Authority": the durable record of why the run
-    /// stopped lives on the forge). Default: label + comment on the issue.
+    /// stopped lives with the task). Default: the coordination layer's
+    /// escalate (needs-human label + comment / `status='needs_human'` +
+    /// reason).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        escalate_on_forge(deps, run.issue_number, reason).await;
+        let _ = deps.task_source.escalate(&run.task_key(), reason).await;
     }
 
     /// The agent ended its execute turn with `needs_plan`: a design decision
@@ -229,47 +231,6 @@ pub struct Checkpoint {
 #[derive(Debug, thiserror::Error)]
 #[error("needs human: {0}")]
 pub struct NeedsHuman(pub String);
-
-/// Shared discovery: open issues carrying `label` that are actionable — not
-/// held, not claimed by another host, not already shipped by a succeeded run
-/// of this loop (avoids duplicate PRs when the trigger label lingers or
-/// reappears; humans can force a rerun with `meguri run --issue N`), and not
-/// gated by an unresolved `blocked_by` dependency.
-pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Result<Vec<Target>> {
-    let issues = deps.forge.list_issues_with_label(label).await?;
-    let mut targets = Vec::new();
-    for issue in issues {
-        if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
-            continue;
-        }
-        if deps
-            .store
-            .issue_has_succeeded_run(&deps.project.id, loop_kind, issue.number)?
-        {
-            continue;
-        }
-        if has_unresolved_blockers(deps, issue.number).await {
-            continue;
-        }
-        targets.push(Target {
-            issue_number: issue.number,
-            title: issue.title,
-        });
-    }
-    Ok(targets)
-}
-
-/// Dependency gate (looper ADR-0004): GitHub-native `blocked_by` is the
-/// authority. Only a blocker closed as completed resolves; open blockers,
-/// not_planned/duplicate closes, and blockers we cannot read all keep the
-/// issue out of discovery. The skip is silent — no label, no comment: the
-/// dependency graph on the forge already tells a human why nothing starts.
-async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
-    match deps.forge.blocked_by(issue).await {
-        Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
-        Err(_) => true,
-    }
-}
 
 pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<WorkerOutcome> {
     let run = deps
@@ -443,9 +404,12 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     }
 
     if step == STEP_OPEN_PR {
-        let pr_url = open_pr(deps, &run, &mut checkpoint, &worktree, flavor).await?;
+        // `deliver` dispatches on the project's `deliver` setting (issue #54):
+        // a PR (open_pr), or just the verified branch. `finish_pane` applies
+        // the issue-scoped pane lifetime (issue #92) either way.
+        let artifact = deliver(deps, &run, &mut checkpoint, &worktree, flavor).await?;
         finish_pane(deps, &run).await;
-        return Ok(WorkerOutcome::Succeeded { pr_url });
+        return Ok(WorkerOutcome::Succeeded { pr_url: artifact });
     }
 
     bail!("unknown step {step:?}");
@@ -509,20 +473,15 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
 }
 
 /// Failure escalation on the forge ("Authority": the durable record of why
-/// the run stopped lives on the issue, not in meguri's local state).
+/// the run stopped lives on the issue, not in meguri's local state). Used by
+/// forge loops that escalate on the issue directly (the spec worker); the
+/// worker/planner default escalate goes through the task source instead.
 pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
-    let _ = deps.forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = deps.forge.remove_label(issue, forge::LABEL_WORKING).await;
-    let _ = deps
-        .forge
-        .comment(
-            issue,
-            &format!(
-                "🔁 **meguri** could not finish this issue and needs a human.\n\n> {reason}\n\n\
-                 The agent's pane (if still open) has the full context — \
-                 see `meguri ps` / `meguri attach` on the host running meguri."
-            ),
-        )
+    let forge = deps.forge();
+    let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
+    let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
+    let _ = forge
+        .comment(issue, &tasks::needs_human_comment(reason))
         .await;
 }
 
@@ -539,59 +498,44 @@ pub enum PreparedWork {
     Skip(String),
 }
 
-/// Default prepare-work: re-verify labels on the forge, then claim with
-/// `meguri:working` (the durable claim marker). A hold or missing trigger
-/// label here is a benign race (the issue changed between discovery and
-/// claim, e.g. another run just shipped it) — skip, don't escalate.
-async fn claim_issue(
-    deps: &Deps,
-    run: &RunRecord,
-    trigger_label: &str,
-    cp: &mut Checkpoint,
-) -> Result<PreparedWork> {
-    let issue = deps.forge.get_issue(run.issue_number).await?;
-    if issue.has_label(forge::LABEL_HOLD) {
-        return Ok(PreparedWork::Skip(format!(
-            "issue #{} is on hold ({})",
-            issue.number,
-            forge::LABEL_HOLD
-        )));
+/// Default prepare-work: the coordination layer's single atomic claim
+/// (github: label re-verification + `meguri:working` + needs-human clear;
+/// local: the atomic `tasks` UPDATE). `None` is a benign race — the task
+/// changed between discovery and claim (e.g. another run shipped it, or a
+/// second host took it) — so skip, don't escalate.
+async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result<PreparedWork> {
+    let key = run.task_key();
+    match deps.task_source.claim(&key, tasks::LOCAL_HOST).await? {
+        Some(task) => {
+            // Carry the auto-merge opt-in from the issue to the PR (auto-merge
+            // 1/3, #41): recorded now, applied in open-pr (non-draft + label
+            // copy). The coordination layer decides it (github: the
+            // `meguri:automerge` label; local: always off).
+            cp.automerge = task.automerge;
+            cp.issue_title = task.title;
+            cp.issue_body = task.body;
+            deps.store.emit(
+                Some(&run.id),
+                "issue.claimed",
+                json!({ "key": format!("{key:?}") }),
+            )?;
+            Ok(PreparedWork::Claimed)
+        }
+        None => Ok(PreparedWork::Skip(format!(
+            "task {key:?} is no longer claimable (raced, de-labeled, or already taken)"
+        ))),
     }
-    if !issue.has_label(trigger_label) {
-        return Ok(PreparedWork::Skip(format!(
-            "issue #{} is not labeled {trigger_label} (removed since discovery?)",
-            issue.number,
-        )));
-    }
-    deps.forge
-        .add_label(issue.number, forge::LABEL_WORKING)
-        .await?;
-    // A fresh claim supersedes a previous run's escalation: the human is no
-    // longer needed while this run is in flight (and a new failure re-adds
-    // the label). No-op if absent; best-effort like the escalation side.
-    let _ = deps
-        .forge
-        .remove_label(issue.number, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    deps.store.emit(
-        Some(&run.id),
-        "issue.claimed",
-        json!({ "issue": issue.number }),
-    )?;
-    // Carry the auto-merge opt-in from the issue to the PR (auto-merge 1/3,
-    // #41): recorded now, applied in open-pr (non-draft + label copy).
-    cp.automerge = issue.has_label(forge::LABEL_AUTOMERGE);
-    cp.issue_title = issue.title;
-    cp.issue_body = issue.body;
-    Ok(PreparedWork::Claimed)
 }
 
 /// Default prepare-worktree: a new run-scoped branch off the default branch.
+/// The branch name encodes the target so a resume (and Phase 4's cross-host
+/// re-claim) can find it: `meguri/<issue>-…` for github, `meguri/t<id>-…`
+/// for local tasks.
 async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
-    let branch = run
-        .branch
-        .clone()
-        .unwrap_or_else(|| gitops::branch_name(run.issue_number, &cp.issue_title, &run.id));
+    let branch = run.branch.clone().unwrap_or_else(|| match run.task_key() {
+        TaskKey::Issue(n) => gitops::branch_name(n, &cp.issue_title, &run.id),
+        TaskKey::Local(id) => gitops::task_branch_name(id, &cp.issue_title, &run.id),
+    });
     let root = deps
         .project
         .worktree_root
@@ -1264,6 +1208,37 @@ pub(crate) async fn validate(
     }
 }
 
+/// Produce the run's deliverable per the project's `deliver` setting and
+/// return a string locating it (a PR URL, or the branch name). The shape is
+/// mode-independent from here on; only this step differs.
+async fn deliver(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+    worktree: &Path,
+    flavor: &dyn Flavor,
+) -> Result<String> {
+    match deps.config.deliver_for(&deps.project) {
+        Deliver::Pr => open_pr(deps, run, cp, worktree, flavor).await,
+        Deliver::Branch => {
+            // Leave the verified commits on the local branch: no push, no PR.
+            // `settle_labels` still runs (it is the coordination-layer
+            // completion — `status='done'` locally, label removal in github).
+            let branch = run.branch.clone().context("run has no branch")?;
+            flavor.settle_labels(deps, run, cp).await?;
+            deps.store.emit(
+                Some(&run.id),
+                "branch.delivered",
+                json!({ "branch": branch }),
+            )?;
+            Ok(branch)
+        }
+        Deliver::Patch => {
+            bail!("deliver = \"patch\" is not implemented yet (issue #54 Phase 2)")
+        }
+    }
+}
+
 /// open-pr: push, create the PR, settle labels. All side effects here are
 /// idempotent enough to re-run after an interruption.
 async fn open_pr(
@@ -1286,7 +1261,7 @@ async fn open_pr(
         // (auto-merge 1/3, #41).
         let draft = deps.config.pr_for(&deps.project).draft && !cp.automerge;
         let pr = deps
-            .forge
+            .forge()
             .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
             .await?;
         cp.pr_url = Some(pr.url.clone());
@@ -1298,7 +1273,7 @@ async fn open_pr(
         // re-reading the issue (the sweep keeps the issue-label fallback for
         // any copy that does not land).
         if cp.automerge {
-            deps.forge
+            deps.forge()
                 .add_pr_label(pr.number, forge::LABEL_AUTOMERGE)
                 .await
                 .ok();

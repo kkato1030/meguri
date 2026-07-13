@@ -112,7 +112,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: check_command.map(str::to_string),
@@ -121,14 +123,13 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         clean: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -260,7 +261,7 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     // Discovery keys the run to the issue the branch encodes, not the PR.
     let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![5]
     );
 
@@ -504,7 +505,7 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
 
     let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![5]
     );
 

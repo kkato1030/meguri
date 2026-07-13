@@ -106,7 +106,9 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
@@ -115,14 +117,13 @@ async fn setup() -> TestEnv {
         clean: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -350,7 +351,7 @@ async fn reviewer_findings_comment_then_re_review_after_push() {
     env.forge.set_pr_head(PR, "feedfacefeedface");
     let targets = SpecReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![ISSUE],
         "targets are keyed by the canonical issue, not the PR"
     );
@@ -535,7 +536,7 @@ async fn reviewer_discovery_filters_hold_working_and_reviewed_heads() {
 
     let targets = SpecReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![ISSUE]
     );
 }

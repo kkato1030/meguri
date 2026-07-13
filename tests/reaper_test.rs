@@ -39,24 +39,26 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 
 async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
-    Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(root.join("worktrees")),
+        pr: None,
+        clean: None,
+    };
+    Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
         forge,
-        config: Config::default(),
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: clone,
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(root.join("worktrees")),
-            pr: None,
-            clean: None,
-        },
-    }
+        Config::default(),
+        project,
+    )
 }
 
 /// Create a meguri worktree for `issue` with one committed file; returns

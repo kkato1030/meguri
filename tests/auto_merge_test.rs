@@ -16,24 +16,26 @@ use meguri::forge::{
 fn deps_with(forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.pr.auto_merge.enabled = true;
-    Deps {
-        store: meguri::store::Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(meguri::mux::fake::FakeMux::new(false)),
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: "/tmp/unused".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: None,
+        pr: None,
+        clean: None,
+    };
+    Deps::with_label_source(
+        meguri::store::Store::open_in_memory().unwrap(),
+        Arc::new(meguri::mux::fake::FakeMux::new(false)),
         forge,
         config,
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: None,
-            pr: None,
-            clean: None,
-        },
-    }
+        project,
+    )
 }
 
 /// Seed a fully-armable PR: meguri branch, `Closes #N.` link, the opt-in

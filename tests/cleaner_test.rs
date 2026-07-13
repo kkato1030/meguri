@@ -107,23 +107,24 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone.clone(),
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        mode: Default::default(),
+        deliver: None,
         clean: None,
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-        notifier: meguri::notify::fake::recording_notifier().0,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -251,7 +252,7 @@ async fn first_sweep_creates_report_issue_and_touches_nothing_else() {
     // Discovery: no report issue yet → the synthetic target 0.
     let targets = CleanerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![0]
     );
 
@@ -345,7 +346,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .unwrap();
     let targets = CleanerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![report]
     );
 
