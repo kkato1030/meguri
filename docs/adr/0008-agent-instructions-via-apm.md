@@ -28,7 +28,7 @@ merge のたびに conflict とレビューノイズを生む。
    codex]` — `src/routing.rs` の built-in 推奨テーブルがルーティング先として使う2つの CLI)と
    `.apm/instructions/*.instructions.md` をコミットする。`apm.lock.yaml` も固定のためコミットする
    (apm は v0.x で破壊的変更が起きうるため、ロックなしでは `apm install` の再現性が保証できない)。
-   ただしコミットするのは `apm lock`(依存解決のみ、ローカル展開はしない)で生成した最小形
+   ただしコミットするのは `apm.yml` に依存が無い状態で `apm lock` を実行して得た最小形
    (`dependencies: []` のみ)に限る — 詳細は 2. で述べる理由により、実際に `apm install` を
    ローカルで走らせた直後の状態(`local_deployed_files` 付き)はコミットしない。
 
@@ -53,9 +53,11 @@ merge のたびに conflict とレビューノイズを生む。
      が書き込まれる。これらは gitignore 対象のコンパイル成果物そのものを指しているので、
      コミットしてしまうと今度は「成果物を置かない worktree で `apm audit --ci` /
      `apm install --frozen` が missing-files エラーになる」という 1. の逆向きの矛盾を起こす。
-     したがってこの diff は常にコミット対象外とし(`git checkout apm.lock.yaml` で戻すか、
-     コミット前に `apm lock` で最小形に作り直す)、リポジトリに残す `apm.lock.yaml` は
-     `dependencies: []` のみの形に保つ。
+     したがってこの diff は常にコミット対象外とし、コミット前に `git checkout apm.lock.yaml`
+     で戻す。実機で確認した限り `apm lock` を(削除せず)再実行しても `local_deployed_files` /
+     `local_deployed_file_hashes` は既存のロックファイルからそのまま引き継がれて消えない
+     ため、最小形に戻す手段として使えるのは `git checkout apm.lock.yaml` だけである。
+     リポジトリに残す `apm.lock.yaml` は `dependencies: []` のみの形に保つ。
    - 生成する仕組みは worktree 準備時のフック(#138 の `worktree_setup`)に持たせる。この issue
      (#137)ではソースの整備までを範囲とし、フック自体は実装しない。
 
@@ -86,5 +88,6 @@ merge のたびに conflict とレビューノイズを生む。
   この ADR の前提(生成される成果物の一覧)を見直す必要がある。
 - ローカルで `apm install` を実行すると `apm.lock.yaml` に `local_deployed_files` が付いた
   状態に一時的に書き換わる(意図した挙動)。`git status` で `apm.lock.yaml` の変更が見えても
-  それはコミット対象ではない — コミット前に `apm lock` で最小形に戻す一手間が要る。この手順を
-  忘れないよう README / README.ja に明記した。
+  それはコミット対象ではない — コミット前に `git checkout apm.lock.yaml` で戻す一手間が要る
+  (`apm lock` の再実行では戻らないことを実機で確認済み)。この手順を忘れないよう README /
+  README.ja に明記した。
