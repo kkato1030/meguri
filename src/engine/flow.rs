@@ -646,6 +646,11 @@ pub(crate) async fn run_worktree_setup(
         for (key, value) in &env {
             cmd.env(key, value);
         }
+        // `output()` spawns eagerly; wrapping it in `timeout` only drops the
+        // *future* on expiry, which would otherwise leave the shell (and
+        // whatever it started) running as an orphan. `kill_on_drop` makes
+        // dropping the child on that cancellation actually kill it.
+        cmd.kill_on_drop(true);
 
         let failure = match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(Ok(out)) if out.status.success() => None,
@@ -1661,6 +1666,43 @@ mod tests {
         assert!(
             events.iter().any(|e| e.kind == "worktree_setup.failed"),
             "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_timeout_kills_the_child_process() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["sleep 2 && echo late > marker.txt".into()],
+                timeout_secs: 1,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        let start = std::time::Instant::now();
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "prepare-worktree must not block past the command's timeout"
+        );
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+
+        // Wait past when the sleep would have finished had it survived the
+        // timeout; if `kill_on_drop` didn't actually kill it, marker.txt
+        // would show up here.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !wt.join("marker.txt").exists(),
+            "the timed-out command must be killed, not left running in the background"
         );
     }
 

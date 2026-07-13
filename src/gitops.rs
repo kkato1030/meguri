@@ -133,7 +133,10 @@ pub async fn create_worktree(
     extra_excludes: &[String],
 ) -> Result<()> {
     if worktree.join(".git").exists() {
-        return Ok(()); // resuming an interrupted run
+        // Resuming an interrupted run. `worktree_setup.exclude` may have
+        // changed since this worktree was first created, so re-apply it
+        // rather than assuming the original creation covered it.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -192,7 +195,9 @@ pub async fn attach_worktree(
             &["merge", "--ff-only", &format!("origin/{branch}")],
         )
         .await;
-        return Ok(());
+        // `worktree_setup.exclude` may have changed since this worktree was
+        // first attached, so re-apply it rather than assuming it's covered.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -254,7 +259,9 @@ pub async fn create_review_worktree(
         run_git(worktree, &["clean", "-fd"])
             .await
             .context("git clean (review re-point)")?;
-        return Ok(());
+        // `worktree_setup.exclude` may have changed since this worktree was
+        // first created, so re-apply it rather than assuming it's covered.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -704,6 +711,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extra_excludes_apply_on_the_resume_fast_path_too() {
+        // `create_worktree` short-circuits when the worktree already exists
+        // (resuming); excludes configured *after* that first creation must
+        // still land on a later call, not just on the initial `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = branch_name(6, "Resume excludes", "run-r");
+        let wt = worktree_path(wt_root.path(), "proj", &branch);
+
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
+            .await
+            .unwrap();
+        assert!(wt.join(".git").exists());
+
+        let extra = vec!["late-generated/".to_string()];
+        create_worktree(repo.path(), &wt, &branch, "main", &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "resume path must still apply new excludes: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_worktrees_reports_paths_and_branches() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;
@@ -787,6 +826,37 @@ mod tests {
             attach_worktree(repo.path(), &missing, "meguri/none", &[])
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_applies_new_excludes_on_the_reuse_path() {
+        // `attach_worktree`'s reuse branch (fetch + ff-only merge) must still
+        // re-apply `extra_excludes`, not just the first `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let branch = "meguri/9-reuse";
+        run_git(repo.path(), &["branch", branch]).await.unwrap();
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = worktree_path(wt_root.path(), "proj", branch);
+        attach_worktree(repo.path(), &wt, branch, &[])
+            .await
+            .unwrap();
+
+        let extra = vec!["late-generated/".to_string()];
+        attach_worktree(repo.path(), &wt, branch, &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "reuse path must still apply new excludes: {contents:?}"
         );
     }
 
@@ -944,5 +1014,44 @@ mod tests {
         create_review_worktree(repo.path(), &wt, "pr-branch", &sha, &[])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_worktree_applies_new_excludes_on_the_repoint_path() {
+        // The re-point branch (`reset --hard` + `clean -fd`) must still
+        // re-apply `extra_excludes`, not just the first `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        run_git(repo.path(), &["checkout", "-b", "pr-branch"])
+            .await
+            .unwrap();
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "r1"])
+            .await
+            .unwrap();
+        let sha1 = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = worktree_path(wt_root.path(), "proj", "review-2-run-x");
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha1, &[])
+            .await
+            .unwrap();
+
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "r2"])
+            .await
+            .unwrap();
+        let sha2 = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let extra = vec!["late-generated/".to_string()];
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha2, &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "re-point path must still apply new excludes: {contents:?}"
+        );
     }
 }
