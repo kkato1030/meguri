@@ -56,7 +56,19 @@ ADR 0003 で「auto の推奨表はバイナリに焼き込み、生成日(`GENE
 
 閾値セクションは **`RoutingConfig` の中(`[routing.drift]`)には置かず、トップレベル `[drift]` に置く**。ADR 0003 で `[routing]` は「書けば role routing の推奨解決が発動する switch」と決めており、実装も `Config.routing: Option<RoutingConfig>` で `[routing]` の存在そのものを active 判定に使う(`src/routing.rs::resolve` は `cfg.routing` が `Some` かどうかで legacy と分岐)。TOML では `[routing.drift]` を書くと `[routing]` テーブルが暗黙生成され `routing` が `Some` になるため、**legacy のまま drift 閾値だけ締めたいユーザーが意図せず `mode = auto` の推奨プロファイル解決を発動させてしまう**。drift 検知は routing の active/legacy に依存しない(legacy でも全 run は `default` プロファイルで走るので (役割, default) 単位の成績悪化は検出できる)ので、設定も routing から切り離してトップレベルに置くのが筋。これで `[drift]` の有無は routing の active 判定に一切影響しない。
 
-### 6. 実起動プローブはネットワーク/認証失敗と「モデル不正」を区別する
+### 6. project スコープは「現在 project」を導入せず、既存の各コマンドの流儀に合わせる
+
+`routing_drift` を `project_id` で持つと決めた以上、読む 3 コマンドが「どの project を出すか」を確定しないと実装者が受け入れ条件を満たせない。ここで**新たに「現在 project」という概念を導入しない** — 現行コードにそんな状態はどこにも無く(doctor は `cfg.projects` を全件ループ、top は明示的に cross-project)、導入すれば別問題(どこに保存する/どう切り替える)を新設することになる。代わりに各コマンドの**既存の性格に合わせて**スコープを決める:
+
+| コマンド | 現状 | drift のスコープ |
+|---|---|---|
+| `meguri stats routing` | 新設 | 既定は全 project(project 列付き)。`--project <id>`(`cmd_run`/`cmd_prune` と同じ optional 引数)で単一 project に絞る |
+| `meguri doctor` | `cfg.projects` を全件ループ | 全 project の未解消行を project id 前置で列挙(選択フラグ無し) |
+| `meguri top` | 明示的に cross-project view | 全 project の active drift を横断集計してヘッダに 1 行 |
+
+判定基準: **単一 project を狙う操作性が要るコマンドだけ `--project` を持つ**(stats は表を絞りたい需要がある)。doctor と top は元々 all-project／cross-project の道具なので、そのまま全 project を出し、drift 行に project ラベルを付けて分離する。どのビューでも読みは `routing_drift` を `project_id` で絞る(単一)か project 列付きで全件出す(横断)かのどちらかで、`WHERE project_id=?` を基本に据えるので「ある project の drift が別 project のものとして混ざる」ことは無い。受け入れ条件の「project で正しく分離」は、単一表示では絞り込みで、横断表示では project ラベルの付与で、それぞれ満たす。
+
+### 7. 実起動プローブはネットワーク/認証失敗と「モデル不正」を区別する
 
 doctor 実行時のみ、各プロファイルで超短命の 1 ターン(claude なら `claude -p "reply: ok" --model sonnet` 相当)を打ち、モデルエイリアスの生死を実地確認する(quota を数百トークン消費する opt-in コスト)。ここで失敗の**原因を切り分ける**のが肝:
 
@@ -71,4 +83,5 @@ doctor 実行時のみ、各プロファイルで超短命の 1 ターン(claude
 - serve 撤去(ADR 0002)を受け、issue が想定した「serve ダッシュボードの 1 ページ」は **`meguri stats routing`(CLI)+ `meguri top` ヘッダの drift 行**に置き換わる。Web ページは作らない。
 - CLI バージョンは doctor 実行ごとに sqlite に UPSERT し、メジャー番号の変化で「再評価推奨」を出す。バージョン履歴の最小の永続化(1 CLI = 1 行)を新設する。
 - drift の現在状態は `routing_drift` テーブル(project×役割×プロファイル = 1 行、`active` フラグ)に持ち、read 側の project スコープと「解消したら消える」を保証する。`events` は project を持たず run 非依存の drift を絞れないため、read の真実源にはしない(履歴としては残す)。
+- 表示側は「現在 project」を新設せず、既存の性格を踏襲する: `stats routing` だけが `--project` で単一 project に絞れ(既定は全 project の project 列付き)、doctor と top は従来通り all-project／cross-project のまま drift を project ラベル付きで出す。これで実装者は 3 コマンドそれぞれのスコープを迷わず決められる。
 - 成果ドリフトの精度はターン単位集計・トークン会計を足せば上げられるが、いずれも本 ADR の軸(役割×プロファイル / ターン数×所要時間)の**下**に足す拡張であり、この決定を覆さない。

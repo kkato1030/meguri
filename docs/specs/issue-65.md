@@ -21,6 +21,11 @@
 - 成功率の分母 = `succeeded`+`failed`+`cancelled` のみ(`skipped`/`needs_plan`/`decomposed` は除外)。この定義をテストで固定。
 - コスト代理 = ターン数 × 所要時間。トークン会計はスコープ外。
 - 読み取り(stats/doctor/top)は sqlite 直読み。ドリフト**検知**だけ scheduler の sweep が担う。sweep は (project, 役割, プロファイル) 単位の**現在の drift 状態**を `routing_drift` テーブルに UPSERT し(現状態のソースオブトゥルース)、状態が遷移したときだけ `routing.drift` / `routing.drift_cleared` イベントを履歴として追記する。doctor/top/stats は `routing_drift` を `project_id` で絞って未解消(`active`)行を読むだけ。`events` は `project_id` を持たず drift は run 非依存の集計なので、read 側のスコープ・解消判定はイベントではなく状態テーブルで担保する。
+- **表示 3 コマンドの project スコープは既存 UI の流儀に合わせる**(コマンドごとに違う)。「現在 project」という概念は現行コードに存在しないので導入しない。代わりに (a) 全 project を **project 列付き**で出すか、(b) `--project <id>` で単一 project に絞るか、を各コマンドで確定する:
+  - **`meguri stats routing`**: 既定は全 project を project 列付きで表示。`--project <id>`(`cmd_run`/`cmd_prune` と同じ optional 引数、`src/main.rs:34,37,53,56`)で単一 project に絞る。集計 `routing_stats` と drift 読みは引数があれば `project_id=?` で絞り、無ければ全 project。
+  - **`meguri doctor`**: 現行 doctor は `cfg.projects` を全件ループする all-project コマンド(`src/main.rs:178`)。drift 検査も同様に全 project の未解消行を **project id を前置して**列挙する。project 選択フラグは足さない(doctor に単一 project という概念がないため)。
+  - **`meguri top`**: 現行コードで明示的に cross-project view(`src/app.rs:573-581`, `src/app.rs:614-623`)。ヘッダの drift 行は全 project の active drift を**横断集計**する(合計件数 + project ごとの要約)。cross-project のまま。
+  - どの表示でも drift 行は `routing_drift` を `WHERE project_id=?`(または全件+project 列)で読み、常に自身の project ラベルを伴う。よって「ある project の drift が別 project のものとして出る/混ざる」ことはない(all-project ビューでも project 列で分離される)。
 - 閾値は**トップレベル** `[drift]` セクション(`[routing.drift]` にはしない)。既定 = 成功率 -20pt または平均ターン数 +50%。テストで固定。`[routing]` は書けば role routing が発動する switch(`Config.routing: Option<RoutingConfig>`、`src/config.rs:78` / `src/routing.rs:180`、ADR 0003)なので、TOML で `[routing]` テーブルを暗黙生成する `[routing.drift]` に閾値を置くと、legacy のまま drift だけ締めたいユーザーが意図せず `mode = auto` を発動させてしまう。drift 検知は routing の active/legacy と独立(legacy でも全 run は `default` プロファイルなので (役割, default) 単位で成績悪化を検出できる)なので、設定も routing から切り離す。
 - プローブは「モデル不正 → ❌」「ネットワーク/認証失敗 → ⚠️」を区別。注入クロージャ + fake agent でテスト。
 
@@ -34,12 +39,13 @@
 
 ### 層 2 — 成果集計とドリフト検知
 
-4. **集計(sqlite 直読み)**: `Store` に `routing_stats(project_id, window)` を追加。(loop_kind, agent_profile) ごとに、直近 N 件の terminal run から成功率・平均ターン数(`AVG(turn_no)`)・平均所要時間(`finished_at - started_at` を `parse_ts` で秒化)を返す構造体 `RoutingStatRow` を返す。`agent_profile IS NULL`(未固定の旧 run)は「(unrouted)」等でまとめる。
-5. **`meguri stats routing`**(`src/cli.rs` に `Stats { StatsCommand::Routing }`、`src/main.rs` で dispatch、レンダリングは `src/app.rs`): 上記 3 指標を (役割, プロファイル) 表で表示。直近 drift があれば併記。
+4. **集計(sqlite 直読み)**: `Store` に `routing_stats(project: Option<&str>, window)` を追加(`None` = 全 project を project 列付きで、`Some(id)` = 単一 project)。`runs` は `project_id` を持つ(`0001_init.sql`、index `runs(project_id, loop_kind, issue_number)`)。(loop_kind, agent_profile) ごとに、直近 N 件の terminal run から成功率・平均ターン数(`AVG(turn_no)`)・平均所要時間(`finished_at - started_at` を `parse_ts` で秒化)を返す構造体 `RoutingStatRow` を返す。`agent_profile IS NULL`(未固定の旧 run)は「(unrouted)」等でまとめる。
+5. **`meguri stats routing`**(`src/cli.rs` に `Stats { StatsCommand::Routing { project: Option<String> } }`、`src/main.rs` で dispatch、レンダリングは `src/app.rs`): 上記 3 指標を (役割, プロファイル) 表で表示。直近 drift があれば併記。**`--project <id>` 省略時は全 project を project 列付きで、指定時はその project だけ**を表示する(`routing_stats` と drift 読みへ `Option<&str>` project フィルタを渡す)。
 6. **ドリフト検知(scheduler の sweep)**: 新モジュール(例 `src/engine/routing_drift.rs`)の `sweep(deps)` を poll に追加。project ごとに (役割, プロファイル) 単位で直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、`成功率 -Δpt` か `平均ターン数 +Δ%` が閾値超えなら drift ありと判定。判定結果を `routing_drift` に UPSERT する(`active=1` + before/after 指標、または `active=0`)。**`active` が遷移したときだけ**イベントを追記する(0→1 で `routing.drift`、1→0 で `routing.drift_cleared`。payload に `project_id`/`role`/`profile`/`before`/`after`)。この「テーブルの現在値と比較して遷移時のみ書く」が dedup(同じ状態を毎 tick 書かない)の実装であり、テストで「同一状態の連続 sweep でイベントが 1 度だけ / 回復で cleared が 1 度だけ」を固定する。ウィンドウが埋まっていない (役割, プロファイル) は判定せず状態を書かない。
-7. **表示**:
-   - **doctor**: 現在 project の `routing_drift` の未解消(`active`)行を読み「worker/claude-sonnet の成績が悪化 — CLI 更新かモデル変更の影響の可能性」を ⚠️ 表示。回復済み(`active=0`)は出さない。
-   - **`meguri top`**(`src/app.rs::render_top` / `TopStatus`): ヘッダに drift 件数/要約行を 1 行追加。
+7. **表示**(project スコープは上記「決定」の通りコマンドごとに異なる):
+   - **doctor**: 全 project(`cfg.projects` ループ)の `routing_drift` 未解消(`active`)行を **project id を前置して**「[proj] worker/claude-sonnet の成績が悪化 — CLI 更新かモデル変更の影響の可能性」を ⚠️ 表示。回復済み(`active=0`)は出さない。
+   - **`meguri top`**(`src/app.rs::render_top` / `TopStatus`): cross-project のまま、全 project の active drift を横断集計してヘッダに drift 件数/要約行を 1 行追加。
+   - **`meguri stats routing`**: 上記 5 の通り、`--project` 無しは全 project(project 列付き)、有りは単一 project。
 
 ### 設定(`src/config.rs`)
 
@@ -69,7 +75,7 @@
 
 - [ ] `meguri stats routing` が (役割, プロファイル) 別の成功率・平均ターン数・平均所要時間を表示する
 - [ ] ウィンドウ比較でドリフトが `routing_drift` に記録され(`routing.drift` イベントも追記)、`meguri top` と doctor に表示される(閾値はテストで固定 / serve 撤去に伴い web ページではなく top+stats に表示)
-- [ ] 複数 project の drift が `project_id` で正しく分離される(ある project の drift が別 project の doctor/top/stats に出ない)
+- [ ] 複数 project の drift が `project_id` で正しく分離される: `stats routing --project X` は X の drift だけを出す / doctor・top・`stats routing`(全 project 表示)では各 drift 行が自分の project ラベルを伴い、別 project のものとして混同されない
 - [ ] 成績が閾値内に回復すると `active=0` になり(`routing.drift_cleared` イベント)、doctor/top/stats から消える。同一状態の連続 sweep でイベントが増えない(テストで固定)
 - [ ] doctor: `GENERATED_AT` 90 日超で ⚠️ が出る
 - [ ] doctor: 実起動プローブが無効モデルを ❌ で検知する(fake agent = 注入クロージャでのテスト)。ネットワーク/認証失敗は ⚠️ に落ちて doctor を fail させない
@@ -79,10 +85,10 @@
 
 - `src/main.rs` — doctor に 3 検査(表鮮度 / プローブ / CLI バージョン)を追加
 - `src/routing.rs` — `table_age_days()` 等の純関数、プローブ結果型 `ProbeOutcome`、プローブ本番実装
-- `src/cli.rs` — `Stats` サブコマンド(`routing`)
-- `src/app.rs` — `meguri stats routing` レンダリング、`render_top`/`TopStatus` に drift 行
+- `src/cli.rs` — `Stats` サブコマンド(`routing { project: Option<String> }`)
+- `src/app.rs` — `meguri stats routing` レンダリング(全 project = project 列付き / `--project` = 単一)、`render_top`/`TopStatus` に cross-project drift 行
 - `src/engine/routing_drift.rs`(新規)+ `src/engine/scheduler.rs` — poll に drift sweep を追加、`super::routing_drift` を配線
-- `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats()`、CLI バージョン UPSERT/読み出し、`routing_drift` の UPSERT / project 別未解消行の読み出し
+- `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats(project: Option<&str>, window)`、CLI バージョン UPSERT/読み出し、`routing_drift` の UPSERT / project 別(または全 project)未解消行の読み出し
 - `src/store/migrations/0007_routing_freshness.sql` + `src/store/mod.rs` — `cli_versions` + `routing_drift` の移行登録
 - `src/config.rs` — トップレベル `[drift]`(`DriftConfig`)。`RoutingConfig` の外に置き routing の activation に影響させない
 - `docs/adr/0007-routing-freshness-and-outcome-drift.md` — 本 PR 同梱
