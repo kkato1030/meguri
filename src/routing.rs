@@ -32,22 +32,30 @@ pub const GENERATED_AT: &str = "2026-07-12";
 pub const DEFAULT_PROFILE: &str = "default";
 
 /// Roles routing knows about. Most are loop kinds (= `runs.loop_kind`);
-/// `impl-reviewer` is not a loop but the profile of the worker's internal
-/// self-review turn (ADR 0006). Explicit entries for anything outside this
-/// set are a startup error.
+/// `self-review` is not a loop but the profile of the internal self-review
+/// turn (ADR 0006/0008), and `guard` the profile of the external guard review
+/// (ADR 0008). Both are shared across the plan and impl kinds (requirement 3:
+/// spec and impl are managed by the same model). Explicit entries for anything
+/// outside this set are a startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
-    "spec-reviewer",
-    "impl-reviewer",
+    "self-review",
+    "guard",
     "worker",
     "spec-worker",
     "fixer",
     "conflict-resolver",
 ];
 
-/// Deprecated routing role keys → their current name (issue #108). A config
-/// still using the old key resolves as if it named the new one.
-const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[("reviewer", "spec-reviewer")];
+/// Deprecated routing role keys → their current name (issue #108 / ADR 0008).
+/// A config still using the old key resolves as if it named the new one:
+/// `reviewer`/`spec-reviewer` → `guard` (the external review), `impl-reviewer`
+/// → `self-review` (the internal review).
+const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[
+    ("reviewer", "guard"),
+    ("spec-reviewer", "guard"),
+    ("impl-reviewer", "self-review"),
+];
 
 /// Map a (possibly deprecated) config role key to its canonical name.
 fn canonical_role(role: &str) -> &str {
@@ -124,9 +132,9 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         // Small consumption, top leverage: best spec = fewest downstream turns.
         "planner" => &["claude-opus", DEFAULT_PROFILE],
         // Cross-vendor on purpose: reviewing with the author's model shares its
-        // blind spots (and spares the Claude quota). Both the external spec
-        // reviewer and the worker's internal self-review turn key off this.
-        "spec-reviewer" | "impl-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
+        // blind spots (and spares the Claude quota). Both the internal
+        // self-review turn and the external guard review key off this.
+        "self-review" | "guard" => &["codex", "claude-opus", DEFAULT_PROFILE],
         // The bulk of consumption; Sonnet lands close to Opus on coding at
         // roughly half the quota/price.
         "worker" | "spec-worker" => &["claude-sonnet", DEFAULT_PROFILE],
@@ -327,24 +335,21 @@ worker = "claude-opus"
     #[test]
     fn auto_falls_back_along_the_chain() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
-        // codex present → spec-reviewer uses codex.
+        // codex present → guard uses codex.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "guard", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
-        // codex absent → spec-reviewer falls to claude-opus.
+        // codex absent → guard falls to claude-opus.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["claude"])).unwrap(),
+            resolve(&cfg, "guard", &only(&["claude"])).unwrap(),
             "claude-opus"
         );
-        // neither present → spec-reviewer falls to default.
+        // neither present → guard falls to default.
+        assert_eq!(resolve(&cfg, "guard", &only(&[])).unwrap(), DEFAULT_PROFILE);
+        // The internal self-review role shares the cross-vendor chain.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&[])).unwrap(),
-            DEFAULT_PROFILE
-        );
-        // The internal-review role shares the cross-vendor chain.
-        assert_eq!(
-            resolve(&cfg, "impl-reviewer", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "self-review", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
     }
@@ -384,9 +389,10 @@ spec-reviewer = "codex"
     }
 
     #[test]
-    fn deprecated_reviewer_key_steers_spec_reviewer() {
-        // A config still using the old `reviewer` key resolves as if it named
-        // `spec-reviewer`, and validate() accepts it.
+    fn deprecated_review_keys_steer_the_renamed_roles() {
+        // Configs still using the old keys resolve to the ADR-0008 roles:
+        // `reviewer` / `spec-reviewer` → `guard`, `impl-reviewer` →
+        // `self-review`, and validate() accepts them all.
         let cfg = cfg_from(
             r#"
 [routing]
@@ -394,13 +400,21 @@ mode = "manual"
 
 [routing.roles]
 reviewer = "codex"
+impl-reviewer = "claude-opus"
 "#,
         );
+        assert_eq!(resolve(&cfg, "guard", &only(&["codex"])).unwrap(), "codex");
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
-            "codex"
+            resolve(&cfg, "self-review", &only(&["claude"])).unwrap(),
+            "claude-opus"
         );
-        validate(&cfg, &only(&["codex"])).unwrap();
+        validate(&cfg, &only(&["codex", "claude"])).unwrap();
+
+        // The current `spec-reviewer` key also still steers `guard`.
+        let cfg2 =
+            cfg_from("[routing]\nmode = \"manual\"\n[routing.roles]\nspec-reviewer = \"codex\"\n");
+        assert_eq!(resolve(&cfg2, "guard", &only(&["codex"])).unwrap(), "codex");
+        validate(&cfg2, &only(&["codex"])).unwrap();
     }
 
     #[test]

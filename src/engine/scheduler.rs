@@ -109,6 +109,11 @@ impl Scheduler {
                 if let Err(e) = super::merge_watch::sweep(deps).await {
                     tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
+                // flips its issue speccing → ready so the worker implements it.
+                if let Err(e) = super::handoff::sweep(deps).await {
+                    tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
+                }
                 // Notice body edits on already-shipped issues the label-filtered
                 // discovery can no longer see (issue #142, half B) and leave a
                 // re-attention signal. Light API sweep, no run record.

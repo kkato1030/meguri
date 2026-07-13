@@ -175,6 +175,7 @@ async fn cmd_doctor() -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
+            doctor_workspaces(cfg);
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
             ok &= check_auto_merge(cfg).await;
@@ -240,6 +241,21 @@ async fn check_auto_merge(cfg: &Config) -> bool {
         }
     }
     ok
+}
+
+/// Doctor's workspace section (issue #154): list each `[[workspaces]]` group
+/// and its member projects. Reaching here means the config already loaded, and
+/// loading hard-fails on an undefined project reference or a project in two
+/// workspaces — so a printed workspace is a validated one. An invalid
+/// workspace instead surfaces on doctor's `config` line (the load error).
+fn doctor_workspaces(cfg: &Config) {
+    if cfg.workspaces.is_empty() {
+        return;
+    }
+    println!("\nworkspaces:");
+    for ws in &cfg.workspaces {
+        println!("  ✅ {} → {}", ws.id, ws.projects.join(", "));
+    }
 }
 
 /// Doctor's routing section: list every defined profile (default + builtin +

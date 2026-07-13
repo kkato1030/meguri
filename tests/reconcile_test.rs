@@ -25,6 +25,8 @@ fn deps_with(forge: Arc<FakeForge>, store: Store, reconcile: ReconcileConfig) ->
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
+        plan_delivery: Default::default(),
+        review: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
