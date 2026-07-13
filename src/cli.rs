@@ -16,7 +16,12 @@ pub enum Command {
     /// Create ~/.meguri (config.toml + sqlite db)
     Init,
     /// Check environment: gh auth, mux availability, git
-    Doctor,
+    Doctor {
+        /// Also fire a one-shot live probe per agent profile to verify each
+        /// model alias still resolves (spends a few hundred tokens of quota)
+        #[arg(long)]
+        probe: bool,
+    },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
     /// Manage the resident watch: detach, OS supervision, status, logs
@@ -41,6 +46,11 @@ pub enum Command {
         /// Include finished runs
         #[arg(long)]
         all: bool,
+    },
+    /// Show aggregate stats read straight from sqlite (works with watch stopped)
+    Stats {
+        #[command(subcommand)]
+        command: StatsCommand,
     },
     /// Build a dedicated dashboard workspace of tiled live agent panes and
     /// attach to it — a terminal dashboard
@@ -99,6 +109,17 @@ pub enum Command {
         /// Also reclaim dirty worktrees and force-delete unmerged branches
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StatsCommand {
+    /// Success rate / mean turns / mean duration per (role, profile), plus any
+    /// active routing drift
+    Routing {
+        /// Restrict to one project id (default: all projects, project column)
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 

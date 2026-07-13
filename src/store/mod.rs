@@ -6,8 +6,10 @@ use rusqlite::Connection;
 
 mod panes;
 mod runs;
+mod stats;
 pub use panes::*;
 pub use runs::*;
+pub use stats::*;
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
@@ -27,6 +29,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0006_pane_role",
         include_str!("migrations/0006_pane_role.sql"),
+    ),
+    (
+        "0007_routing_freshness",
+        include_str!("migrations/0007_routing_freshness.sql"),
     ),
 ];
 

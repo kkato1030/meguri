@@ -27,6 +27,103 @@ use crate::config::{AgentProfile, Config, RoutingMode};
 /// into a machine freshness check; for now it is documentation with teeth.
 pub const GENERATED_AT: &str = "2026-07-12";
 
+/// Age past which doctor warns the recommendation table may be stale. The
+/// table is a "2026-07 snapshot"; models turn over on roughly this cadence.
+pub const TABLE_STALE_DAYS: i64 = 90;
+
+/// Age in days of the recommendation table (`GENERATED_AT`) relative to
+/// `now_ts` (an RFC3339 UTC stamp, e.g. from `store::now`). None if either
+/// date is malformed. Clamped at 0 for a future/skewed clock.
+pub fn table_age_days_at(now_ts: &str) -> Option<i64> {
+    let generated = format!("{GENERATED_AT}T00:00:00Z");
+    let g = crate::store::parse_ts(&generated)?;
+    let n = crate::store::parse_ts(now_ts)?;
+    Some((n.saturating_sub(g) / 86_400) as i64)
+}
+
+/// Age in days of the recommendation table as of now.
+pub fn table_age_days() -> Option<i64> {
+    table_age_days_at(&crate::store::now())
+}
+
+/// The major version number in a CLI `--version` line: the integer at the
+/// first digit run. "gh version 2.40.1" → 2, "v1.2.3" → 1, "codex 0.5" → 0,
+/// a line with no digits → None. Used to flag a CLI major-version drift.
+pub fn major_version(version_line: &str) -> Option<u64> {
+    let start = version_line.find(|c: char| c.is_ascii_digit())?;
+    let rest = &version_line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|e| start + e)
+        .unwrap_or(version_line.len());
+    version_line[start..end].parse().ok()
+}
+
+/// The result of doctor's live-launch probe: does the profile's model alias
+/// still resolve? The three cases carry different doctor severities (ADR
+/// 0007) — a bad model is actionable (❌); a transport/auth failure is not
+/// routing's fault (⚠️).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The alias resolved and the CLI produced a reply.
+    Ok,
+    /// The CLI ran but rejected the model — alias retired/renamed.
+    ModelInvalid,
+    /// Network / auth / spawn failure — indistinguishable from a bad model
+    /// only by fault, not by routing: don't fail doctor on it.
+    Unavailable,
+}
+
+/// Production live-launch probe: fire a one-shot, ~1-token turn to check the
+/// profile's model alias is still valid. Only the `claude` CLI has a known
+/// probe form today; other commands report `Unavailable` (⚠️, non-fatal)
+/// rather than a false `ModelInvalid`. Injected as a closure in doctor so
+/// tests exercise the classification without spawning a real CLI.
+pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
+    // Match the CLI by basename so an absolute path to a `claude` binary (or a
+    // test fake) still counts.
+    let base = std::path::Path::new(&profile.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&profile.command);
+    if base != "claude" {
+        return ProbeOutcome::Unavailable;
+    }
+    // Reuse the profile's own args (which carry `--model <alias>`) plus a
+    // trivial one-shot prompt.
+    let mut args = profile.args.clone();
+    args.push("-p".into());
+    args.push("reply: ok".into());
+    match std::process::Command::new(&profile.command)
+        .args(&args)
+        .output()
+    {
+        Ok(out) if out.status.success() => ProbeOutcome::Ok,
+        Ok(out) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .to_lowercase();
+            // A model-rejection message names the model and an invalidity;
+            // everything else (auth, rate limit, network) is Unavailable.
+            let model_rejected = text.contains("model")
+                && (text.contains("invalid")
+                    || text.contains("unknown")
+                    || text.contains("not found")
+                    || text.contains("does not exist")
+                    || text.contains("no such"));
+            if model_rejected {
+                ProbeOutcome::ModelInvalid
+            } else {
+                ProbeOutcome::Unavailable
+            }
+        }
+        Err(_) => ProbeOutcome::Unavailable,
+    }
+}
+
 /// The reserved profile name for the historical `[agent]` section. Users
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
@@ -496,6 +593,36 @@ args = ["--foo"]
         let p = profile_by_name(&cfg, "codex").unwrap();
         assert_eq!(p.command, "my-codex");
         assert_eq!(p.args, vec!["--foo"]);
+    }
+
+    #[test]
+    fn table_age_days_counts_from_generated_at() {
+        // GENERATED_AT is 2026-07-12. 90 days later crosses the stale line.
+        assert_eq!(table_age_days_at("2026-07-12T00:00:00Z"), Some(0));
+        assert_eq!(table_age_days_at("2026-07-13T00:00:00Z"), Some(1));
+        assert_eq!(table_age_days_at("2026-10-11T00:00:00Z"), Some(91));
+        assert!(table_age_days_at("2026-10-11T00:00:00Z").unwrap() > TABLE_STALE_DAYS);
+        // A date before the table's own date clamps to 0, never negative.
+        assert_eq!(table_age_days_at("2026-01-01T00:00:00Z"), Some(0));
+        assert_eq!(table_age_days_at("garbage"), None);
+    }
+
+    #[test]
+    fn major_version_extracts_leading_integer() {
+        assert_eq!(major_version("gh version 2.40.1 (2024-01-01)"), Some(2));
+        assert_eq!(major_version("git version 2.39.2"), Some(2));
+        assert_eq!(major_version("v1.2.3"), Some(1));
+        assert_eq!(major_version("codex 0.5.0"), Some(0));
+        assert_eq!(major_version("claude 13.0.1"), Some(13));
+        assert_eq!(major_version("reply: ok"), None);
+    }
+
+    #[test]
+    fn probe_non_claude_is_unavailable_not_a_false_negative() {
+        // We can't drive an arbitrary CLI's one-shot form, so report a
+        // non-fatal Unavailable rather than a false ModelInvalid.
+        let codex = builtin_profiles().remove("codex").unwrap();
+        assert_eq!(probe_profile(&codex), ProbeOutcome::Unavailable);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod flow;
 pub mod impl_reviewer;
 pub mod planner;
 pub mod reaper;
+pub mod routing_drift;
 pub mod scheduler;
 pub mod spec_reviewer;
 pub mod spec_worker;

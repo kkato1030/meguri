@@ -76,6 +76,15 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
+    /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
+    /// presence switches role routing on (see [`routing`]), so a
+    /// `[routing.drift]` table would silently activate routing for a user who
+    /// only wanted to tune drift. Drift detection is independent of routing
+    /// being active — legacy runs all use `default`, so `(role, default)`
+    /// regressions are still caught.
+    #[serde(default)]
+    pub drift: DriftConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -353,6 +362,44 @@ pub struct RoutingConfig {
     /// values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+}
+
+/// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
+/// The scheduler compares the most recent `window` runs of each
+/// `(role, profile)` against the preceding `window` and flags a regression
+/// when the success rate drops by `success_rate_drop_pt` points OR the mean
+/// turn count rises by `turns_increase_pct` percent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftConfig {
+    /// Success-rate drop (in percentage points, 0–100) that trips a warning.
+    #[serde(default = "default_success_rate_drop_pt")]
+    pub success_rate_drop_pt: f64,
+    /// Mean-turn-count increase (in percent) that trips a warning.
+    #[serde(default = "default_turns_increase_pct")]
+    pub turns_increase_pct: f64,
+    /// Runs per comparison window (recent vs. preceding).
+    #[serde(default = "default_drift_window")]
+    pub window: usize,
+}
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            success_rate_drop_pt: default_success_rate_drop_pt(),
+            turns_increase_pct: default_turns_increase_pct(),
+            window: default_drift_window(),
+        }
+    }
+}
+
+fn default_success_rate_drop_pt() -> f64 {
+    20.0
+}
+fn default_turns_increase_pct() -> f64 {
+    50.0
+}
+fn default_drift_window() -> usize {
+    20
 }
 
 fn default_agent_command() -> String {
@@ -1183,6 +1230,34 @@ ignore = ["docs/legacy"]
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.agents.is_none());
         assert!(cfg.routing.is_none());
+    }
+
+    #[test]
+    fn drift_defaults_and_does_not_activate_routing() {
+        // Defaults hold with no `[drift]` section.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.drift.success_rate_drop_pt, 20.0);
+        assert_eq!(cfg.drift.turns_increase_pct, 50.0);
+        assert_eq!(cfg.drift.window, 20);
+
+        // A `[drift]` section tunes the thresholds but is top-level: it must
+        // NOT imply `[routing]` (which would silently switch role routing on).
+        let cfg: Config = toml::from_str(
+            r#"
+[drift]
+success_rate_drop_pt = 10.0
+turns_increase_pct = 25.0
+window = 50
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.drift.success_rate_drop_pt, 10.0);
+        assert_eq!(cfg.drift.turns_increase_pct, 25.0);
+        assert_eq!(cfg.drift.window, 50);
+        assert!(
+            cfg.routing.is_none(),
+            "[drift] must stay legacy for routing"
+        );
     }
 
     #[test]

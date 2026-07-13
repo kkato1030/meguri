@@ -15,7 +15,7 @@ use crate::engine::{self, Deps};
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
-use crate::store::{DesiredState, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
+use crate::store::{DesiredState, DriftRow, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
 
 pub fn open_store() -> Result<Store> {
     Store::open(&config::db_path())
@@ -345,6 +345,64 @@ fn require_run(store: &Store, needle: &str) -> Result<RunRecord> {
         .with_context(|| format!("no run matches {needle:?} (try `meguri ps --all`)"))
 }
 
+/// `meguri stats routing` — success rate / mean turns / mean duration per
+/// `(role, profile)` over the last N scored runs, plus any active drift.
+/// Pure sqlite direct-read, so it works with the watch stopped. `project =
+/// None` spans every project with a project column; `Some(id)` restricts to one.
+pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let window = cfg.drift.window;
+
+    let rows = store.routing_stats(project, window)?;
+    if rows.is_empty() {
+        match project {
+            Some(p) => println!("no routing stats yet for project {p}"),
+            None => println!("no routing stats yet"),
+        }
+    } else {
+        println!("routing stats — last {window} scored run(s) per (role, profile)\n");
+        println!(
+            "{:<8} {:<18} {:<16} {:>5} {:>8} {:>9} {:>9}",
+            "PROJECT", "ROLE", "PROFILE", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
+        );
+        for r in &rows {
+            let profile = if r.agent_profile.is_empty() {
+                "(unrouted)"
+            } else {
+                &r.agent_profile
+            };
+            let dur = r
+                .avg_duration_secs
+                .map(|s| format!("{s:.0}s"))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<8} {:<18} {:<16} {:>5} {:>7.0}% {:>9.1} {:>9}",
+                r.project_id, r.loop_kind, profile, r.runs, r.success_rate, r.avg_turns, dur,
+            );
+        }
+    }
+
+    let drifts = store.active_drift(project)?;
+    if !drifts.is_empty() {
+        println!("\ndrift (成績が悪化):");
+        for d in &drifts {
+            println!("  ⚠️  {}", drift_label(d));
+        }
+    }
+    Ok(())
+}
+
+/// A `[project] role/profile` label for a drift row (empty profile = default).
+fn drift_label(d: &DriftRow) -> String {
+    let profile = if d.agent_profile.is_empty() {
+        "default"
+    } else {
+        &d.agent_profile
+    };
+    format!("[{}] {}/{}", d.project_id, d.loop_kind, profile)
+}
+
 pub fn cmd_ps(all: bool) -> Result<()> {
     let store = open_store()?;
     let runs = store.list_runs(!all)?;
@@ -394,6 +452,8 @@ struct TopRow {
 struct TopStatus {
     watch_alive: bool,
     rows: Vec<TopRow>,
+    /// Active routing drift across every project (cross-project view, #65).
+    drift: Vec<DriftRow>,
 }
 
 /// Freshness window for the watch heartbeat: two poll ticks plus slack, so a
@@ -498,7 +558,13 @@ async fn top_refresh(
         .latest_heartbeat("watch")?
         .map(|ts| heartbeat_alive(&ts, poll_interval_secs))
         .unwrap_or(false);
-    Ok(TopStatus { watch_alive, rows })
+    // Cross-project active routing drift (#65), read-only from the state table.
+    let drift = store.active_drift(None)?;
+    Ok(TopStatus {
+        watch_alive,
+        rows,
+        drift,
+    })
 }
 
 /// Render the status header printed above the tiled panes each tick.
@@ -517,6 +583,15 @@ fn render_top(status: &TopStatus, attach_hint: &str) -> String {
             "stale ⚠"
         },
     ));
+    // Routing drift banner (#65): one cross-project line, only when non-empty.
+    if !status.drift.is_empty() {
+        let labels: Vec<String> = status.drift.iter().map(drift_label).collect();
+        out.push_str(&format!(
+            "⚠ routing drift: {} — {}\n",
+            status.drift.len(),
+            labels.join(", "),
+        ));
+    }
     if status.rows.is_empty() {
         out.push_str("\nno active runs — start one with `meguri watch` or `meguri run`\n");
     } else {
@@ -856,6 +931,7 @@ mod tests {
                     awaiting_human: true,
                 },
             ],
+            drift: vec![],
         };
         let out = render_top(&status, "herdr tab focus wD:t9; herdr");
         assert!(out.contains("2 run(s)"));
@@ -864,6 +940,27 @@ mod tests {
         assert!(out.contains("▶ run-bbbb"), "awaiting run gets a marker");
         assert!(out.contains("#42"));
         assert!(out.contains("herdr tab focus wD:t9"));
+        assert!(!out.contains("routing drift"), "no drift line when empty");
+    }
+
+    #[test]
+    fn render_top_shows_routing_drift_line() {
+        let status = TopStatus {
+            watch_alive: true,
+            rows: vec![],
+            drift: vec![DriftRow {
+                project_id: "demo".into(),
+                loop_kind: "worker".into(),
+                agent_profile: "claude-sonnet".into(),
+                active: true,
+                metric_json: "{}".into(),
+                detected_at: "2026-07-13T00:00:00Z".into(),
+                updated_at: "2026-07-13T00:00:00Z".into(),
+            }],
+        };
+        let out = render_top(&status, "echo attach");
+        assert!(out.contains("routing drift: 1"));
+        assert!(out.contains("[demo] worker/claude-sonnet"));
     }
 
     #[tokio::test]
@@ -946,6 +1043,7 @@ mod tests {
         let status = TopStatus {
             watch_alive: true,
             rows: vec![],
+            drift: vec![],
         };
         let out = render_top(&status, "echo attach");
         assert!(out.contains("0 run(s)"));

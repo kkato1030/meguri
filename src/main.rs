@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::Parser;
 use meguri::app;
-use meguri::cli::{Cli, Command, DaemonCommand};
+use meguri::cli::{Cli, Command, DaemonCommand, StatsCommand};
 use meguri::config::{self, Config};
 use meguri::daemon;
 use meguri::store::Store;
@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => cmd_init(),
-        Command::Doctor => cmd_doctor().await,
+        Command::Doctor { probe } => cmd_doctor(probe).await,
         Command::Watch => app::cmd_watch().await,
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon::cmd_start(),
@@ -36,6 +36,9 @@ async fn main() -> Result<()> {
             mux,
         } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
+        Command::Stats { command } => match command {
+            StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
+        },
         Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::TopStatus {
             mux,
@@ -79,8 +82,12 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_doctor() -> Result<()> {
+async fn cmd_doctor(probe: bool) -> Result<()> {
     let mut ok = true;
+
+    // Best-effort: the DB backs CLI-version drift and routing-drift display.
+    // A missing/broken store just means those checks are skipped, not a fail.
+    let store = Store::open(&config::db_path()).ok();
 
     let check = |name: &str, pass: bool, detail: String| {
         println!("{} {name}: {detail}", if pass { "✅" } else { "❌" });
@@ -137,7 +144,7 @@ async fn cmd_doctor() -> Result<()> {
 
     match Config::load() {
         Ok(cfg) => {
-            ok &= doctor_agents(&cfg);
+            ok &= doctor_agents(&cfg, store.as_ref(), probe);
             let n = cfg.projects.len();
             println!(
                 "{} projects: {n} configured{}",
@@ -148,6 +155,11 @@ async fn cmd_doctor() -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
+            // Outcome-based routing drift (routing 2/3, #65): surface any
+            // active drift the watch's sweep recorded. Read-only, all-project.
+            if let Some(store) = &store {
+                doctor_drift(store);
+            }
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
             ok &= check_auto_merge(&cfg).await;
@@ -211,10 +223,12 @@ async fn check_auto_merge(cfg: &Config) -> bool {
 }
 
 /// Doctor's routing section: list every defined profile (default + builtin +
-/// user) with its detection result, then — when `[routing]` is active — the
-/// final role→profile resolution. Returns whether the mandatory `default`
-/// profile CLI is present and explicit routing validates.
-fn doctor_agents(cfg: &Config) -> bool {
+/// user) with its detection result and — with `--probe` — a live model-alias
+/// probe, record CLI major-version drift, warn on a stale recommendation
+/// table, and print the role→profile resolution. Returns whether the mandatory
+/// `default` profile CLI is present, explicit routing validates, and no probe
+/// found an invalid model.
+fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
     use meguri::routing;
 
     // Merged profile set: builtins first, user profiles override same names.
@@ -229,6 +243,10 @@ fn doctor_agents(cfg: &Config) -> bool {
     }
     names.sort();
 
+    // CLI major-version drift is per command, but several profiles can share a
+    // command (claude-opus / claude-sonnet → `claude`): check each command once.
+    let mut version_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     println!("\nagent profiles:");
     // The default profile is required: a missing CLI here breaks every legacy
     // and fall-through run.
@@ -241,6 +259,15 @@ fn doctor_agents(cfg: &Config) -> bool {
         cfg.agent.command,
         default_detail.clone().unwrap_or_else(|e| e),
     );
+    if let (Ok(v), Some(store)) = (&default_detail, store) {
+        doctor_version_drift(store, &cfg.agent.command, v, &mut version_checked);
+    }
+
+    let mut ok = default_ok;
+    if probe {
+        ok &= doctor_probe("default", &cfg.agent, &routing::probe_profile);
+    }
+
     // Named profiles are optional — a missing CLI just prunes it from the auto
     // chain; only report their detection, don't fail doctor.
     for name in &names {
@@ -251,11 +278,32 @@ fn doctor_agents(cfg: &Config) -> bool {
             "  {} {name} ({}): {}",
             if detail.is_ok() { "✅" } else { "⚠️ " },
             profile.command,
-            detail.unwrap_or_else(|e| e),
+            detail.clone().unwrap_or_else(|e| e),
         );
+        if let (Ok(v), Some(store)) = (&detail, store) {
+            doctor_version_drift(store, &profile.command, v, &mut version_checked);
+        }
+        // Probe only profiles whose CLI was detected — a missing CLI is
+        // already reported above and can't be launched.
+        if probe && detail.is_ok() {
+            ok &= doctor_probe(name, &profile, &routing::probe_profile);
+        }
     }
 
-    let mut ok = default_ok;
+    // Recommendation-table freshness (routing 2/3, #65): warn when the baked-in
+    // snapshot has aged past the staleness window.
+    match routing::table_age_days() {
+        Some(days) if days > routing::TABLE_STALE_DAYS => {
+            let ym = routing::GENERATED_AT
+                .get(..7)
+                .unwrap_or(routing::GENERATED_AT);
+            println!(
+                "⚠️  routing 推奨は {ym} 版({days} 日前)。新モデルのリリースを確認してください"
+            );
+        }
+        _ => {}
+    }
+
     match &cfg.routing {
         None => {
             println!("routing: legacy — every role runs `default` ([agent])");
@@ -285,6 +333,99 @@ fn doctor_agents(cfg: &Config) -> bool {
     ok
 }
 
+/// Compare a CLI's detected version against the last one doctor recorded and
+/// warn on a major-version bump (behavior may have shifted; re-evaluate
+/// routing), then persist the current version. Each command is checked once
+/// per doctor run.
+fn doctor_version_drift(
+    store: &Store,
+    command: &str,
+    version_line: &str,
+    checked: &mut std::collections::HashSet<String>,
+) {
+    use meguri::routing;
+
+    if !checked.insert(command.to_string()) {
+        return;
+    }
+    let major = routing::major_version(version_line);
+    match store.get_cli_version(command) {
+        Ok(Some((_, Some(prev_major)))) => {
+            if let Some(now_major) = major
+                && now_major as i64 > prev_major
+            {
+                println!(
+                    "⚠️  {command}: メジャーバージョンが {prev_major} → {now_major} に変化 — \
+                     挙動が変わっている可能性。ルーティング再評価を推奨"
+                );
+            }
+        }
+        Ok(_) => {} // first sighting: just record below.
+        Err(e) => tracing::warn!("cli version read failed for {command}: {e:#}"),
+    }
+    if let Err(e) = store.record_cli_version(command, version_line, major.map(|m| m as i64)) {
+        tracing::warn!("cli version write failed for {command}: {e:#}");
+    }
+}
+
+/// doctor's severity for one profile's live probe. `ModelInvalid` is fatal (the
+/// routing table points at a model that no longer resolves); `Unavailable`
+/// (network/auth/unknown CLI) is a non-fatal ⚠️ so a flaky link doesn't fail
+/// doctor. Returns whether doctor may still pass.
+fn doctor_probe(
+    label: &str,
+    profile: &config::AgentProfile,
+    probe: &dyn Fn(&config::AgentProfile) -> meguri::routing::ProbeOutcome,
+) -> bool {
+    use meguri::routing::ProbeOutcome;
+    let (symbol, detail, fatal) = match probe(profile) {
+        ProbeOutcome::Ok => ("✅", "model alias valid".to_string(), false),
+        ProbeOutcome::ModelInvalid => (
+            "❌",
+            format!(
+                "model alias rejected by `{}` — routing 表が古い可能性",
+                profile.command
+            ),
+            true,
+        ),
+        ProbeOutcome::Unavailable => (
+            "⚠️ ",
+            "probe inconclusive (network/auth/unknown CLI) — doctor は fail させない".to_string(),
+            false,
+        ),
+    };
+    println!("  {symbol} probe {label}: {detail}");
+    !fatal
+}
+
+/// Doctor's routing-drift section: list every project's unresolved outcome
+/// drift (recorded by the watch's sweep, routing 2/3 #65). Read-only; a run of
+/// doctor never computes drift itself.
+fn doctor_drift(store: &Store) {
+    let drifts = match store.active_drift(None) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("routing drift read failed: {e:#}");
+            return;
+        }
+    };
+    if drifts.is_empty() {
+        return;
+    }
+    println!("\nrouting drift:");
+    for d in drifts {
+        let profile = if d.agent_profile.is_empty() {
+            "default"
+        } else {
+            &d.agent_profile
+        };
+        println!(
+            "  ⚠️  [{}] {}/{} の成績が悪化 — CLI 更新かモデル変更の影響の可能性",
+            d.project_id, d.loop_kind, profile
+        );
+    }
+}
+
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
     match std::process::Command::new(cmd).args(args).output() {
         Ok(out) if out.status.success() => {
@@ -296,5 +437,67 @@ fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> 
             String::from_utf8_lossy(&out.stderr).trim()
         )),
         Err(e) => Err(format!("not found ({e})")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meguri::routing::ProbeOutcome;
+
+    fn fake_profile() -> config::AgentProfile {
+        config::AgentProfile {
+            command: "fake-claude".into(),
+            args: vec![],
+            resume_args: vec![],
+            herdr_agent_hint: None,
+            session_dir: None,
+        }
+    }
+
+    #[test]
+    fn probe_invalid_model_fails_doctor() {
+        // "fake agent" = injected probe closure: a rejected model is fatal (❌).
+        let p = fake_profile();
+        let bad = |_: &config::AgentProfile| ProbeOutcome::ModelInvalid;
+        assert!(!doctor_probe("default", &p, &bad));
+    }
+
+    #[test]
+    fn probe_network_failure_does_not_fail_doctor() {
+        let p = fake_profile();
+        let flaky = |_: &config::AgentProfile| ProbeOutcome::Unavailable;
+        assert!(doctor_probe("default", &p, &flaky));
+        let ok = |_: &config::AgentProfile| ProbeOutcome::Ok;
+        assert!(doctor_probe("default", &p, &ok));
+    }
+
+    #[test]
+    fn version_drift_warns_only_on_major_bump_and_records() {
+        let store = Store::open_in_memory().unwrap();
+        let mut checked = std::collections::HashSet::new();
+
+        // First sighting records, no comparison.
+        doctor_version_drift(&store, "claude", "claude 1.2.3", &mut checked);
+        assert_eq!(
+            store.get_cli_version("claude").unwrap(),
+            Some(("claude 1.2.3".to_string(), Some(1)))
+        );
+
+        // Same command is only checked once per doctor run (dedup within run).
+        doctor_version_drift(&store, "claude", "claude 9.9.9", &mut checked);
+        assert_eq!(
+            store.get_cli_version("claude").unwrap(),
+            Some(("claude 1.2.3".to_string(), Some(1))),
+            "second call in same run is a no-op"
+        );
+
+        // A fresh run (new set) sees the major bump and re-records.
+        let mut next_run = std::collections::HashSet::new();
+        doctor_version_drift(&store, "claude", "claude 2.0.0", &mut next_run);
+        assert_eq!(
+            store.get_cli_version("claude").unwrap(),
+            Some(("claude 2.0.0".to_string(), Some(2)))
+        );
     }
 }
