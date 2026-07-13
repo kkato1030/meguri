@@ -102,6 +102,12 @@ impl Scheduler {
                 if let Err(e) = super::auto_merger::sweep(deps).await {
                     tracing::warn!("auto-merge sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Then watch the PRs it armed for drift GitHub silently stalled
+                // (auto-merge 2/3, #42). After the arm sweep so a freshly armed
+                // PR is seen once in the same tick.
+                if let Err(e) = super::merge_watch::sweep(deps).await {
+                    tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {

@@ -38,8 +38,12 @@ const BLOCKING_LABELS: &[&str] = &[
 /// and the conditions are re-evaluated). Same style as the reviewer's
 /// head-sha marker (`src/engine/reviewer.rs`).
 pub fn armed_marker(head_sha: &str) -> String {
-    format!("<!-- meguri:automerge armed head={head_sha} -->")
+    format!("{ARMED_MARKER_PREFIX} head={head_sha} -->")
 }
+
+/// The head-independent prefix of [`armed_marker`]. merge-watch (#42) uses it
+/// to recognize an armed PR regardless of which head was armed.
+pub const ARMED_MARKER_PREFIX: &str = "<!-- meguri:automerge armed";
 
 pub fn head_already_armed(comments: &[String], head_sha: &str) -> bool {
     let marker = armed_marker(head_sha);
