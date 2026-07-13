@@ -6,9 +6,11 @@ use rusqlite::Connection;
 
 mod panes;
 mod runs;
+mod stats;
 mod tasks;
 pub use panes::*;
 pub use runs::*;
+pub use stats::*;
 pub use tasks::*;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -35,6 +37,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // other runs-touching migration (0005 adds `agent_profile`) to carry those
     // columns forward.
     ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
+    // routing 2/3 (#65): cli_versions + routing_drift. Independent new tables,
+    // renumbered to 0008 after main claimed 0007; runs last so it sees the
+    // recreated `runs` table from 0007_tasks.
+    (
+        "0008_routing_freshness",
+        include_str!("migrations/0008_routing_freshness.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

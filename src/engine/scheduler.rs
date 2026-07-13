@@ -114,6 +114,12 @@ impl Scheduler {
                 if let Err(e) = super::handoff::sweep(deps).await {
                     tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Ride the poll: recompute routing outcome drift from run
+                // history and record any threshold crossing (routing 2/3,
+                // #65). Pure sqlite, no pane, no API.
+                if let Err(e) = super::routing_drift::sweep(deps) {
+                    tracing::warn!("routing drift sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {
