@@ -67,7 +67,10 @@ reconcile loop が反応するのは「ラベル・open/closed・新規コミッ
   「常に一致」= 従来どおり恒久抑止として扱い、アップグレード時の暴発を防ぐ。ダイジェストを記録するのは
   本 issue 以降の新しい success だけ。
 - 検知と再着手の遷移は `issue.body_changed` イベントで durable に残り、`meguri logs` / events から
-  追える。
+  追える。events は append-only で discover / reconcile sweep は毎 tick 走るため、イベント発火は
+  本文ダイジェスト単位で dedup する(同じ新本文に対して一度きり)。ダイジェストの記録は特定の flavor の
+  claim path ではなく、`issue_body` が確定した後の flow 共通ステップで行い、custom prepare path を
+  持つ loop(spec-worker 等)も NULL ダイジェストで取りこぼさないようにする。
 - 将来 `[reconcile] body_edits = "auto"` として「本文編集で自動再着手」を opt-in できる設計余地は残す。
   ただしデフォルトは signal-only で、上の権限不変条件を守るのは opt-in しない限り変わらない。
 - 既存コメントの編集やコメントの自然文 trigger は本 ADR の射程外(別 issue)。本文編集だけを
