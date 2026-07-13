@@ -1,0 +1,41 @@
+# git-cliff 設定(issue #118 / ADR 0007)。
+# 本リポジトリは Conventional Commits ではない(commit subject は issue タイトル由来)。
+# したがって型分類には頼らず、コミット subject の 1 行目をそのまま列挙する。
+# subject の質は将来「subject をエージェントが変更由来で author する」決定(別 issue)で改善される。
+# それまでは既存履歴由来で不揃いになりうる点を許容する。
+
+[changelog]
+header = """
+# Changelog
+
+このプロジェクトの主要な変更を記録します。バージョンは [SemVer](https://semver.org/lang/ja/) に従います(現在 0.x — 詳細は README の Status 節)。
+
+"""
+# タグごとに 1 セクション。各コミットは subject の 1 行目 + 短縮 SHA を列挙する。
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif -%}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }} ({{ commit.id | truncate(length=7, end="") }})
+{%- endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+# 非 Conventional Commits: 型接頭辞をパースしない。
+conventional_commits = false
+filter_commits = false
+protect_breaking_commits = false
+split_commits = false
+topo_order = false
+sort_commits = "oldest"
+tag_pattern = "v[0-9]*"
+# マージコミットは除外。それ以外はすべて残す。
+commit_parsers = [
+  { message = "^Merge ", skip = true },
+  { message = ".*", group = "Changes" },
+]
