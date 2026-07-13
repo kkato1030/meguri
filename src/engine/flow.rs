@@ -598,16 +598,16 @@ pub(crate) async fn attach_pr_worktree(
 /// Env vars passed to `worktree_setup` commands: the run's role (its loop
 /// kind — `worker`, `fixer`, `spec-reviewer`, …), the launch profile that
 /// role resolves to, and the target issue/task number. Lets a user script
-/// specialize per role (e.g. skip a heavy step for `cleaner`).
+/// specialize per role (e.g. skip a heavy step for `cleaner`). `MEGURI_PROFILE`
+/// goes through [`resolve_run_profile`] — the same pin-aware resolution the
+/// run's pane spawn uses — rather than re-resolving routing from scratch, so
+/// it can't drift from the profile the agent actually launches under (e.g.
+/// if routing config or CLI detection changes between the two).
 fn worktree_setup_env(deps: &Deps, run: &RunRecord) -> Result<[(&'static str, String); 3]> {
-    let profile = crate::routing::resolve(
-        &deps.config,
-        &run.loop_kind,
-        &crate::routing::detect_command,
-    )?;
+    let (profile_name, _) = resolve_run_profile(deps, run)?;
     Ok([
         ("MEGURI_ROLE", run.loop_kind.clone()),
-        ("MEGURI_PROFILE", profile),
+        ("MEGURI_PROFILE", profile_name),
         ("MEGURI_ISSUE", run.task_key().number().to_string()),
     ])
 }
@@ -1614,6 +1614,42 @@ mod tests {
         let wt = PathBuf::from(run.worktree_path.unwrap());
         let marker = std::fs::read_to_string(wt.join("marker.txt")).unwrap();
         assert_eq!(marker.trim(), "worker-default-7");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_env_honors_an_already_pinned_profile() {
+        // A run's launch profile can be pinned (runs.agent_profile) before
+        // prepare-worktree ever runs — e.g. a resumed/retried run, or a
+        // concurrent spawn. MEGURI_PROFILE must reuse that pin instead of
+        // re-resolving routing from scratch, or the hook and the pane it's
+        // preparing for could end up generating for different profiles.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["echo $MEGURI_PROFILE > profile.txt".into()],
+                ..Default::default()
+            },
+        );
+        // No [routing] configured, so a fresh `routing::resolve` call would
+        // return "default" — pin something else first and confirm the hook
+        // picks that up instead.
+        deps.store
+            .update_run_agent_profile(&run.id, "codex")
+            .unwrap();
+        let cp = Checkpoint::default();
+
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.agent_profile.as_deref(), Some("codex"));
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        let profile = std::fs::read_to_string(wt.join("profile.txt")).unwrap();
+        assert_eq!(profile.trim(), "codex");
     }
 
     #[tokio::test]
