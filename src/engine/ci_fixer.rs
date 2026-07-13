@@ -48,6 +48,25 @@ pub const MAX_CI_FIX_RUNS: i64 = 3;
 /// work meguri opened).
 const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
+/// Prefix of meguri's own commit-status contexts (`meguri/self-review`,
+/// `meguri/guard-review`). The ci-fixer must not treat these as fixable CI:
+/// they carry no failed-job log to diagnose, and an advisory-red guard status
+/// (ADR 0008) is deliberately not a merge blocker — picking it up would spin
+/// the ci-fixer on nothing and could wrongly escalate it (criterion 6).
+const MEGURI_STATUS_PREFIX: &str = "meguri/";
+
+/// The rollup with meguri's own status contexts stripped, so the ci-fixer's
+/// fixable verdict and prompt only ever consider real CI.
+fn without_meguri_statuses(rollup: CheckRollup) -> CheckRollup {
+    CheckRollup {
+        checks: rollup
+            .checks
+            .into_iter()
+            .filter(|c| !c.name.starts_with(MEGURI_STATUS_PREFIX))
+            .collect(),
+    }
+}
+
 /// Whether the ci-fixer may touch this PR at all (independent of its CI
 /// state).
 fn pr_is_ci_fixable(pr: &PullRequest) -> Option<String> {
@@ -101,7 +120,8 @@ impl super::Loop for CiFixerLoop {
             {
                 continue;
             }
-            if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Failure {
+            let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
+            if rollup.state() != CheckState::Failure {
                 continue;
             }
             let issue = canonical_key(&pr);
@@ -226,7 +246,7 @@ impl Flavor for CiFixerFlavor {
                 forge::LABEL_NEEDS_HUMAN
             )));
         }
-        let rollup = deps.forge().pr_check_rollup(pr.number).await?;
+        let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
         if rollup.state() != CheckState::Failure {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{}'s CI is no longer failing",
@@ -462,6 +482,48 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn meguri_status_contexts_are_stripped_from_the_rollup() {
+        // A red `meguri/guard-review` advisory status (ADR 0008) must not make
+        // the ci-fixer think there is CI to fix (criterion 6).
+        let rollup = CheckRollup {
+            checks: vec![
+                CheckRun {
+                    name: "meguri/guard-review".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+                CheckRun {
+                    name: "test".into(),
+                    state: CheckState::Success,
+                    url: String::new(),
+                },
+            ],
+        };
+        let stripped = without_meguri_statuses(rollup);
+        assert_eq!(stripped.checks.len(), 1);
+        assert_eq!(stripped.checks[0].name, "test");
+        // Only real CI remains, so the verdict is green (nothing to fix).
+        assert_eq!(stripped.state(), CheckState::Success);
+
+        // A real red check still drives the ci-fixer even next to a meguri one.
+        let mixed = CheckRollup {
+            checks: vec![
+                CheckRun {
+                    name: "meguri/guard-review".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+                CheckRun {
+                    name: "test".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+            ],
+        };
+        assert_eq!(without_meguri_statuses(mixed).state(), CheckState::Failure);
     }
 
     #[test]
