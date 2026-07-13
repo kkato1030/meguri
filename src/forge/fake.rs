@@ -8,8 +8,8 @@ use async_trait::async_trait;
 
 use super::{
     ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeStrategy, MergeableState, PullRequest, ReviewComment, ReviewCommentDraft,
-    ReviewThread,
+    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
+    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// The FakeForge's default merge policy: everything allowed and the base
@@ -53,8 +53,18 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
-    pub pr_comments: Mutex<Vec<(i64, String)>>,
+    /// PR conversation comments: (pr, body, createdAt). `comment_pr` stamps
+    /// `store::now()`; [`FakeForge::add_pr_comment_at`] seeds an explicit
+    /// (e.g. stale) timestamp for merge-watch arm-since tests.
+    pub pr_comments: Mutex<Vec<(i64, String, String)>>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
+    /// `mergeStateStatus` per PR (merge-watch); unset reports `Unknown`.
+    pub merge_status: Mutex<HashMap<i64, MergeStateStatus>>,
+    /// Explicit auto-merge-armed override per PR (merge-watch HumanDisabled
+    /// tests). Unset falls back to whether `armed` holds the PR.
+    pub auto_merge_enabled: Mutex<HashMap<i64, bool>>,
+    /// PRs whose `pr_merge_state` fails — the 429/5xx TransientError scenario.
+    pub merge_state_errors: Mutex<HashSet<i64>>,
     /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
     /// before it finished computing).
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
@@ -286,9 +296,37 @@ impl FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _)| *n == number)
-            .map(|(_, c)| c.clone())
+            .filter(|(n, _, _)| *n == number)
+            .map(|(_, body, _)| body.clone())
             .collect()
+    }
+
+    /// Seed a PR comment with an explicit `createdAt` (merge-watch tests seed a
+    /// stale arm marker to drive arm-since past `STALE_AFTER`).
+    pub fn add_pr_comment_at(&self, pr: i64, body: &str, created_at: &str) {
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .push((pr, body.into(), created_at.into()));
+    }
+
+    /// Simulate GitHub's `mergeStateStatus` for a PR (merge-watch tests).
+    pub fn set_merge_state_status(&self, number: i64, status: MergeStateStatus) {
+        self.merge_status.lock().unwrap().insert(number, status);
+    }
+
+    /// Force whether auto-merge reads as armed on a PR, independent of the
+    /// `armed` map (merge-watch HumanDisabled: arm marker present, this false).
+    pub fn set_auto_merge_enabled(&self, number: i64, enabled: bool) {
+        self.auto_merge_enabled
+            .lock()
+            .unwrap()
+            .insert(number, enabled);
+    }
+
+    /// Make `pr_merge_state` fail for a PR (the 429/5xx TransientError path).
+    pub fn fail_merge_state(&self, number: i64) {
+        self.merge_state_errors.lock().unwrap().insert(number);
     }
 
     /// Seed an already-open PR (as if a worker run shipped it earlier);
@@ -638,6 +676,38 @@ impl Forge for FakeForge {
             .unwrap_or(MergeableState::Unknown))
     }
 
+    async fn pr_merge_state(&self, number: i64) -> Result<MergeState> {
+        if self.merge_state_errors.lock().unwrap().contains(&number) {
+            bail!("merge state of PR #{number} is unavailable (simulated 429)");
+        }
+        let mergeable = self
+            .mergeable
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or(MergeableState::Unknown);
+        let status = self
+            .merge_status
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or(MergeStateStatus::Unknown);
+        let auto_merge_enabled = self
+            .auto_merge_enabled
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or_else(|| self.armed.lock().unwrap().contains_key(&number));
+        Ok(MergeState {
+            mergeable,
+            status,
+            auto_merge_enabled,
+        })
+    }
+
     async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup> {
         Ok(CheckRollup {
             checks: self
@@ -685,8 +755,25 @@ impl Forge for FakeForge {
         Ok(self.pr_comments_of(number))
     }
 
+    async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>> {
+        Ok(self
+            .pr_comments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| *n == number)
+            .map(|(_, body, created_at)| PrComment {
+                body: body.clone(),
+                created_at: created_at.clone(),
+            })
+            .collect())
+    }
+
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
-        self.pr_comments.lock().unwrap().push((pr, body.into()));
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .push((pr, body.into(), crate::store::now()));
         Ok(())
     }
 
