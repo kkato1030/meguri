@@ -65,6 +65,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         forge,
         task_source,
         notifier: Arc::new(Notifier::from_config(&cfg.notifications)),
+        forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
         config: cfg.clone(),
         project: project.clone(),
     })
@@ -489,11 +490,13 @@ pub fn cmd_ps(all: bool) -> Result<()> {
         println!("no {}runs", if all { "" } else { "active " });
         return Ok(());
     }
-    println!(
-        "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
-        "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE"
-    );
-    for run in runs {
+    let print_header = || {
+        println!(
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
+            "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE"
+        );
+    };
+    let print_row = |run: &RunRecord| {
         // A github run is keyed by its issue (`#7`), a local run by its task
         // row (`t3`); the branch prefix uses the same convention.
         let target = match run.task_key() {
@@ -511,8 +514,67 @@ pub fn cmd_ps(all: bool) -> Result<()> {
             run.agent_profile.as_deref().unwrap_or("-"),
             run.mux_pane_id.as_deref().unwrap_or("-"),
         );
+    };
+
+    // Workspace grouping (issue #154) is display-only and opt-in: with no
+    // workspaces configured — or an unreadable config — the listing is exactly
+    // as before (acceptance criterion 5).
+    let cfg = Config::load().ok();
+    let groups = group_by_workspace(cfg.as_ref(), &runs);
+    match groups {
+        None => {
+            print_header();
+            for run in &runs {
+                print_row(run);
+            }
+        }
+        Some(groups) => {
+            for (i, (label, group_runs)) in groups.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                println!("[{label}]");
+                print_header();
+                for run in group_runs {
+                    print_row(run);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Group runs by the workspace their project belongs to, for display only
+/// (issue #154). Returns `None` when no workspaces are configured (the caller
+/// then prints the flat, unchanged listing); otherwise groups in config order,
+/// with an "(no workspace)" bucket last for projects that joined none. Empty
+/// groups are omitted so a workspace with no active runs prints nothing.
+fn group_by_workspace<'a>(
+    cfg: Option<&Config>,
+    runs: &'a [RunRecord],
+) -> Option<Vec<(String, Vec<&'a RunRecord>)>> {
+    let cfg = cfg?;
+    if cfg.workspaces.is_empty() {
+        return None;
+    }
+    let mut groups: Vec<(String, Vec<&RunRecord>)> = Vec::new();
+    for ws in &cfg.workspaces {
+        let members: Vec<&RunRecord> = runs
+            .iter()
+            .filter(|r| ws.projects.iter().any(|p| p == &r.project_id))
+            .collect();
+        if !members.is_empty() {
+            groups.push((format!("workspace: {}", ws.id), members));
+        }
+    }
+    let orphans: Vec<&RunRecord> = runs
+        .iter()
+        .filter(|r| cfg.workspace_of(&r.project_id).is_none())
+        .collect();
+    if !orphans.is_empty() {
+        groups.push(("no workspace".to_string(), orphans));
+    }
+    Some(groups)
 }
 
 /// Label of the dedicated dashboard workspace/session `meguri top` builds.
@@ -644,8 +706,11 @@ async fn top_refresh(
     Ok(TopStatus { watch_alive, rows })
 }
 
-/// Render the status header printed above the tiled panes each tick.
-fn render_top(status: &TopStatus, attach_hint: &str) -> String {
+/// Render the status header printed above the tiled panes each tick. When
+/// `cfg` has `[[workspaces]]`, rows are grouped by workspace for display only
+/// (issue #154); without workspaces (or config, e.g. tests) the flat listing is
+/// unchanged.
+fn render_top(status: &TopStatus, attach_hint: &str, cfg: Option<&Config>) -> String {
     let awaiting = status.rows.iter().filter(|r| r.awaiting_human).count();
     let mut out = String::new();
     // Clear screen + home cursor so the header refreshes in place.
@@ -660,29 +725,74 @@ fn render_top(status: &TopStatus, attach_hint: &str) -> String {
             "stale ⚠"
         },
     ));
+    let col_header = format!(
+        "\n{:<14} {:<8} {:>6}  {:<16} {:<9} PANE\n",
+        "RUN", "PROJECT", "ISSUE", "INTERACTION", "AGENT"
+    );
+    let row_line = |r: &TopRow| {
+        // Flag awaiting-human runs so a human eye lands on them first.
+        let marker = if r.awaiting_human { "▶ " } else { "  " };
+        format!(
+            "{marker}{:<12} {:<8} {:>6}  {:<16} {:<9} {}\n",
+            r.run_id,
+            r.project,
+            format!("#{}", r.issue),
+            r.interaction,
+            r.agent,
+            r.pane,
+        )
+    };
+
     if status.rows.is_empty() {
         out.push_str("\nno active runs — start one with `meguri watch` or `meguri run`\n");
+    } else if let Some(groups) = top_groups(cfg, &status.rows) {
+        for (label, rows) in groups {
+            out.push_str(&format!("\n[{label}]"));
+            out.push_str(&col_header);
+            for r in rows {
+                out.push_str(&row_line(r));
+            }
+        }
     } else {
-        out.push_str(&format!(
-            "\n{:<14} {:<8} {:>6}  {:<16} {:<9} PANE\n",
-            "RUN", "PROJECT", "ISSUE", "INTERACTION", "AGENT"
-        ));
+        out.push_str(&col_header);
         for r in &status.rows {
-            // Flag awaiting-human runs so a human eye lands on them first.
-            let marker = if r.awaiting_human { "▶ " } else { "  " };
-            out.push_str(&format!(
-                "{marker}{:<12} {:<8} {:>6}  {:<16} {:<9} {}\n",
-                r.run_id,
-                r.project,
-                format!("#{}", r.issue),
-                r.interaction,
-                r.agent,
-                r.pane,
-            ));
+            out.push_str(&row_line(r));
         }
     }
     out.push_str(&format!("\nview tiles: {attach_hint}\n"));
     out
+}
+
+/// Group `top` rows by workspace for display (issue #154). `None` when no
+/// workspaces are configured (the caller prints the flat listing); otherwise
+/// config-ordered groups plus a trailing "no workspace" bucket, empty groups
+/// omitted.
+fn top_groups<'a>(
+    cfg: Option<&Config>,
+    rows: &'a [TopRow],
+) -> Option<Vec<(String, Vec<&'a TopRow>)>> {
+    let cfg = cfg?;
+    if cfg.workspaces.is_empty() {
+        return None;
+    }
+    let mut groups: Vec<(String, Vec<&TopRow>)> = Vec::new();
+    for ws in &cfg.workspaces {
+        let members: Vec<&TopRow> = rows
+            .iter()
+            .filter(|r| ws.projects.iter().any(|p| p == &r.project))
+            .collect();
+        if !members.is_empty() {
+            groups.push((format!("workspace: {}", ws.id), members));
+        }
+    }
+    let orphans: Vec<&TopRow> = rows
+        .iter()
+        .filter(|r| cfg.workspace_of(&r.project).is_none())
+        .collect();
+    if !orphans.is_empty() {
+        groups.push(("no workspace".to_string(), orphans));
+    }
+    Some(groups)
 }
 
 /// argv of the internal status-render loop (`meguri top-status`) that runs
@@ -773,7 +883,7 @@ pub async fn cmd_top_status(
     let mut tiled: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let status = top_refresh(&store, &mux, &dashboard, &mut tiled, poll).await?;
-        print!("{}", render_top(&status, &attach_hint));
+        print!("{}", render_top(&status, &attach_hint, Some(&cfg)));
         use std::io::Write;
         let _ = std::io::stdout().flush();
         tokio::time::sleep(interval).await;
@@ -1000,7 +1110,7 @@ mod tests {
                 },
             ],
         };
-        let out = render_top(&status, "herdr tab focus wD:t9; herdr");
+        let out = render_top(&status, "herdr tab focus wD:t9; herdr", None);
         assert!(out.contains("2 run(s)"));
         assert!(out.contains("1 awaiting human"));
         assert!(out.contains("stale"), "watch liveness must show stale");
@@ -1090,9 +1200,86 @@ mod tests {
             watch_alive: true,
             rows: vec![],
         };
-        let out = render_top(&status, "echo attach");
+        let out = render_top(&status, "echo attach", None);
         assert!(out.contains("0 run(s)"));
         assert!(out.contains("no active runs"));
         assert!(out.contains("watch live"));
+    }
+
+    fn top_row(project: &str, issue: i64) -> TopRow {
+        TopRow {
+            run_id: format!("run-{project}-{issue}"),
+            project: project.into(),
+            issue,
+            interaction: "agent_working",
+            agent: "working",
+            pane: format!("wD:{project}{issue}"),
+            awaiting_human: false,
+        }
+    }
+
+    fn config_with_workspace() -> Config {
+        let raw = "\
+[[projects]]\nid = \"shop-api\"\nrepo_path = \"/tmp/a\"\nrepo_slug = \"me/a\"\n\
+[[projects]]\nid = \"shop-web\"\nrepo_path = \"/tmp/b\"\nrepo_slug = \"me/b\"\n\
+[[projects]]\nid = \"loner\"\nrepo_path = \"/tmp/c\"\nrepo_slug = \"me/c\"\n\
+[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"shop-web\"]\n";
+        toml::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn render_top_groups_by_workspace_when_configured() {
+        let status = TopStatus {
+            watch_alive: true,
+            rows: vec![
+                top_row("shop-api", 1),
+                top_row("loner", 2),
+                top_row("shop-web", 3),
+            ],
+        };
+        let cfg = config_with_workspace();
+        let out = render_top(&status, "echo attach", Some(&cfg));
+        // Workspace members grouped under one heading; unworkspaced last.
+        assert!(out.contains("[workspace: shop]"), "{out}");
+        assert!(out.contains("[no workspace]"), "{out}");
+        let ws_at = out.find("[workspace: shop]").unwrap();
+        let orphan_at = out.find("[no workspace]").unwrap();
+        assert!(ws_at < orphan_at, "workspace group precedes orphans");
+        // The unworkspaced project's row sits after the orphan heading.
+        assert!(out[orphan_at..].contains("loner"), "{out}");
+    }
+
+    #[test]
+    fn render_top_stays_flat_without_workspaces() {
+        // Acceptance criterion 5: no [[workspaces]] → no grouping headings.
+        let status = TopStatus {
+            watch_alive: true,
+            rows: vec![top_row("demo", 1)],
+        };
+        let cfg: Config = toml::from_str(
+            "[[projects]]\nid = \"demo\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n",
+        )
+        .unwrap();
+        let out = render_top(&status, "echo attach", Some(&cfg));
+        assert!(!out.contains("[workspace"), "{out}");
+        assert!(!out.contains("[no workspace]"), "{out}");
+    }
+
+    #[test]
+    fn group_by_workspace_omits_empty_groups_and_none_without_config() {
+        let cfg = config_with_workspace();
+        let store = Store::open_in_memory().unwrap();
+        let runs = vec![
+            store.create_run("shop-api", 1, "t").unwrap(),
+            store.create_run("loner", 2, "t").unwrap(),
+        ];
+        let groups = group_by_workspace(Some(&cfg), &runs).unwrap();
+        // shop has one active member; the empty side is not printed; orphans last.
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "workspace: shop");
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[1].0, "no workspace");
+        // No config → flat (None).
+        assert!(group_by_workspace(None, &runs).is_none());
     }
 }

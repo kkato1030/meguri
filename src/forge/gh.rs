@@ -51,6 +51,17 @@ pub struct GhForge {
     repo: String,
 }
 
+/// Production [`ForgeFactory`](super::ForgeFactory): builds a [`GhForge`] per
+/// repo slug. Used by cross-repo decomposition to reach workspace siblings
+/// (issue #154).
+pub struct GhForgeFactory;
+
+impl super::ForgeFactory for GhForgeFactory {
+    fn for_slug(&self, slug: &str) -> std::sync::Arc<dyn Forge> {
+        std::sync::Arc::new(GhForge::new(slug))
+    }
+}
+
 impl GhForge {
     pub fn new(repo_slug: &str) -> Self {
         Self {
@@ -488,17 +499,24 @@ impl Forge for GhForge {
             .with_context(|| format!("no issue number in gh issue create output: {out}"))
     }
 
-    /// The dependencies endpoint wants the blocking issue's database id, not
-    /// its number — resolve it first.
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        let repo = self.repo.clone();
+        self.add_blocked_by_in(issue, &repo, blocker).await
+    }
+
+    /// The dependencies endpoint wants the blocking issue's database id, not
+    /// its number — resolve it from the blocker's own repo (which may be a
+    /// workspace sibling, issue #154). The `issue_id` is unique across GitHub,
+    /// so once resolved the POST targets this forge's repo unchanged.
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()> {
         let raw = self
-            .gh(&["api", &format!("repos/{}/issues/{blocker}", self.repo)])
+            .gh(&["api", &format!("repos/{blocker_repo}/issues/{blocker}")])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh issue output")?;
         let id = v
             .get("id")
             .and_then(Value::as_i64)
-            .with_context(|| format!("issue #{blocker} has no id: {raw}"))?;
+            .with_context(|| format!("issue {blocker_repo}#{blocker} has no id: {raw}"))?;
         self.gh(&[
             "api",
             "-X",
