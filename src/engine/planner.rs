@@ -177,6 +177,7 @@ impl Flavor for PlannerFlavor {
                Leave the working tree clean.\n\
              - Do NOT push and do NOT create a pull request; meguri handles both.\n\
              - Do NOT switch branches or touch other worktrees.\n\n\
+             {depth_section}\
              {decompose_section}\
              {pr_section}{lang_section}",
             number = run.issue_number,
@@ -184,6 +185,7 @@ impl Flavor for PlannerFlavor {
             title = cp.issue_title,
             body = cp.issue_body,
             spec = spec_rel_path(run.issue_number),
+            depth_section = adaptive_depth_instruction(&cp.issue_body),
             decompose_section = decompose_instruction(deps, &cp.issue_body),
             pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
@@ -475,6 +477,72 @@ fn validate_children(
     Ok(())
 }
 
+/// An explicit `spec_depth:` hint in the issue body (ADR 0010). Today the
+/// only source is a human writing it into the issue; when triage v1 (#87)
+/// lands, its proposal comment / hidden marker feeds the same line. The
+/// planner still decides in-context — this only surfaces the hint into the
+/// prompt so the agent can honor it. Matching is case-insensitive and
+/// tolerates an optional space after the colon.
+fn spec_depth_hint(issue_body: &str) -> Option<&'static str> {
+    let lower = issue_body.to_lowercase();
+    let has = |value: &str| {
+        lower.contains(&format!("spec_depth: {value}"))
+            || lower.contains(&format!("spec_depth:{value}"))
+    };
+    if has("design") {
+        Some("design")
+    } else if has("normal") {
+        Some("normal")
+    } else {
+        None
+    }
+}
+
+/// Prompt section that makes the spec's depth adaptive (issue #133, ADR
+/// 0010): the planner picks `normal` (the default light spec) or `design`
+/// (a deeper spec with extra required sections) by uncertainty × blast
+/// radius, with a veto that forces migration / rollback whenever persistent
+/// state or a public contract is involved. Kept prompt-only — no depth is
+/// computed in code — so the decision stays the agent's in-context judgment.
+/// An explicit `spec_depth:` hint in the body is surfaced verbatim so the
+/// agent honors it (never below the veto floor).
+fn adaptive_depth_instruction(issue_body: &str) -> String {
+    let hint = match spec_depth_hint(issue_body) {
+        Some(depth) => format!(
+            "\nThis issue carries an explicit `spec_depth: {depth}` hint — apply \
+             it as described above (a `design` hint raises the floor; a `normal` \
+             hint never lowers it below what the veto rule demands).\n"
+        ),
+        None => String::new(),
+    };
+    format!(
+        "# Spec depth — adaptive (normal vs. design)\n\
+         Not every issue needs the same spec. Choose the depth by \
+         **uncertainty × blast radius**, NOT by implementation effort (you are \
+         weak at effort estimates but strong at listing what is undecided and \
+         how far a mistake would spread). First enumerate: what is still \
+         undecided, and what breaks if you get it wrong. Then pick:\n\
+         - **normal spec** (the default described above): acceptance criteria, \
+           files to touch, key decisions. For local, well-understood changes.\n\
+         - **design spec** (deeper): a normal spec PLUS these required sections \
+           — architecture impact / alternatives considered & the decision / \
+           migration & rollback (when persistent state is affected) / \
+           observability / test strategy. For high uncertainty or wide blast \
+           radius.\n\
+         **Veto rule (a hard floor that overrides the overall judgment):** if \
+         the change touches persistent state, a schema, or a public contract, \
+         OR carries an irreversible operational risk, the migration & rollback \
+         sections are MANDATORY even if the change otherwise looks small.\n\
+         **Record the reason:** state in 1–2 sentences (in the spec body or the \
+         PR description) why you chose this depth.\n\
+         A design spec is still disposable scaffolding, not a permanent design \
+         document: at implementation its architecture / decision content is \
+         routed to an ADR, durable domain rules to a domain document, and the \
+         rest is distilled into the code — the spec itself is still deleted. \
+         The deeper tier is no exception to the disposal rule above.{hint}\n\n"
+    )
+}
+
 /// Prompt section inviting the decompose ending — except on issues that are
 /// themselves decomposition children, where only one level is allowed and
 /// the agent is told to hand a still-too-big issue to a human instead. When
@@ -648,6 +716,62 @@ mod tests {
         assert!(prompt.contains("# Too big for one spec?"));
         assert!(prompt.contains("one level only"));
         assert!(!prompt.contains(r#""status": "decompose""#));
+    }
+
+    #[test]
+    fn prompt_makes_spec_depth_adaptive_with_veto_and_design_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = fake_run(7);
+        let cp = Checkpoint::default();
+        let prompt = PlannerFlavor.execute_prompt(&fake_deps(), &run, &cp, dir.path());
+        // Decision principle: uncertainty × blast radius, not effort.
+        assert!(prompt.contains("Spec depth"));
+        assert!(prompt.contains("uncertainty × blast radius"));
+        assert!(prompt.contains("NOT by implementation effort"));
+        // Two tiers and the veto floor.
+        assert!(prompt.contains("normal spec"));
+        assert!(prompt.contains("design spec"));
+        assert!(prompt.contains("Veto rule"));
+        assert!(prompt.contains("migration & rollback"));
+        // Design-spec required sections.
+        assert!(prompt.contains("architecture impact"));
+        assert!(prompt.contains("observability"));
+        assert!(prompt.contains("test strategy"));
+        // Rationale requirement and disposable-even-when-deep reminder.
+        assert!(prompt.contains("why you chose this depth"));
+        assert!(prompt.contains("still disposable scaffolding"));
+    }
+
+    #[test]
+    fn adaptive_depth_surfaces_an_explicit_hint_only_when_present() {
+        // No hint: the section is generic, no callout line.
+        let plain = adaptive_depth_instruction("Cache the thing.");
+        assert!(plain.contains("Spec depth"));
+        assert!(!plain.contains("explicit `spec_depth:"));
+
+        // Explicit design hint is surfaced verbatim and framed as a floor.
+        let design = adaptive_depth_instruction("Please handle this.\n\nspec_depth: design\n");
+        assert!(design.contains("explicit `spec_depth: design` hint"));
+        assert!(design.contains("raises the floor"));
+
+        // Explicit normal hint is surfaced but framed as never lowering the veto.
+        let normal = adaptive_depth_instruction("spec_depth: normal");
+        assert!(normal.contains("explicit `spec_depth: normal` hint"));
+        assert!(normal.contains("never lowers it below"));
+    }
+
+    #[test]
+    fn spec_depth_hint_parses_case_insensitively_and_tolerates_spacing() {
+        assert_eq!(spec_depth_hint("nothing here"), None);
+        assert_eq!(spec_depth_hint("spec_depth: design"), Some("design"));
+        assert_eq!(spec_depth_hint("spec_depth:design"), Some("design"));
+        assert_eq!(spec_depth_hint("SPEC_DEPTH: Design"), Some("design"));
+        assert_eq!(spec_depth_hint("spec_depth: normal"), Some("normal"));
+        // design wins if both somehow appear (raise, never lower).
+        assert_eq!(
+            spec_depth_hint("spec_depth: normal and spec_depth: design"),
+            Some("design")
+        );
     }
 
     #[test]

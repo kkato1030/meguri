@@ -196,7 +196,7 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 ### spec 先行フロー（オプトイン）
 
-`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。任意の **guard** レビュー（後述）が spec PR をレビューし、指摘なしならラベルを `meguri:spec-ready` に貼り替えます — 人間が直接貼り替えても構いません。その後は `plan_delivery` で分岐します（ADR 0008）:
+`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。spec の深さは **適応的** です（[ADR 0010](docs/adr/0010-adaptive-spec-depth.md)）: planner は不確実性 × 影響範囲で `normal` かより深い `design` かを選び、永続状態や公開 contract に触れる変更は veto によって migration・rollback セクションを持つ深い構成になります — 選んだ深さの理由は spec または PR に残ります。任意の **guard** レビュー（後述）が spec PR をレビューし、指摘なしならラベルを `meguri:spec-ready` に貼り替えます — 人間が直接貼り替えても構いません。その後は `plan_delivery` で分岐します（ADR 0008）:
 
 - **`separate`**（既定）— 2 本の PR。spec/ADR PR は単体でレビュー・**マージ**されます（issue は非クローズの `Refs #N` で参照するので、マージしても issue は閉じません）。マージ済みの spec PR は issue を `speccing → ready` に張り替え、**worker** が着地した spec を読み込み（実装の一部として削除しつつ）別 PR で実装します。
 - **`combined`** — 1 本の PR。**spec worker** が spec PR のブランチを takeover して実装を積みます（#98 の morph 型）。spec と実装はまとめて 1 回でマージされます。
