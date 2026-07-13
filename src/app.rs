@@ -482,6 +482,47 @@ pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
     Ok(())
 }
 
+/// `meguri schedules`: list a project's cron schedules with their definition,
+/// last fire (from sqlite `schedule_state`), and next fire (computed from the
+/// cron expression, UTC). Times are UTC, matching the cron interpretation.
+pub fn cmd_schedules(project: Option<&str>) -> Result<()> {
+    let cfg = Config::load()?;
+    let project = pick_project(&cfg, project)?;
+    if project.schedules.is_empty() {
+        println!("no schedules configured for {}", project.id);
+        return Ok(());
+    }
+    let store = open_store()?;
+    let now = crate::engine::scheduler_fire::epoch_now();
+    println!(
+        "{:<16} {:<6} {:<16} {:<21} {:<21}",
+        "NAME", "KIND", "CRON", "LAST FIRE (UTC)", "NEXT FIRE (UTC)"
+    );
+    for s in &project.schedules {
+        let state = store.get_schedule_state(&project.id, &s.name)?;
+        let last = state
+            .as_ref()
+            .and_then(|st| st.last_fired_at.clone())
+            .unwrap_or_else(|| "-".into());
+        let next = match crate::cron::Cron::parse(&s.cron) {
+            Ok(cron) => cron
+                .next_after(now)
+                .map(crate::store::format_epoch)
+                .unwrap_or_else(|| "never".into()),
+            Err(e) => format!("invalid cron: {e}"),
+        };
+        println!(
+            "{:<16} {:<6} {:<16} {:<21} {:<21}",
+            s.name,
+            s.kind.as_str(),
+            s.cron,
+            last,
+            next
+        );
+    }
+    Ok(())
+}
+
 pub fn cmd_ps(all: bool) -> Result<()> {
     let store = open_store()?;
     let runs = store.list_runs(!all)?;

@@ -83,6 +83,7 @@ async fn setup() -> TestEnv {
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let mux = Arc::new(FakeMux::new(false));

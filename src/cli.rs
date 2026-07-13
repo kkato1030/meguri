@@ -59,6 +59,12 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// List cron schedules (definition, last fire, next fire)
+    Schedules {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List runs and their interaction state
     Ps {
         /// Include finished runs

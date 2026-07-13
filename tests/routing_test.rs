@@ -204,6 +204,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         deliver: None,
         clean: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),

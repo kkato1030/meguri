@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
             title,
         } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
+        Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
         Command::Ps { all } => app::cmd_ps(all),
         Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::TopStatus {
@@ -178,6 +179,10 @@ async fn cmd_doctor() -> Result<()> {
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
             ok &= check_auto_merge(cfg).await;
+            // Cron schedules (issue #146): cron/name/body validity already
+            // fail-fast at load; here we check body_file existence and show
+            // the next fire.
+            ok &= doctor_schedules(cfg);
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -237,6 +242,59 @@ async fn check_auto_merge(cfg: &Config) -> bool {
                 println!("❌ {label}: cannot read repo merge settings: {e:#}");
                 ok = false;
             }
+        }
+    }
+    ok
+}
+
+/// Doctor's schedules section (issue #146): the cron expression, name
+/// uniqueness, body exclusivity, and local-mode `plan` rejection are already
+/// enforced at config load (so a loaded `cfg` has passed them). What load does
+/// *not* check is that each `body_file` actually exists on disk — do that here,
+/// and print each schedule's next fire. Returns false if any `body_file` is
+/// missing; projects without schedules print nothing.
+fn doctor_schedules(cfg: &Config) -> bool {
+    use meguri::cron::Cron;
+    use meguri::store::format_epoch;
+
+    let has_any = cfg.projects.iter().any(|p| !p.schedules.is_empty());
+    if !has_any {
+        return true;
+    }
+    let now = meguri::engine::scheduler_fire::epoch_now();
+    let mut ok = true;
+    println!("\nschedules:");
+    for project in &cfg.projects {
+        for s in &project.schedules {
+            let next = Cron::parse(&s.cron)
+                .ok()
+                .and_then(|c| c.next_after(now))
+                .map(format_epoch)
+                .unwrap_or_else(|| "never".into());
+            // body_file must exist (repo-relative); inline body is always fine.
+            let (line_ok, body_detail) = match &s.body_file {
+                Some(rel) => {
+                    let path = project.repo_path.join(rel);
+                    if path.exists() {
+                        (true, format!("body_file {rel}"))
+                    } else {
+                        (
+                            false,
+                            format!("body_file {rel} not found at {}", path.display()),
+                        )
+                    }
+                }
+                None => (true, "inline body".to_string()),
+            };
+            ok &= line_ok;
+            println!(
+                "  {} {}/{} ({} {}, next {next} UTC) — {body_detail}",
+                if line_ok { "✅" } else { "❌" },
+                project.id,
+                s.name,
+                s.kind.as_str(),
+                s.cron,
+            );
         }
     }
     ok

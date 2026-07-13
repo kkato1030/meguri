@@ -9,6 +9,7 @@ pub mod merge_watch;
 pub mod planner;
 pub mod reaper;
 pub mod scheduler;
+pub mod scheduler_fire;
 pub mod spec_reviewer;
 pub mod spec_worker;
 pub mod worker;

@@ -65,6 +65,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         pr: None,
         clean: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let store = Store::open_in_memory().unwrap();

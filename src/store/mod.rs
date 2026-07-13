@@ -6,9 +6,11 @@ use rusqlite::Connection;
 
 mod panes;
 mod runs;
+mod schedules;
 mod tasks;
 pub use panes::*;
 pub use runs::*;
+pub use schedules::*;
 pub use tasks::*;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -35,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // other runs-touching migration (0005 adds `agent_profile`) to carry those
     // columns forward.
     ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
+    (
+        "0008_schedules",
+        include_str!("migrations/0008_schedules.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).
@@ -154,10 +160,17 @@ pub fn parse_ts(ts: &str) -> Option<u64> {
 
 /// RFC3339 UTC timestamp without external chrono dependency.
 pub fn now() -> String {
-    let d = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    let secs = d.as_secs();
+        .unwrap()
+        .as_secs();
+    format_epoch(secs)
+}
+
+/// Format epoch seconds as our RFC3339 UTC shape (`YYYY-MM-DDThh:mm:ssZ`).
+/// Split out from [`now`] so callers with an injected clock (e.g. the schedule
+/// sweep, whose `now` is a test-supplied epoch) format the same way.
+pub fn format_epoch(secs: u64) -> String {
     // Days-to-civil algorithm (Howard Hinnant), valid for the years we care about.
     let days = secs / 86_400;
     let rem = secs % 86_400;

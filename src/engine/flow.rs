@@ -1721,6 +1721,7 @@ mod tests {
             pr: None,
             clean: None,
             worktree_setup,
+            schedules: Vec::new(),
         };
         let deps = Deps::with_label_source(
             store,

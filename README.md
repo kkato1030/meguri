@@ -95,6 +95,7 @@ meguri run --project myproj --issue 42
 meguri watch
 
 meguri ps                 # runs, interaction state, panes
+meguri schedules          # cron schedules: definition, last fire, next fire
 meguri top                # build a dashboard workspace of tiled agent panes & attach
 meguri logs <run>         # event trail + live pane tail
 meguri attach <issue>     # jump into the issue's agent pane (or pass a run id)
@@ -329,6 +330,28 @@ timeout_secs = 300                         # per-command; commands may fetch ove
 ```
 
 Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+
+### Scheduled enqueue (`[[projects.schedules]]`, optional)
+
+For time-driven operation — a daily production task, a weekly tidy — a project can carry cron **schedules** that periodically enqueue work. A schedule only *puts one item on the queue* (a labeled issue in github mode, a local task in local mode); the existing worker/planner loops consume it exactly as if you had filed it by hand. meguri does **not** run arbitrary commands on a timer — enqueue is the whole job, execution stays the loops' (ADR 0009). This makes it the recurring-work counterpart to `meguri add`, evaluated by `meguri watch` on every poll tick.
+
+```toml
+[[projects.schedules]]
+name = "daily-tidy"              # unique within the project
+cron = "0 9 * * *"              # standard 5-field cron, interpreted as UTC
+kind = "ready"                  # "ready" → worker (meguri:ready) | "plan" → planner (meguri:plan, github only)
+title = "Daily tidy {{date}}"  # template; the only variable is {{date}} (the fire date, YYYY-MM-DD UTC)
+body_file = "ops/daily-tidy.md" # repo-relative body file — or `body = "..."` inline (exactly one)
+# allow_overlap = false         # default: skip firing while this schedule's last issue/task is still open
+```
+
+- **Cron is UTC** and evaluated at poll-interval granularity (5 fields: minute hour day-of-month month day-of-week; `*`, ranges, `*/n` steps, and lists supported). Want local time? Offset the expression yourself; a per-schedule timezone is a later addition.
+- **Catch-up is folded.** The last-fired time is persisted in sqlite (not config, so a hot-reload edit to the definition never loses it). If `watch` was down across several occurrences, the schedule fires **once** on the next tick, not once per missed occurrence — the cron-daemon rule. A newly-added schedule never backfills the past: its first tick just records "seen".
+- **Overlap guard.** By default a schedule skips (but still consumes that occurrence — no backfill when it later closes) while its previous issue/task is still open, so a slow item doesn't pile up duplicates. Set `allow_overlap = true` to fire every occurrence regardless.
+- **Provenance.** Each fired item carries a hidden `<!-- meguri:schedule name=<name> -->` marker in its body (local tasks also get `origin = schedule:<name>`).
+- Definitions are hot-reloaded (#73): add or change a schedule and it takes effect on the next tick, no `watch` restart. `meguri doctor` validates the cron expression, name uniqueness, body exclusivity, and `body_file` existence; `meguri schedules` lists each definition with its last and next fire.
+
+Since local mode has no planner, `kind = "plan"` is github-only — a local `plan` schedule is rejected at config load (the task would never be consumed).
 
 ### Role-based agent routing (optional)
 

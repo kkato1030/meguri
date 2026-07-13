@@ -101,15 +101,16 @@ conflict_resolver → ci_fixer → fixer → spec_worker → spec_reviewer → w
 
 ### 帯域外(out-of-band)sweep
 
-`default_loops()` の**外**で、`scheduler.rs` の poll tick から直接呼ばれる軽量 API 掃引が3つある。いずれも `Loop` trait を実装せず、run レコードも pane も持たないため、上のディスパッチ優先度リストには現れない:
+`default_loops()` の**外**で、`scheduler.rs` の poll tick から直接呼ばれる軽量 API 掃引が4つある。いずれも `Loop` trait を実装せず、run レコードも pane も持たないため、上のディスパッチ優先度リストには現れない:
 
 | sweep | 役割 | ADR |
 |---|---|---|
+| `scheduler_fire::sweep` | cron スケジュール(`[[projects.schedules]]`)を評価し、due なら issue/task を1件起票する(起票のみ、消化は既存ループ) | [0009-schedules-enqueue-only-not-a-cron-replacement](../adr/0009-schedules-enqueue-only-not-a-cron-replacement.md) |
 | `reaper::sweep` | close された issue の pane・worktree・マージ済みローカルブランチを回収 | [0004-issue-lane-pane-session-lifetime](../adr/0004-issue-lane-pane-session-lifetime.md) |
 | `auto_merger::sweep` | 条件が揃った PR に GitHub-native auto-merge を arm(opt-in) | [0003-auto-merge-github-native-arm-only](../adr/0003-auto-merge-github-native-arm-only.md) |
 | `merge_watch::sweep` | arm 済み PR のドリフト検出。conflict/red CI は fixer 系ループに委譲(no-op)、拾われない stall だけ escalate | [0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md) |
 
-3つは実行順に固定されている(reaper → auto_merger → merge_watch)。新しく arm した PR を同じ tick 内で merge_watch が一度観測できるよう、auto_merger の後に merge_watch が続く。
+実行順は固定(scheduler_fire → reaper → auto_merger → merge_watch)。`scheduler_fire` が起票した issue/task はその tick の discovery を既に過ぎているため次 tick で拾われる(poll_interval 粒度なので実害なし)。auto_merger → merge_watch の順は、新しく arm した PR を同じ tick 内で merge_watch が一度観測できるようにするため。`scheduler_fire` の状態(最終発火時刻)は forge ではなく sqlite の `schedule_state` に置く — 定義は config 側(hot reload 対象)にあり、Authority 原則の「forge が唯一の永続状態」の例外として、これは純粋にローカルなスケジューラの進行管理だから(cleaner の interval と同種)。
 
 ## 3. loop 別ライフサイクル
 
