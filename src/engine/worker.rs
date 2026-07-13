@@ -147,7 +147,7 @@ impl Flavor for WorkerFlavor {
     }
 
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
     }
 
     /// Phase transition (ADR 0005) + claim release. In github mode the issue's
@@ -255,6 +255,26 @@ mod tests {
     use crate::config::{Config, ProjectConfig};
     use crate::forge::fake::FakeForge;
     use crate::store::Store;
+
+    #[test]
+    fn pr_title_prefers_subject_and_falls_back_to_issue_title() {
+        let (_deps, run, _forge) = fake_env(&[forge::LABEL_READY]);
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        assert_eq!(WorkerFlavor.pr_title(&run, &cp), "Add caching (#7)");
+
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            subject: Some("Cache API responses in memory".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            WorkerFlavor.pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
 
     #[test]
     fn prompt_invites_needs_plan() {
