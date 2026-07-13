@@ -290,20 +290,23 @@ impl Flavor for SpecWorkerFlavor {
     }
 
     /// open-pr never *creates* the PR (it already exists), but
-    /// [`Flavor::settle_presentation`] retitles it to this: the planner opened
-    /// the PR as `Spec: X (#N)`, and once implementation lands the `Spec:`
-    /// prefix is dropped so the title reads as an implementation PR (issue #98).
+    /// [`Flavor::settle_presentation`] retitles it to this: this turn's own
+    /// execute step sets `cp.subject` to the implementation subject (issue
+    /// #136), so the title moves from the planner's spec subject to the
+    /// implementation's once the turn is verified.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
     }
 
     /// Transition the takeover PR's presentation from spec to implementation.
-    /// The planner authored it as `Spec: X (#N)` with a spec-premised body;
-    /// now that the implementation is committed, retitle it `X (#N)` and
-    /// replace the body with the implementation description the agent wrote
-    /// (issue #98). Idempotent: re-running sets the same values. This is the
-    /// spec-worker-only half of the presentation the normal worker sets at PR
-    /// creation, so the two paths converge instead of diverging.
+    /// The planner authored the title from its own spec-writing turn's
+    /// subject (or the issue title) with a spec-premised body; now that the
+    /// implementation is committed under this turn's own subject (issue
+    /// #136), retitle the PR and replace the body with the implementation
+    /// description the agent wrote (issue #98). Idempotent: re-running sets
+    /// the same values. This is the spec-worker-only half of the
+    /// presentation the normal worker sets at PR creation, so the two paths
+    /// converge instead of diverging.
     async fn settle_presentation(
         &self,
         deps: &Deps,
@@ -368,6 +371,34 @@ impl Flavor for SpecWorkerFlavor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_title_moves_from_spec_subject_to_implementation_subject() {
+        let run = fake_run(7);
+        // Before the takeover's own execute turn sets a subject, the title
+        // falls back to the issue title (or whatever the planner's spec
+        // subject left behind, if this checkpoint came with one).
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            subject: Some("Write a spec for caching".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            SpecWorkerFlavor.pr_title(&run, &cp),
+            "Write a spec for caching (#7)"
+        );
+
+        // Once the implementation turn is verified, `cp.subject` moves on to
+        // the implementation's own subject (issue #136).
+        let cp = Checkpoint {
+            subject: Some("Cache API responses in memory".into()),
+            ..cp
+        };
+        assert_eq!(
+            SpecWorkerFlavor.pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
 
     #[test]
     fn prompt_carries_issue_spec_and_takeover_rules() {
@@ -487,6 +518,7 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

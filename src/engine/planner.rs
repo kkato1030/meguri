@@ -180,8 +180,13 @@ impl Flavor for PlannerFlavor {
         }
     }
 
+    /// The `Spec:` prefix hack is retired (issue #136): the planner's own
+    /// execute turn sets `cp.subject` to what it actually did (e.g. "Write a
+    /// spec for ..."), so the PR title reads honestly without a mechanical
+    /// prefix. Falls back to the issue title when the agent omitted
+    /// `subject` (backward compatibility).
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("Spec: {} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
     }
 
     /// Label transition (ADR 0005): the PR gets `meguri:spec-reviewing` (it is
@@ -516,13 +521,27 @@ mod tests {
     }
 
     #[test]
-    fn pr_title_carries_spec_prefix() {
+    fn pr_title_falls_back_to_issue_title_without_subject() {
         let run = fake_run(7);
         let cp = Checkpoint {
             issue_title: "Add caching".into(),
             ..Default::default()
         };
-        assert_eq!(PlannerFlavor.pr_title(&run, &cp), "Spec: Add caching (#7)");
+        assert_eq!(PlannerFlavor.pr_title(&run, &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn pr_title_prefers_agent_authored_subject_over_spec_prefix_hack() {
+        let run = fake_run(7);
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            subject: Some("Write a spec for cache invalidation".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PlannerFlavor.pr_title(&run, &cp),
+            "Write a spec for cache invalidation (#7)"
+        );
     }
 
     fn fake_run(issue: i64) -> RunRecord {
@@ -548,6 +567,7 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

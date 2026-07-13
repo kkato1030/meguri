@@ -325,6 +325,20 @@ signal_comment = true  # 「meguri:ready を付け直して」の促しコメン
 
 `[projects.pr]` は `[pr]` セクションを（キー単位ではなく)丸ごと上書きします: `[projects.pr]` を書いたプロジェクトは、省略したキーはデフォルトになり、`[pr.auto_merge]` も含めてそうなります。
 
+### worktree セットアップフック（オプトイン）
+
+`[projects.worktree_setup]` は、meguri が worktree を準備するたびに(初回だけでなく create/attach/re-point のたびに)プロジェクト独自のコマンドを実行します。`attach_worktree`/`create_review_worktree` は再利用時に `reset --hard` + `clean -fd` で untracked なファイルを消すことがあるため、毎回の実行が必要になります。meguri 自身はここで何を実行するかに関与しません(ADR 0003)。apm(「[エージェント向け指示（apm）](#エージェント向け指示apm)」参照)はその一利用例であり、専用の組み込み連携ではありません:
+
+```toml
+[projects.worktree_setup]
+commands = ["apm install --frozen"]        # sh -c で順に実行。途中で失敗したら以降は実行しない
+exclude = [".claude/rules", "AGENTS.md"]   # .git/info/exclude に追記(常時追記される .meguri/ に加えて)
+required = false                           # true にすると失敗時に run が失敗扱いになる(既定は warn して続行)
+timeout_secs = 300                         # コマンドごとのタイムアウト。ネットワーク fetch を伴い得るため
+```
+
+コマンドは worktree を `cwd` として実行され、`MEGURI_ROLE`(run のロール — `worker` / `fixer` / `spec-reviewer` など)、`MEGURI_PROFILE`(解決された起動プロファイル)、`MEGURI_ISSUE`(対象の issue/task 番号)が環境変数として渡されるので、ロールごとにスクリプト側で最適化できます。コマンドは同じ worktree に対して複数回実行され得るため、冪等に書いてください。
+
 ## 開発
 
 ```bash
@@ -333,6 +347,22 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 ```
 
 テストスイートは、スクリプト化された偽エージェント TUI（`tests/fixtures/fake_agent.sh`）を使い、本物の tmux・本物の git worktree・ローカルの bare origin に対してループ全体を駆動します — blocked ダイアログの処理、嘘をつくエージェントの矯正、検証フィードバック、クラッシュリカバリを含みます。
+
+loop がどう繋がっているか（パイプライン全体図・ディスパッチ優先度・loop 別ライフサイクル・ADR 索引）を設計者向けにまとめた地図は [docs/architecture/loops.md](docs/architecture/loops.md) を参照してください。この README は引き続き利用者向けの「使い方」、あちらは設計者向けの「なぜこの構造か」です。
+
+### エージェント向け指示（apm）
+
+meguri 自身のリポジトリ固有の AI エージェント（Claude Code / Codex）向け指示は、手書きの `CLAUDE.md` / `AGENTS.md` ではなく [microsoft/apm](https://github.com/microsoft/apm)（`apm.yml`・`apm.lock.yaml`・`.apm/instructions/`）をソースにしています。コンパイル成果物（`CLAUDE.md` / `AGENTS.md` / `.claude/rules/` / `.codex/` / `apm_modules/` / `.agents/`）は `.gitignore` に入れてあります — 指示を1行直すたびに並行中の worktree/PR 全部で再生成 diff が出るのを避けるためです（[ADR 0008](docs/adr/0008-agent-instructions-via-apm.md) 参照）。ローカルで生成するには:
+
+```bash
+brew install microsoft/apm/apm   # または: curl -sSL https://aka.ms/apm-unix | sh
+apm install                      # .apm/instructions/ を .claude/rules/ に展開
+apm compile                      # Codex 向けに AGENTS.md（+ src/AGENTS.md）を生成
+```
+
+順序が重要です: `apm compile` が `CLAUDE.md` を生成しないのは、直前の `apm install` が `.claude/rules/` を先に展開しているからです(Claude Code はそちらを直接読むので、apm が重複コンテキストとして `CLAUDE.md` を除外する)。先に `apm compile` を実行した場合や、空のツリーに対して実行した場合(例: 隔離検証用の `--root <scratch-dir>`)は、除外対象がまだ無いため `CLAUDE.md`/`src/CLAUDE.md` も生成されます。`apm install --dry-run` もこのステップのプレビューにはなりません — dry-run が報告するのは `apm`/`mcp` パッケージ依存(このリポジトリには無い)だけで、ローカルの `.apm/instructions/` 展開は対象外です。`.claude/rules/` を実際に展開するには dry-run なしの `apm install` が必要です。
+
+`.apm/instructions/` や `apm.yml` を編集したら両方を再実行してください。実際に `apm install` を実行すると `apm.lock.yaml` の `local_deployed_files` / `local_deployed_file_hashes` もディスク上の現在のデプロイ状態に合わせて書き換わります — これらは gitignore 対象のコンパイル成果物を追跡しているだけなので、その差分はコミットせず、コミット前に `git checkout apm.lock.yaml` で戻してください(`apm lock` を再実行しても、これらのフィールドは既存の lockfile から引き継がれて消えません)。meguri にはこのビルドを worktree 準備のたびに自動実行できる汎用の [worktree セットアップフック](#worktree-セットアップフックオプトイン)(`[projects.worktree_setup]`)がすでにあります。meguri 自身のループにそれを配線するのは別issue（#139）で扱います。
 
 ## ステータス / ロードマップ
 

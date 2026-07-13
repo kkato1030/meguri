@@ -41,6 +41,12 @@ repo_slug = "owner/repo"
 # mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、成果物はローカルブランチ)。
                       # `meguri add "タスク"` で投入。詳細は README を参照。
 
+# [projects.worktree_setup]                  # worktree 準備のたびに(再利用時も)実行する汎用フック
+# commands = ["apm install --frozen"]        # 例: agent 指示ファイルの再生成。apm 専用ではなく任意コマンド列
+# exclude = [".claude/rules", "AGENTS.md"]   # 生成物を .git/info/exclude に追記(.meguri/ は常に追記される)
+# required = false                           # true にすると失敗時に run が失敗扱いになる(既定は warn で続行)
+# timeout_secs = 300
+
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
@@ -590,6 +596,50 @@ pub enum Deliver {
     Patch,
 }
 
+/// `[projects.worktree_setup]` (agent 指示基盤 2/3, issue #138): a generic
+/// post-worktree-preparation hook. meguri stays agnostic to what runs here
+/// (ADR 0003) — a project might regenerate agent instructions
+/// (`apm install --frozen`, see README), fetch dependencies, or warm a build
+/// cache. Commands run with the worktree as `cwd`, in order, every time the
+/// worktree is prepared (created, attached, or re-pointed) — not just the
+/// first time, since `attach_worktree` / `create_review_worktree` can wipe
+/// untracked files on reuse — so write them idempotently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeSetupConfig {
+    /// Shell commands (`sh -c`), run in order; a later command does not run
+    /// after an earlier one fails.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// Extra paths appended to `.git/info/exclude`, alongside the always-on
+    /// `.meguri/` — keeps the commands' untracked output out of the agent's
+    /// diffs and out of the clean-tree verification.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Failure policy: false (default) logs a warning, emits
+    /// `worktree_setup.failed`, and lets the run continue; true escalates a
+    /// failing command to a run failure.
+    #[serde(default)]
+    pub required: bool,
+    /// Per-command timeout in seconds; commands may fetch over the network.
+    #[serde(default = "default_worktree_setup_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for WorktreeSetupConfig {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            exclude: Vec::new(),
+            required: false,
+            timeout_secs: default_worktree_setup_timeout_secs(),
+        }
+    }
+}
+
+fn default_worktree_setup_timeout_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -623,6 +673,9 @@ pub struct ProjectConfig {
     /// (the ignore list in particular is inherently project-specific).
     #[serde(default)]
     pub clean: Option<CleanConfig>,
+    /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
+    #[serde(default)]
+    pub worktree_setup: WorktreeSetupConfig,
 }
 
 fn default_branch() -> String {
@@ -1440,5 +1493,39 @@ check_command = "cargo test"
         let cfg: Config = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.deliver_for(cfg.project("l").unwrap()), Deliver::Branch);
+    }
+
+    #[test]
+    fn worktree_setup_defaults_to_empty_and_optional() {
+        let raw =
+            "[[projects]]\nid = \"demo\"\nrepo_path = \"/tmp/demo\"\nrepo_slug = \"me/demo\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let ws = &cfg.project("demo").unwrap().worktree_setup;
+        assert!(ws.commands.is_empty());
+        assert!(ws.exclude.is_empty());
+        assert!(!ws.required);
+        assert_eq!(ws.timeout_secs, 300);
+    }
+
+    #[test]
+    fn worktree_setup_parses_project_table() {
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[projects.worktree_setup]
+commands = ["apm install --frozen", "apm compile"]
+exclude = [".claude/rules", "AGENTS.md"]
+required = true
+timeout_secs = 60
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let ws = &cfg.project("demo").unwrap().worktree_setup;
+        assert_eq!(ws.commands, vec!["apm install --frozen", "apm compile"]);
+        assert_eq!(ws.exclude, vec![".claude/rules", "AGENTS.md"]);
+        assert!(ws.required);
+        assert_eq!(ws.timeout_secs, 60);
     }
 }

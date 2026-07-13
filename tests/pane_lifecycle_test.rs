@@ -82,6 +82,7 @@ async fn setup() -> TestEnv {
         clean: None,
         mode: Default::default(),
         deliver: None,
+        worktree_setup: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -122,7 +123,8 @@ impl Flavor for FixedBranchFlavor {
         let root = deps.project.worktree_root.clone().unwrap();
         let wt = gitops::worktree_path(&root, &deps.project.id, &self.branch);
         if !wt.exists() {
-            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main").await?;
+            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main", &[])
+                .await?;
         }
         deps.store
             .update_run_worktree(&run.id, &self.branch, &wt.to_string_lossy())?;

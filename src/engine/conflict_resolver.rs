@@ -288,7 +288,14 @@ impl Flavor for ConflictResolverFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Resolving a conflict doesn't change the nature of the change (issue
+    /// #136): keep the subject the establishing turn set instead of letting
+    /// the resolution's wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: leave a durable trace on the PR (the resolution is
@@ -361,6 +368,11 @@ impl Flavor for ConflictResolverFlavor {
 mod tests {
     use super::*;
     use crate::gitops::run_git_sync;
+
+    #[test]
+    fn resolve_turns_never_establish_a_new_subject() {
+        assert!(!ConflictResolverFlavor.sets_subject());
+    }
 
     #[test]
     fn resolvable_guards_state_ownership_and_hold() {
@@ -530,6 +542,7 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

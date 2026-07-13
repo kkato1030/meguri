@@ -95,6 +95,17 @@ pub trait Flavor: Send + Sync {
         deps.project.default_branch.clone()
     }
 
+    /// Whether this loop's execute turn may (re)establish `cp.subject`
+    /// (issue #136). Implementation-shaping turns — the worker, the
+    /// planner, the spec worker's takeover — do; fix-family turns whose job
+    /// is to amend without changing the nature of the change (the fixer,
+    /// the ci-fixer, the conflict resolver) must not, so the PR title stays
+    /// fixed to whatever turn established it instead of flapping with every
+    /// fix's wording. Default: yes.
+    fn sets_subject(&self) -> bool {
+        true
+    }
+
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String;
 
     /// Settle forge labels once the PR exists. Re-run on resume, so keep it
@@ -190,6 +201,11 @@ pub struct Checkpoint {
     /// (fallback PR body).
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored PR/commit subject from the verified execute turn
+    /// (issue #136); `pr_title()` prefers this over `issue_title` when
+    /// present. Only set by turns whose [`Flavor::sets_subject`] is true.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
@@ -557,6 +573,7 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
         &wt,
         &branch,
         &deps.project.default_branch,
+        &deps.project.worktree_setup.exclude,
     )
     .await?;
     deps.store
@@ -566,7 +583,7 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
         "worktree.created",
         json!({ "branch": branch, "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    run_worktree_setup(deps, run, &wt).await
 }
 
 /// Attach the run's worktree to an existing PR head branch instead of
@@ -587,7 +604,13 @@ pub(crate) async fn attach_pr_worktree(
         .clone()
         .unwrap_or_else(crate::config::worktrees_root);
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-    gitops::attach_worktree(&deps.project.repo_path, &wt, &branch).await?;
+    gitops::attach_worktree(
+        &deps.project.repo_path,
+        &wt,
+        &branch,
+        &deps.project.worktree_setup.exclude,
+    )
+    .await?;
     deps.store
         .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())?;
     deps.store.emit(
@@ -595,6 +618,104 @@ pub(crate) async fn attach_pr_worktree(
         "worktree.attached",
         json!({ "branch": branch, "path": wt.to_string_lossy() }),
     )?;
+    run_worktree_setup(deps, run, &wt).await
+}
+
+/// Env vars passed to `worktree_setup` commands: the run's role (its loop
+/// kind — `worker`, `fixer`, `spec-reviewer`, …), the launch profile that
+/// role resolves to, and the target issue/task number. Lets a user script
+/// specialize per role (e.g. skip a heavy step for `cleaner`). `MEGURI_PROFILE`
+/// goes through [`resolve_run_profile`] — the same pin-aware resolution the
+/// run's pane spawn uses — rather than re-resolving routing from scratch, so
+/// it can't drift from the profile the agent actually launches under (e.g.
+/// if routing config or CLI detection changes between the two).
+fn worktree_setup_env(deps: &Deps, run: &RunRecord) -> Result<[(&'static str, String); 3]> {
+    let (profile_name, _) = resolve_run_profile(deps, run)?;
+    Ok([
+        ("MEGURI_ROLE", run.loop_kind.clone()),
+        ("MEGURI_PROFILE", profile_name),
+        ("MEGURI_ISSUE", run.task_key().number().to_string()),
+    ])
+}
+
+/// Generic post-worktree-preparation hook (`[projects.worktree_setup]`,
+/// agent 指示基盤 2/3 — issue #138): runs the project's configured commands
+/// with the worktree as cwd. Called on every worktree preparation, not just
+/// the first — `attach_worktree` / `create_review_worktree` can wipe
+/// untracked files via `reset --hard` + `clean -fd` on reuse, so generated
+/// artifacts (e.g. `apm install --frozen` output) must be regenerated each
+/// time. Commands are expected to be idempotent, and a failing command stops
+/// the remaining ones in the list. Failure is a warning by default (the run
+/// continues); `worktree_setup.required = true` escalates it to a run
+/// failure.
+pub(crate) async fn run_worktree_setup(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+) -> Result<()> {
+    let setup = &deps.project.worktree_setup;
+    if setup.commands.is_empty() {
+        return Ok(());
+    }
+    let env = worktree_setup_env(deps, run)?;
+    let timeout = Duration::from_secs(setup.timeout_secs);
+
+    for command in &setup.commands {
+        deps.store.emit(
+            Some(&run.id),
+            "worktree_setup.running",
+            json!({ "command": command }),
+        )?;
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(worktree);
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+        // `output()` spawns eagerly; wrapping it in `timeout` only drops the
+        // *future* on expiry, which would otherwise leave the shell (and
+        // whatever it started) running as an orphan. `kill_on_drop` makes
+        // dropping the child on that cancellation actually kill it.
+        cmd.kill_on_drop(true);
+
+        let failure = match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => None,
+            Ok(Ok(out)) => Some(format!(
+                "`{command}` exited {}: {}",
+                out.status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Ok(Err(e)) => Some(format!("spawning `{command}`: {e}")),
+            Err(_) => Some(format!(
+                "`{command}` timed out after {}s",
+                setup.timeout_secs
+            )),
+        };
+
+        let Some(reason) = failure else {
+            deps.store.emit(
+                Some(&run.id),
+                "worktree_setup.ok",
+                json!({ "command": command }),
+            )?;
+            continue;
+        };
+
+        deps.store.emit(
+            Some(&run.id),
+            "worktree_setup.failed",
+            json!({ "command": command, "reason": reason }),
+        )?;
+        if setup.required {
+            bail!("worktree_setup command {reason}");
+        }
+        tracing::warn!(
+            "worktree_setup command {reason} (continuing: worktree_setup.required = false)"
+        );
+        break;
+    }
     Ok(())
 }
 
@@ -1026,6 +1147,24 @@ async fn record_agent_session(
     Ok(())
 }
 
+/// Applies a verified execute turn's agent-authored fields to the
+/// checkpoint. `sets_subject` gates whether `result.subject` may
+/// (re)establish `cp.subject` (see [`Flavor::sets_subject`]); an absent or
+/// blank (whitespace-only) `subject` never clears one an earlier turn
+/// already set — a blank value would otherwise survive into
+/// `default_pr_title()` as a literal empty title instead of falling back to
+/// the issue title.
+fn apply_execute_result(cp: &mut Checkpoint, result: TurnResultFile, sets_subject: bool) {
+    if sets_subject {
+        let subject = result.subject.as_deref().map(str::trim).unwrap_or("");
+        if !subject.is_empty() {
+            cp.subject = Some(subject.to_string());
+        }
+    }
+    cp.summary = result.summary;
+    cp.pr_body = result.pr_body;
+}
+
 /// execute: agent does the loop's work; the orchestrator independently
 /// verifies that committed work exists (plus the flavor's own check) before
 /// moving on.
@@ -1087,10 +1226,9 @@ async fn execute(
             flavor.verify_work(run, cp, worktree).err()
         };
         let Some(problem) = problem else {
-            // Keep what the agent said for the PR body (persisted by the
-            // caller's step save).
-            cp.summary = result.summary;
-            cp.pr_body = result.pr_body;
+            // Keep what the agent said for the PR title/body (persisted by
+            // the caller's step save).
+            apply_execute_result(cp, result, flavor.sets_subject());
             deps.store.emit(
                 Some(&run.id),
                 "execute.verified",
@@ -1296,6 +1434,18 @@ async fn open_pr(
     Ok(pr_url)
 }
 
+/// The PR-title formula every [`Flavor::pr_title`] shares (issue #136): the
+/// agent-authored `subject` from the turn that established it, or the issue
+/// title when none was ever set (backward compatibility) — followed by the
+/// issue number the forge conventionally carries in a squash-merged repo.
+pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
+    format!(
+        "{} (#{})",
+        cp.subject.as_deref().unwrap_or(&cp.issue_title),
+        run.issue_number
+    )
+}
+
 /// The PR body meguri wraps around the agent's description: a `Closes #N`
 /// header, the agent-authored description (its `pr_body`, or the execute
 /// turn's summary as a fallback), and the meguri footer. Shared by new-PR
@@ -1384,6 +1534,103 @@ pub fn pr_body_instruction(worktree: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn fake_run(issue: i64) -> RunRecord {
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", "test-flavor", issue, "t")
+            .unwrap();
+        store.get_run(&run.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn default_pr_title_prefers_subject_and_falls_back_to_issue_title() {
+        let run = fake_run(7);
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        assert_eq!(default_pr_title(&run, &cp), "Add caching (#7)");
+
+        cp.subject = Some("Cache API responses in memory".into());
+        assert_eq!(
+            default_pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
+
+    #[test]
+    fn apply_execute_result_gates_subject_by_flavor() {
+        let mut cp = Checkpoint::default();
+        let result_with = |subject: Option<&str>| TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: subject.map(str::to_string),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        // Implementation-shaping turn: subject is established.
+        apply_execute_result(&mut cp, result_with(Some("Add caching")), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Fix-family turn (sets_subject = false): a new subject is ignored,
+        // the established one survives (no flapping).
+        apply_execute_result(&mut cp, result_with(Some("Fix flaky test")), false);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Omitting `subject` never clears an already-established one either.
+        apply_execute_result(&mut cp, result_with(None), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
+    #[test]
+    fn apply_execute_result_ignores_a_blank_subject() {
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("   ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(
+            cp.subject, None,
+            "a whitespace-only subject must not become the checkpoint's subject"
+        );
+        // Otherwise default_pr_title() would render a broken " (#N)" title
+        // instead of falling back to the issue title.
+        assert_eq!(default_pr_title(&fake_run(7), &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn apply_execute_result_trims_subject_whitespace() {
+        let mut cp = Checkpoint::default();
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("  Add caching  ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
     #[test]
     fn pr_template_discovery_prefers_repo_locations_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1439,5 +1686,244 @@ mod tests {
         let section = pr_body_instruction(dir.path());
         assert!(section.contains("## Repo Sections"));
         assert!(!section.contains("<what & why>"));
+    }
+
+    async fn init_repo(dir: &Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            gitops::run_git(dir, &args).await.unwrap();
+        }
+    }
+
+    /// A `Deps` wired to a real local repo (no origin needed — `create_worktree`
+    /// falls back to the local branch) plus fake forge/mux, and a run of
+    /// `loop_kind` "worker" for issue 7 — enough to drive `prepare_worktree`
+    /// in isolation, without spawning a pane.
+    fn make_deps(
+        repo_path: PathBuf,
+        worktree_root: PathBuf,
+        worktree_setup: crate::config::WorktreeSetupConfig,
+    ) -> (Deps, RunRecord) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", "worker", 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(worktree_root),
+            pr: None,
+            clean: None,
+            worktree_setup,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge,
+            crate::config::Config::default(),
+            project,
+        );
+        (deps, run)
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_runs_with_the_documented_env_vars() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec![
+                    "echo $MEGURI_ROLE-$MEGURI_PROFILE-$MEGURI_ISSUE > marker.txt".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        let marker = std::fs::read_to_string(wt.join("marker.txt")).unwrap();
+        assert_eq!(marker.trim(), "worker-default-7");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_env_honors_an_already_pinned_profile() {
+        // A run's launch profile can be pinned (runs.agent_profile) before
+        // prepare-worktree ever runs — e.g. a resumed/retried run, or a
+        // concurrent spawn. MEGURI_PROFILE must reuse that pin instead of
+        // re-resolving routing from scratch, or the hook and the pane it's
+        // preparing for could end up generating for different profiles.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["echo $MEGURI_PROFILE > profile.txt".into()],
+                ..Default::default()
+            },
+        );
+        // No [routing] configured, so a fresh `routing::resolve` call would
+        // return "default" — pin something else first and confirm the hook
+        // picks that up instead.
+        deps.store
+            .update_run_agent_profile(&run.id, "codex")
+            .unwrap();
+        let cp = Checkpoint::default();
+
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.agent_profile.as_deref(), Some("codex"));
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        let profile = std::fs::read_to_string(wt.join("profile.txt")).unwrap();
+        assert_eq!(profile.trim(), "codex");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_required_failure_fails_prepare_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["exit 1".into()],
+                required: true,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        let err = create_branch_worktree(&deps, &run, &cp).await.unwrap_err();
+        assert!(err.to_string().contains("worktree_setup"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_optional_failure_warns_and_stops_remaining_commands() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["exit 1".into(), "echo late > marker.txt".into()],
+                required: false,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        // Soft failure: the run continues (Ok), but the second command never
+        // runs because the first one failed.
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        assert!(!wt.join("marker.txt").exists());
+
+        let events = deps.store.events_for_run(&run.id, 20).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "worktree_setup.failed"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_timeout_kills_the_child_process() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["sleep 2 && echo late > marker.txt".into()],
+                timeout_secs: 1,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        let start = std::time::Instant::now();
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "prepare-worktree must not block past the command's timeout"
+        );
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+
+        // Wait past when the sleep would have finished had it survived the
+        // timeout; if `kill_on_drop` didn't actually kill it, marker.txt
+        // would show up here.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !wt.join("marker.txt").exists(),
+            "the timed-out command must be killed, not left running in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_reruns_on_attach_reuse() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        // The setup command overwrites the marker each time it runs.
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["echo ran > marker.txt".into()],
+                ..Default::default()
+            },
+        );
+        let mut cp = Checkpoint::default();
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let branch = run.branch.clone().unwrap();
+        let wt = PathBuf::from(run.worktree_path.clone().unwrap());
+        cp.head_branch = Some(branch.clone());
+
+        // Simulate the marker being wiped (as `attach_worktree` would if it
+        // re-pointed the checkout) and re-attach the same run's worktree:
+        // the hook must run again, not just on first creation.
+        std::fs::remove_file(wt.join("marker.txt")).unwrap();
+        let mut run = run;
+        run.branch = Some(branch);
+        attach_pr_worktree(&deps, &run, &cp).await.unwrap();
+
+        assert!(wt.join("marker.txt").exists());
     }
 }
