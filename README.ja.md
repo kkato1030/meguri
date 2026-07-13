@@ -57,7 +57,7 @@ meguri 自体の脆弱性を見つけた場合は [SECURITY.md](SECURITY.md) を
 
 ## インストールとセットアップ
 
-前提: `git`、[`gh`](https://cli.github.com)（認証済み）、エージェント CLI（デフォルトは `claude`）、そしてマルチプレクサ — 起動中の [herdr](https://herdr.dev)（推奨。エージェント状態のネイティブ検出）または `tmux`（画面ヒューリスティックのフォールバック）。
+前提: `git`、[`gh`](https://cli.github.com)（認証済み）、エージェント CLI（デフォルトは `claude`）、そしてマルチプレクサ — 起動中の [herdr](https://herdr.dev)（推奨。エージェント状態のネイティブ検出）または `tmux`（画面ヒューリスティックのフォールバック）。これらのランタイム前提はインストール方法によらず同じです — 配布バイナリを使う場合もホストに `git`/`gh`/マルチプレクサが必要です。
 
 対応プラットフォーム: meguri のコア（CLI・`watch`・全ループ）は macOS / Linux で動作します。`meguri daemon install`（`launchd` supervisor、「[常駐させる（daemon）](#常駐させるdaemon)」参照）は macOS 専用です。
 
@@ -66,6 +66,11 @@ cargo install --path .   # or: cargo build --release
 meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
+
+バイナリの入手方法（その他）:
+
+- **配布バイナリ** — [最新の GitHub Release](https://github.com/kkato1030/meguri/releases/latest) から自分のプラットフォーム（macOS arm64 / Linux x86_64）のアーカイブをダウンロードし、`.sha256` で検証・展開して `meguri` を `PATH` に置きます。
+- **crates.io** — `cargo install meguri`（crate の publish 後。[ステータス / ロードマップ](#ステータス--ロードマップ) を参照）。
 
 `meguri init` は次のプロジェクトスタブ入りの最小 `~/.meguri/config.toml` を書き出すので、値を埋めます:
 
@@ -322,6 +327,10 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 ## ステータス / ロードマップ
 
 GitHub 上で 8 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → self-review → PR）、**planner**（`meguri:plan` issue → spec PR）、**spec reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。実装 diff の AI レビューはもうループではなく worker の内部フェーズ（**self-review**、ADR 0006）です: run の worktree の中で回り、forge には一切触れません。
+
+**バージョニング。** meguri は 1.0 前（`0.x`）で [SemVer](https://semver.org/lang/ja/) に従います: `0.x` の間は public API と CLI が未安定で、minor（`0.y`）が破壊的変更を含みうる一方、patch（`0.y.z`）は互換を保ちます。安定を約束するのは `1.0.0` からです。現在の挙動に依存する場合はバージョンを固定してください。
+
+**リリース。** リリースはタグ駆動です（ADR 0007）: メンテナがバージョンを bump し、`CHANGELOG.md` を更新して `vX.Y.Z` タグを push すると、`.github/workflows/release.yml` が macOS arm64 / Linux x86_64 のバイナリをビルドして GitHub Release に添付し（本文は git-cliff 生成のノート）、（crate 設定が済めば）OIDC Trusted Publishing で crates.io に publish します。**push したタグがそのままリリースの起点**なので、タグは慎重に — 誤タグは誤リリースになります。
 
 ## コントリビューション
 
