@@ -52,6 +52,13 @@ shell access, so that label is a deliberate trust gate, not a formality).
 
 So: open issues freely, and leave the `meguri:*` labels alone.
 
+## Architecture
+
+New to the codebase? [docs/architecture/loops.md](docs/architecture/loops.md) is the
+designer-facing map of how the loops fit together — the full pipeline, dispatch
+priority, per-loop lifecycle, and an index into the ADRs behind individual
+decisions. It's a good place to start before diving into `docs/adr/`.
+
 ## Development environment
 
 Prereqs: a Rust toolchain matching `rust-version` in `Cargo.toml` (currently

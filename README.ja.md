@@ -338,6 +338,8 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 テストスイートは、スクリプト化された偽エージェント TUI（`tests/fixtures/fake_agent.sh`）を使い、本物の tmux・本物の git worktree・ローカルの bare origin に対してループ全体を駆動します — blocked ダイアログの処理、嘘をつくエージェントの矯正、検証フィードバック、クラッシュリカバリを含みます。
 
+loop がどう繋がっているか（パイプライン全体図・ディスパッチ優先度・loop 別ライフサイクル・ADR 索引）を設計者向けにまとめた地図は [docs/architecture/loops.md](docs/architecture/loops.md) を参照してください。この README は引き続き利用者向けの「使い方」、あちらは設計者向けの「なぜこの構造か」です。
+
 ### エージェント向け指示（apm）
 
 meguri 自身のリポジトリ固有の AI エージェント（Claude Code / Codex）向け指示は、手書きの `CLAUDE.md` / `AGENTS.md` ではなく [microsoft/apm](https://github.com/microsoft/apm)（`apm.yml`・`apm.lock.yaml`・`.apm/instructions/`）をソースにしています。コンパイル成果物（`CLAUDE.md` / `AGENTS.md` / `.claude/rules/` / `.codex/` / `apm_modules/` / `.agents/`）は `.gitignore` に入れてあります — 指示を1行直すたびに並行中の worktree/PR 全部で再生成 diff が出るのを避けるためです（[ADR 0008](docs/adr/0008-agent-instructions-via-apm.md) 参照）。ローカルで生成するには:
