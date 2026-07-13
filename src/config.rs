@@ -93,6 +93,8 @@ pub struct Config {
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
+    pub reconcile: ReconcileConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
 }
 
@@ -127,6 +129,38 @@ fn default_self_review_enabled() -> bool {
 }
 fn default_self_review_max_rounds() -> u32 {
     3
+}
+
+/// Settings for the reconcile loop (issue #142): detecting that a once-shipped
+/// issue's body was edited and treating it as a re-attention signal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ReconcileConfig {
+    /// Kill switch: false restores the pre-#142 behavior — a succeeded run
+    /// suppresses the issue permanently regardless of later body edits (half A
+    /// and half B both go inert).
+    #[serde(default = "default_reconcile_body_edits")]
+    pub body_edits: bool,
+    /// Whether the poll sweep (half B) posts the "本文が更新されました" signal
+    /// comment on a changed-body issue. False emits the `issue.body_changed`
+    /// event only (no forge write).
+    #[serde(default = "default_reconcile_signal_comment")]
+    pub signal_comment: bool,
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self {
+        Self {
+            body_edits: default_reconcile_body_edits(),
+            signal_comment: default_reconcile_signal_comment(),
+        }
+    }
+}
+
+fn default_reconcile_body_edits() -> bool {
+    true
+}
+fn default_reconcile_signal_comment() -> bool {
+    true
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -843,6 +877,22 @@ impl_max_rounds = 5
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(!cfg.review.enabled);
         assert_eq!(cfg.review.max_rounds, 5);
+    }
+
+    #[test]
+    fn reconcile_defaults_are_on_and_overridable() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.reconcile.body_edits);
+        assert!(cfg.reconcile.signal_comment);
+
+        let raw = r#"
+[reconcile]
+body_edits = false
+signal_comment = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.reconcile.body_edits);
+        assert!(!cfg.reconcile.signal_comment);
     }
 
     #[test]

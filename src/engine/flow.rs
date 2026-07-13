@@ -309,6 +309,16 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             PreparedWork::Claimed => {}
             PreparedWork::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
         }
+        // Record the normalized-body digest this run acted on (issue #142), in
+        // the shared step — not in a flavor's claim path — so a loop with a
+        // custom prepare_work (the spec worker) still stamps its succeeded runs
+        // instead of leaving them NULL (which the discover guard would read as
+        // permanently suppressed). Only github issue runs carry an issue body;
+        // local tasks have none.
+        if let TaskKey::Issue(_) = run.task_key() {
+            deps.store
+                .set_run_body_digest(&run.id, &tasks::body_digest(&checkpoint.issue_body))?;
+        }
         step = save_step(deps, run, STEP_PREPARE_WORKTREE, &checkpoint)?;
     }
 

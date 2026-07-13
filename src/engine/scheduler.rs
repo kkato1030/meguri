@@ -109,6 +109,12 @@ impl Scheduler {
                 if let Err(e) = super::merge_watch::sweep(deps).await {
                     tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Notice body edits on already-shipped issues the label-filtered
+                // discovery can no longer see (issue #142, half B) and leave a
+                // re-attention signal. Light API sweep, no run record.
+                if let Err(e) = super::reconcile::sweep(deps).await {
+                    tracing::warn!("reconcile sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {

@@ -8,6 +8,7 @@ pub mod impl_reviewer;
 pub mod merge_watch;
 pub mod planner;
 pub mod reaper;
+pub mod reconcile;
 pub mod scheduler;
 pub mod spec_reviewer;
 pub mod spec_worker;
@@ -66,6 +67,7 @@ impl Deps {
             forge.clone(),
             store.clone(),
             project.id.clone(),
+            config.reconcile,
         ));
         let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {

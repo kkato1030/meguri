@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Row, params};
+use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Store, now};
@@ -156,6 +156,11 @@ pub struct RunRecord {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// Normalized-body SHA-256 the run acted on (issue #142), set once the
+    /// checkpoint's `issue_body` is settled. NULL for pre-#142 runs — treated
+    /// as "matches any body" by [`Store::issue_processed_current_body`] so the
+    /// old permanent-suppression behavior survives an upgrade.
+    pub body_digest: Option<String>,
 }
 
 impl RunRecord {
@@ -201,6 +206,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
+        body_digest: row.get("body_digest")?,
     })
 }
 
@@ -336,6 +342,71 @@ impl Store {
                 )?
                 .exists(params![project_id, loop_kind, issue_number])?;
             Ok(exists)
+        })
+    }
+
+    /// Whether a succeeded run of `loop_kind` already covers the issue's
+    /// *current* body (issue #142): either a succeeded run whose `body_digest`
+    /// matches `digest`, or a legacy NULL-digest succeeded run (pre-#142 —
+    /// treated as "matches any body" so the old permanent suppression survives
+    /// an upgrade). The body-aware replacement for [`Store::issue_has_succeeded_run`]
+    /// in discovery: when this returns false while `issue_has_succeeded_run` is
+    /// true, the body changed since it was last processed — the suppression
+    /// lifts and the reconcile loop signals the edit.
+    pub fn issue_processed_current_body(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+        digest: &str,
+    ) -> Result<bool> {
+        self.with_conn(|c| {
+            let exists = c
+                .prepare(
+                    "SELECT 1 FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'succeeded'
+                       AND (body_digest IS NULL OR body_digest = ?4) LIMIT 1",
+                )?
+                .exists(params![project_id, loop_kind, issue_number, digest])?;
+            Ok(exists)
+        })
+    }
+
+    /// The most recent succeeded run of `loop_kind` for an issue (issue #142):
+    /// the run whose work a later body edit invalidates. `issue.body_changed`
+    /// is emitted against it so the signal shows up under `meguri logs` on that
+    /// run, not orphaned with a NULL run id.
+    pub fn latest_succeeded_run_id(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let id = c
+                .query_row(
+                    "SELECT id FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'succeeded'
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![project_id, loop_kind, issue_number],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(id)
+        })
+    }
+
+    /// Record the normalized-body digest a run acted on (issue #142). Written
+    /// once the checkpoint's `issue_body` is settled, in the flow step shared
+    /// by every flavor, so a loop with a custom claim path (the spec worker)
+    /// still stamps its succeeded runs.
+    pub fn set_run_body_digest(&self, id: &str, digest: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET body_digest = ?2 WHERE id = ?1",
+                params![id, digest],
+            )?;
+            Ok(())
         })
     }
 
@@ -670,6 +741,47 @@ mod tests {
         assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
+    }
+
+    #[test]
+    fn issue_processed_current_body_is_digest_aware_with_null_legacy() {
+        let store = Store::open_in_memory().unwrap();
+
+        // A legacy succeeded run with a NULL digest suppresses any body
+        // (preserves the old permanent-suppression behavior on upgrade).
+        let legacy = store.create_run("demo", 9, "t").unwrap();
+        store
+            .update_run_status(&legacy.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert!(
+            store
+                .issue_processed_current_body("demo", "worker", 9, "any")
+                .unwrap()
+        );
+
+        // A run that recorded a digest covers only that exact body.
+        let run = store.create_run("demo", 10, "t").unwrap();
+        store.set_run_body_digest(&run.id, "aaa").unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert!(
+            store
+                .issue_processed_current_body("demo", "worker", 10, "aaa")
+                .unwrap()
+        );
+        // A different body is no longer covered → suppression lifts.
+        assert!(
+            !store
+                .issue_processed_current_body("demo", "worker", 10, "bbb")
+                .unwrap()
+        );
+        // No succeeded run at all: never suppressed.
+        assert!(
+            !store
+                .issue_processed_current_body("demo", "worker", 11, "aaa")
+                .unwrap()
+        );
     }
 
     #[test]

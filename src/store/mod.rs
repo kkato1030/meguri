@@ -5,11 +5,13 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
+mod reconcile;
 mod runs;
 mod tasks;
 pub use panes::*;
 pub use runs::*;
 pub use tasks::*;
+// `reconcile` only adds inherent `impl Store` methods (no exported types).
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
@@ -35,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // other runs-touching migration (0005 adds `agent_profile`) to carry those
     // columns forward.
     ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
+    (
+        "0008_reconcile",
+        include_str!("migrations/0008_reconcile.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

@@ -30,7 +30,11 @@ type Coordination = (Option<Arc<dyn Forge>>, Arc<dyn TaskSource>);
 /// The coordination layer (and whether there is a forge at all) is chosen by
 /// the project mode: labels+GitHub for github, the local sqlite `tasks` table
 /// for local. Shared by `build_deps` and the driverless `cmd_stop` finalize.
-fn build_coordination(project: &ProjectConfig, store: &Store) -> Result<Coordination> {
+fn build_coordination(
+    cfg: &Config,
+    project: &ProjectConfig,
+    store: &Store,
+) -> Result<Coordination> {
     match project.mode {
         ProjectMode::Github => {
             let slug = project.repo_slug.clone().context(
@@ -41,6 +45,7 @@ fn build_coordination(project: &ProjectConfig, store: &Store) -> Result<Coordina
                 forge.clone(),
                 store.clone(),
                 project.id.clone(),
+                cfg.reconcile,
             ));
             Ok((Some(forge), ts))
         }
@@ -58,7 +63,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
     // (herdr) / `<session>-<project>` (tmux), not the shared base workspace.
     let mux = mux::detect(kind, &cfg.mux.session, Some(&project.id))?;
     let store = open_store()?;
-    let (forge, task_source) = build_coordination(project, &store)?;
+    let (forge, task_source) = build_coordination(cfg, project, &store)?;
     Ok(Deps {
         store,
         mux,

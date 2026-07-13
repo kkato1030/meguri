@@ -209,6 +209,12 @@ Because the AI no longer creates review threads, the **fixer** naturally picks u
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
+### Reconcile (issue body edits are a re-attention signal)
+
+Once an issue has been shipped by a succeeded run, meguri stops rediscovering it — otherwise every poll would re-file the same work. But that suppression used to be permanent: editing the issue's description afterwards changed nothing. The **reconcile** loop makes the suppression *body-aware* (comparing a whitespace-normalized digest of the body, so a mere label change — which also bumps GitHub's `updatedAt` — is ignored, and a whitespace-only edit doesn't count). A materially edited body lifts the suppression and emits a durable `issue.body_changed` event (visible in `meguri logs`); a poll sweep also leaves one comment on the already-`implementing` issue nudging you to re-label it `meguri:ready` if a re-run is wanted.
+
+**A body edit is a signal, not a trigger.** It never launches an agent on its own — the execution gate stays the collaborator-applied phase label (the same [label gate](#labels) that bounds prompt-injection: "who can get an agent to execute" = "who has write access"). Editing the body only makes the issue *eligible* again; a collaborator still has to (re-)apply `meguri:ready`. Both the signal and the comment fire at most once per distinct new body, so a pending edit never floods the log. Turn the whole loop off with `reconcile.body_edits = false`, or keep detection but silence the comment with `reconcile.signal_comment = false`.
+
 Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the spec reviewer (and a transient **impl-review** pane while the worker self-reviews). After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
 
 Per-loop lifetimes at a glance:
@@ -312,6 +318,10 @@ ignore = []             # substrings that silence false positives; override per 
 enabled = true    # kill switch for the worker's self-review phase (internal AI review of the diff)
 max_rounds = 3    # max self-review rounds per run; past the cap the PR is published as-is
 # (the old impl_enabled / impl_max_rounds keys still load as aliases)
+
+[reconcile]
+body_edits = true      # detect that a shipped issue's body was edited and treat it as a re-attention signal
+signal_comment = true  # also leave a "re-label meguri:ready" nudge comment (false = the durable event only)
 ```
 
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.

@@ -74,7 +74,30 @@ impl super::Loop for SpecWorkerLoop {
             let Some(issue) = gitops::issue_from_branch(&pr.head_branch) else {
                 continue; // human-made head: not meguri's to take over
             };
-            if deps
+            // Body-aware suppression (issue #142, half A): a succeeded takeover
+            // suppresses re-discovery only while the issue body is unchanged.
+            // Editing the issue body lifts it (and signals the edit once), so a
+            // human re-triggering the spec-ready takeover after a body edit is
+            // no longer permanently blocked. `body_edits = false` restores the
+            // old permanent suppression.
+            if deps.config.reconcile.body_edits {
+                let digest = crate::tasks::body_digest(&deps.forge().get_issue(issue).await?.body);
+                if deps.store.issue_processed_current_body(
+                    &deps.project.id,
+                    KIND,
+                    issue,
+                    &digest,
+                )? {
+                    continue;
+                }
+                if deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
+                {
+                    deps.store
+                        .signal_body_changed_event(&deps.project.id, KIND, issue, &digest)?;
+                }
+            } else if deps
                 .store
                 .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
             {
