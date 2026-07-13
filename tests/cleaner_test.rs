@@ -116,8 +116,8 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         mode: Default::default(),
         deliver: None,
         clean: None,
-            plan_delivery: Default::default(),
-            review: None,
+        plan_delivery: Default::default(),
+        review: None,
     };
 
     let deps = Deps::with_label_source(

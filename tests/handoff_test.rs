@@ -8,7 +8,7 @@ use meguri::config::{Config, PlanDelivery, ProjectConfig};
 use meguri::engine::handoff;
 use meguri::engine::{Deps, planner};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, Issue, LABEL_READY, LABEL_SPECCING};
+use meguri::forge::{Issue, LABEL_READY, LABEL_SPECCING};
 
 fn deps_with(forge: Arc<FakeForge>, delivery: PlanDelivery) -> Deps {
     let project = ProjectConfig {
@@ -69,7 +69,12 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
     assert!(!labels.contains(&LABEL_SPECCING.to_string()));
     // The handoff left a note naming the spec PR.
-    assert!(forge.comments_of(5).iter().any(|c| c.contains(&format!("#{pr}"))));
+    assert!(
+        forge
+            .comments_of(5)
+            .iter()
+            .any(|c| c.contains(&format!("#{pr}")))
+    );
 
     // Idempotent: a second sweep (issue no longer speccing) is a no-op.
     handoff::sweep(&deps).await.unwrap();

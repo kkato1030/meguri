@@ -85,8 +85,8 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
-            plan_delivery: Default::default(),
-            review: None,
+        plan_delivery: Default::default(),
+        review: None,
     };
 
     let deps = Deps::with_label_source(
@@ -335,9 +335,8 @@ async fn planner_self_reviews_the_spec_before_opening_the_pr() {
         let wt = wt.to_path_buf();
         let turn_id = turn_id.to_string();
         tokio::spawn(async move {
-            let prompt =
-                std::fs::read_to_string(wt.join(format!(".meguri/prompt-{turn_id}.md")))
-                    .unwrap_or_default();
+            let prompt = std::fs::read_to_string(wt.join(format!(".meguri/prompt-{turn_id}.md")))
+                .unwrap_or_default();
             if prompt.contains("self-review round") {
                 // A clean spec review: write the verdict file, touch nothing.
                 let body = serde_json::json!({

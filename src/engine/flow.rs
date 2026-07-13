@@ -926,11 +926,8 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
 /// fixes. Resolved without pinning the run's own profile. Shared by the plan
 /// and impl self-review (the loop is symmetric).
 fn impl_review_lane(deps: &Deps) -> Result<Lane> {
-    let profile_name = crate::routing::resolve(
-        &deps.config,
-        "self-review",
-        &crate::routing::detect_command,
-    )?;
+    let profile_name =
+        crate::routing::resolve(&deps.config, "self-review", &crate::routing::detect_command)?;
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
     Ok(Lane {
         role: crate::store::ROLE_IMPL_REVIEW,

@@ -259,7 +259,12 @@ async fn plan_guard_clean_flips_to_spec_ready_via_status_and_body() {
 
     // The verdict folds into the PR body — not a conversation comment, and
     // never an inline thread (the fixer stays inert, criterion 3).
-    let pr = env.forge.prs().into_iter().find(|p| p.number == PR).unwrap();
+    let pr = env
+        .forge
+        .prs()
+        .into_iter()
+        .find(|p| p.number == PR)
+        .unwrap();
     assert!(pr.body.contains("<details>"), "body: {}", pr.body);
     assert!(pr.body.contains("guard review (plan) — clean"));
     assert!(
@@ -302,13 +307,21 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
     let labels = env.forge.pr_labels_of(PR);
-    assert!(labels.contains(&LABEL_SPEC_REVIEWING.to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&LABEL_SPEC_REVIEWING.to_string()),
+        "{labels:?}"
+    );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
     assert_eq!(
         env.forge.commit_status_of(&env.head_sha, GUARD_STATUS),
         Some(CommitStatusState::Failure)
     );
-    let pr = env.forge.prs().into_iter().find(|p| p.number == PR).unwrap();
+    let pr = env
+        .forge
+        .prs()
+        .into_iter()
+        .find(|p| p.number == PR)
+        .unwrap();
     assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
 
     // Idempotency: the reviewed head (now carrying a guard status) is skipped.
@@ -352,11 +365,19 @@ async fn impl_guard_reviews_without_touching_spec_labels() {
         Some(CommitStatusState::Failure)
     );
     let labels = env.forge.pr_labels_of(PR);
-    assert!(labels.contains(&LABEL_IMPLEMENTING.to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&LABEL_IMPLEMENTING.to_string()),
+        "{labels:?}"
+    );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
     assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
-    let pr = env.forge.prs().into_iter().find(|p| p.number == PR).unwrap();
+    let pr = env
+        .forge
+        .prs()
+        .into_iter()
+        .find(|p| p.number == PR)
+        .unwrap();
     assert!(pr.body.contains("guard review (impl)"), "body: {}", pr.body);
     assert!(env.forge.threads_of(PR).is_empty());
     assert!(env.forge.pr_comments_of(PR).is_empty());
@@ -378,8 +399,14 @@ async fn impl_guard_off_discovers_nothing() {
 async fn discovery_filters_hold_claimed_and_guarded_heads() {
     let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
 
-    env.forge
-        .add_pr(13, "held", "", &[LABEL_SPEC_REVIEWING, LABEL_HOLD], "b13", "sha13");
+    env.forge.add_pr(
+        13,
+        "held",
+        "",
+        &[LABEL_SPEC_REVIEWING, LABEL_HOLD],
+        "b13",
+        "sha13",
+    );
     env.forge.add_pr(
         14,
         "claimed",
@@ -410,15 +437,25 @@ async fn discovery_filters_hold_claimed_and_guarded_heads() {
 async fn skips_quietly_when_label_removed_after_discovery() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     let run = create_guard_run(&env);
-    env.forge.remove_pr_label(PR, LABEL_SPEC_REVIEWING).await.unwrap();
+    env.forge
+        .remove_pr_label(PR, LABEL_SPEC_REVIEWING)
+        .await
+        .unwrap();
 
     let outcome = tokio::time::timeout(Duration::from_secs(30), run_guard(&env.deps, &run.id))
         .await
         .expect("guard timed out")
         .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Skipped(_)), "{outcome:?}");
-    assert_eq!(env.deps.store.get_run(&run.id).unwrap().unwrap().status, RunStatus::Skipped);
-    assert!(!env.forge.pr_labels_of(PR).contains(&LABEL_WORKING.to_string()));
+    assert_eq!(
+        env.deps.store.get_run(&run.id).unwrap().unwrap().status,
+        RunStatus::Skipped
+    );
+    assert!(
+        !env.forge
+            .pr_labels_of(PR)
+            .contains(&LABEL_WORKING.to_string())
+    );
 }
 
 /// needs_human on the review turn escalates on the PR.
@@ -437,7 +474,10 @@ async fn needs_human_escalates_on_the_pr() {
     agent.abort();
     assert!(result.is_err());
     let labels = env.forge.pr_labels_of(PR);
-    assert!(labels.contains(&LABEL_NEEDS_HUMAN.to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     let comments = env.forge.pr_comments_of(PR);
@@ -463,7 +503,12 @@ async fn second_round_reuses_pane_and_worktree() {
         .expect("guard timed out")
         .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
-    let pane1 = env.deps.store.get_pane("proj", ISSUE, ROLE_REVIEW).unwrap().unwrap();
+    let pane1 = env
+        .deps
+        .store
+        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .unwrap()
+        .unwrap();
     let pane1_id = pane1.mux_pane_id.expect("review pane registered");
     let wt = PathBuf::from(pane1.worktree_path.expect("worktree recorded"));
     assert!(wt.ends_with(format!("guard-{ISSUE}")), "{}", wt.display());
@@ -471,8 +516,12 @@ async fn second_round_reuses_pane_and_worktree() {
     // The author pushes a fix: the PR head moves.
     run_git(&clone, &["checkout", PR_BRANCH]).await.unwrap();
     std::fs::write(clone.join("docs/specs/issue-5.md"), "# Spec v2\n").unwrap();
-    run_git(&clone, &["commit", "-am", "address findings"]).await.unwrap();
-    run_git(&clone, &["push", "origin", PR_BRANCH]).await.unwrap();
+    run_git(&clone, &["commit", "-am", "address findings"])
+        .await
+        .unwrap();
+    run_git(&clone, &["push", "origin", PR_BRANCH])
+        .await
+        .unwrap();
     let head2 = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
     run_git(&clone, &["checkout", "main"]).await.unwrap();
     env.forge.set_pr_head(PR, &head2);
@@ -485,8 +534,16 @@ async fn second_round_reuses_pane_and_worktree() {
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
-    let pane2 = env.deps.store.get_pane("proj", ISSUE, ROLE_REVIEW).unwrap().unwrap();
+    let pane2 = env
+        .deps
+        .store
+        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .unwrap()
+        .unwrap();
     assert_eq!(pane2.mux_pane_id.as_deref(), Some(pane1_id.as_str()));
-    assert_eq!(pane2.worktree_path.as_deref(), Some(wt.to_string_lossy().as_ref()));
+    assert_eq!(
+        pane2.worktree_path.as_deref(),
+        Some(wt.to_string_lossy().as_ref())
+    );
     assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(), head2);
 }

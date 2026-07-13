@@ -90,6 +90,9 @@ async fn process_issue(deps: &Deps, issue: i64, labels: &[String]) -> Result<()>
         "handoff.speccing_to_ready",
         json!({ "issue": issue, "spec_pr": pr.number }),
     )?;
-    tracing::info!("handoff: issue #{issue} speccing → ready (spec PR #{})", pr.number);
+    tracing::info!(
+        "handoff: issue #{issue} speccing → ready (spec PR #{})",
+        pr.number
+    );
     Ok(())
 }

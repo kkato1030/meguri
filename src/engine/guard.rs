@@ -624,7 +624,11 @@ fn guard_details(cp: &GuardCheckpoint, verdict: ReviewVerdict) -> String {
         ReviewVerdict::Findings => "findings",
     };
     let review = cp.review.trim();
-    let review = if review.is_empty() { "(no notes)" } else { review };
+    let review = if review.is_empty() {
+        "(no notes)"
+    } else {
+        review
+    };
     format!(
         "{GUARD_BODY_MARKER}\n<details>\n<summary>🛡️ guard review ({kind}) — {outcome} at `{short}`</summary>\n\n{review}\n</details>",
         kind = cp.kind.as_str(),
@@ -795,7 +799,11 @@ mod tests {
                 .contains("does not exist")
         );
         std::fs::write(&path, "not json").unwrap();
-        assert!(read_review(dir.path()).unwrap_err().contains("not valid JSON"));
+        assert!(
+            read_review(dir.path())
+                .unwrap_err()
+                .contains("not valid JSON")
+        );
         std::fs::write(&path, r#"{"verdict":"findings","review":"  "}"#).unwrap();
         assert!(read_review(dir.path()).unwrap_err().contains("empty"));
         std::fs::write(&path, r#"{"verdict":"clean"}"#).unwrap();

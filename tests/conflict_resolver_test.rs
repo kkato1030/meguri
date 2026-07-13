@@ -110,8 +110,8 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         language: None,
         pr: None,
         clean: None,
-            plan_delivery: Default::default(),
-            review: None,
+        plan_delivery: Default::default(),
+        review: None,
     };
 
     let deps = Deps::with_label_source(

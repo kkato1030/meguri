@@ -103,9 +103,7 @@ pub(crate) async fn self_review(
         }
 
         // ---- review turn (in the self-review lane) ----
-        let review = match review_turn(deps, run, cp, worktree, &base, kind, &lenses, language)
-            .await?
-        {
+        let review = match review_turn(deps, run, cp, worktree, &base, kind, &lenses).await? {
             ReviewTurn::Reviewed(review) => review,
             ReviewTurn::Stopped => return Ok(flow::StepFlow::Stopped),
             ReviewTurn::Interrupted(r) => return Ok(flow::StepFlow::Interrupted(r)),
@@ -195,7 +193,6 @@ async fn review_turn(
     base: &str,
     kind: Kind,
     lenses: &[String],
-    language: Option<&str>,
 ) -> Result<ReviewTurn> {
     // Drop the local diff where the prompt says it is, and clear any stale
     // review file so we read *this* turn's verdict.
@@ -204,6 +201,7 @@ async fn review_turn(
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
     let _ = std::fs::remove_file(worktree.join(REVIEW_FILE));
 
+    let language = deps.config.language_for(&deps.project);
     let head_before = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
     let mut prompt = review_prompt(run, cp, kind, lenses, language);
     let mut corrective_turns = 0u32;
@@ -373,9 +371,7 @@ fn lens_instruction(kind: Kind, lenses: &[String]) -> String {
              `tests` = is the plan verifiable / are acceptance criteria present; \
              `simplicity` = is the scope minimal; `security` = are risks acknowledged).\n"
         ),
-        Kind::Impl => format!(
-            "- Review through each of these lenses: {list}.\n"
-        ),
+        Kind::Impl => format!("- Review through each of these lenses: {list}.\n"),
     }
 }
 

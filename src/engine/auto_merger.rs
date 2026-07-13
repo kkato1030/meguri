@@ -14,9 +14,7 @@ use serde_json::json;
 use super::Deps;
 use super::guard::GUARD_STATUS;
 use crate::config::{AutoMergeConfig, AutoMergeOptIn};
-use crate::forge::{
-    self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, PullRequest,
-};
+use crate::forge::{self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, PullRequest};
 
 /// Head-branch prefix identifying meguri's own PRs — auto-merge only ever
 /// touches branches meguri opened (same guard as the fixer / conflict

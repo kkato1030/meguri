@@ -30,8 +30,8 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         worktree_root: None,
         pr: None,
         clean: None,
-            plan_delivery: Default::default(),
-            review: None,
+        plan_delivery: Default::default(),
+        review: None,
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
@@ -112,7 +112,10 @@ async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
     sweep(&deps).await.unwrap();
     assert_eq!(forge.armed_of(pr), None, "a red guard status blocks arming");
     let labels = forge.pr_labels_of(pr);
-    assert!(labels.contains(&LABEL_NEEDS_HUMAN.to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
     assert!(
         forge
             .pr_comments_of(pr)
@@ -131,7 +134,9 @@ async fn guard_gate_waits_when_status_absent() {
     assert_eq!(forge.armed_of(pr), None, "no status yet: wait, don't arm");
     // Waiting is silent — no escalation while the guard has not run.
     assert!(
-        !forge.pr_labels_of(pr).contains(&LABEL_NEEDS_HUMAN.to_string()),
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
         "an absent status must not escalate"
     );
 }

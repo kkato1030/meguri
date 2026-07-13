@@ -346,10 +346,7 @@ worker = "claude-opus"
             "claude-opus"
         );
         // neither present → guard falls to default.
-        assert_eq!(
-            resolve(&cfg, "guard", &only(&[])).unwrap(),
-            DEFAULT_PROFILE
-        );
+        assert_eq!(resolve(&cfg, "guard", &only(&[])).unwrap(), DEFAULT_PROFILE);
         // The internal self-review role shares the cross-vendor chain.
         assert_eq!(
             resolve(&cfg, "self-review", &only(&["codex", "claude"])).unwrap(),
@@ -414,9 +411,8 @@ impl-reviewer = "claude-opus"
         validate(&cfg, &only(&["codex", "claude"])).unwrap();
 
         // The current `spec-reviewer` key also still steers `guard`.
-        let cfg2 = cfg_from(
-            "[routing]\nmode = \"manual\"\n[routing.roles]\nspec-reviewer = \"codex\"\n",
-        );
+        let cfg2 =
+            cfg_from("[routing]\nmode = \"manual\"\n[routing.roles]\nspec-reviewer = \"codex\"\n");
         assert_eq!(resolve(&cfg2, "guard", &only(&["codex"])).unwrap(), "codex");
         validate(&cfg2, &only(&["codex"])).unwrap();
     }

@@ -100,9 +100,7 @@ impl Flavor for WorkerFlavor {
         // the spec worker's read-and-prune responsibilities — inject the spec
         // and ask for its deletion. A normal issue with no spec degrades to the
         // ordinary flow (the section is empty).
-        let spec_section = if deps.project.plan_delivery
-            == crate::config::PlanDelivery::Separate
-        {
+        let spec_section = if deps.project.plan_delivery == crate::config::PlanDelivery::Separate {
             match run.task_key() {
                 TaskKey::Issue(number) => {
                     super::spec_worker::reviewed_spec_section(worktree, number).unwrap_or_default()
@@ -285,7 +283,10 @@ mod tests {
             issue_body: "Cache the thing.".into(),
             ..Default::default()
         };
-        let prompt = WorkerFlavor { separate_delivery: false }.execute_prompt(&deps, &run, &cp, dir.path());
+        let prompt = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .execute_prompt(&deps, &run, &cp, dir.path());
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Needs a design decision first?"));
         assert!(prompt.contains(r#""status": "needs_plan""#));
@@ -296,10 +297,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (deps, run, forge) = fake_env(&[forge::LABEL_READY, forge::LABEL_WORKING]);
 
-        let outcome = WorkerFlavor { separate_delivery: false }
-            .on_needs_plan(&deps, &run, dir.path(), "auth model undecided")
-            .await
-            .unwrap();
+        let outcome = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .on_needs_plan(&deps, &run, dir.path(), "auth model undecided")
+        .await
+        .unwrap();
         let WorkerOutcome::NeedsPlan(reason) = outcome else {
             panic!("expected NeedsPlan, got {outcome:?}");
         };
@@ -326,10 +329,12 @@ mod tests {
         std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
         let (deps, run, forge) = fake_env(&[forge::LABEL_READY, forge::LABEL_WORKING]);
 
-        let err = WorkerFlavor { separate_delivery: false }
-            .on_needs_plan(&deps, &run, dir.path(), "still unclear")
-            .await
-            .unwrap_err();
+        let err = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .on_needs_plan(&deps, &run, dir.path(), "still unclear")
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("docs/specs/issue-7.md"), "{err}");
 
         // The hook only reports; run_flow's failure path does the labeling.
@@ -347,7 +352,11 @@ mod tests {
         // worker injects it and must see it deleted (ADR 0008 finding 1).
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
-        std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n\n- do X\n").unwrap();
+        std::fs::write(
+            dir.path().join("docs/specs/issue-7.md"),
+            "# Spec\n\n- do X\n",
+        )
+        .unwrap();
         let (deps, run, _forge) = fake_env(&[forge::LABEL_READY]);
         let cp = Checkpoint {
             issue_title: "T".into(),
