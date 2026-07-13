@@ -319,6 +319,18 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 テストスイートは、スクリプト化された偽エージェント TUI（`tests/fixtures/fake_agent.sh`）を使い、本物の tmux・本物の git worktree・ローカルの bare origin に対してループ全体を駆動します — blocked ダイアログの処理、嘘をつくエージェントの矯正、検証フィードバック、クラッシュリカバリを含みます。
 
+### エージェント向け指示（apm）
+
+meguri 自身のリポジトリ固有の AI エージェント（Claude Code / Codex）向け指示は、手書きの `CLAUDE.md` / `AGENTS.md` ではなく [microsoft/apm](https://github.com/microsoft/apm)（`apm.yml`・`apm.lock.yaml`・`.apm/instructions/`）をソースにしています。コンパイル成果物（`CLAUDE.md` / `AGENTS.md` / `.claude/rules/` / `.codex/` / `apm_modules/` / `.agents/`）は `.gitignore` に入れてあります — 指示を1行直すたびに並行中の worktree/PR 全部で再生成 diff が出るのを避けるためです（[ADR 0008](docs/adr/0008-agent-instructions-via-apm.md) 参照）。ローカルで生成するには:
+
+```bash
+brew install microsoft/apm/apm   # または: curl -sSL https://aka.ms/apm-unix | sh
+apm install                      # .apm/instructions/ を .claude/rules/ に展開
+apm compile                      # Codex 向けに AGENTS.md（+ src/AGENTS.md）を生成
+```
+
+`.apm/instructions/` や `apm.yml` を編集したら両方を再実行してください。meguri 自身のループが起動する worktree でこれを自動実行する `worktree_setup` フックは別issue（#138）で扱います。
+
 ## ステータス / ロードマップ
 
 GitHub 上で 8 つのループが動きます。looper のロールモデルを踏襲し、いずれも同じターンエンジンを共有する `Loop` 実装です: **worker**（issue → self-review → PR）、**planner**（`meguri:plan` issue → spec PR）、**spec reviewer**（`meguri:spec-reviewing` PR → サマリレビュー → `meguri:spec-ready`）、**spec worker**（`meguri:spec-ready` PR → 同じブランチ・同じ PR に実装コミットを積む）、**fixer**（meguri の PR の未解決レビューコメント → 修正コミットを push）、**ci fixer**（CI チェックが赤で確定した meguri の PR → 失敗ジョブのログを agent に渡す → 修正コミットを push。3 回の修正ラウンド後もまだ赤なら `meguri:needs-human` にエスカレーション）、**conflict resolver**（CONFLICTING な meguri の PR → ベースブランチを取り込み、コンフリクトを解消したマージコミットを push）、**cleaner**（定期的な read-only 巡回 → 乖離レポートを 1 本の `meguri:clean-report` issue に）。実装 diff の AI レビューはもうループではなく worker の内部フェーズ（**self-review**、ADR 0006）です: run の worktree の中で回り、forge には一切触れません。

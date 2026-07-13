@@ -355,6 +355,18 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtures/fake_agent.sh`) against real tmux, real git worktrees, and a local bare origin — including blocked-dialog handling, lying-agent correction, validation feedback, and crash recovery.
 
+### Agent instructions (apm)
+
+meguri's own repo-specific instructions for AI coding agents (Claude Code / Codex) are sourced from [microsoft/apm](https://github.com/microsoft/apm) (`apm.yml`, `apm.lock.yaml`, `.apm/instructions/`) rather than hand-written `CLAUDE.md` / `AGENTS.md` files. The compiled artifacts (`CLAUDE.md`, `AGENTS.md`, `.claude/rules/`, `.codex/`, `apm_modules/`, `.agents/`) are gitignored — a one-line instructions edit shouldn't produce a regeneration diff on every parallel worktree/PR (see [ADR 0008](docs/adr/0008-agent-instructions-via-apm.md)). To build them locally:
+
+```bash
+brew install microsoft/apm/apm   # or: curl -sSL https://aka.ms/apm-unix | sh
+apm install                      # deploys .apm/instructions/ -> .claude/rules/
+apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Codex
+```
+
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A `worktree_setup` hook that runs this automatically for meguri's own loops is tracked separately (#138).
+
 ## Status / roadmap
 
 Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
