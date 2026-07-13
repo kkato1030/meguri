@@ -54,10 +54,18 @@ impl super::Loop for WorkerLoop {
 }
 
 pub async fn run_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-    flow::run_flow(deps, run_id, &WorkerFlavor).await
+    let flavor = WorkerFlavor {
+        separate_delivery: deps.project.plan_delivery == crate::config::PlanDelivery::Separate,
+    };
+    flow::run_flow(deps, run_id, &flavor).await
 }
 
-struct WorkerFlavor;
+struct WorkerFlavor {
+    /// Whether the project uses separate plan delivery (ADR 0008): the worker
+    /// then reads/prunes a landed spec (finding 1). Carried on the flavor
+    /// because [`Flavor::verify_work`] has no `deps`.
+    separate_delivery: bool,
+}
 
 #[async_trait]
 impl Flavor for WorkerFlavor {
@@ -87,6 +95,21 @@ impl Flavor for WorkerFlavor {
         } else {
             String::new()
         };
+        // Separate delivery (ADR 0008 finding 1): if a reviewed spec landed on
+        // the default branch (from a merged spec/ADR PR), the worker inherits
+        // the spec worker's read-and-prune responsibilities — inject the spec
+        // and ask for its deletion. A normal issue with no spec degrades to the
+        // ordinary flow (the section is empty).
+        let spec_section = if deps.project.plan_delivery == crate::config::PlanDelivery::Separate {
+            match run.task_key() {
+                TaskKey::Issue(number) => {
+                    super::spec_worker::reviewed_spec_section(worktree, number).unwrap_or_default()
+                }
+                TaskKey::Local(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
         match run.task_key() {
             // github issue: the familiar prompt, including the needs-plan
             // handoff (only the label flow has a planner to hand to).
@@ -94,6 +117,7 @@ impl Flavor for WorkerFlavor {
                 "You are implementing GitHub issue #{number} in this repository \
                  (branch `{branch}`, a dedicated worktree).\n\n\
                  # Issue: {title}\n\n{body}\n\n\
+                 {spec_section}\
                  # Instructions\n\
                  - Explore the repository first and follow its existing conventions.\n\
                  - Implement the issue completely, including tests where the project has them.\n\
@@ -139,10 +163,18 @@ impl Flavor for WorkerFlavor {
 
     fn verify_work(
         &self,
-        _run: &RunRecord,
+        run: &RunRecord,
         _cp: &Checkpoint,
-        _worktree: &Path,
+        worktree: &Path,
     ) -> std::result::Result<(), String> {
+        // Separate delivery (ADR 0008 finding 1): the spec is disposable, so a
+        // spec that survived implementation gets a corrective turn — the same
+        // symmetric check the spec worker runs under combined delivery.
+        if let TaskKey::Issue(issue) = run.task_key()
+            && self.separate_delivery
+        {
+            return super::spec_worker::verify_spec_pruned(worktree, issue);
+        }
         Ok(()) // committed work is all the worker requires
     }
 
@@ -263,7 +295,10 @@ mod tests {
             issue_title: "Add caching".into(),
             ..Default::default()
         };
-        assert_eq!(WorkerFlavor.pr_title(&run, &cp), "Add caching (#7)");
+        let flavor = WorkerFlavor {
+            separate_delivery: false,
+        };
+        assert_eq!(flavor.pr_title(&run, &cp), "Add caching (#7)");
 
         let cp = Checkpoint {
             issue_title: "Add caching".into(),
@@ -271,7 +306,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            WorkerFlavor.pr_title(&run, &cp),
+            flavor.pr_title(&run, &cp),
             "Cache API responses in memory (#7)"
         );
     }
@@ -285,7 +320,10 @@ mod tests {
             issue_body: "Cache the thing.".into(),
             ..Default::default()
         };
-        let prompt = WorkerFlavor.execute_prompt(&deps, &run, &cp, dir.path());
+        let prompt = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .execute_prompt(&deps, &run, &cp, dir.path());
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Needs a design decision first?"));
         assert!(prompt.contains(r#""status": "needs_plan""#));
@@ -296,10 +334,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (deps, run, forge) = fake_env(&[forge::LABEL_READY, forge::LABEL_WORKING]);
 
-        let outcome = WorkerFlavor
-            .on_needs_plan(&deps, &run, dir.path(), "auth model undecided")
-            .await
-            .unwrap();
+        let outcome = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .on_needs_plan(&deps, &run, dir.path(), "auth model undecided")
+        .await
+        .unwrap();
         let WorkerOutcome::NeedsPlan(reason) = outcome else {
             panic!("expected NeedsPlan, got {outcome:?}");
         };
@@ -326,10 +366,12 @@ mod tests {
         std::fs::write(dir.path().join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
         let (deps, run, forge) = fake_env(&[forge::LABEL_READY, forge::LABEL_WORKING]);
 
-        let err = WorkerFlavor
-            .on_needs_plan(&deps, &run, dir.path(), "still unclear")
-            .await
-            .unwrap_err();
+        let err = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .on_needs_plan(&deps, &run, dir.path(), "still unclear")
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("docs/specs/issue-7.md"), "{err}");
 
         // The hook only reports; run_flow's failure path does the labeling.
@@ -339,6 +381,50 @@ mod tests {
             "{labels:?}"
         );
         assert!(forge.comments_of(7).is_empty());
+    }
+
+    #[test]
+    fn separate_delivery_injects_and_prunes_a_landed_spec() {
+        // A reviewed spec landed on the branch (from a merged spec PR): the
+        // worker injects it and must see it deleted (ADR 0008 finding 1).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/specs")).unwrap();
+        std::fs::write(
+            dir.path().join("docs/specs/issue-7.md"),
+            "# Spec\n\n- do X\n",
+        )
+        .unwrap();
+        let (deps, run, _forge) = fake_env(&[forge::LABEL_READY]);
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let flavor = WorkerFlavor {
+            separate_delivery: true,
+        };
+        let prompt = flavor.execute_prompt(&deps, &run, &cp, dir.path());
+        assert!(prompt.contains("# Reviewed spec (`docs/specs/issue-7.md`)"));
+        assert!(prompt.contains("- do X"));
+        assert!(prompt.contains("delete `docs/specs/issue-7.md`"));
+
+        // verify_work rejects a surviving spec, accepts its absence.
+        assert!(flavor.verify_work(&run, &cp, dir.path()).is_err());
+        std::fs::remove_file(dir.path().join("docs/specs/issue-7.md")).unwrap();
+        assert!(flavor.verify_work(&run, &cp, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn a_normal_issue_without_a_spec_degrades_to_the_ordinary_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, run, _forge) = fake_env(&[forge::LABEL_READY]);
+        let cp = Checkpoint::default();
+        let flavor = WorkerFlavor {
+            separate_delivery: true,
+        };
+        let prompt = flavor.execute_prompt(&deps, &run, &cp, dir.path());
+        assert!(!prompt.contains("# Reviewed spec"));
+        assert!(flavor.verify_work(&run, &cp, dir.path()).is_ok());
     }
 
     /// The vibration guard's other leg (issue #135): even when no spec ever
@@ -359,10 +445,12 @@ mod tests {
             .create_run_for_loop("proj", KIND, 7, "t")
             .unwrap();
 
-        let err = WorkerFlavor
-            .on_needs_plan(&deps, &second_run, dir.path(), "still unclear")
-            .await
-            .unwrap_err();
+        let err = WorkerFlavor {
+            separate_delivery: false,
+        }
+        .on_needs_plan(&deps, &second_run, dir.path(), "still unclear")
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("already retreated"), "{err}");
 
         // The hook only reports; run_flow's failure path does the labeling.
@@ -397,6 +485,8 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
         };

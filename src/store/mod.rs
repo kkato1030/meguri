@@ -5,13 +5,17 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
+mod reconcile;
 mod runs;
 mod schedules;
+mod stats;
 mod tasks;
 pub use panes::*;
 pub use runs::*;
 pub use schedules::*;
+pub use stats::*;
 pub use tasks::*;
+// `reconcile` only adds inherent `impl Store` methods (no exported types).
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
@@ -37,9 +41,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // other runs-touching migration (0005 adds `agent_profile`) to carry those
     // columns forward.
     ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
+    // routing 2/3 (#65): cli_versions + routing_drift. Independent new tables,
+    // renumbered to 0008 after main claimed 0007; runs last so it sees the
+    // recreated `runs` table from 0007_tasks.
     (
-        "0008_schedules",
-        include_str!("migrations/0008_schedules.sql"),
+        "0008_routing_freshness",
+        include_str!("migrations/0008_routing_freshness.sql"),
+    ),
+    // issue #142: reconcile — runs.body_digest + issue_reconcile. Renumbered to
+    // 0009 after main claimed 0008 for routing freshness; independent tables.
+    (
+        "0009_reconcile",
+        include_str!("migrations/0009_reconcile.sql"),
+    ),
+    // issue #146: schedule_state — cron schedule bookkeeping. Renumbered to
+    // 0010 after main claimed 0008/0009; an independent new table.
+    (
+        "0010_schedules",
+        include_str!("migrations/0010_schedules.sql"),
     ),
 ];
 

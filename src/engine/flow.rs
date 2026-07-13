@@ -32,6 +32,34 @@ pub const STEP_VALIDATE: &str = "validate";
 pub const STEP_SELF_REVIEW: &str = "self-review";
 pub const STEP_OPEN_PR: &str = "open-pr";
 
+/// Which side of the symmetric plan/impl loop a run is on (ADR 0008). The
+/// self-review turn frames its lenses differently for a spec/ADR document
+/// (Plan) than for a code diff (Impl); the guard reads it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Plan,
+    #[default]
+    Impl,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Impl => "impl",
+        }
+    }
+
+    /// Whether the project's guard is enabled for this kind (ADR 0008 §1).
+    pub fn guard_enabled(self, review: &crate::config::ReviewConfig) -> bool {
+        match self {
+            Self::Plan => review.guard.plan,
+            Self::Impl => review.guard.impl_enabled,
+        }
+    }
+}
+
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
 /// The default method bodies implement the issue-triggered "new branch, new
@@ -43,11 +71,29 @@ pub trait Flavor: Send + Sync {
     /// the default [`Flavor::prepare_work`].
     fn trigger_label(&self) -> &'static str;
 
-    /// Whether this loop runs the internal self-review phase (ADR 0006)
+    /// Which side of the symmetric loop this flavor drives (ADR 0008): the
+    /// planner is `Plan`, everything else `Impl`. Steers the self-review
+    /// framing (spec document vs code diff).
+    fn kind(&self) -> Kind {
+        Kind::Impl
+    }
+
+    /// Whether this loop runs the internal self-review phase (ADR 0006/0008)
     /// between `validate` and `open-pr`. Default: no (the historical
-    /// straight-to-PR shape). Only the worker opts in for the MVP.
+    /// straight-to-PR shape). The worker and the planner opt in — self-review
+    /// is symmetric across plan and impl (ADR 0008).
     fn self_reviews(&self) -> bool {
         false
+    }
+
+    /// Whether this loop's PR should auto-close its issue on merge (`Closes #N`
+    /// vs the non-closing `Refs #N`). Default: yes — an implementation PR
+    /// closes its issue. The planner overrides it in separate delivery: the
+    /// spec/ADR PR merges on its own and must NOT close the issue (the handoff
+    /// then flips it to `ready`, ADR 0008 §6).
+    fn pr_closes_issue(&self, deps: &Deps) -> bool {
+        let _ = deps;
+        true
     }
 
     /// Claim the run's target and fill the checkpoint. Default: the
@@ -240,6 +286,11 @@ pub struct Checkpoint {
     /// drives the single footer line noting the non-convergence.
     #[serde(default)]
     pub self_review_unconverged: bool,
+    /// One entry per self-review round (ADR 0008): what the folded PR-body
+    /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
+    /// the history it already built.
+    #[serde(default)]
+    pub self_review_log: Vec<super::impl_reviewer::RoundRecord>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -325,6 +376,16 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             PreparedWork::Claimed => {}
             PreparedWork::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
         }
+        // Record the normalized-body digest this run acted on (issue #142), in
+        // the shared step — not in a flavor's claim path — so a loop with a
+        // custom prepare_work (the spec worker) still stamps its succeeded runs
+        // instead of leaving them NULL (which the discover guard would read as
+        // permanently suppressed). Only github issue runs carry an issue body;
+        // local tasks have none.
+        if let TaskKey::Issue(_) = run.task_key() {
+            deps.store
+                .set_run_body_digest(&run.id, &tasks::body_digest(&checkpoint.issue_body))?;
+        }
         step = save_step(deps, run, STEP_PREPARE_WORKTREE, &checkpoint)?;
     }
 
@@ -393,8 +454,10 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     }
 
     if step == STEP_SELF_REVIEW {
-        if flavor.self_reviews() && deps.config.review.enabled {
-            match super::impl_reviewer::self_review(deps, &run, &mut checkpoint, &worktree).await? {
+        if flavor.self_reviews() && deps.config.review_for(&deps.project).enabled {
+            match super::impl_reviewer::self_review(deps, &run, &mut checkpoint, &worktree, flavor)
+                .await?
+            {
                 StepFlow::Continue => {}
                 StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
                 StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
@@ -988,16 +1051,14 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
     })
 }
 
-/// The worker's self-review lane: a separate pane keyed by the same issue,
-/// launched under the `impl-reviewer` routing profile so the review turn can
-/// be a different model than the author doing the fixes. Resolved without
-/// pinning the run's own (worker) profile.
+/// The self-review lane: a separate pane keyed by the same issue, launched
+/// under the `self-review` routing profile (formerly `impl-reviewer`, ADR
+/// 0008) so the review turn can be a different model than the author doing the
+/// fixes. Resolved without pinning the run's own profile. Shared by the plan
+/// and impl self-review (the loop is symmetric).
 fn impl_review_lane(deps: &Deps) -> Result<Lane> {
-    let profile_name = crate::routing::resolve(
-        &deps.config,
-        "impl-reviewer",
-        &crate::routing::detect_command,
-    )?;
+    let profile_name =
+        crate::routing::resolve(&deps.config, "self-review", &crate::routing::detect_command)?;
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
     Ok(Lane {
         role: crate::store::ROLE_IMPL_REVIEW,
@@ -1389,11 +1450,20 @@ async fn open_pr(
     let branch = run.branch.clone().context("run has no branch")?;
     gitops::push_branch(worktree, &branch).await?;
 
+    // Inspection history (ADR 0008): once the reviewed head is pushed, stamp
+    // the self-review verdict as a `meguri/self-review` commit status. The
+    // internal loop ran pre-open in the worktree; the status makes its outcome
+    // visible on the PR head without touching the conversation. Best-effort:
+    // a status failure must not fail an otherwise-good PR.
+    post_self_review_status(deps, run, cp, worktree).await;
+
+    let lenses = &deps.config.review_for(&deps.project).lenses;
+    let close = flavor.pr_closes_issue(deps);
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
     } else {
         let title = flavor.pr_title(run, cp);
-        let body = compose_pr_body(run, cp);
+        let body = compose_pr_body(run, cp, lenses, close);
         // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
         // a draft would waste the required-checks run the arm is waiting on
         // (auto-merge 1/3, #41).
@@ -1436,21 +1506,26 @@ pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
     )
 }
 
-/// The PR body meguri wraps around the agent's description: a `Closes #N`
+/// The PR body meguri wraps around the agent's description: an issue-link
 /// header, the agent-authored description (its `pr_body`, or the execute
-/// turn's summary as a fallback), and the meguri footer. Shared by new-PR
-/// creation and the spec worker's spec→implementation body transition so the
-/// two paths render an identical shape (issue #98).
-pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint) -> String {
+/// turn's summary as a fallback), the self-review `<details>` (ADR 0008), and
+/// the meguri footer. Shared by new-PR creation and the spec worker's
+/// spec→implementation body transition so the two paths render an identical
+/// shape (issue #98). `lenses` names the perspectives the self-review applied.
+pub(crate) fn compose_pr_body(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    lenses: &[String],
+    close: bool,
+) -> String {
     let description = cp
         .pr_body
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
-    // The only trace of the AI self-review that reaches the PR: a single
-    // footer line when the rounds cap was hit without a clean verdict (ADR
-    // 0006). The review→fix transcript itself never lands here.
+    // A single footer line when the rounds cap was hit without a clean verdict
+    // (ADR 0006): the human/guard review is the backstop.
     let self_review_note = if cp.self_review_unconverged {
         format!(
             "\n\n> 🔁 self-review: {} ラウンド回しても収束しませんでした（未解決の指摘が残ったまま公開しています。人間レビューで確認してください）。",
@@ -1460,10 +1535,96 @@ pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint) -> String {
         String::new()
     };
     format!(
-        "Closes #{}.\n\n{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
-        run.issue_number, description, self_review_note, run.id
+        issue_reference(run.issue_number, close),
+        description,
+        self_review_note,
+        self_review_details(cp, lenses),
+        run.id
     )
+}
+
+/// The header line linking a PR to its issue. `Closes #N` (auto-closes on
+/// merge) for a combined delivery / normal PR; `Refs #N` (non-closing) when
+/// the caller sets `close = false` — the separate spec PR must not close the
+/// issue when it merges (ADR 0008 §6).
+pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
+    if close {
+        format!("Closes #{issue}")
+    } else {
+        format!("Refs #{issue}")
+    }
+}
+
+/// The folded self-review summary that rides the PR body (ADR 0008): the
+/// lenses applied and one line per round (verdict + finding count). Empty when
+/// no self-review ran (loops without it, or `review.enabled = false`), so the
+/// body stays clean.
+fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
+    if cp.self_review_log.is_empty() {
+        return String::new();
+    }
+    let rounds = cp
+        .self_review_log
+        .iter()
+        .map(|r| {
+            let verdict = if r.findings == 0 {
+                "clean".to_string()
+            } else {
+                format!("{} findings", r.findings)
+            };
+            format!("- round {}: {verdict}", r.round)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let outcome = if cp.self_review_unconverged {
+        format!("unconverged after {} rounds", cp.self_review_rounds)
+    } else {
+        format!("clean after {} rounds", cp.self_review_rounds)
+    };
+    format!(
+        "\n\n<details>\n<summary>🔁 self-review — {outcome}</summary>\n\n\
+         lenses: {lenses}\n\n{rounds}\n</details>",
+        lenses = lenses.join(" / "),
+    )
+}
+
+/// Stamp the self-review verdict as a `meguri/self-review` commit status on
+/// the freshly-pushed head (ADR 0008). Only when a self-review actually ran
+/// and a forge is present; best-effort (the PR is already the durable truth).
+async fn post_self_review_status(deps: &Deps, run: &RunRecord, cp: &Checkpoint, worktree: &Path) {
+    if cp.self_review_log.is_empty() || deps.forge.is_none() {
+        return;
+    }
+    let Ok(head) = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await else {
+        return;
+    };
+    let head = head.trim();
+    let (state, desc) = if cp.self_review_unconverged {
+        (
+            crate::forge::CommitStatusState::Failure,
+            format!("unconverged · {} rounds", cp.self_review_rounds),
+        )
+    } else {
+        (
+            crate::forge::CommitStatusState::Success,
+            format!("clean · {} rounds", cp.self_review_rounds),
+        )
+    };
+    if let Err(e) = deps
+        .forge()
+        .set_commit_status(head, "meguri/self-review", state, &desc)
+        .await
+    {
+        deps.store
+            .emit(
+                Some(&run.id),
+                "self_review.status_failed",
+                json!({ "error": format!("{e:#}") }),
+            )
+            .ok();
+    }
 }
 
 /// Where repositories keep their PR template, in priority order.
@@ -1720,6 +1881,8 @@ mod tests {
             worktree_root: Some(worktree_root),
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup,
             schedules: Vec::new(),
         };

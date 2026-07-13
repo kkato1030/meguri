@@ -4,13 +4,16 @@ pub mod cleaner;
 pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
+pub mod guard;
+pub mod handoff;
 pub mod impl_reviewer;
 pub mod merge_watch;
 pub mod planner;
 pub mod reaper;
+pub mod reconcile;
+pub mod routing_drift;
 pub mod scheduler;
 pub mod scheduler_fire;
-pub mod spec_reviewer;
 pub mod spec_worker;
 pub mod worker;
 
@@ -45,6 +48,11 @@ pub struct Deps {
     /// Shared across every run of the project so the per-run notification
     /// throttle survives turn boundaries.
     pub notifier: Arc<Notifier>,
+    /// Builds a forge for a repo slug — how cross-repo decomposition reaches a
+    /// workspace sibling's repository (issue #154). Production is
+    /// `GhForgeFactory`; tests inject fakes. Only ever consulted for siblings;
+    /// the project's own repo uses [`Deps::forge`].
+    pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
 }
@@ -67,6 +75,7 @@ impl Deps {
             forge.clone(),
             store.clone(),
             project.id.clone(),
+            config.reconcile,
         ));
         let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {
@@ -75,9 +84,18 @@ impl Deps {
             forge: Some(forge),
             task_source,
             notifier,
+            forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
         }
+    }
+
+    /// Swap in a custom [`ForgeFactory`] (cross-repo decomposition tests inject
+    /// fakes for workspace siblings). Builder-style so the common
+    /// `with_label_source` path stays a single call.
+    pub fn with_forge_factory(mut self, factory: Arc<dyn crate::forge::ForgeFactory>) -> Self {
+        self.forge_factory = factory;
+        self
     }
 
     /// The forge for github-mode loops. Panics if absent — only the
@@ -166,14 +184,14 @@ pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullReq
     }
 }
 
-/// The pane lane a loop's runs live in: the spec reviewer keeps its
-/// independent `review` lane; every other loop shares the issue's `author`
-/// lane (the cleaner's report issue is only ever touched by the cleaner, so
-/// the default lane cannot collide). The worker's internal self-review turn
-/// runs in its own `impl-review` lane, but that lane is entered explicitly by
-/// the flow, not via a loop_kind, so it is not resolved here.
+/// The pane lane a loop's runs live in: the guard keeps its independent
+/// `review` lane; every other loop shares the issue's `author` lane (the
+/// cleaner's report issue is only ever touched by the cleaner, so the default
+/// lane cannot collide). The internal self-review turn runs in its own
+/// `impl-review` lane, but that lane is entered explicitly by the flow, not
+/// via a loop_kind, so it is not resolved here.
 pub fn role_for_loop(loop_kind: &str) -> &'static str {
-    if loop_kind == spec_reviewer::KIND {
+    if loop_kind == guard::KIND {
         ROLE_REVIEW
     } else {
         ROLE_AUTHOR
@@ -227,7 +245,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(spec_reviewer::SpecReviewerLoop),
+        Arc::new(guard::GuardLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
@@ -326,8 +344,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_is_review_only_for_the_spec_reviewer() {
-        assert_eq!(role_for_loop(spec_reviewer::KIND), ROLE_REVIEW);
+    fn lane_is_review_only_for_the_guard() {
+        assert_eq!(role_for_loop(guard::KIND), ROLE_REVIEW);
         for kind in [
             "worker",
             "planner",

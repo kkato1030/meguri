@@ -52,6 +52,8 @@ fn make_project(
         worktree_root: None,
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
         schedules,
     }
@@ -85,6 +87,7 @@ fn local_deps(schedules: Vec<ScheduleConfig>) -> (Deps, tempfile::TempDir) {
         forge: None,
         task_source,
         notifier: meguri::notify::fake::recording_notifier().0,
+        forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config: Config::default(),
         project,
     };

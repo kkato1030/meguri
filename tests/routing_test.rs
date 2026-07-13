@@ -203,6 +203,8 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         mode: Default::default(),
         deliver: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
     };

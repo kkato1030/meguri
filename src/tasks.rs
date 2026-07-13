@@ -21,10 +21,26 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
+use crate::config::ReconcileConfig;
 use crate::engine::{planner, worker};
 use crate::forge::{self, Forge};
 use crate::store::Store;
+
+/// The reconcile loop's fingerprint of an issue body (issue #142): a SHA-256
+/// over the body with whitespace normalized (trim + collapse every run of
+/// whitespace, including newlines, to a single space). Whitespace-only or
+/// reflow edits therefore hash identically and never re-fire; anything with a
+/// semantic change does. Ties the discover guard, the sweep, and the signal
+/// dedup to one definition of "the body changed".
+pub fn body_digest(body: &str) -> String {
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    Sha256::digest(normalized.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 
 /// The claiming host id stored in `tasks.claimed_by`. Fixed on a single
 /// machine (Phase 1–3); Phase 4's remote DB gives each host its own.
@@ -155,15 +171,63 @@ pub struct LabelTaskSource {
     forge: Arc<dyn Forge>,
     store: Store,
     project_id: String,
+    /// Reconcile settings (issue #142): `body_edits` toggles the body-aware
+    /// suppression in `discover`. When false, a succeeded run suppresses the
+    /// issue permanently as before.
+    reconcile: ReconcileConfig,
 }
 
 impl LabelTaskSource {
-    pub fn new(forge: Arc<dyn Forge>, store: Store, project_id: String) -> Self {
+    pub fn new(
+        forge: Arc<dyn Forge>,
+        store: Store,
+        project_id: String,
+        reconcile: ReconcileConfig,
+    ) -> Self {
         Self {
             forge,
             store,
             project_id,
+            reconcile,
         }
+    }
+
+    /// Whether a succeeded run already covers this issue at its *current* body
+    /// (issue #142). With `body_edits` on this is body-aware — a body edit
+    /// since the last success lifts suppression, and the first time a given new
+    /// body is seen it emits a deduped `issue.body_changed` signal. With it off
+    /// it degrades to the pre-#142 permanent suppression.
+    fn already_shipped(&self, loop_kind: &str, issue: &forge::Issue) -> Result<bool> {
+        if !self.reconcile.body_edits {
+            return self
+                .store
+                .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number);
+        }
+        let digest = body_digest(&issue.body);
+        if self.store.issue_processed_current_body(
+            &self.project_id,
+            loop_kind,
+            issue.number,
+            &digest,
+        )? {
+            return Ok(true);
+        }
+        // Not suppressed. If a prior success exists, the body changed since it
+        // was processed: record the re-attention signal once per new body. The
+        // issue still needs its trigger label (collaborator-gated) to actually
+        // re-run — the edit only lifts suppression, it does not launch.
+        if self
+            .store
+            .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number)?
+        {
+            self.store.signal_body_changed_event(
+                &self.project_id,
+                loop_kind,
+                issue.number,
+                &digest,
+            )?;
+        }
+        Ok(false)
     }
 }
 
@@ -177,10 +241,7 @@ impl TaskSource for LabelTaskSource {
             if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
                 continue;
             }
-            if self
-                .store
-                .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number)?
-            {
+            if self.already_shipped(loop_kind, &issue)? {
                 continue;
             }
             if has_unresolved_blockers(&*self.forge, issue.number).await {
@@ -387,6 +448,7 @@ mod tests {
             forge.clone(),
             Store::open_in_memory().unwrap(),
             "proj".into(),
+            ReconcileConfig::default(),
         );
         let key = TaskKey::Issue(7);
 
