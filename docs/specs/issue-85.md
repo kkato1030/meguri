@@ -18,12 +18,17 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
   **既定 `mode = "off"`(完全オプトイン)**。`clean_for` に倣った `triage_for()` アクセサ。
 - `mode = "report"` のときのみ discover が起動する。`off` / `advise` / `auto` は v0 では起動しない
   (`advise`/`auto` は forward-compat のためパースだけ通し、v0 は idle)。
-- **discover**: `meguri:triage-report` レポート issue の head/interval マーカーで律速。
+- **discover**: `meguri:triage-report` レポート issue の head/interval/max_issue マーカーで律速。
   - 対象 issue 集合 = 「open かつ `meguri:*` ワークフローラベルが未付与、`meguri:hold` でない、
     未解決 blocker がない」open issue。レポート issue 自身(`meguri:triage-report`)も
     `meguri:clean-report` も `meguri:*` プレフィックスで自動的に除外される。
-  - cleaner の `needs_scan()`(default-branch head 移動 + `interval_hours` 経過)で再走査を律速。
-    対象 issue 集合はマーカーに含めない(過剰トリアージは v0 では単なる上書きで無害)。
+  - 再走査の律速は cleaner の `needs_scan()` 条件(default-branch head 移動 + `interval_hours`
+    経過)に加え、**マーカーの `max_issue`(前回走査時点の最大 open issue 番号)より大きい番号の
+    open issue が存在すれば head が静止していても再走査する**。triage の入力は issue 集合なので、
+    head の移動だけを律速にすると「head 静止中に立った新規 issue を次の push まで拾わない」
+    under-triage になるため。既存 issue の更新(updatedAt)に追従する*再*トリアージは v1 #87 の
+    スコープで、v0 は新規 issue の初回トリアージにのみ反応する。過剰トリアージは v0 では単なる
+    上書きで無害。
   - レポート issue に `meguri:hold` が付いていたら discover は空を返す。
 - **prepare-worktree**: cleaner と同じ read-only detached checkout(`gitops::create_review_worktree`)。
 - **execute**: read-only turn。対象 issue 群(番号・タイトル・本文)をプロンプトに埋め、
@@ -34,7 +39,8 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 - **settle**: 判定をまとめて推薦テーブル本文を全上書きで書く。**唯一の forge write はこのレポート
   issue の create/update**。cleaner と同様レポート issue は閉じないので、自分の pane / worktree は
   自分で回収する(reaper に残さない)。
-- 単体テスト: マーカー round-trip、`needs_scan` 判定表、`triage-report.json` のパース、
+- 単体テスト: マーカー round-trip、`needs_scan` 判定表(head 移動 / interval / `max_issue` 超えの
+  新規 issue による再走査)、`triage-report.json` のパース、
   レポート本文レンダリング(推薦テーブル + マーカー + ignore 適用)、プロンプト内容、
   discover の対象フィルタ(ワークフローラベル付き / hold / blocker を除外)を FakeForge で検証。
 
@@ -60,7 +66,7 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 `recommendation` / `estimated_complexity` は kebab-case enum、`confidence` は 0.0–1.0。
 `missing_info` は任意(空可)。空配列(対象 issue なし)も正当な結果。
 
-レポート本文 = マーカー `<!-- meguri:triage head=<sha> scanned=<epoch> -->` +
+レポート本文 = マーカー `<!-- meguri:triage head=<sha> scanned=<epoch> max_issue=<n> -->` +
 推薦テーブル(issue 番号 / 推薦 / 確信度 / 複雑度 / 根拠、`missing_info` は注記)+
 「採用は自分で `meguri:ready`/`meguri:plan` を貼る・誤判定は `triage.ignore` へ・停止は
 `meguri:hold`」のフッター。cleaner と同型。
@@ -92,13 +98,17 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 3. **新 forge プリミティブ `list_open_issues()`**: 現状の list は `list_issues_with_label` のみで
    「ラベルなし open issue」を引けない。`--search` は使わずまず全列挙 → Rust 側でラベル/hold/blocker
    フィルタ(cleaner の `phase_label_anomaly` が全 issue をクライアント側で分類するのと同じ方針)。
-4. **マーカー/dedup の共有**: `needs_scan()` は純粋・cleaner でテスト済み。triage は tag 違い
-   (`meguri:triage`)のマーカーが要るので、`needs_scan` を再利用しつつマーカーの
-   parse/format/replace は tag を引数化した薄いヘルパにする(cleaner と triage の重複ロジックを
-   避ける)。実装詳細のため、単純なら triage.rs 内複製でも可。
+4. **マーカー/dedup の共有**: マーカーの parse/format/replace は tag(`meguri:triage`)と
+   `max_issue` フィールドが違うだけなので、tag を引数化した薄いヘルパにする(cleaner と triage の
+   重複ロジックを避ける)。走査判定は cleaner の `needs_scan()`(純粋・テスト済み)を土台にするが、
+   そのままでは head 静止中の新規 issue に反応できないため、`max_issue` シグナルを加えた triage 版の
+   純粋関数として持つ。実装詳細のため、単純なら triage.rs 内複製でも可。
 5. **対象集合の取得タイミング**: discover が返すのはレポート issue 1 件のみ。実トリアージ対象は
    execute でプロンプト構築時に `list_open_issues()` + フィルタで集める(最新状態を反映)。
    blocker gate は issue ごとに `blocked_by` を引く(v0 の小規模リポジトリでは許容)。
+   対象 issue 群の番号・タイトル・本文をプロンプトへ全量埋める設計も、`--limit 50` の対象規模・
+   本文長を含め同じく v0 の小規模リポジトリでは許容(コンテキスト圧迫が問題になったら本文の
+   切り詰め等を後続で検討)。
 6. **失敗は静かに諦める**: 誤検知が壊すものが無いので `needs-human` escalation も bot ループ防止も
    不要(cleaner と同じ)。永続失敗時も marker の `scanned` だけ進めて次回 interval まで待つ。
 
