@@ -448,7 +448,7 @@ fn validate_children(
     Ok(())
 }
 
-/// An explicit `spec_depth:` hint in the issue body (ADR 0009). Today the
+/// An explicit `spec_depth:` hint in the issue body (ADR 0010). Today the
 /// only source is a human writing it into the issue; when triage v1 (#87)
 /// lands, its proposal comment / hidden marker feeds the same line. The
 /// planner still decides in-context — this only surfaces the hint into the
@@ -470,7 +470,7 @@ fn spec_depth_hint(issue_body: &str) -> Option<&'static str> {
 }
 
 /// Prompt section that makes the spec's depth adaptive (issue #133, ADR
-/// 0009): the planner picks `normal` (the default light spec) or `design`
+/// 0010): the planner picks `normal` (the default light spec) or `design`
 /// (a deeper spec with extra required sections) by uncertainty × blast
 /// radius, with a veto that forces migration / rollback whenever persistent
 /// state or a public contract is involved. Kept prompt-only — no depth is

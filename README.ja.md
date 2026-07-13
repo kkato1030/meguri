@@ -196,7 +196,7 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 ### spec 先行フロー（オプトイン）
 
-`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。spec の深さは **適応的** です（[ADR 0009](docs/adr/0009-adaptive-spec-depth.md)）: planner は不確実性 × 影響範囲で `normal` かより深い `design` かを選び、永続状態や公開 contract に触れる変更は veto によって migration・rollback セクションを持つ深い構成になります — 選んだ深さの理由は spec または PR に残ります。続いて **spec reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
+`meguri:ready` の代わりに `meguri:plan` を貼ると、**planner** ループがリポジトリを調査し、軽量な 1 ファイル `docs/specs/issue-<N>.md`（受け入れ条件・触るファイル・決定事項）だけを含む *spec PR*（`Spec: <title>`、`meguri:spec-reviewing` 付き）を開きます。spec の深さは **適応的** です（[ADR 0010](docs/adr/0010-adaptive-spec-depth.md)）: planner は不確実性 × 影響範囲で `normal` かより深い `design` かを選び、永続状態や公開 contract に触れる変更は veto によって migration・rollback セクションを持つ深い構成になります — 選んだ深さの理由は spec または PR に残ります。続いて **spec reviewer** ループが spec PR をレビューします: 指摘があればサマリコメントとして投稿され（修正を push すると新しい head を再レビュー。同じ head は 1 回しかレビューされません）、指摘なしならラベルが `meguri:spec-ready` に貼り替わります — 人間が直接貼り替えても構いません。その後 worker が **同じブランチ・同じ PR の上で** 実装を続けます — spec と実装はまとめて 1 回でマージされます。spec 自体はレビュー用の使い捨ての足場で、spec worker が実装時に削除します — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
 
 ### self-review（実装 diff の内部 AI レビュー）
 
