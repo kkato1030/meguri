@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
 ## 起票
 
 - **github mode**: `forge.create_issue(title, body, &[label])`。label は `kind` から引く — `kind = "ready"` → `LABEL_READY`(worker 行き)、`kind = "plan"` → `LABEL_PLAN`(planner 行き)。ラベル二軸(ADR 0005)のフェーズ軸を1枚だけ付ける。作成した issue 番号を `schedule_state.last_key` に記録。
-- **local mode**: `store.create_task(project_id, kind, title, body, origin)`。`kind = "ready"` → task kind `"work"`、`"plan"` → `"plan"`。`origin` は `schedule:<name>`(既存の `local` / `github:<N>` に倣った新しい origin)。作成した task id を `last_key` に記録。
+- **local mode**: `store.create_task(project_id, "work", title, body, origin)`。`origin` は `schedule:<name>`(既存の `local` / `github:<N>` に倣った新しい origin)。作成した task id を `last_key` に記録。**local mode で許すのは `kind = "ready"` のみ**: local mode には planner が無く(`PlannerLoop::discover` は forge 不在なら空を返す — issue #54 Phase 3 未着手)、`plan` task を積んでも dormant のまま実行されない。「積むだけで消化されない」定義は config の hard 検証で弾く(下記 doctor 節)。local planner が入ったら制限を外す(スコープ外節に記載)。
 - **`title` テンプレート変数は最小限**: 発火日付 `{{date}}`(`YYYY-MM-DD`, UTC)だけから始める。本文の動的生成は入れない(ADR 0009: 欲しくなったら #120 と組み合わせて解決)。
 
 ## 重複ガード(要レビュー判断)
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
 
 ## `meguri doctor` の検証
 
-- **hard(load 時、`Config::validate()` `src/config.rs:679-702`)**: cron 式がパースできること、`name` が project 内で一意なこと、`body_file` と `body` が排他かつどちらか一方あること。`watch` の起動/hot reload を壊す不正はここで弾く(`bail!`)。
+- **hard(load 時、`Config::validate()` `src/config.rs:679-702`)**: cron 式がパースできること、`name` が project 内で一意なこと、`body_file` と `body` が排他かつどちらか一方あること、**`mode = "local"` の project に `kind = "plan"` の schedule が無いこと**(local planner 不在のため dormant task しか生めない。既存の「local + `deliver = "pr"`」検証と同型)。`watch` の起動/hot reload を壊す不正はここで弾く(`bail!`)。
 - **soft(`meguri doctor`、`src/main.rs`)**: `doctor_schedules(cfg) -> bool` を `check_auto_merge` と同じ雛形で追加し、`body_file`(repo 相対)の実在を検証・各 schedule の次回発火時刻を人間可読に表示する。`cmd_doctor` の集計 `ok &= ...` に配線。
 
 ## 一覧性: `meguri schedules`
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
 [[projects.schedules]]
 name = "daily-tidy"              # project 内で一意
 cron = "0 9 * * *"              # 標準5フィールド、UTC 解釈
-kind = "ready"                  # "ready"(worker)| "plan"(planner)
+kind = "ready"                  # "ready"(worker)| "plan"(planner、github mode のみ)
 title = "Daily tidy {{date}}"  # テンプレート、変数は {{date}} のみ
 body_file = "ops/daily-tidy.md" # repo 相対。または body(排他):
 # body = "インライン本文"
@@ -102,24 +102,25 @@ body_file = "ops/daily-tidy.md" # repo 相対。または body(排他):
 
 ## 受け入れ基準
 
-1. `[[projects.schedules]]` を config に書くと watch が読み、cron がヒットした tick で github mode は `kind` 相当のフェーズラベル付き issue を、local mode は対応 kind のタスクを1件作る。
-2. 作成物は既存の worker / planner discovery にそのまま拾われる(FakeForge / local store 上で実証)。
+1. `[[projects.schedules]]` を config に書くと watch が読み、cron がヒットした tick で github mode は `kind` 相当のフェーズラベル付き issue を、local mode は `"work"` タスク(`kind = "ready"` のみ許可)を1件作る。
+2. 作成物は既存の discovery にそのまま拾われる(FakeForge / local store 上で実証)— github mode は `kind` に応じて worker / planner、local mode は worker。
 3. 最終発火時刻が sqlite(`schedule_state`)に永続化される。プロセスを止めて cron 発火時刻を複数またいで再開しても、起票は **1件に折りたたまれる**(catch-up しない)。
 4. 新規追加スケジュール(初回観測)は過去分を backfill せず、次回発火から起票する。
 5. 重複ガード: 同一 schedule 起源の open issue/task が残っていれば既定でスキップ。`allow_overlap = true` で毎回起票する。
 6. hot reload(#73)でスケジュール定義を足すと、watch 再起動なしに次 tick 以降で有効になる(最終発火は sqlite にあるため定義側の変更で失われない)。
-7. `meguri doctor` が不正な cron 式・存在しない `body_file`・重複 `name`・`body`/`body_file` の同時指定を報告する。不正 cron / 本文欠落は `watch` 起動時にも `Config::validate()` で弾かれる。
+7. `meguri doctor` が不正な cron 式・存在しない `body_file`・重複 `name`・`body`/`body_file` の同時指定・local mode での `kind = "plan"` を報告する。不正 cron / 本文欠落 / local + plan は `watch` 起動時にも `Config::validate()` で弾かれる。
 8. `meguri schedules` が定義・最終発火・次回発火を表示する。
 9. 時刻はテストで注入でき(注入クロック)、発火・折りたたみ・重複ガード・hot reload での定義追加が fake forge / fake clock で検証される。
 10. 既存テストが全て通る(特に `scheduler_test.rs` の非破壊、`store` の migration 冪等性テスト)。
 
 ## テスト計画
 
-`tests/schedule_test.rs` を新設。cron 評価は `src/cron.rs` の純粋関数を単体で網羅(`*` / 範囲 / ステップ / リスト / 曜日、窓内ヒット判定、next-fire)。sweep はメモリ store + FakeForge に固定 `now` を渡して駆動し、受け入れ基準 1〜6 を検証する — 特に (3) 折りたたみ(下端と `now` の間に複数発火時刻を置いて起票1件を確認)、(4) backfill 抑止(first_seen 直後に過去 cron 時刻があっても発火しない)、(5) 重複ガード(`last_key` が open の間はスキップ、close 後に再発火)、(6) hot reload での定義追加。migration は既存の冪等性テスト(`store/mod.rs`)に `schedule_state` を通す。
+`tests/schedule_test.rs` を新設。cron 評価は `src/cron.rs` の純粋関数を単体で網羅(`*` / 範囲 / ステップ / リスト / 曜日、窓内ヒット判定、next-fire)。sweep はメモリ store + FakeForge に固定 `now` を渡して駆動し、受け入れ基準 1〜6 を検証する — 特に (3) 折りたたみ(下端と `now` の間に複数発火時刻を置いて起票1件を確認)、(4) backfill 抑止(first_seen 直後に過去 cron 時刻があっても発火しない)、(5) 重複ガード(`last_key` が open の間はスキップ、close 後に再発火)、(6) hot reload での定義追加。config 検証は `mode = "local"` + `kind = "plan"` の組み合わせが `Config::validate()` で拒否されることを既存の validate テスト群に足す。migration は既存の冪等性テスト(`store/mod.rs`)に `schedule_state` を通す。
 
 ## スコープ外(将来)
 
 - 任意コマンドの定期実行(cron 置き換え)— ADR 0009 で恒久的に線引き。
 - 本文の動的/AI 生成 — #120(capture-first)との組み合わせで解決。
 - per-schedule の `timezone` 指定(v1 は UTC 固定)。
+- local mode での `kind = "plan"`(local planner 不在のため v1 は hard 検証で拒否)。issue #54 Phase 3 で local planner が入ったら制限を外す。
 - discovery の cadence 制御(not-before / 消化レート上限)— 後続 #148(2/2)。
