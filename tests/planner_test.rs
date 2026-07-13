@@ -316,6 +316,8 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     assert!(execute_prompt.contains(&spec_rel_path(5)));
     assert!(execute_prompt.contains("do NOT implement"));
     assert!(execute_prompt.contains("# Pull request description"));
+    // The adaptive spec-depth section rides along (issue #133).
+    assert!(execute_prompt.contains("# Spec depth"));
 
     // The spec branch actually landed on origin (the worker resumes there).
     let clone = &env.deps.project.repo_path;
