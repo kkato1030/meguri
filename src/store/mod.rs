@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
+mod reconcile;
 mod runs;
 mod stats;
 mod tasks;
@@ -12,6 +13,7 @@ pub use panes::*;
 pub use runs::*;
 pub use stats::*;
 pub use tasks::*;
+// `reconcile` only adds inherent `impl Store` methods (no exported types).
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
@@ -43,6 +45,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_routing_freshness",
         include_str!("migrations/0008_routing_freshness.sql"),
+    ),
+    // issue #142: reconcile — runs.body_digest + issue_reconcile. Renumbered to
+    // 0009 after main claimed 0008 for routing freshness; independent tables.
+    (
+        "0009_reconcile",
+        include_str!("migrations/0009_reconcile.sql"),
     ),
 ];
 
