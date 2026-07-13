@@ -11,6 +11,7 @@ pub mod merge_watch;
 pub mod planner;
 pub mod reaper;
 pub mod reconcile;
+pub mod routing_drift;
 pub mod scheduler;
 pub mod spec_worker;
 pub mod worker;

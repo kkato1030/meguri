@@ -51,6 +51,19 @@ impl Store {
         })
     }
 
+    /// Count events of a given kind (run-scoped or not). Used by drift
+    /// journalling tests and health summaries — drift events carry no run_id,
+    /// so `events_for_run` can't reach them.
+    pub fn count_events(&self, kind: &str) -> Result<usize> {
+        self.with_conn(|c| {
+            let n: i64 =
+                c.query_row("SELECT COUNT(*) FROM events WHERE kind = ?1", [kind], |r| {
+                    r.get(0)
+                })?;
+            Ok(n as usize)
+        })
+    }
+
     /// Events with id > `after_id`, id-ascending — the polling cursor for the
     /// web UI (`after=0` returns from the beginning).
     pub fn events_for_run_after(
