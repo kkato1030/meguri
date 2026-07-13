@@ -13,6 +13,7 @@ pub mod reaper;
 pub mod reconcile;
 pub mod routing_drift;
 pub mod scheduler;
+pub mod scheduler_fire;
 pub mod spec_worker;
 pub mod worker;
 

@@ -122,6 +122,7 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let deps = Deps::with_label_source(

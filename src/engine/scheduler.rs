@@ -89,11 +89,20 @@ impl Scheduler {
                 tracing::warn!("discovery failed: {e:#}");
             }
 
+            // Ride the poll: fire due cron schedules (issue #146). An
+            // out-of-band enqueue like the sweeps below — it creates an
+            // issue/task that the loops above discover next tick. `now` is
+            // sampled once so every project's schedules see the same instant.
+            let now = super::scheduler_fire::epoch_now();
+
             // Ride the poll: reclaim panes and worktrees whose issue closed
             // (the issue is the unit of lifetime — one author pane plus one
             // review pane per issue, kept until it closes; #13, #92).
             // Runs on the first tick too, i.e. as startup recovery.
             for deps in &self.projects {
+                if let Err(e) = super::scheduler_fire::sweep(deps, now).await {
+                    tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
+                }
                 if let Err(e) = super::reaper::sweep(deps).await {
                     tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
                 }

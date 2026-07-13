@@ -31,6 +31,7 @@ fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
         pr: None,
         clean: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
     Deps::with_label_source(
         store.clone(),

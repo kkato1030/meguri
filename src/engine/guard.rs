@@ -868,6 +868,7 @@ mod tests {
                 commands: vec!["echo ran > marker.txt".into()],
                 ..Default::default()
             },
+            schedules: Vec::new(),
         };
         let deps = Deps::with_label_source(
             store,

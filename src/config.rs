@@ -767,6 +767,59 @@ fn default_worktree_setup_timeout_secs() -> u64 {
     300
 }
 
+/// Which loop a fired schedule targets. `ready` enqueues worker work
+/// (`meguri:ready` / task kind `work`); `plan` enqueues planner work
+/// (`meguri:plan`) and is github-only (local mode has no planner yet, so the
+/// task would never be consumed — rejected by [`Config::validate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleKind {
+    #[default]
+    Ready,
+    Plan,
+}
+
+impl ScheduleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// One `[[projects.schedules]]` entry (issue #146): a cron definition that
+/// periodically enqueues an issue (github mode) or local task (local mode).
+/// Firing only puts one item on the queue — the existing worker/planner loops
+/// consume it (ADR 0009). The last-fired time is *not* here; it lives in
+/// sqlite (`schedule_state`) so a hot-reload edit to the definition never
+/// loses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    /// Unique within the project; the sqlite state key and the body marker id.
+    pub name: String,
+    /// Standard 5-field cron expression (minute hour day-of-month month
+    /// day-of-week), interpreted as UTC. Parsed by [`crate::cron`].
+    pub cron: String,
+    /// Worker-bound (`ready`, default) or planner-bound (`plan`, github-only).
+    #[serde(default)]
+    pub kind: ScheduleKind,
+    /// Title template. The only variable is `{{date}}` (the fire date,
+    /// `YYYY-MM-DD` UTC).
+    pub title: String,
+    /// Repo-relative path to a file whose contents become the body. Mutually
+    /// exclusive with `body`; exactly one is required.
+    #[serde(default)]
+    pub body_file: Option<String>,
+    /// Inline body. Mutually exclusive with `body_file`.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// When false (default), skip firing if the schedule's last-created
+    /// issue/task is still open; true fires every occurrence.
+    #[serde(default)]
+    pub allow_overlap: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -811,6 +864,9 @@ pub struct ProjectConfig {
     /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
     #[serde(default)]
     pub worktree_setup: WorktreeSetupConfig,
+    /// Cron schedules that periodically enqueue issues/tasks (issue #146).
+    #[serde(default)]
+    pub schedules: Vec<ScheduleConfig>,
 }
 
 fn default_branch() -> String {
@@ -887,6 +943,54 @@ impl Config {
                 anyhow::bail!(
                     "project {:?} is mode = \"local\" but deliver = \"pr\" (local has no push target)",
                     p.id
+                );
+            }
+            self.validate_schedules(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject schedule definitions that would break `watch` startup / hot
+    /// reload or silently never fire: a bad cron expression, a duplicate
+    /// `name`, both/neither of `body`/`body_file`, or a local-mode `plan`
+    /// schedule (no local planner — the task would never be consumed).
+    fn validate_schedules(&self, p: &ProjectConfig) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for s in &p.schedules {
+            if !seen.insert(s.name.as_str()) {
+                anyhow::bail!(
+                    "project {:?} has duplicate schedule name {:?}",
+                    p.id,
+                    s.name
+                );
+            }
+            if let Err(e) = crate::cron::Cron::parse(&s.cron) {
+                anyhow::bail!(
+                    "project {:?} schedule {:?} has invalid cron {:?}: {e}",
+                    p.id,
+                    s.name,
+                    s.cron
+                );
+            }
+            match (&s.body, &s.body_file) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "project {:?} schedule {:?} sets both `body` and `body_file` (mutually exclusive)",
+                    p.id,
+                    s.name
+                ),
+                (None, None) => anyhow::bail!(
+                    "project {:?} schedule {:?} sets neither `body` nor `body_file` (one is required)",
+                    p.id,
+                    s.name
+                ),
+                _ => {}
+            }
+            if p.mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
+                anyhow::bail!(
+                    "project {:?} is mode = \"local\" but schedule {:?} has kind = \"plan\" \
+                     (local mode has no planner, so the task would never be consumed)",
+                    p.id,
+                    s.name
                 );
             }
         }
@@ -1784,6 +1888,99 @@ timeout_secs = 60
         assert_eq!(ws.exclude, vec![".claude/rules", "AGENTS.md"]);
         assert!(ws.required);
         assert_eq!(ws.timeout_secs, 60);
+    }
+
+    #[test]
+    fn schedules_parse_as_array_of_project_tables() {
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects.schedules]]
+name = "daily-tidy"
+cron = "0 9 * * *"
+title = "Daily tidy {{date}}"
+body = "do the thing"
+
+[[projects.schedules]]
+name = "weekly-plan"
+cron = "0 9 * * 1"
+kind = "plan"
+title = "Weekly plan"
+body_file = "ops/plan.md"
+allow_overlap = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let schedules = &cfg.project("demo").unwrap().schedules;
+        assert_eq!(schedules.len(), 2);
+        assert_eq!(schedules[0].name, "daily-tidy");
+        assert_eq!(schedules[0].kind, ScheduleKind::Ready); // default
+        assert_eq!(schedules[0].body.as_deref(), Some("do the thing"));
+        assert_eq!(schedules[1].kind, ScheduleKind::Plan);
+        assert_eq!(schedules[1].body_file.as_deref(), Some("ops/plan.md"));
+        assert!(schedules[1].allow_overlap);
+    }
+
+    #[test]
+    fn schedule_with_invalid_cron_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"* * *\"\n\
+                   title = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cron"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_duplicate_name_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
+                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate schedule name"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_both_body_and_body_file_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
+                   body = \"b\"\nbody_file = \"f.md\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_neither_body_nor_body_file_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn local_mode_plan_schedule_is_rejected() {
+        // local mode has no planner; a plan schedule would enqueue a task that
+        // never gets consumed (spec §doctor / ADR 0009).
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\n\
+                   kind = \"plan\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no planner"), "{err}");
+    }
+
+    #[test]
+    fn local_mode_ready_schedule_is_accepted() {
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg = Config::parse(raw, Path::new("cfg")).unwrap();
+        assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
     }
 
     /// Minimal valid config carrying the given projects plus the extra lines.
