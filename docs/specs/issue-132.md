@@ -34,6 +34,7 @@ human: label plan/ready → ai: exec(kind) → ai: self-review×N(必須) → ai
 | plan_delivery | project config `plan_delivery = separate | combined`(既定 **separate**)。`ProjectMode` に相乗りさせない独立キー |
 | separate の受け渡し | spec/ADR PR は `Closes #N` を**使わず** `Refs #N`(マージで issue を閉じない)。マージ検出の掃引が `speccing → ready` を張替 → worker が拾う。`spec_worker` は combined のときだけ活きる |
 | separate の spec ライフサイクル | separate では spec PR が先にマージされ `docs/specs/issue-<N>.md` が default branch に着地する。**normal worker が spec_worker の 3 責務を引き継ぐ**: (a) `ready` 実行時に spec が在れば「Reviewed spec」として exec プロンプトへ注入(無ければ従来の normal issue へ degrade)、(b) 完了時に spec を削除して commit、(c) spec が残れば `verify_work` が Err で corrective。これで ADR 0001(default branch に spec を残さない)を 2 本の PR にまたがって維持し、実装 agent がレビュー済み spec を必ず参照する(finding 1) |
+| fixer/ci-fixer の `spec-ready` skip | `fixer` / `ci_fixer` の `pr_is_fixable` / `pr_is_ci_fixable` が `spec-ready` を無条件 skip する理由(「worker が同一ブランチを所有」)は **combined でのみ成立**。skip を `plan_delivery == combined` に限定し、separate では `spec-ready` の spec/ADR PR も通常の meguri PR として fixer(人間・外部 bot スレッド)/ ci-fixer(赤 CI)が扱う。両ループとも `deps.project` から `plan_delivery` を解決可能。guard(Plan) は inline を出さないので fixer の ping-pong は起きない(ADR 0006)(finding 3) |
 | routing role | 内部 self-review = role `self-review`、外部 guard = role `guard`(spec/impl 同一モデルで管理, 要件 3)。旧 `impl-reviewer`→`self-review`、`spec-reviewer`→`guard` を deprecated alias で温存 |
 
 ## 触るファイル
@@ -54,7 +55,8 @@ human: label plan/ready → ai: exec(kind) → ai: self-review×N(必須) → ai
 
 **auto-merge / ci-fixer**
 - `src/engine/auto_merger.rs` — arm 条件に guard gate を追加(§決定事項どおり保守的分岐)。`opted_in` から kind(= 常に Impl)を解決し guard(Impl) 有効性を参照
-- `src/engine/ci_fixer.rs` — rollup の fixable 判定から `meguri/` status context を除外
+- `src/engine/ci_fixer.rs` — rollup の fixable 判定から `meguri/` status context を除外。加えて `pr_is_ci_fixable` の `spec-ready` skip を `plan_delivery == combined` に限定(`deps.project` の `plan_delivery` を渡す)
+- `src/engine/fixer.rs` — `pr_is_fixable` の `spec-ready` skip を `plan_delivery == combined` に限定(`deps.project` の `plan_delivery` を渡す)。separate では spec/ADR PR の人間・外部 bot スレッドを fixer が拾える(finding 3)
 
 **plan_delivery / 受け渡し**
 - `src/config.rs` — `PlanDelivery` enum + `plan_delivery` フィールド(既定 separate)。`ReviewConfig` に `lenses` と `guard {plan,impl}` を追加し per-project override(`Config::review_for` / `guard_enabled(project, kind)`)
@@ -68,7 +70,7 @@ human: label plan/ready → ai: exec(kind) → ai: self-review×N(必須) → ai
 - `docs/ops/github-settings.md` — `meguri/guard-review` を required check にすると human 側も厳密ゲートになる旨を追記(任意運用)
 
 **テスト**
-- 更新: `tests/spec_reviewer_test.rs`(→guard)、`tests/worker_test.rs` / `tests/planner_test.rs`(self-review 必須化)、`tests/auto_merge_test.rs`(guard gate)、`tests/ci_fixer_test.rs`(meguri status 除外)、`tests/spec_worker_test.rs`(combined 限定)
+- 更新: `tests/spec_reviewer_test.rs`(→guard)、`tests/worker_test.rs` / `tests/planner_test.rs`(self-review 必須化)、`tests/auto_merge_test.rs`(guard gate)、`tests/ci_fixer_test.rs`(meguri status 除外 + separate で `spec-ready` PR を拾い combined で skip)、`tests/fixer_test.rs`(separate で `spec-ready` PR の人間スレッドを拾い combined で skip = finding 3)、`tests/spec_worker_test.rs`(combined 限定)
 - 新規: `tests/guard_test.rs`(kind 別 discover/settle・status・inline を出さないこと。**guard(Plan) clean が `spec-reviewing→spec-ready` を張替・findings で維持・guard(Impl) は spec-* を触らない**を固定 = finding 2)、plan_delivery separate の受け渡し
 - 新規/更新(finding 1): separate の worker spec ライフサイクル — `execute_prompt` が着地した spec を「Reviewed spec」として注入すること、削除指示を含むこと、`verify_work` が残存 spec を Err にすること、spec 無し normal issue が従来分岐で degrade すること。guard(Plan)=OFF で planner が `spec-ready` 直開き(finding 2)も固定
 
@@ -84,6 +86,7 @@ human: label plan/ready → ai: exec(kind) → ai: self-review×N(必須) → ai
 6. ci-fixer は `meguri/*` の status context を fixable として拾わない(advisory 赤 guard で空振り/誤昇格しない)。
 7. `plan_delivery=separate`(既定): spec/ADR PR は `Closes #N` を含まず、マージしても issue が閉じない。マージ後、掃引が issue を `speccing→ready` に張替、worker が実装を別 PR で拾う。
    - 7a. **separate の normal worker は着地した spec を読み・消し・検証する**(ADR 0001 の不変条件, finding 1): `ready` 実行時に `docs/specs/issue-<N>.md` が存在すれば exec プロンプトに「Reviewed spec」として注入され、実装完了時に spec が削除されて commit され、spec が残ったまま完了しようとすると corrective ターンが走る。spec が無い normal issue はこの分岐に入らず従来どおり動く。
+   - 7b. **separate の `spec-ready` spec/ADR PR は fixer / ci-fixer が扱える**(finding 3): `plan_delivery=separate` では `spec-ready` ラベル付き spec/ADR PR に人間レビュースレッドがあれば fixer が拾い、CI が赤なら ci-fixer が拾う。`plan_delivery=combined` では従来どおり `spec-ready` PR を両ループが skip する(spec_worker の所有を尊重)。
 8. `plan_delivery=combined`: 現行の spec-worker morph(同一ブランチ takeover, 1 PR)が従来どおり動く。
 9. 既存テストが全て通る(特に fixer / conflict-resolver / merge-watch の非破壊、ADR 0006/0007 の不変条件)。
 10. ADR 0008 に本設計が記録され、README(en/ja)が対称ループ・guard 任意化・検査履歴の置き場を説明する。
@@ -93,7 +96,7 @@ human: label plan/ready → ai: exec(kind) → ai: self-review×N(必須) → ai
 - **P1 — self-review の対称化・多角視点化**: `Flavor::kind()`、planner の self_reviews、N レンズ prompt、self-review status + 本文 `<details>`、routing role `self-review`。(基準 1,2)
 - **P2 — guard(kind) の一般化**: `spec_reviewer`→`guard`、guard(Impl) discover/settle、`set_commit_status` forge メソッド、guard status + `<details>`、**guard(Plan) のラベル遷移保持 + guard(Plan)=OFF 時の planner `spec-ready` 直開き**、config `guard{plan,impl}`、routing role `guard`。(基準 3, 3a, 3b, 4)
 - **P3 — auto-merge gate + ci-fixer 除外**: arm 条件、needs-human 分岐、`meguri/*` 除外。(基準 5,6)
-- **P4 — plan_delivery separate + 受け渡し**: config、非クローズ参照、マージ検出張替掃引、**normal worker の spec 読み込み/削除/対称検証(spec_worker から共有)**、combined 温存。(基準 7, 7a, 8)
+- **P4 — plan_delivery separate + 受け渡し**: config、非クローズ参照、マージ検出張替掃引、**normal worker の spec 読み込み/削除/対称検証(spec_worker から共有)**、**fixer/ci-fixer の `spec-ready` skip を combined に限定**、combined 温存。(基準 7, 7a, 7b, 8)
 - **P5 — 文書 + テスト仕上げ**: README、github-settings、ADR 微修正。(基準 9,10)
 
 ## 未解決の論点 / リスク

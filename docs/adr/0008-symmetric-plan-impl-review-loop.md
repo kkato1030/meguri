@@ -150,6 +150,16 @@ status も本文 `<details>` も**会話コメントではない**ため、ADR 0
   これにより separate でも「spec-PR マージ〜impl-PR マージ」の窓の外では `docs/specs/` が空に戻り、
   かつ実装 agent が**必ずレビュー済み spec を参照する**保証(finding 1)が保たれる。窓の内側で
   spec が一時的に default branch に載るのは意図した挙動であり、impl PR のマージで解消する。
+- **separate の spec PR は fixer / ci-fixer の対象になる(`spec-ready` skip を combined に限定)。**
+  現行 `fixer` / `ci_fixer` は `spec-ready` ラベルの PR を「spec-worker が同一ブランチを所有するので
+  他ループは触らない」という理由で無条件に skip する。この理由は **combined でのみ成立する**:
+  combined では spec-worker が takeover して同一ブランチを走らせるが、separate では spec-worker は
+  動かず、`spec-ready` の spec/ADR PR は独立 PR として人間のマージ待ちで残る。その PR に人間が
+  レビュースレッドを付けたり CI が赤になっても、無条件 skip では meguri の fixer/ci-fixer が
+  介入できない(finding: separate の `spec-ready` PR が機械修正から取り残される)。したがって
+  `spec-ready` の skip を `plan_delivery == combined` に限定し、separate では spec/ADR PR も
+  通常の meguri PR と同じく fixer(人間・外部 bot スレッド)/ ci-fixer(赤 CI)が面倒を見る。
+  guard(Plan) は inline を出さないので fixer の ping-pong は起きない(ADR 0006 の不変条件は保たれる)。
 - **`combined`**: 現行の morph 型(spec-worker が同一ブランチを takeover して spec+実装を 1 PR に、
   ≒ #98)。`spec_worker` は combined のときだけ活きる。
 - 設定名は `ProjectMode`(github/local)に相乗りさせない独立キー。per-issue 上書きは後回し。
@@ -170,8 +180,10 @@ status も本文 `<details>` も**会話コメントではない**ため、ADR 0
 - 検査履歴が status + 本文 `<details>` に残り、`meguri top` / GitHub UI から追える。会話は汚さない。
 - 新しい二重判定は増やさない: required 判定は GitHub、guard の advisory/gate 分岐だけを meguri が
   持つ。auto-merger の新条件は「guard が有効かつ failure」でのみ escalate する保守的な形。
-- guard(Impl) は inline を出さないので fixer は無変更のまま。ci-fixer にだけ `meguri/*` status
-  除外という小さな変更が要る。
+- guard(Impl) は inline を出さないので fixer の**スレッド discover は無変更**。ただし fixer /
+  ci-fixer の `spec-ready` skip は combined に限定する小変更が要る(separate の spec/ADR PR を
+  人間スレッド・赤 CI に対して機械修正可能にするため)。ci-fixer にはさらに `meguri/*` status を
+  fixable から除外する変更が要る。
 
 ## Out of scope(将来枠)
 
