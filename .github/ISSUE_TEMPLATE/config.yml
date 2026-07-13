@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/kkato1030/meguri/security/advisories/new
+    about: Please report vulnerabilities privately — see SECURITY.md, do not open a public issue.

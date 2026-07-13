@@ -59,6 +59,8 @@ Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
 
 Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback). These runtime prerequisites are the same however you install meguri — a prebuilt binary still needs `git`/`gh`/a multiplexer on the host.
 
+Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
+
 ```bash
 cargo install --path .   # or: cargo build --release
 meguri init              # writes ~/.meguri/config.toml, creates the db
@@ -365,6 +367,11 @@ Eight loops run on GitHub today, mirroring looper's role model as `Loop` impleme
 **Versioning.** meguri is pre-1.0 (`0.x`) and follows [SemVer](https://semver.org): while on `0.x` the public API and CLI are not yet stable, so a minor bump (`0.y`) may carry breaking changes and patches (`0.y.z`) stay compatible; `1.0.0` is when stability is promised. Pin an exact version if you depend on current behavior.
 
 **Releases.** Releases are tag-driven (ADR 0007): a maintainer bumps the version, refreshes `CHANGELOG.md`, and pushes a `vX.Y.Z` tag; `.github/workflows/release.yml` then builds the macOS arm64 / Linux x86_64 binaries, attaches them to a GitHub Release with git-cliff-generated notes, and (once the crate is set up) publishes to crates.io via OIDC Trusted Publishing. Because a pushed tag *is* the release trigger, tag deliberately — a mistaken tag ships a release.
+
+## Contributing
+
+Bug reports and PRs from humans are welcome — normal fork & PR flow, no
+`meguri:*` labels to worry about. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
