@@ -17,54 +17,52 @@ meguri の loop についての説明は今まで2系統に散らばっていた
 
 ## 1. パイプライン全体図
 
-入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。どちらも最終的に self-review 済みの PR に収束し、fixer 系ループ・auto-merge・merge-watch を経て GitHub がマージを確定する。cleaner だけはこのパイプラインの外で独立に回る。
+入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。**この2つは実装 diff の担保が非対称**: 直行(`meguri:ready`)経路は worker の内部 self-review(ADR 0006)を経てから PR を開くが、spec 先行経路は spec PR が(planner によって)既に open な状態で `spec_worker` が実装 commit を積むだけで完了し、`SpecWorkerFlavor` は `Flavor::self_reviews()` を override していない(既定 `false`)ため worker と同じ内部 self-review フェーズを通らない。spec 先行経路での実装 diff のレビューは、GitHub 上の `spec_reviewer`(spec 内容そのものが対象)と、PR が open した後の fixer 系ループ・人間レビューに委ねられる。両経路とも最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。cleaner だけはこのパイプラインの外で独立に回る。
 
 ```
 GitHub issue(未トリアージ、無ラベル)
         │
         │  人間がラベルを選ぶ ── 2つの入口 ──
-        │
-  ┌─────┴─────────────────┐
-  │ meguri:plan            │ meguri:ready
-  │ (spec 先行、opt-in)     │ (直行)
-  ▼                         │
-planner (author)            │
-  │ 調査 → spec PR           │
-  │ (`Spec: <title>`)        │
-  │ issue: plan→speccing     │
-  │ PR: meguri:spec-reviewing│
-  ▼                          │
-spec_reviewer (review, 独立pane) │
-  │ clean → PR: spec-ready   │
-  │ findings → PRコメント、  │
-  │ 次の push 待ち(同じ head │
-  │ は1回だけレビュー)       │
-  ▼                          │
-spec_worker (author, 同一PRを継続) │
-  │ 実装 commit を同じ branch/PR に積む │
-  │ spec を削除(disposable、ADR 0001) │
-  │ issue: speccing→implementing │
-  └─────────────┬─────────────┘
-                 ▼
-          worker (author) ◀── meguri:ready issue はここに直接入る
-                 │            issue: ready→implementing
-                 ▼
-   self-review(内部ループ、ADR 0006)
-   execute → validate → self-review ⇄ fix(ラウンド上限まで)
-   forge には一切触れない(routing の impl-reviewer profile で回る)
-                 │
-                 ▼
-          PR open(`Closes #N`)
-                 │
-   ┌─────────────┼──────────────────┐
-   ▼              ▼                  ▼
- fixer         ci_fixer        conflict_resolver
- (author,      (author,        (author,
-  継続)         継続)            継続)
- 人間/外部botの  CI red →         CONFLICTING →
- 未解決スレッド   fix push        base merge・解消 push
- に返信          (≤3 round)      (≤3 round)
-   └─────────────┴──────────────────┘
+        ├──────────────────────────────┐
+        ▼                               ▼
+  meguri:plan(spec 先行、opt-in)    meguri:ready(直行)
+        │                               │
+        ▼                               │
+  planner (author)                      │
+    調査 → spec PR を open               │
+    issue: plan→speccing                │
+    PR: meguri:spec-reviewing           │
+        │                               │
+        ▼                               │
+  spec_reviewer (review, 独立pane)       │
+    clean → PR: spec-ready              │
+    findings → PRコメント、次の push待ち   │
+    (同じ head は1回だけレビュー)          │
+        │                               │
+        ▼                               ▼
+  spec_worker (author, 同一PRを継続)    worker (author)
+    実装 commit を同じ branch/PR に積む    issue: ready→implementing
+    spec を削除(disposable、ADR 0001)          │
+    issue: speccing→implementing              ▼
+    → そのまま完了(PR は既に open 済み)  self-review(内部ループ、ADR 0006、worker のみ)
+    ※ SpecWorkerFlavor は self_reviews() execute → validate → self-review ⇄ fix
+      を override しないため、右側の      (ラウンド上限まで、forge には一切触れない)
+      内部 self-review フェーズは通らない        │
+        │                                       ▼
+        │                                PR open(`Closes #N`)
+        │                                       │
+        └───────────────────┬───────────────────┘
+                             ▼
+        (spec 先行経路はここで合流 — PR は既に open 済み)
+   ┌─────────────────────────┼──────────────────────┐
+   ▼                          ▼                       ▼
+ fixer                    ci_fixer             conflict_resolver
+ (author,                 (author,               (author,
+  継続)                     継続)                   継続)
+ 人間/外部botの              CI red →               CONFLICTING →
+ 未解決スレッド               fix push              base merge・解消 push
+ に返信                     (≤3 round)             (≤3 round)
+   └─────────────────────────┴──────────────────────┘
                  │
                  │  ここから先は run/pane を持たない「帯域外 sweep」(§2)
                  ▼
@@ -88,7 +86,7 @@ cleaner (standalone) ── パイプラインの外を独立に回る
 
 補足:
 
-- **local モード**(GitHub なし)では discovery の入口が GitHub ラベルではなく meguri のローカル task queue になる(`TaskSource` 抽象、[ADR 0003(tasksource-task-moves-run-pins)](../adr/0003-tasksource-task-moves-run-pins.md))。パイプラインの形自体(spec 先行 / 直行 → self-review → 完了)は変わらないが、PR ではなく検証済みローカルブランチが成果物になる。詳細は README の「Local mode」を参照。
+- **local モード**(GitHub なし)は spec 先行経路を持たない。`planner`(および spec_reviewer / spec_worker)がまだ無く(issue #54 Phase 3)、`PlannerLoop::discover` は `deps.forge.is_none()` なら空を返すため、ローカルの `plan` task は queued のまま dormant になる。worker が `needs_plan` を返しても、local task は forge 越しの planner 委譲ができないため人間へエスカレーション(`NeedsHuman`)される。つまり local モードで実際に回るのはこの図の `meguri:ready` 直行経路(worker → self-review → 完了)だけ。discovery の入口自体も GitHub ラベルではなく meguri のローカル task queue になり(`TaskSource` 抽象、[ADR 0003(tasksource-task-moves-run-pins)](../adr/0003-tasksource-task-moves-run-pins.md))、成果物も PR ではなく検証済みローカルブランチになる。詳細は README の「Local mode」を参照。
 - fixer / ci_fixer / conflict_resolver は互いに排他ではなく、同じ PR に対して並行して起こりうる(スレッド対応・CI 修正・conflict 解消は独立事象)。図は簡略化のため並列に描いているが、実際の駆動順は §2 のディスパッチ優先度に従う。
 
 ## 2. ディスパッチ優先度
