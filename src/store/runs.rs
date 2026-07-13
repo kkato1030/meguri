@@ -149,8 +149,11 @@ pub struct RunRecord {
     /// the conversation when the pane dies.
     pub agent_session_id: Option<String>,
     /// Launch profile pinned at the run's first pane spawn (role-based
-    /// routing, issue #64). NULL until the first spawn resolves it; once set,
-    /// every later spawn and resume of this run reuses it.
+    /// routing, issue #64) — or earlier, at the first `worktree_setup` hook
+    /// run (issue #138), if the project configures one; both go through the
+    /// same pin-aware resolver so whichever runs first is authoritative.
+    /// NULL until something resolves it; once set, every later spawn,
+    /// resume, or hook run of this run reuses it.
     pub agent_profile: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,

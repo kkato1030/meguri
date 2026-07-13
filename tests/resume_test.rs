@@ -84,6 +84,7 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
 
     let deps = Deps::with_label_source(

@@ -75,6 +75,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         worktree_root: Some(root.join("worktrees")),
         pr: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),
