@@ -45,10 +45,12 @@ don't decide these for them, ask explicitly and wait for an answer before moving
 
 7. **Prove it out on one small issue.** Find, or ask the user to point at, one small,
    low-risk, well-scoped issue — or file one yourself if none exists (e.g. a one-line doc
-   fix). Label it `meguri:ready` (or `meguri add "..."` in local mode), then either run
-   `meguri run --project <id> --issue <n>` or let `meguri watch` pick it up, so the user sees
-   one full loop succeed end to end — worktree, live pane, completion contract, PR (or local
-   branch) — before trusting it with a bigger backlog.
+   fix). On a GitHub-backed project, label it `meguri:ready`, then either run
+   `meguri run --project <id> --issue <n>` or let `meguri watch` pick it up. On a local-mode
+   project, `meguri add "..."` queues it and `meguri watch` is what picks it up —
+   `meguri run --issue` only works for GitHub-backed projects. Either way, the goal is for the
+   user to see one full loop succeed end to end — worktree, live pane, completion contract, PR
+   (or local branch) — before trusting it with a bigger backlog.
 
 8. **Report back.** Summarize what got configured, which label(s)/task(s) now exist, and
    point at `references/operate.md` for ongoing use.

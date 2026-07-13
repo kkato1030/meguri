@@ -10,9 +10,10 @@ Assumes meguri is already set up for this repo — see `references/setup.md` if 
   ball-in-court (`meguri:working` / `meguri:needs-human` / `meguri:hold`, layered on top of
   the phase). An unlabeled issue means untriaged — see the README's Labels section for the
   full table if you need it.
-- **Local-mode project:** `meguri add "<description>"` queues a task (`--file task.md` reads
-  title + body from a file, `--plan "..."` sends it to the planner instead of the worker).
-  `meguri tasks` lists open ones.
+- **Local-mode project:** `meguri add "<description>"` queues a task for the worker
+  (`--file task.md` reads title + body from a file). `meguri tasks` lists open ones. The
+  planner doesn't run in local mode yet, so avoid `meguri add --plan "..."` here — the task
+  would just sit queued/dormant instead of being picked up.
 
 ## Watch what's running
 
