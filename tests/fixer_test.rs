@@ -100,6 +100,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         // by the fixer unit test.
         plan_delivery: meguri::config::PlanDelivery::Combined,
         review: None,
+        worktree_setup: Default::default(),
     };
 
     let deps = Deps::with_label_source(

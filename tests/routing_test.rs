@@ -205,6 +205,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         clean: None,
         plan_delivery: Default::default(),
         review: None,
+        worktree_setup: Default::default(),
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),

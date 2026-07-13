@@ -449,8 +449,14 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &GuardCheckpoint) ->
         .unwrap_or_else(crate::config::worktrees_root);
     let dir = format!("guard-{}", run.issue_number);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
-    gitops::create_review_worktree(&deps.project.repo_path, &wt, &cp.head_branch, &cp.head_sha)
-        .await?;
+    gitops::create_review_worktree(
+        &deps.project.repo_path,
+        &wt,
+        &cp.head_branch,
+        &cp.head_sha,
+        &deps.project.worktree_setup.exclude,
+    )
+    .await?;
     deps.store
         .update_run_worktree(&run.id, &cp.head_branch, &wt.to_string_lossy())?;
     deps.store.emit(
@@ -459,7 +465,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &GuardCheckpoint) ->
         json!({ "branch": cp.head_branch, "head": cp.head_sha,
                 "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    flow::run_worktree_setup(deps, run, &wt).await
 }
 
 fn execute_prompt(cp: &GuardCheckpoint, language: Option<&str>) -> String {
@@ -810,6 +816,99 @@ mod tests {
         assert_eq!(
             read_review(dir.path()).unwrap().verdict,
             ReviewVerdict::Clean
+        );
+    }
+
+    /// `prepare_worktree` re-points the same detached checkout onto each new
+    /// review round's head via `reset --hard` + `clean -fd` (see
+    /// `gitops::create_review_worktree`), which wipes untracked files. The
+    /// `worktree_setup` hook (issue #138) must run again on that re-point — not
+    /// just the first time the checkout is created — since its output is
+    /// exactly the kind of untracked artifact `clean -fd` removes.
+    #[tokio::test]
+    async fn worktree_setup_reruns_when_the_guard_worktree_is_repointed() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["checkout", "-b", "pr-branch"],
+            vec!["commit", "--allow-empty", "-m", "round1"],
+        ] {
+            gitops::run_git(repo.path(), &args).await.unwrap();
+        }
+
+        let worktree_root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", KIND, 5, "Spec: caching (#5)")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            5,
+            "Spec: caching (#5)",
+            "body",
+            &[],
+        ));
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: repo.path().to_path_buf(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(worktree_root.path().to_path_buf()),
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: crate::config::WorktreeSetupConfig {
+                commands: vec!["echo ran > marker.txt".into()],
+                ..Default::default()
+            },
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge,
+            crate::config::Config::default(),
+            project,
+        );
+
+        let head1 = gitops::run_git(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let mut cp = GuardCheckpoint {
+            head_branch: "pr-branch".into(),
+            head_sha: head1,
+            ..Default::default()
+        };
+        prepare_worktree(&deps, &run, &cp).await.unwrap();
+        let wt = PathBuf::from(
+            deps.store
+                .get_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .worktree_path
+                .unwrap(),
+        );
+        assert!(wt.join("marker.txt").exists());
+
+        // A second review round: a new commit lands on the PR branch, the
+        // checkout re-points onto it (reset --hard + clean -fd wipes
+        // marker.txt), and the hook must regenerate it.
+        gitops::run_git(repo.path(), &["commit", "--allow-empty", "-m", "round2"])
+            .await
+            .unwrap();
+        cp.head_sha = gitops::run_git(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        prepare_worktree(&deps, &run, &cp).await.unwrap();
+        assert!(
+            wt.join("marker.txt").exists(),
+            "worktree_setup must rerun after the guard worktree re-points"
         );
     }
 }

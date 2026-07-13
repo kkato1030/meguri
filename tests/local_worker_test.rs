@@ -66,6 +66,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         clean: None,
         plan_delivery: Default::default(),
         review: None,
+        worktree_setup: Default::default(),
     };
 
     let store = Store::open_in_memory().unwrap();

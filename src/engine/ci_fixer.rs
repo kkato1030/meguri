@@ -356,7 +356,14 @@ impl Flavor for CiFixerFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Fixing CI doesn't change the nature of the change (issue #136): keep
+    /// the subject the establishing turn set instead of letting a fix's
+    /// wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: leave a durable trace on the PR, then release the
@@ -426,6 +433,11 @@ impl Flavor for CiFixerFlavor {
 mod tests {
     use super::*;
     use crate::forge::CheckRun;
+
+    #[test]
+    fn ci_fix_turns_never_establish_a_new_subject() {
+        assert!(!CiFixerFlavor.sets_subject());
+    }
 
     #[test]
     fn fixable_guards_state_ownership_and_labels() {
@@ -605,6 +617,7 @@ mod tests {
             clean: None,
             plan_delivery: Default::default(),
             review: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

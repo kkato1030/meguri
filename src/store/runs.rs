@@ -149,8 +149,11 @@ pub struct RunRecord {
     /// the conversation when the pane dies.
     pub agent_session_id: Option<String>,
     /// Launch profile pinned at the run's first pane spawn (role-based
-    /// routing, issue #64). NULL until the first spawn resolves it; once set,
-    /// every later spawn and resume of this run reuses it.
+    /// routing, issue #64) — or earlier, at the first `worktree_setup` hook
+    /// run (issue #138), if the project configures one; both go through the
+    /// same pin-aware resolver so whichever runs first is authoritative.
+    /// NULL until something resolves it; once set, every later spawn,
+    /// resume, or hook run of this run reuses it.
     pub agent_profile: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,
@@ -382,6 +385,30 @@ impl Store {
                 .ok()
                 .flatten();
             Ok(branch)
+        })
+    }
+
+    /// Whether the issue has already retreated to planning once before, via
+    /// an earlier `needs_plan` run of the given loop — the "same issue twice"
+    /// leg of the worker's vibration guard (issue #135). A spec-file check
+    /// alone misses issues that were re-labeled `ready` without a spec ever
+    /// landing on disk (e.g. planning resolved the ambiguity some other way);
+    /// this catches that case so a second retreat escalates to a human
+    /// instead of bouncing `ready` ⇄ `plan` forever.
+    pub fn issue_has_needs_plan_run(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<bool> {
+        self.with_conn(|c| {
+            let exists = c
+                .prepare(
+                    "SELECT 1 FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'needs_plan' LIMIT 1",
+                )?
+                .exists(params![project_id, loop_kind, issue_number])?;
+            Ok(exists)
         })
     }
 

@@ -281,7 +281,14 @@ impl Flavor for FixerFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Fixing review comments doesn't change the nature of the change
+    /// (issue #136): keep the subject the establishing turn set instead of
+    /// letting a fix's wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: park every addressed thread with a marker reply (this
@@ -356,6 +363,11 @@ impl Flavor for FixerFlavor {
 mod tests {
     use super::*;
     use crate::forge::ReviewComment;
+
+    #[test]
+    fn fix_turns_never_establish_a_new_subject() {
+        assert!(!FixerFlavor.sets_subject());
+    }
 
     fn thread(resolved: bool, last_body: &str) -> ReviewThread {
         ReviewThread {
@@ -488,6 +500,7 @@ mod tests {
             clean: None,
             plan_delivery: Default::default(),
             review: None,
+            worktree_setup: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

@@ -32,6 +32,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         clean: None,
         plan_delivery: Default::default(),
         review: None,
+        worktree_setup: Default::default(),
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
