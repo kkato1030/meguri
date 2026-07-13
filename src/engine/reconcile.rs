@@ -10,7 +10,7 @@
 //!
 //! What it does NOT do: it never launches an agent. The body edit is a signal,
 //! not a trigger — the execution gate stays the collaborator-applied label
-//! (ADR 0008). The sweep emits `issue.body_changed` and, unless disabled, posts
+//! (ADR 0009). The sweep emits `issue.body_changed` and, unless disabled, posts
 //! one comment nudging a human to re-label `meguri:ready` if a re-run is wanted.
 //! Both are deduped per new-body digest (shared `issue_reconcile` table with
 //! half A), so an edit waiting to be reprocessed does not re-fire every tick.
