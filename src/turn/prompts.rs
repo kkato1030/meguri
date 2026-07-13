@@ -33,12 +33,21 @@ pub struct ChildIssue {
     #[serde(default)]
     pub body: String,
     /// How the child enters the loops: "ready" (small enough to implement
-    /// directly) or "plan" (needs its own design pass first).
+    /// directly), "plan" (needs its own design pass first), or "human" (a task
+    /// meguri cannot run — filed with no trigger label so discovery never
+    /// picks it up and a human closes it; issue #154).
     pub kind: String,
     /// Zero-based indices of *earlier* `children` entries this one depends
     /// on; meguri wires them as GitHub-native `blocked_by`.
     #[serde(default)]
     pub blocked_by: Vec<usize>,
+    /// Which project (repository) to file this child in. `None` (the default)
+    /// files it in the parent issue's own repo — the existing behavior. A
+    /// value must name a workspace sibling of the parent's project; the
+    /// planner rejects anything else, keeping issue-filing scope pinned to the
+    /// host operator's config (issue #154 / ADR 0009).
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

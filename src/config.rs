@@ -47,6 +47,10 @@ repo_slug = "owner/repo"
 # required = false                           # true にすると失敗時に run が失敗扱いになる(既定は warn で続行)
 # timeout_secs = 300
 
+# [[workspaces]]                       # 関連 project の静的グルーピング(cross-repo 分解のスコープ + 表示単位)
+# id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
+# projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
+
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
@@ -109,6 +113,13 @@ pub struct Config {
     pub review: ReviewConfig,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+    /// Static groupings of related projects (issue #154). Purely declarative —
+    /// no runtime state, never touches run/turn — and used for exactly three
+    /// things: the decompose issue-filing scope, the cross-repo blocker
+    /// resolution scope, and `ps`/`top` display grouping. Opt-in: a config
+    /// without `[[workspaces]]` behaves exactly as before. See ADR 0009.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceConfig>,
 }
 
 /// Settings for the worker's self-review phase (ADR 0006): the internal
@@ -695,6 +706,29 @@ fn default_branch() -> String {
     "main".into()
 }
 
+/// `[[workspaces]]` — a static grouping of related projects (issue #154).
+///
+/// ```toml
+/// [[workspaces]]
+/// id = "shop"
+/// projects = ["shop-api", "shop-web", "shop-infra"]
+/// ```
+///
+/// A workspace never appears in the execution path (worktree / pane / branch /
+/// verification are unchanged) and carries no runtime state. It only bounds
+/// where a decomposition may file cross-repo child issues, which sibling repos
+/// discovery is willing to resolve blockers in, and how `ps` / `top` group
+/// their rows. See ADR 0009.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub id: String,
+    /// Member project ids. Each must reference a defined `[[projects]]` entry,
+    /// and a project may belong to at most one workspace (both enforced by
+    /// [`Config::validate`]).
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_from(&config_path())
@@ -745,11 +779,76 @@ impl Config {
                 );
             }
         }
+        self.validate_workspaces()?;
+        Ok(())
+    }
+
+    /// Workspace invariants (issue #154): every referenced project is defined,
+    /// no project belongs to two workspaces, and workspace ids are unique and
+    /// non-empty. Hard-fail like the other structural checks so a typo surfaces
+    /// at load time (and `meguri doctor`) rather than as a silent no-op scope.
+    fn validate_workspaces(&self) -> Result<()> {
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut owner: HashMap<&str, &str> = HashMap::new();
+        for ws in &self.workspaces {
+            if !seen_ids.insert(ws.id.as_str()) {
+                anyhow::bail!("workspace id {:?} is defined more than once", ws.id);
+            }
+            if ws.projects.is_empty() {
+                anyhow::bail!("workspace {:?} has no projects", ws.id);
+            }
+            for pid in &ws.projects {
+                if self.project(pid).is_none() {
+                    anyhow::bail!(
+                        "workspace {:?} references undefined project {:?}",
+                        ws.id,
+                        pid
+                    );
+                }
+                if let Some(other) = owner.insert(pid.as_str(), ws.id.as_str()) {
+                    anyhow::bail!(
+                        "project {:?} belongs to both workspace {:?} and {:?} \
+                         (a project may join at most one workspace)",
+                        pid,
+                        other,
+                        ws.id
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
         self.projects.iter().find(|p| p.id == id)
+    }
+
+    /// The workspace with this id, if any.
+    pub fn workspace(&self, id: &str) -> Option<&WorkspaceConfig> {
+        self.workspaces.iter().find(|w| w.id == id)
+    }
+
+    /// The workspace a project belongs to, if any. `None` for a project that
+    /// joined no workspace (the opt-out default).
+    pub fn workspace_of(&self, project_id: &str) -> Option<&WorkspaceConfig> {
+        self.workspaces
+            .iter()
+            .find(|w| w.projects.iter().any(|p| p == project_id))
+    }
+
+    /// The other projects sharing `project_id`'s workspace (self excluded),
+    /// resolved to their [`ProjectConfig`]. Empty when the project joined no
+    /// workspace. Drives both the decompose issue-filing scope and the
+    /// cross-repo blocker resolution scope (issue #154).
+    pub fn workspace_siblings(&self, project_id: &str) -> Vec<&ProjectConfig> {
+        let Some(ws) = self.workspace_of(project_id) else {
+            return Vec::new();
+        };
+        ws.projects
+            .iter()
+            .filter(|p| p.as_str() != project_id)
+            .filter_map(|p| self.project(p))
+            .collect()
     }
 
     /// Effective PR settings for a project (project override wins).
@@ -1552,5 +1651,95 @@ timeout_secs = 60
         assert_eq!(ws.exclude, vec![".claude/rules", "AGENTS.md"]);
         assert!(ws.required);
         assert_eq!(ws.timeout_secs, 60);
+    }
+
+    /// Minimal valid config carrying the given projects plus the extra lines.
+    fn config_with_projects(ids: &[&str], extra: &str) -> String {
+        let mut raw = String::new();
+        for id in ids {
+            raw.push_str(&format!(
+                "[[projects]]\nid = \"{id}\"\nrepo_path = \"/tmp/{id}\"\nrepo_slug = \"me/{id}\"\n\n"
+            ));
+        }
+        raw.push_str(extra);
+        raw
+    }
+
+    #[test]
+    fn workspaces_default_to_empty() {
+        // Opt-in: a config without [[workspaces]] has none, and behavior is
+        // unchanged (acceptance criterion 5).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.workspaces.is_empty());
+        assert!(cfg.workspace_of("anything").is_none());
+        assert!(cfg.workspace_siblings("anything").is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_and_resolves_membership() {
+        let raw = config_with_projects(
+            &["shop-api", "shop-web", "shop-infra", "loner"],
+            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"shop-web\", \"shop-infra\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.workspace("shop").unwrap().projects.len(), 3);
+        assert_eq!(
+            cfg.workspace_of("shop-web").map(|w| w.id.as_str()),
+            Some("shop")
+        );
+        assert!(cfg.workspace_of("loner").is_none());
+
+        let siblings: Vec<&str> = cfg
+            .workspace_siblings("shop-api")
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(siblings, vec!["shop-web", "shop-infra"]);
+        assert!(cfg.workspace_siblings("loner").is_empty());
+    }
+
+    #[test]
+    fn workspace_referencing_undefined_project_is_rejected() {
+        let raw = config_with_projects(
+            &["shop-api"],
+            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"ghost\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("undefined project") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_in_two_workspaces_is_rejected() {
+        let raw = config_with_projects(
+            &["a", "b"],
+            "[[workspaces]]\nid = \"w1\"\nprojects = [\"a\", \"b\"]\n\
+             [[workspaces]]\nid = \"w2\"\nprojects = [\"b\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("at most one workspace"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_workspace_id_and_empty_projects_are_rejected() {
+        let dup = config_with_projects(
+            &["a"],
+            "[[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n\
+             [[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n",
+        );
+        let cfg: Config = toml::from_str(&dup).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+
+        let empty = config_with_projects(&["a"], "[[workspaces]]\nid = \"w\"\nprojects = []\n");
+        let cfg: Config = toml::from_str(&empty).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no projects"), "{err}");
     }
 }
