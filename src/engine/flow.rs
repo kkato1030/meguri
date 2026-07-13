@@ -12,12 +12,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, Target, WorkerOutcome, role_for_loop};
+use super::{Deps, StoreControl, WorkerOutcome, role_for_loop};
 use crate::agent_session;
+use crate::config::Deliver;
 use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
 use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
 pub const STEP_PREPARE_WORK: &str = "prepare-work";
@@ -48,15 +50,16 @@ pub trait Flavor: Send + Sync {
         false
     }
 
-    /// Claim the run's target and fill the checkpoint. Default: re-verify
-    /// the trigger label on the issue, then claim it with `meguri:working`.
+    /// Claim the run's target and fill the checkpoint. Default: the
+    /// coordination layer's atomic claim (label re-verification + working
+    /// label in github mode, an atomic DB update in local mode).
     async fn prepare_work(
         &self,
         deps: &Deps,
         run: &RunRecord,
         cp: &mut Checkpoint,
     ) -> Result<PreparedWork> {
-        claim_issue(deps, run, self.trigger_label(), cp).await
+        claim_task(deps, run, cp).await
     }
 
     /// Set up the run's worktree and persist branch/path. Default: a new
@@ -92,6 +95,17 @@ pub trait Flavor: Send + Sync {
         deps.project.default_branch.clone()
     }
 
+    /// Whether this loop's execute turn may (re)establish `cp.subject`
+    /// (issue #136). Implementation-shaping turns — the worker, the
+    /// planner, the spec worker's takeover — do; fix-family turns whose job
+    /// is to amend without changing the nature of the change (the fixer,
+    /// the ci-fixer, the conflict resolver) must not, so the PR title stays
+    /// fixed to whatever turn established it instead of flapping with every
+    /// fix's wording. Default: yes.
+    fn sets_subject(&self) -> bool {
+        true
+    }
+
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String;
 
     /// Settle forge labels once the PR exists. Re-run on resume, so keep it
@@ -114,19 +128,18 @@ pub trait Flavor: Send + Sync {
         Ok(())
     }
 
-    /// Release the claim marker on `meguri stop`. Default: the issue's
-    /// `meguri:working` label.
+    /// Release the claim marker on `meguri stop`. Default: the coordination
+    /// layer's release (drop `meguri:working` / requeue the task).
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
-        deps.forge
-            .remove_label(run.issue_number, forge::LABEL_WORKING)
-            .await
-            .ok();
+        let _ = deps.task_source.release(&run.task_key()).await;
     }
 
     /// Failure escalation ("Authority": the durable record of why the run
-    /// stopped lives on the forge). Default: label + comment on the issue.
+    /// stopped lives with the task). Default: the coordination layer's
+    /// escalate (needs-human label + comment / `status='needs_human'` +
+    /// reason).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        escalate_on_forge(deps, run.issue_number, reason).await;
+        let _ = deps.task_source.escalate(&run.task_key(), reason).await;
     }
 
     /// The agent ended its execute turn with `needs_plan`: a design decision
@@ -188,6 +201,11 @@ pub struct Checkpoint {
     /// (fallback PR body).
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored PR/commit subject from the verified execute turn
+    /// (issue #136); `pr_title()` prefers this over `issue_title` when
+    /// present. Only set by turns whose [`Flavor::sets_subject`] is true.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
@@ -229,47 +247,6 @@ pub struct Checkpoint {
 #[derive(Debug, thiserror::Error)]
 #[error("needs human: {0}")]
 pub struct NeedsHuman(pub String);
-
-/// Shared discovery: open issues carrying `label` that are actionable — not
-/// held, not claimed by another host, not already shipped by a succeeded run
-/// of this loop (avoids duplicate PRs when the trigger label lingers or
-/// reappears; humans can force a rerun with `meguri run --issue N`), and not
-/// gated by an unresolved `blocked_by` dependency.
-pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Result<Vec<Target>> {
-    let issues = deps.forge.list_issues_with_label(label).await?;
-    let mut targets = Vec::new();
-    for issue in issues {
-        if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
-            continue;
-        }
-        if deps
-            .store
-            .issue_has_succeeded_run(&deps.project.id, loop_kind, issue.number)?
-        {
-            continue;
-        }
-        if has_unresolved_blockers(deps, issue.number).await {
-            continue;
-        }
-        targets.push(Target {
-            issue_number: issue.number,
-            title: issue.title,
-        });
-    }
-    Ok(targets)
-}
-
-/// Dependency gate (looper ADR-0004): GitHub-native `blocked_by` is the
-/// authority. Only a blocker closed as completed resolves; open blockers,
-/// not_planned/duplicate closes, and blockers we cannot read all keep the
-/// issue out of discovery. The skip is silent — no label, no comment: the
-/// dependency graph on the forge already tells a human why nothing starts.
-async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
-    match deps.forge.blocked_by(issue).await {
-        Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
-        Err(_) => true,
-    }
-}
 
 pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<WorkerOutcome> {
     let run = deps
@@ -443,9 +420,12 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     }
 
     if step == STEP_OPEN_PR {
-        let pr_url = open_pr(deps, &run, &mut checkpoint, &worktree, flavor).await?;
+        // `deliver` dispatches on the project's `deliver` setting (issue #54):
+        // a PR (open_pr), or just the verified branch. `finish_pane` applies
+        // the issue-scoped pane lifetime (issue #92) either way.
+        let artifact = deliver(deps, &run, &mut checkpoint, &worktree, flavor).await?;
         finish_pane(deps, &run).await;
-        return Ok(WorkerOutcome::Succeeded { pr_url });
+        return Ok(WorkerOutcome::Succeeded { pr_url: artifact });
     }
 
     bail!("unknown step {step:?}");
@@ -509,20 +489,15 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
 }
 
 /// Failure escalation on the forge ("Authority": the durable record of why
-/// the run stopped lives on the issue, not in meguri's local state).
+/// the run stopped lives on the issue, not in meguri's local state). Used by
+/// forge loops that escalate on the issue directly (the spec worker); the
+/// worker/planner default escalate goes through the task source instead.
 pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
-    let _ = deps.forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = deps.forge.remove_label(issue, forge::LABEL_WORKING).await;
-    let _ = deps
-        .forge
-        .comment(
-            issue,
-            &format!(
-                "🔁 **meguri** could not finish this issue and needs a human.\n\n> {reason}\n\n\
-                 The agent's pane (if still open) has the full context — \
-                 see `meguri ps` / `meguri attach` on the host running meguri."
-            ),
-        )
+    let forge = deps.forge();
+    let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
+    let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
+    let _ = forge
+        .comment(issue, &tasks::needs_human_comment(reason))
         .await;
 }
 
@@ -539,59 +514,44 @@ pub enum PreparedWork {
     Skip(String),
 }
 
-/// Default prepare-work: re-verify labels on the forge, then claim with
-/// `meguri:working` (the durable claim marker). A hold or missing trigger
-/// label here is a benign race (the issue changed between discovery and
-/// claim, e.g. another run just shipped it) — skip, don't escalate.
-async fn claim_issue(
-    deps: &Deps,
-    run: &RunRecord,
-    trigger_label: &str,
-    cp: &mut Checkpoint,
-) -> Result<PreparedWork> {
-    let issue = deps.forge.get_issue(run.issue_number).await?;
-    if issue.has_label(forge::LABEL_HOLD) {
-        return Ok(PreparedWork::Skip(format!(
-            "issue #{} is on hold ({})",
-            issue.number,
-            forge::LABEL_HOLD
-        )));
+/// Default prepare-work: the coordination layer's single atomic claim
+/// (github: label re-verification + `meguri:working` + needs-human clear;
+/// local: the atomic `tasks` UPDATE). `None` is a benign race — the task
+/// changed between discovery and claim (e.g. another run shipped it, or a
+/// second host took it) — so skip, don't escalate.
+async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result<PreparedWork> {
+    let key = run.task_key();
+    match deps.task_source.claim(&key, tasks::LOCAL_HOST).await? {
+        Some(task) => {
+            // Carry the auto-merge opt-in from the issue to the PR (auto-merge
+            // 1/3, #41): recorded now, applied in open-pr (non-draft + label
+            // copy). The coordination layer decides it (github: the
+            // `meguri:automerge` label; local: always off).
+            cp.automerge = task.automerge;
+            cp.issue_title = task.title;
+            cp.issue_body = task.body;
+            deps.store.emit(
+                Some(&run.id),
+                "issue.claimed",
+                json!({ "key": format!("{key:?}") }),
+            )?;
+            Ok(PreparedWork::Claimed)
+        }
+        None => Ok(PreparedWork::Skip(format!(
+            "task {key:?} is no longer claimable (raced, de-labeled, or already taken)"
+        ))),
     }
-    if !issue.has_label(trigger_label) {
-        return Ok(PreparedWork::Skip(format!(
-            "issue #{} is not labeled {trigger_label} (removed since discovery?)",
-            issue.number,
-        )));
-    }
-    deps.forge
-        .add_label(issue.number, forge::LABEL_WORKING)
-        .await?;
-    // A fresh claim supersedes a previous run's escalation: the human is no
-    // longer needed while this run is in flight (and a new failure re-adds
-    // the label). No-op if absent; best-effort like the escalation side.
-    let _ = deps
-        .forge
-        .remove_label(issue.number, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    deps.store.emit(
-        Some(&run.id),
-        "issue.claimed",
-        json!({ "issue": issue.number }),
-    )?;
-    // Carry the auto-merge opt-in from the issue to the PR (auto-merge 1/3,
-    // #41): recorded now, applied in open-pr (non-draft + label copy).
-    cp.automerge = issue.has_label(forge::LABEL_AUTOMERGE);
-    cp.issue_title = issue.title;
-    cp.issue_body = issue.body;
-    Ok(PreparedWork::Claimed)
 }
 
 /// Default prepare-worktree: a new run-scoped branch off the default branch.
+/// The branch name encodes the target so a resume (and Phase 4's cross-host
+/// re-claim) can find it: `meguri/<issue>-…` for github, `meguri/t<id>-…`
+/// for local tasks.
 async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
-    let branch = run
-        .branch
-        .clone()
-        .unwrap_or_else(|| gitops::branch_name(run.issue_number, &cp.issue_title, &run.id));
+    let branch = run.branch.clone().unwrap_or_else(|| match run.task_key() {
+        TaskKey::Issue(n) => gitops::branch_name(n, &cp.issue_title, &run.id),
+        TaskKey::Local(id) => gitops::task_branch_name(id, &cp.issue_title, &run.id),
+    });
     let root = deps
         .project
         .worktree_root
@@ -603,6 +563,7 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
         &wt,
         &branch,
         &deps.project.default_branch,
+        &deps.project.worktree_setup.exclude,
     )
     .await?;
     deps.store
@@ -612,7 +573,7 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
         "worktree.created",
         json!({ "branch": branch, "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    run_worktree_setup(deps, run, &wt).await
 }
 
 /// Attach the run's worktree to an existing PR head branch instead of
@@ -633,7 +594,13 @@ pub(crate) async fn attach_pr_worktree(
         .clone()
         .unwrap_or_else(crate::config::worktrees_root);
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-    gitops::attach_worktree(&deps.project.repo_path, &wt, &branch).await?;
+    gitops::attach_worktree(
+        &deps.project.repo_path,
+        &wt,
+        &branch,
+        &deps.project.worktree_setup.exclude,
+    )
+    .await?;
     deps.store
         .update_run_worktree(&run.id, &branch, &wt.to_string_lossy())?;
     deps.store.emit(
@@ -641,6 +608,104 @@ pub(crate) async fn attach_pr_worktree(
         "worktree.attached",
         json!({ "branch": branch, "path": wt.to_string_lossy() }),
     )?;
+    run_worktree_setup(deps, run, &wt).await
+}
+
+/// Env vars passed to `worktree_setup` commands: the run's role (its loop
+/// kind — `worker`, `fixer`, `spec-reviewer`, …), the launch profile that
+/// role resolves to, and the target issue/task number. Lets a user script
+/// specialize per role (e.g. skip a heavy step for `cleaner`). `MEGURI_PROFILE`
+/// goes through [`resolve_run_profile`] — the same pin-aware resolution the
+/// run's pane spawn uses — rather than re-resolving routing from scratch, so
+/// it can't drift from the profile the agent actually launches under (e.g.
+/// if routing config or CLI detection changes between the two).
+fn worktree_setup_env(deps: &Deps, run: &RunRecord) -> Result<[(&'static str, String); 3]> {
+    let (profile_name, _) = resolve_run_profile(deps, run)?;
+    Ok([
+        ("MEGURI_ROLE", run.loop_kind.clone()),
+        ("MEGURI_PROFILE", profile_name),
+        ("MEGURI_ISSUE", run.task_key().number().to_string()),
+    ])
+}
+
+/// Generic post-worktree-preparation hook (`[projects.worktree_setup]`,
+/// agent 指示基盤 2/3 — issue #138): runs the project's configured commands
+/// with the worktree as cwd. Called on every worktree preparation, not just
+/// the first — `attach_worktree` / `create_review_worktree` can wipe
+/// untracked files via `reset --hard` + `clean -fd` on reuse, so generated
+/// artifacts (e.g. `apm install --frozen` output) must be regenerated each
+/// time. Commands are expected to be idempotent, and a failing command stops
+/// the remaining ones in the list. Failure is a warning by default (the run
+/// continues); `worktree_setup.required = true` escalates it to a run
+/// failure.
+pub(crate) async fn run_worktree_setup(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+) -> Result<()> {
+    let setup = &deps.project.worktree_setup;
+    if setup.commands.is_empty() {
+        return Ok(());
+    }
+    let env = worktree_setup_env(deps, run)?;
+    let timeout = Duration::from_secs(setup.timeout_secs);
+
+    for command in &setup.commands {
+        deps.store.emit(
+            Some(&run.id),
+            "worktree_setup.running",
+            json!({ "command": command }),
+        )?;
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(worktree);
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+        // `output()` spawns eagerly; wrapping it in `timeout` only drops the
+        // *future* on expiry, which would otherwise leave the shell (and
+        // whatever it started) running as an orphan. `kill_on_drop` makes
+        // dropping the child on that cancellation actually kill it.
+        cmd.kill_on_drop(true);
+
+        let failure = match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => None,
+            Ok(Ok(out)) => Some(format!(
+                "`{command}` exited {}: {}",
+                out.status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Ok(Err(e)) => Some(format!("spawning `{command}`: {e}")),
+            Err(_) => Some(format!(
+                "`{command}` timed out after {}s",
+                setup.timeout_secs
+            )),
+        };
+
+        let Some(reason) = failure else {
+            deps.store.emit(
+                Some(&run.id),
+                "worktree_setup.ok",
+                json!({ "command": command }),
+            )?;
+            continue;
+        };
+
+        deps.store.emit(
+            Some(&run.id),
+            "worktree_setup.failed",
+            json!({ "command": command, "reason": reason }),
+        )?;
+        if setup.required {
+            bail!("worktree_setup command {reason}");
+        }
+        tracing::warn!(
+            "worktree_setup command {reason} (continuing: worktree_setup.required = false)"
+        );
+        break;
+    }
     Ok(())
 }
 
@@ -1072,6 +1137,24 @@ async fn record_agent_session(
     Ok(())
 }
 
+/// Applies a verified execute turn's agent-authored fields to the
+/// checkpoint. `sets_subject` gates whether `result.subject` may
+/// (re)establish `cp.subject` (see [`Flavor::sets_subject`]); an absent or
+/// blank (whitespace-only) `subject` never clears one an earlier turn
+/// already set — a blank value would otherwise survive into
+/// `default_pr_title()` as a literal empty title instead of falling back to
+/// the issue title.
+fn apply_execute_result(cp: &mut Checkpoint, result: TurnResultFile, sets_subject: bool) {
+    if sets_subject {
+        let subject = result.subject.as_deref().map(str::trim).unwrap_or("");
+        if !subject.is_empty() {
+            cp.subject = Some(subject.to_string());
+        }
+    }
+    cp.summary = result.summary;
+    cp.pr_body = result.pr_body;
+}
+
 /// execute: agent does the loop's work; the orchestrator independently
 /// verifies that committed work exists (plus the flavor's own check) before
 /// moving on.
@@ -1133,10 +1216,9 @@ async fn execute(
             flavor.verify_work(run, cp, worktree).err()
         };
         let Some(problem) = problem else {
-            // Keep what the agent said for the PR body (persisted by the
-            // caller's step save).
-            cp.summary = result.summary;
-            cp.pr_body = result.pr_body;
+            // Keep what the agent said for the PR title/body (persisted by
+            // the caller's step save).
+            apply_execute_result(cp, result, flavor.sets_subject());
             deps.store.emit(
                 Some(&run.id),
                 "execute.verified",
@@ -1264,6 +1346,37 @@ pub(crate) async fn validate(
     }
 }
 
+/// Produce the run's deliverable per the project's `deliver` setting and
+/// return a string locating it (a PR URL, or the branch name). The shape is
+/// mode-independent from here on; only this step differs.
+async fn deliver(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+    worktree: &Path,
+    flavor: &dyn Flavor,
+) -> Result<String> {
+    match deps.config.deliver_for(&deps.project) {
+        Deliver::Pr => open_pr(deps, run, cp, worktree, flavor).await,
+        Deliver::Branch => {
+            // Leave the verified commits on the local branch: no push, no PR.
+            // `settle_labels` still runs (it is the coordination-layer
+            // completion — `status='done'` locally, label removal in github).
+            let branch = run.branch.clone().context("run has no branch")?;
+            flavor.settle_labels(deps, run, cp).await?;
+            deps.store.emit(
+                Some(&run.id),
+                "branch.delivered",
+                json!({ "branch": branch }),
+            )?;
+            Ok(branch)
+        }
+        Deliver::Patch => {
+            bail!("deliver = \"patch\" is not implemented yet (issue #54 Phase 2)")
+        }
+    }
+}
+
 /// open-pr: push, create the PR, settle labels. All side effects here are
 /// idempotent enough to re-run after an interruption.
 async fn open_pr(
@@ -1286,7 +1399,7 @@ async fn open_pr(
         // (auto-merge 1/3, #41).
         let draft = deps.config.pr_for(&deps.project).draft && !cp.automerge;
         let pr = deps
-            .forge
+            .forge()
             .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
             .await?;
         cp.pr_url = Some(pr.url.clone());
@@ -1298,7 +1411,7 @@ async fn open_pr(
         // re-reading the issue (the sweep keeps the issue-label fallback for
         // any copy that does not land).
         if cp.automerge {
-            deps.forge
+            deps.forge()
                 .add_pr_label(pr.number, forge::LABEL_AUTOMERGE)
                 .await
                 .ok();
@@ -1309,6 +1422,18 @@ async fn open_pr(
     flavor.settle_presentation(deps, run, cp).await?;
     flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
+}
+
+/// The PR-title formula every [`Flavor::pr_title`] shares (issue #136): the
+/// agent-authored `subject` from the turn that established it, or the issue
+/// title when none was ever set (backward compatibility) — followed by the
+/// issue number the forge conventionally carries in a squash-merged repo.
+pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
+    format!(
+        "{} (#{})",
+        cp.subject.as_deref().unwrap_or(&cp.issue_title),
+        run.issue_number
+    )
 }
 
 /// The PR body meguri wraps around the agent's description: a `Closes #N`
@@ -1399,6 +1524,103 @@ pub fn pr_body_instruction(worktree: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn fake_run(issue: i64) -> RunRecord {
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", "test-flavor", issue, "t")
+            .unwrap();
+        store.get_run(&run.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn default_pr_title_prefers_subject_and_falls_back_to_issue_title() {
+        let run = fake_run(7);
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        assert_eq!(default_pr_title(&run, &cp), "Add caching (#7)");
+
+        cp.subject = Some("Cache API responses in memory".into());
+        assert_eq!(
+            default_pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
+
+    #[test]
+    fn apply_execute_result_gates_subject_by_flavor() {
+        let mut cp = Checkpoint::default();
+        let result_with = |subject: Option<&str>| TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: subject.map(str::to_string),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        // Implementation-shaping turn: subject is established.
+        apply_execute_result(&mut cp, result_with(Some("Add caching")), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Fix-family turn (sets_subject = false): a new subject is ignored,
+        // the established one survives (no flapping).
+        apply_execute_result(&mut cp, result_with(Some("Fix flaky test")), false);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Omitting `subject` never clears an already-established one either.
+        apply_execute_result(&mut cp, result_with(None), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
+    #[test]
+    fn apply_execute_result_ignores_a_blank_subject() {
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("   ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(
+            cp.subject, None,
+            "a whitespace-only subject must not become the checkpoint's subject"
+        );
+        // Otherwise default_pr_title() would render a broken " (#N)" title
+        // instead of falling back to the issue title.
+        assert_eq!(default_pr_title(&fake_run(7), &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn apply_execute_result_trims_subject_whitespace() {
+        let mut cp = Checkpoint::default();
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("  Add caching  ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
     #[test]
     fn pr_template_discovery_prefers_repo_locations_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1454,5 +1676,244 @@ mod tests {
         let section = pr_body_instruction(dir.path());
         assert!(section.contains("## Repo Sections"));
         assert!(!section.contains("<what & why>"));
+    }
+
+    async fn init_repo(dir: &Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            gitops::run_git(dir, &args).await.unwrap();
+        }
+    }
+
+    /// A `Deps` wired to a real local repo (no origin needed — `create_worktree`
+    /// falls back to the local branch) plus fake forge/mux, and a run of
+    /// `loop_kind` "worker" for issue 7 — enough to drive `prepare_worktree`
+    /// in isolation, without spawning a pane.
+    fn make_deps(
+        repo_path: PathBuf,
+        worktree_root: PathBuf,
+        worktree_setup: crate::config::WorktreeSetupConfig,
+    ) -> (Deps, RunRecord) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", "worker", 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(worktree_root),
+            pr: None,
+            clean: None,
+            worktree_setup,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge,
+            crate::config::Config::default(),
+            project,
+        );
+        (deps, run)
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_runs_with_the_documented_env_vars() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec![
+                    "echo $MEGURI_ROLE-$MEGURI_PROFILE-$MEGURI_ISSUE > marker.txt".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        let marker = std::fs::read_to_string(wt.join("marker.txt")).unwrap();
+        assert_eq!(marker.trim(), "worker-default-7");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_env_honors_an_already_pinned_profile() {
+        // A run's launch profile can be pinned (runs.agent_profile) before
+        // prepare-worktree ever runs — e.g. a resumed/retried run, or a
+        // concurrent spawn. MEGURI_PROFILE must reuse that pin instead of
+        // re-resolving routing from scratch, or the hook and the pane it's
+        // preparing for could end up generating for different profiles.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["echo $MEGURI_PROFILE > profile.txt".into()],
+                ..Default::default()
+            },
+        );
+        // No [routing] configured, so a fresh `routing::resolve` call would
+        // return "default" — pin something else first and confirm the hook
+        // picks that up instead.
+        deps.store
+            .update_run_agent_profile(&run.id, "codex")
+            .unwrap();
+        let cp = Checkpoint::default();
+
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.agent_profile.as_deref(), Some("codex"));
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        let profile = std::fs::read_to_string(wt.join("profile.txt")).unwrap();
+        assert_eq!(profile.trim(), "codex");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_required_failure_fails_prepare_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["exit 1".into()],
+                required: true,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        let err = create_branch_worktree(&deps, &run, &cp).await.unwrap_err();
+        assert!(err.to_string().contains("worktree_setup"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_optional_failure_warns_and_stops_remaining_commands() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["exit 1".into(), "echo late > marker.txt".into()],
+                required: false,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        // Soft failure: the run continues (Ok), but the second command never
+        // runs because the first one failed.
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+        assert!(!wt.join("marker.txt").exists());
+
+        let events = deps.store.events_for_run(&run.id, 20).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "worktree_setup.failed"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_timeout_kills_the_child_process() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["sleep 2 && echo late > marker.txt".into()],
+                timeout_secs: 1,
+                ..Default::default()
+            },
+        );
+        let cp = Checkpoint::default();
+
+        let start = std::time::Instant::now();
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "prepare-worktree must not block past the command's timeout"
+        );
+
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let wt = PathBuf::from(run.worktree_path.unwrap());
+
+        // Wait past when the sleep would have finished had it survived the
+        // timeout; if `kill_on_drop` didn't actually kill it, marker.txt
+        // would show up here.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !wt.join("marker.txt").exists(),
+            "the timed-out command must be killed, not left running in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_reruns_on_attach_reuse() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_root = tempfile::tempdir().unwrap();
+
+        // The setup command overwrites the marker each time it runs.
+        let (deps, run) = make_deps(
+            repo.path().to_path_buf(),
+            worktree_root.path().to_path_buf(),
+            crate::config::WorktreeSetupConfig {
+                commands: vec!["echo ran > marker.txt".into()],
+                ..Default::default()
+            },
+        );
+        let mut cp = Checkpoint::default();
+        create_branch_worktree(&deps, &run, &cp).await.unwrap();
+        let run = deps.store.get_run(&run.id).unwrap().unwrap();
+        let branch = run.branch.clone().unwrap();
+        let wt = PathBuf::from(run.worktree_path.clone().unwrap());
+        cp.head_branch = Some(branch.clone());
+
+        // Simulate the marker being wiped (as `attach_worktree` would if it
+        // re-pointed the checkout) and re-attach the same run's worktree:
+        // the hook must run again, not just on first creation.
+        std::fs::remove_file(wt.join("marker.txt")).unwrap();
+        let mut run = run;
+        run.branch = Some(branch);
+        attach_pr_worktree(&deps, &run, &cp).await.unwrap();
+
+        assert!(wt.join("marker.txt").exists());
     }
 }

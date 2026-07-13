@@ -88,23 +88,25 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
         clean: None,
+        mode: Default::default(),
+        deliver: None,
+        worktree_setup: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -344,7 +346,7 @@ async fn ci_fixer_discovery_wants_red_unclaimed_meguri_prs_only() {
 
     let targets = CiFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![9],
         "only the open, unclaimed, unescalated meguri PR whose CI settled red is actionable \
          — keyed by its canonical issue"

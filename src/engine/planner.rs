@@ -40,6 +40,7 @@ use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
 use super::{Deps, Target};
 use crate::forge;
 use crate::store::RunRecord;
+use crate::tasks::TaskKind;
 use crate::turn::{ChildIssue, TurnResultFile};
 
 /// `runs.loop_kind` value for planner runs.
@@ -77,7 +78,22 @@ impl super::Loop for PlannerLoop {
     }
 
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        flow::discover_by_label(deps, KIND, forge::LABEL_PLAN).await
+        // The planner ships a spec *PR*, so it needs a forge. Local mode has
+        // no planner yet (issue #54 Phase 3): a local `plan` task stays
+        // queued and dormant rather than being driven into a forge call.
+        if deps.forge.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(deps
+            .task_source
+            .discover(TaskKind::Plan)
+            .await?
+            .into_iter()
+            .map(|t| Target {
+                key: t.key,
+                title: t.title,
+            })
+            .collect())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -164,8 +180,13 @@ impl Flavor for PlannerFlavor {
         }
     }
 
+    /// The `Spec:` prefix hack is retired (issue #136): the planner's own
+    /// execute turn sets `cp.subject` to what it actually did (e.g. "Write a
+    /// spec for ..."), so the PR title reads honestly without a mechanical
+    /// prefix. Falls back to the issue title when the agent omitted
+    /// `subject` (backward compatibility).
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("Spec: {} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
     }
 
     /// Label transition (ADR 0005): the PR gets `meguri:spec-reviewing` (it is
@@ -176,18 +197,18 @@ impl Flavor for PlannerFlavor {
     /// either fails the run; the `plan` / `working` removals stay best-effort.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         if let Some(pr) = cp.pr_number {
-            deps.forge
+            deps.forge()
                 .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
                 .await?;
         }
-        deps.forge
+        deps.forge()
             .add_label(run.issue_number, forge::LABEL_SPECCING)
             .await?;
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await
             .ok();
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_PLAN)
             .await
             .ok();
@@ -234,17 +255,19 @@ impl Flavor for PlannerFlavor {
                 decompose_child_footer(run.issue_number)
             );
             let number = deps
-                .forge
+                .forge()
                 .create_issue(&child.title, &body, &[label])
                 .await?;
             // Sibling dependencies: the dependency gate (issue #23) keys off
             // these, so they decide the implementation order.
             for &dep in &child.blocked_by {
-                deps.forge.add_blocked_by(number, numbers[dep]).await?;
+                deps.forge().add_blocked_by(number, numbers[dep]).await?;
             }
             // Parent-child dependency: the parent visibly waits for every
             // child on the forge's graph.
-            deps.forge.add_blocked_by(run.issue_number, number).await?;
+            deps.forge()
+                .add_blocked_by(run.issue_number, number)
+                .await?;
             numbers.push(number);
         }
 
@@ -259,7 +282,7 @@ impl Flavor for PlannerFlavor {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        deps.forge
+        deps.forge()
             .comment(
                 run.issue_number,
                 &format!(
@@ -277,10 +300,10 @@ impl Flavor for PlannerFlavor {
         // The parent leaves the planner queue. Dropping the plan label is
         // load-bearing (if it lingered, the next poll would decompose
         // again); the claim release is best-effort as everywhere else.
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_PLAN)
             .await?;
-        deps.forge
+        deps.forge()
             .remove_label(run.issue_number, forge::LABEL_WORKING)
             .await
             .ok();
@@ -498,13 +521,27 @@ mod tests {
     }
 
     #[test]
-    fn pr_title_carries_spec_prefix() {
+    fn pr_title_falls_back_to_issue_title_without_subject() {
         let run = fake_run(7);
         let cp = Checkpoint {
             issue_title: "Add caching".into(),
             ..Default::default()
         };
-        assert_eq!(PlannerFlavor.pr_title(&run, &cp), "Spec: Add caching (#7)");
+        assert_eq!(PlannerFlavor.pr_title(&run, &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn pr_title_prefers_agent_authored_subject_over_spec_prefix_hack() {
+        let run = fake_run(7);
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            subject: Some("Write a spec for cache invalidation".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PlannerFlavor.pr_title(&run, &cp),
+            "Write a spec for cache invalidation (#7)"
+        );
     }
 
     fn fake_run(issue: i64) -> RunRecord {
@@ -518,23 +555,26 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                language: None,
-                check_command: None,
-                worktree_root: None,
-                pr: None,
-                clean: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            worktree_setup: Default::default(),
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

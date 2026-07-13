@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use super::{
     ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeStrategy, MergeableState, PullRequest, ReviewComment, ReviewCommentDraft,
-    ReviewThread,
+    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
+    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// How much of each failed job log survives into the fix prompt (logs can be
@@ -680,6 +680,44 @@ impl Forge for GhForge {
         )
     }
 
+    /// One `gh pr view` folding the three signals merge-watch classifies on:
+    /// mergeability, the `mergeStateStatus` verdict, and whether auto-merge is
+    /// armed (`autoMergeRequest` is null when it is not). A `gh` failure
+    /// propagates as `Err`, which merge-watch reads as TransientError (no
+    /// escalation — ADR 0007).
+    async fn pr_merge_state(&self, number: i64) -> Result<MergeState> {
+        let raw = self
+            .gh(&[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "mergeable,mergeStateStatus,autoMergeRequest",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh pr view merge-state")?;
+        let mergeable = match v.get("mergeable").and_then(Value::as_str).unwrap_or("") {
+            s if s.eq_ignore_ascii_case("mergeable") => MergeableState::Mergeable,
+            s if s.eq_ignore_ascii_case("conflicting") => MergeableState::Conflicting,
+            _ => MergeableState::Unknown,
+        };
+        let status = MergeStateStatus::from_gh(
+            v.get("mergeStateStatus")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        // `autoMergeRequest` is a non-null object while armed, null once a
+        // human (or a merge) clears it.
+        let auto_merge_enabled = v.get("autoMergeRequest").is_some_and(|a| !a.is_null());
+        Ok(MergeState {
+            mergeable,
+            status,
+            auto_merge_enabled,
+        })
+    }
+
     /// Checks and classic commit statuses both live in GraphQL's
     /// `statusCheckRollup` contexts; `gh pr checks` is avoided because it
     /// exits non-zero on pending/failing checks (indistinguishable from a
@@ -799,6 +837,15 @@ impl Forge for GhForge {
     }
 
     async fn pr_comments(&self, number: i64) -> Result<Vec<String>> {
+        Ok(self
+            .pr_comments_meta(number)
+            .await?
+            .into_iter()
+            .map(|c| c.body)
+            .collect())
+    }
+
+    async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>> {
         let raw = self
             .gh(&[
                 "pr",
@@ -816,8 +863,15 @@ impl Forge for GhForge {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|c| c.get("body").and_then(Value::as_str))
-                    .map(str::to_string)
+                    .filter_map(|c| {
+                        let body = c.get("body").and_then(Value::as_str)?.to_string();
+                        let created_at = c
+                            .get("createdAt")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        Some(PrComment { body, created_at })
+                    })
                     .collect()
             })
             .unwrap_or_default())

@@ -35,6 +35,7 @@ use super::{Deps, Target, canonical_key, open_pr_for_issue};
 use crate::forge::{self, MergeableState, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for conflict-resolver runs.
@@ -81,8 +82,11 @@ impl super::Loop for ConflictResolverLoop {
     /// the per-PR resolve budget stops a resolve→re-conflict ping-pong; the
     /// active-run unique index dedups concurrent rounds as usual.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
+        for pr in deps.forge().list_open_prs().await? {
             if pr_is_resolvable(&pr).is_some()
                 || pr.has_label(forge::LABEL_WORKING)
                 || pr.has_label(forge::LABEL_NEEDS_HUMAN)
@@ -97,11 +101,11 @@ impl super::Loop for ConflictResolverLoop {
             {
                 continue;
             }
-            if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
                 continue;
             }
             targets.push(Target {
-                issue_number: issue,
+                key: TaskKey::Issue(issue),
                 title: pr.title,
             });
         }
@@ -161,7 +165,7 @@ impl Flavor for ConflictResolverFlavor {
                 forge::LABEL_NEEDS_HUMAN
             )));
         }
-        if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+        if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{} is no longer conflicting",
                 pr.number
@@ -173,7 +177,7 @@ impl Flavor for ConflictResolverFlavor {
         let base_sha =
             gitops::fetch_base_tip(&deps.project.repo_path, &deps.project.default_branch).await?;
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store.emit(
@@ -284,7 +288,14 @@ impl Flavor for ConflictResolverFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Resolving a conflict doesn't change the nature of the change (issue
+    /// #136): keep the subject the establishing turn set instead of letting
+    /// the resolution's wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: leave a durable trace on the PR (the resolution is
@@ -298,7 +309,7 @@ impl Flavor for ConflictResolverFlavor {
             .context("conflict-resolver checkpoint has no PR number")?;
         let base = cp.base_sha.as_deref().unwrap_or("?");
         let _ = deps
-            .forge
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -309,7 +320,7 @@ impl Flavor for ConflictResolverFlavor {
                 ),
             )
             .await;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -318,7 +329,7 @@ impl Flavor for ConflictResolverFlavor {
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
         if let Some(pr) = flow::claimed_pr(deps, &run.id) {
-            deps.forge
+            deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
@@ -333,10 +344,13 @@ impl Flavor for ConflictResolverFlavor {
             flow::escalate_on_forge(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -354,6 +368,11 @@ impl Flavor for ConflictResolverFlavor {
 mod tests {
     use super::*;
     use crate::gitops::run_git_sync;
+
+    #[test]
+    fn resolve_turns_never_establish_a_new_subject() {
+        assert!(!ConflictResolverFlavor.sets_subject());
+    }
 
     #[test]
     fn resolvable_guards_state_ownership_and_hold() {
@@ -511,23 +530,26 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-                clean: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            worktree_setup: Default::default(),
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

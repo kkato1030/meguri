@@ -39,24 +39,27 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 
 async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
-    Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(root.join("worktrees")),
+        pr: None,
+        clean: None,
+        worktree_setup: Default::default(),
+    };
+    Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
         forge,
-        config: Config::default(),
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: clone,
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(root.join("worktrees")),
-            pr: None,
-            clean: None,
-        },
-    }
+        Config::default(),
+        project,
+    )
 }
 
 /// Create a meguri worktree for `issue` with one committed file; returns
@@ -65,7 +68,7 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
     let branch = gitops::branch_name(issue, title, &format!("run-{issue}"));
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main")
+    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main", &[])
         .await
         .unwrap();
     std::fs::write(wt.join("work.txt"), format!("issue {issue}\n")).unwrap();
@@ -100,7 +103,7 @@ async fn add_review_worktree(deps: &Deps, pr: i64) -> PathBuf {
     let head = run_git(&deps.project.repo_path, &["rev-parse", "HEAD"])
         .await
         .unwrap();
-    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim())
+    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim(), &[])
         .await
         .unwrap();
     // A detached checkout reports no branch, so the run lookup goes by path;

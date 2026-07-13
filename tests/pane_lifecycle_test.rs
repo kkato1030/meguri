@@ -73,24 +73,26 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        mode: Default::default(),
+        deliver: None,
+        worktree_setup: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: mux.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
         forge,
         config,
         project,
-        notifier: meguri::notify::fake::recording_notifier().0,
-    };
+    );
     TestEnv {
         deps,
         mux,
@@ -121,7 +123,8 @@ impl Flavor for FixedBranchFlavor {
         let root = deps.project.worktree_root.clone().unwrap();
         let wt = gitops::worktree_path(&root, &deps.project.id, &self.branch);
         if !wt.exists() {
-            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main").await?;
+            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main", &[])
+                .await?;
         }
         deps.store
             .update_run_worktree(&run.id, &self.branch, &wt.to_string_lossy())?;

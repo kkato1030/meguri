@@ -16,24 +16,27 @@ use meguri::store::{RunStatus, Store};
 fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
     let mut config = Config::default();
     config.drift.window = window;
-    Deps {
-        store: store.clone(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: Arc::new(FakeForge::default()),
+    let project_cfg = ProjectConfig {
+        id: project.into(),
+        repo_path: std::path::PathBuf::from("/tmp/none"),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: None,
+        pr: None,
+        clean: None,
+        worktree_setup: Default::default(),
+    };
+    Deps::with_label_source(
+        store.clone(),
+        Arc::new(FakeMux::new(false)),
+        Arc::new(FakeForge::default()),
         config,
-        project: ProjectConfig {
-            id: project.into(),
-            repo_path: std::path::PathBuf::from("/tmp/none"),
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: None,
-            pr: None,
-            clean: None,
-        },
-    }
+        project_cfg,
+    )
 }
 
 /// Insert one terminal scored run in the given group with `turns` turns.

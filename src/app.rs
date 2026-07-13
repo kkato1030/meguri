@@ -6,19 +6,50 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{self, Config, ProjectConfig};
+use crate::config::{self, Config, ProjectConfig, ProjectMode};
 use crate::daemon;
 use crate::engine::reaper;
 use crate::engine::scheduler::{Reload, Scheduler};
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::engine::{self, Deps};
+use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
 use crate::store::{DesiredState, DriftRow, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
+use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
     Store::open(&config::db_path())
+}
+
+/// A project's coordination layer: its optional forge (github only) and its
+/// task source.
+type Coordination = (Option<Arc<dyn Forge>>, Arc<dyn TaskSource>);
+
+/// The coordination layer (and whether there is a forge at all) is chosen by
+/// the project mode: labels+GitHub for github, the local sqlite `tasks` table
+/// for local. Shared by `build_deps` and the driverless `cmd_stop` finalize.
+fn build_coordination(project: &ProjectConfig, store: &Store) -> Result<Coordination> {
+    match project.mode {
+        ProjectMode::Github => {
+            let slug = project.repo_slug.clone().context(
+                "github-mode project has no repo_slug (config validation should have caught this)",
+            )?;
+            let forge: Arc<dyn Forge> = Arc::new(GhForge::new(&slug));
+            let ts: Arc<dyn TaskSource> = Arc::new(LabelTaskSource::new(
+                forge.clone(),
+                store.clone(),
+                project.id.clone(),
+            ));
+            Ok((Some(forge), ts))
+        }
+        ProjectMode::Local => {
+            let ts: Arc<dyn TaskSource> =
+                Arc::new(LocalTaskSource::new(store.clone(), project.id.clone()));
+            Ok((None, ts))
+        }
+    }
 }
 
 fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>) -> Result<Deps> {
@@ -26,10 +57,13 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
     // Per-project workspace: this project's panes live in `<session>:<project>`
     // (herdr) / `<session>-<project>` (tmux), not the shared base workspace.
     let mux = mux::detect(kind, &cfg.mux.session, Some(&project.id))?;
+    let store = open_store()?;
+    let (forge, task_source) = build_coordination(project, &store)?;
     Ok(Deps {
-        store: open_store()?,
+        store,
         mux,
-        forge: Arc::new(GhForge::new(&project.repo_slug)),
+        forge,
+        task_source,
         notifier: Arc::new(Notifier::from_config(&cfg.notifications)),
         config: cfg.clone(),
         project: project.clone(),
@@ -56,9 +90,15 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
+    if project.mode == ProjectMode::Local {
+        bail!(
+            "`meguri run --issue` is for github-mode projects; \
+             for a local project use `meguri add` and let `meguri watch` pick it up"
+        );
+    }
     let deps = build_deps(&cfg, project, mux_override)?;
 
-    let gh_issue = deps.forge.get_issue(issue).await?;
+    let gh_issue = deps.forge().get_issue(issue).await?;
     let run = match deps.store.create_run(&project.id, issue, &gh_issue.title) {
         Ok(run) => run,
         Err(_) => {
@@ -206,22 +246,26 @@ async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
     if !am.enabled {
         return Ok(());
     }
-    let policy = deps
-        .forge
+    // Auto-merge is a GitHub-PR concern; a forge-less (local-mode) project has
+    // no PRs to arm, so there is nothing to fail-fast on.
+    let Some(forge) = &deps.forge else {
+        return Ok(());
+    };
+    let slug = deps
+        .project
+        .repo_slug
+        .as_deref()
+        .unwrap_or(&deps.project.id);
+    let policy = forge
         .merge_policy(&deps.project.default_branch, am.require_branch_protection)
         .await
-        .with_context(|| {
-            format!(
-                "cannot read merge settings for {} to validate auto-merge",
-                deps.project.repo_slug
-            )
-        })?;
+        .with_context(|| format!("cannot read merge settings for {slug} to validate auto-merge"))?;
     if let Err(problems) = crate::engine::auto_merger::validate_policy(am, &policy) {
         bail!(
             "auto-merge is enabled for project `{}` ({}) but the repository cannot \
              honor it:\n  - {}",
             deps.project.id,
-            deps.project.repo_slug,
+            slug,
             problems.join("\n  - "),
         );
     }
@@ -393,6 +437,99 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `meguri add`: queue a local task. Phase 1 only serves local-mode projects
+/// (silent mode's `meguri queue --issue` is Phase 2); a task added to a github
+/// project would never be discovered, so refuse it loudly instead.
+pub fn cmd_add(
+    project: Option<&str>,
+    plan: bool,
+    file: Option<&str>,
+    title: Option<&str>,
+) -> Result<()> {
+    let cfg = Config::load()?;
+    let project = pick_project(&cfg, project)?;
+    if project.mode != ProjectMode::Local {
+        bail!(
+            "`meguri add` queues local tasks, but project {:?} is mode = {:?}. \
+             Phase 1 supports local mode only (silent mode's `meguri queue --issue` is Phase 2).",
+            project.id,
+            project.mode.as_str()
+        );
+    }
+    let (title, body) = resolve_task_input(title, file)?;
+    let kind = if plan { TaskKind::Plan } else { TaskKind::Work };
+    let store = open_store()?;
+    let task = store.create_task(&project.id, kind.as_str(), &title, &body, "local")?;
+    println!(
+        "queued task #{} [{}] {}",
+        task.id,
+        kind.as_str(),
+        task.title
+    );
+    println!("`meguri watch` will pick it up within one poll interval.");
+    Ok(())
+}
+
+/// Resolve a task's `(title, body)` from an optional title argument and an
+/// optional `--file`. `--file` loads the markdown as the body and, absent an
+/// explicit title, lifts the first heading line as the title.
+fn resolve_task_input(title: Option<&str>, file: Option<&str>) -> Result<(String, String)> {
+    match file {
+        Some(path) => {
+            let body = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read task file {path}"))?;
+            let title = match title {
+                Some(t) => t.to_string(),
+                None => first_heading(&body)
+                    .context("--file has no heading line; pass a title explicitly")?,
+            };
+            Ok((title, body))
+        }
+        None => {
+            let title = title
+                .context("provide a task title (or --file <path>)")?
+                .to_string();
+            Ok((title, String::new()))
+        }
+    }
+}
+
+/// The first non-empty line of a markdown document, with leading `#`/spaces
+/// stripped — the task title lifted from a `--file`.
+fn first_heading(markdown: &str) -> Option<String> {
+    let line = markdown.lines().find(|l| !l.trim().is_empty())?;
+    Some(line.trim_start_matches('#').trim().to_string())
+}
+
+/// `meguri tasks`: list a project's local tasks, newest first. needs_human
+/// tasks are highlighted with their reason so a human can pick them up.
+pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
+    let cfg = Config::load()?;
+    let project = pick_project(&cfg, project)?;
+    let store = open_store()?;
+    let tasks = store.list_tasks(&project.id, all)?;
+    if tasks.is_empty() {
+        println!("no {}tasks", if all { "" } else { "open " });
+        return Ok(());
+    }
+    println!("{:>4}  {:<6} {:<12} TITLE", "ID", "KIND", "STATUS");
+    for t in tasks {
+        let flag = if t.status == "needs_human" {
+            "⚠️ "
+        } else {
+            ""
+        };
+        println!(
+            "{:>4}  {:<6} {}{:<12} {}",
+            t.id, t.kind, flag, t.status, t.title
+        );
+        if let Some(reason) = t.reason.filter(|_| t.status == "needs_human") {
+            println!("        ↳ {reason}");
+        }
+    }
+    Ok(())
+}
+
 /// A `[project] role/profile` label for a drift row (empty profile = default).
 fn drift_label(d: &DriftRow) -> String {
     let profile = if d.agent_profile.is_empty() {
@@ -412,14 +549,20 @@ pub fn cmd_ps(all: bool) -> Result<()> {
     }
     println!(
         "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
-        "RUN", "PROJECT", "ISSUE", "STATUS", "INTERACTION", "STEP", "PROFILE"
+        "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE"
     );
     for run in runs {
+        // A github run is keyed by its issue (`#7`), a local run by its task
+        // row (`t3`); the branch prefix uses the same convention.
+        let target = match run.task_key() {
+            crate::tasks::TaskKey::Issue(n) => format!("#{n}"),
+            crate::tasks::TaskKey::Local(id) => format!("t{id}"),
+        };
         println!(
             "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {}",
             run.id,
             run.project_id,
-            format!("#{}", run.issue_number),
+            target,
             run.status.as_str(),
             run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             run.step,
@@ -870,10 +1013,10 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                     "stopped by user",
                 )
                 .await;
-                let _ = deps
-                    .forge
-                    .remove_label(run.issue_number, crate::forge::LABEL_WORKING)
-                    .await;
+                // Drop the claim through the coordination layer, keyed by
+                // whatever this run targets (github: the working label; local:
+                // back to queued).
+                let _ = deps.task_source.release(&run.task_key()).await;
                 released.is_some()
             }
             Err(_) => false,

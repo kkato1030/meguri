@@ -133,6 +133,67 @@ pub enum MergeableState {
     Unknown,
 }
 
+/// GitHub's `mergeStateStatus` — the platform's own verdict on why (or
+/// whether) a PR can merge right now. merge-watch (auto-merge 2/3, #42) leans
+/// on this instead of re-deriving required-vs-optional checks itself: the
+/// required-check authority stays with GitHub (ADR 0003 / 0007). Notably
+/// `Unstable` (a non-required check failing) still merges under auto-merge,
+/// while `Blocked` (a required check failing or a required review missing)
+/// does not — that split is exactly the "required checks only" rule the issue
+/// asks for, computed by GitHub rather than by meguri.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStateStatus {
+    /// Mergeable and every required check green — auto-merge fires immediately.
+    Clean,
+    /// A required check failed, a required review is missing, or other required
+    /// protection blocks the merge.
+    Blocked,
+    /// The base moved ahead; the branch needs an update before merging.
+    Behind,
+    /// Conflicts with the base (the `mergeStateStatus` face of CONFLICTING).
+    Dirty,
+    /// Mergeable, but a non-required check is failing or pending — GitHub still
+    /// merges once the required checks pass.
+    Unstable,
+    /// The PR is a draft.
+    Draft,
+    /// A pre-receive hook blocks the merge.
+    HasHooks,
+    /// GitHub is still computing the state.
+    Unknown,
+}
+
+impl MergeStateStatus {
+    /// Map GitHub's uppercase `mergeStateStatus` string; anything unrecognized
+    /// (including the empty string) degrades to [`Self::Unknown`], never to a
+    /// state that would make merge-watch act.
+    pub fn from_gh(s: &str) -> Self {
+        match s.to_ascii_uppercase().as_str() {
+            "CLEAN" => Self::Clean,
+            "BLOCKED" => Self::Blocked,
+            "BEHIND" => Self::Behind,
+            "DIRTY" => Self::Dirty,
+            "UNSTABLE" => Self::Unstable,
+            "DRAFT" => Self::Draft,
+            "HAS_HOOKS" => Self::HasHooks,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A snapshot of one PR's merge readiness for merge-watch (auto-merge 2/3,
+/// #42): GitHub's mergeability, its `mergeStateStatus` verdict, and whether
+/// auto-merge is currently armed (`autoMergeRequest` non-null).
+#[derive(Debug, Clone)]
+pub struct MergeState {
+    pub mergeable: MergeableState,
+    pub status: MergeStateStatus,
+    /// Whether GitHub-native auto-merge is armed on the PR right now. A human
+    /// disabling it (arm marker present but this false) is the HumanDisabled
+    /// signal merge-watch backs off from.
+    pub auto_merge_enabled: bool,
+}
+
 /// Verdict of one CI check on a PR head, reduced to the axis the ci-fixer
 /// cares about: done-and-green, done-and-red, or still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +313,17 @@ impl PullRequest {
     }
 }
 
+/// One PR conversation comment with its creation time (RFC3339 UTC, as GitHub
+/// returns `createdAt`). merge-watch reads the #41 arm marker's `createdAt` to
+/// know how long a PR has been armed (arm-since) without any local state.
+#[derive(Debug, Clone)]
+pub struct PrComment {
+    pub body: String,
+    /// GitHub's `createdAt`, e.g. `2026-07-13T09:00:00Z`; empty when the forge
+    /// did not supply one (`store::parse_ts` then yields None → never stale).
+    pub created_at: String,
+}
+
 /// One comment inside a review thread.
 #[derive(Debug, Clone)]
 pub struct ReviewComment {
@@ -319,6 +391,9 @@ pub trait Forge: Send + Sync {
     async fn pr_diff(&self, number: i64) -> Result<String>;
     /// Bodies of the PR's conversation comments (review-marker lookups).
     async fn pr_comments(&self, number: i64) -> Result<Vec<String>>;
+    /// The PR's conversation comments with creation timestamps — merge-watch
+    /// reads the arm marker's `createdAt` for arm-since (auto-merge 2/3, #42).
+    async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>>;
     /// Post a conversation comment on a pull request.
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
@@ -339,6 +414,11 @@ pub trait Forge: Send + Sync {
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
+    /// The PR's merge-readiness snapshot for merge-watch (auto-merge 2/3, #42):
+    /// mergeability + `mergeStateStatus` + whether auto-merge is armed, in one
+    /// `gh pr view`. A forge error here is the TransientError signal — the
+    /// caller must not escalate on it (ADR 0007).
+    async fn pr_merge_state(&self, number: i64) -> Result<MergeState>;
     /// The check/status rollup of the PR's head commit (ci-fixer discovery).
     async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup>;
     /// Failed-job logs of the PR's failing checks, pre-trimmed for a prompt.

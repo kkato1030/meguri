@@ -5,6 +5,7 @@ pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
 pub mod impl_reviewer;
+pub mod merge_watch;
 pub mod planner;
 pub mod reaper;
 pub mod routing_drift;
@@ -24,6 +25,7 @@ use crate::gitops;
 use crate::mux::Multiplexer;
 use crate::notify::{Notification, Notifier};
 use crate::store::{DesiredState, InteractionState, ROLE_AUTHOR, ROLE_REVIEW, Store};
+use crate::tasks::{TaskKey, TaskSource};
 use crate::turn::TurnControl;
 
 /// Everything a loop needs to drive runs for one project.
@@ -31,7 +33,15 @@ use crate::turn::TurnControl;
 pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
-    pub forge: Arc<dyn Forge>,
+    /// The GitHub forge — issue reading, PR/label/review operations. `None`
+    /// in local mode; the forge-dependent loops (fixer, reviewer, spec-worker,
+    /// conflict-resolver, ci-fixer, impl-reviewer, cleaner) then discover
+    /// nothing. Task coordination goes through [`Deps::task_source`], not here.
+    pub forge: Option<Arc<dyn Forge>>,
+    /// The task coordination layer (discover / claim / release / escalate /
+    /// complete) — `LabelTaskSource` in github mode, `LocalTaskSource` in
+    /// local mode.
+    pub task_source: Arc<dyn TaskSource>,
     /// Shared across every run of the project so the per-run notification
     /// throttle survives turn boundaries.
     pub notifier: Arc<Notifier>,
@@ -39,13 +49,56 @@ pub struct Deps {
     pub project: ProjectConfig,
 }
 
-/// A unit of work a loop wants a run for: the issue to drive.
-/// `issue_number` is always the canonical GitHub issue number (issue #92) —
-/// PR-targeted loops resolve it via [`canonical_key`] and carry the PR
-/// number in their checkpoint instead.
+impl Deps {
+    /// Assemble github-mode deps: the forge is present and its labels are the
+    /// coordination layer, so `task_source` is a [`LabelTaskSource`] wrapping
+    /// it. This is the shape `app::build_coordination` produces for github
+    /// projects; tests use it so their FakeForge flows through the same
+    /// `TaskSource` seam production does (issue #54 acceptance criterion 6).
+    /// The notifier is built from the config's `[notifications]` section.
+    pub fn with_label_source(
+        store: Store,
+        mux: Arc<dyn Multiplexer>,
+        forge: Arc<dyn Forge>,
+        config: Config,
+        project: ProjectConfig,
+    ) -> Self {
+        let task_source = Arc::new(crate::tasks::LabelTaskSource::new(
+            forge.clone(),
+            store.clone(),
+            project.id.clone(),
+        ));
+        let notifier = Arc::new(Notifier::from_config(&config.notifications));
+        Self {
+            store,
+            mux,
+            forge: Some(forge),
+            task_source,
+            notifier,
+            config,
+            project,
+        }
+    }
+
+    /// The forge for github-mode loops. Panics if absent — only the
+    /// forge-dependent loops run without a forge, and they short-circuit their
+    /// discovery before ever reaching here.
+    pub fn forge(&self) -> &Arc<dyn Forge> {
+        self.forge
+            .as_ref()
+            .expect("forge is required for this loop (github mode)")
+    }
+}
+
+/// A unit of work a loop wants a run for: the task to drive. The `key` is the
+/// coordination-layer identity — a github issue number or a local task row
+/// (issue #54). PR-targeted loops resolve the canonical issue via
+/// [`canonical_key`] and carry the PR number in their checkpoint.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub issue_number: i64,
+    /// The coordination-layer identity of the task (github issue or local
+    /// task row). Also the run-creation and dispatch-sort key.
+    pub key: TaskKey,
     pub title: String,
 }
 
@@ -101,7 +154,7 @@ fn closes_issue(body: &str) -> Option<i64> {
 /// a benign race and skips.
 pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
     let mut matches: Vec<PullRequest> = deps
-        .forge
+        .forge()
         .list_open_prs()
         .await?
         .into_iter()

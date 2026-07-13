@@ -47,6 +47,12 @@ pub struct TurnResultFile {
     pub status: TurnStatus,
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored PR/commit subject (issue #136): a short, imperative
+    /// line describing the actual change, used as the PR title instead of
+    /// the issue title when present. `summary`/`pr_body` follow the same
+    /// optional-field shape.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Agent-authored pull-request description (Markdown), used as the PR
     /// body when present; `summary` is the fallback.
     #[serde(default)]
@@ -88,11 +94,19 @@ fn completion_contract(turn_id: &str) -> String {
 When you have FULLY completed the task above, write a JSON file at
 `{MEGURI_DIR}/{RESULT_FILE}` (relative to the repository root) containing exactly:
 
-    {{"turn_id": "{turn_id}", "status": "success", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
+    {{"turn_id": "{turn_id}", "status": "success", "subject": "<imperative one-line description of the actual change>", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
 
 - `status` must be one of: "success" (task done), "failure" (you tried and
   cannot complete it), "needs_human" (a human decision or missing information
   blocks you — explain what you need in the summary).
+- `subject` (optional): a short, imperative-mood line (roughly 50-72
+  characters) naming what this PR actually changes — not a restatement of
+  the issue's goal. It becomes the commit subject / PR title as "<subject>
+  (#N)"; do not add the "(#N)" yourself, the engine appends it. If you only
+  wrote a spec, say so honestly (e.g. "Add a spec for ..."); if the real
+  change diverged from the issue's ask, describe what landed. Match the
+  repository's existing language convention. Omit this field to fall back
+  to the issue title (previous behavior).
 - `pr_body` (on success): a Markdown pull-request description of what you
   actually changed. If the prompt includes a PR template, fill in each of its
   sections; escape newlines as \n inside the JSON string.
@@ -162,6 +176,7 @@ mod tests {
         assert!(content.contains(r#""turn_id": "abc-123""#));
         assert!(content.contains("needs_human"));
         assert!(content.contains("pr_body"));
+        assert!(content.contains("subject"));
         assert!(content.contains("agent_session_id"));
     }
 
@@ -249,6 +264,28 @@ mod tests {
         assert_eq!(
             read_result(dir.path(), "t1").unwrap().pr_body.as_deref(),
             Some("## Summary\nDid it.")
+        );
+    }
+
+    #[test]
+    fn result_subject_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_result(dir.path(), "t1").unwrap().subject, None);
+
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done","subject":"Cache API responses"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1").unwrap().subject.as_deref(),
+            Some("Cache API responses")
         );
     }
 

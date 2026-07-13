@@ -146,24 +146,27 @@ async fn real_claude_implements_issue_in_tmux() {
     config.limits.result_grace_secs = 20;
     config.mux.session = session.clone();
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: mux.clone(),
-        forge: forge.clone(),
-        config,
-        project: ProjectConfig {
-            id: "sandbox".into(),
-            repo_path: clone.clone(),
-            repo_slug: "local/sandbox".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: Some("python3 -m unittest discover -q".into()),
-            worktree_root: Some(root.path().join("worktrees")),
-            pr: None,
-            clean: None,
-        },
+    let project = ProjectConfig {
+        id: "sandbox".into(),
+        repo_path: clone.clone(),
+        repo_slug: Some("local/sandbox".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: Some("python3 -m unittest discover -q".into()),
+        worktree_root: Some(root.path().join("worktrees")),
+        pr: None,
+        clean: None,
+        worktree_setup: Default::default(),
     };
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
+        forge.clone(),
+        config,
+        project,
+    );
 
     let run = deps
         .store

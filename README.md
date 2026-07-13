@@ -45,15 +45,32 @@ meguri never parses the agent's screen to decide success. Each turn writes a pro
 
 Stale turn ids are ignored; results claiming success are **independently verified** (clean tree, commits ahead of the base branch, project check command passes) before meguri moves on. Verification failures come back to the agent as corrective turns.
 
+## Security
+
+meguri's core trade-off is unattended execution, and that's worth understanding before you point it at a repo.
+
+- **The agent gets real shell access.** The default `[agent].args` includes `--dangerously-skip-permissions`, so once a loop picks up an issue, the agent runs arbitrary commands in its worktree — git, cargo, network calls, anything the CLI allows — with no per-command confirmation. That's what makes an unattended loop possible; it also means you should only run meguri somewhere you're fine with an agent having that level of access (a disposable VM or container, or a machine/account whose blast radius you accept). If you'd rather gate every command, set `args = ["--permission-mode", "acceptEdits"]` (see [Configuration](#configuration)) and answer dialogs by attaching to the pane.
+- **Issue bodies are prompt input.** The full issue body (and comments a loop reads) is injected into the agent's prompt verbatim, so on a repo where anyone can open issues, a malicious one is a prompt-injection attempt against an agent with shell access. The mitigation is the [label gate](#labels): a loop only acts on an issue that already carries a `meguri:*` phase label (`meguri:plan` / `meguri:ready`), and applying labels needs collaborator (write) access — so "who can get an agent to execute" reduces to "who has write access to this repo," not "who can open an issue." Weigh that when granting collaborator access, and don't label untrusted issues `meguri:ready` yourself.
+- **Completion is verified independently, not screen-scraped.** As described in [The completion contract](#the-completion-contract) above, meguri never takes the agent's own "success" claim at face value — it re-checks git state, commits ahead of base, and the project's `check_command` before treating a run as done. This bounds (but doesn't eliminate) the damage a compromised or misled agent can do: it can still act inside the worktree during a run, but it can't talk meguri into merging bad state just by writing "success" to the result file.
+
+Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
+
 ## Install & set up
 
-Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback).
+Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`claude` by default), and a multiplexer — a running [herdr](https://herdr.dev) (recommended; native agent-state detection) or `tmux` (screen-heuristic fallback). These runtime prerequisites are the same however you install meguri — a prebuilt binary still needs `git`/`gh`/a multiplexer on the host.
+
+Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
 
 ```bash
 cargo install --path .   # or: cargo build --release
 meguri init              # writes ~/.meguri/config.toml, creates the db
 meguri doctor            # checks gh auth, mux, agent CLI
 ```
+
+Other ways to get the binary:
+
+- **Prebuilt binary** — download the archive for your platform (macOS arm64 / Linux x86_64) from the [latest GitHub Release](https://github.com/kkato1030/meguri/releases/latest), verify its `.sha256`, extract, and put `meguri` on your `PATH`.
+- **crates.io** — `cargo install meguri` (once the crate is published; see [Status / roadmap](#status--roadmap)).
 
 `meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
 
@@ -89,6 +106,34 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
+
+### Local mode (no GitHub, no labels)
+
+For repos whose labels you can't (or won't) touch, run a project **entirely locally**: the task queue, claim, escalation, and completion live in meguri's sqlite instead of GitHub labels, and the deliverable is a verified local branch instead of a PR. Set `mode = "local"` — `repo_slug` becomes optional and `meguri doctor` stops requiring `gh`:
+
+```toml
+[[projects]]
+id = "work"
+repo_path = "/abs/path/to/repo"
+mode = "local"          # "github" (default) | "local"
+default_branch = "main"
+check_command = "cargo test"
+# deliver = "branch"    # local default: verified commits on a local branch (no push, no PR)
+```
+
+Queue and track work with the local task commands instead of labels:
+
+```bash
+meguri add "Add a --json flag to the export command"   # queue a task
+meguri add --file task.md                              # first heading → title, rest → body
+meguri add --plan "Design the export format"           # queue for the planner instead of the worker
+meguri tasks                                           # list open tasks (needs_human highlighted)
+meguri watch                                           # picks tasks up within one poll interval
+```
+
+A local run works on a `meguri/t<task-id>-<slug>-<hash>` branch; on success it leaves the verified commits there and flips the task to `done` — nothing is pushed. A failed run marks the task `needs_human` with a reason (shown by `meguri tasks` / `meguri ps`), and the next run re-claims it and clears the flag. Review the branch yourself and merge when happy (`meguri review` / `accept` land in a later phase).
+
+> **Single machine only (through Phase 3).** Local mode's local sqlite is the *single source of truth*, so run exactly one meguri host per repo. Coordinating several hosts against a shared task queue is Phase 4 (a remote-DB `TaskSource` with leases); the vocabulary and contract are fixed in [ADR 0003](docs/adr/0003-tasksource-task-moves-run-pins.md). The `silent` mode (read issues, never write labels), `deliver = "patch"`, and `meguri review`/`accept`/`reject` are later phases too.
 
 ### Keep it running (daemon)
 
@@ -271,6 +316,20 @@ max_rounds = 3    # max self-review rounds per run; past the cap the PR is publi
 
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
 
+### Worktree setup hook (optional)
+
+`[projects.worktree_setup]` runs a project's own commands every time meguri prepares a worktree — not just the first time, but every create/attach/re-point, since `attach_worktree`/`create_review_worktree` can wipe untracked files via `reset --hard` + `clean -fd` on reuse. meguri stays agnostic to what runs here (ADR 0003); apm (see [Agent instructions (apm)](#agent-instructions-apm)) is one example use case, not a built-in integration:
+
+```toml
+[projects.worktree_setup]
+commands = ["apm install --frozen"]        # sh -c, run in order; a failing command stops the rest
+exclude = [".claude/rules", "AGENTS.md"]   # appended to .git/info/exclude, alongside the always-on .meguri/
+required = false                           # true escalates a failing command to a run failure (default: warn + continue)
+timeout_secs = 300                         # per-command; commands may fetch over the network
+```
+
+Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+
 ### Role-based agent routing (optional)
 
 By default every role — planner, spec-reviewer, impl-reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
@@ -315,9 +374,34 @@ MEGURI_TEST_HERDR=1 cargo test      # + herdr integration (needs live herdr)
 
 The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtures/fake_agent.sh`) against real tmux, real git worktrees, and a local bare origin — including blocked-dialog handling, lying-agent correction, validation feedback, and crash recovery.
 
+For the designer-facing map of how the loops fit together — the full pipeline, dispatch priority, per-loop lifecycle, and an ADR index — see [docs/architecture/loops.md](docs/architecture/loops.md). This README stays the user-facing "how to use it" side; that doc is the "why it's structured this way" side.
+
+### Agent instructions (apm)
+
+meguri's own repo-specific instructions for AI coding agents (Claude Code / Codex) are sourced from [microsoft/apm](https://github.com/microsoft/apm) (`apm.yml`, `apm.lock.yaml`, `.apm/instructions/`) rather than hand-written `CLAUDE.md` / `AGENTS.md` files. The compiled artifacts (`CLAUDE.md`, `AGENTS.md`, `.claude/rules/`, `.codex/`, `apm_modules/`, `.agents/`) are gitignored — a one-line instructions edit shouldn't produce a regeneration diff on every parallel worktree/PR (see [ADR 0008](docs/adr/0008-agent-instructions-via-apm.md)). To build them locally:
+
+```bash
+brew install microsoft/apm/apm   # or: curl -sSL https://aka.ms/apm-unix | sh
+apm install                      # deploys .apm/instructions/ -> .claude/rules/
+apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Codex
+```
+
+Order matters: `apm compile` skips `CLAUDE.md` only because the preceding `apm install` already populated `.claude/rules/` (Claude Code reads that directly, so `apm` dedupes `CLAUDE.md` out). Compile first, or compile against an empty tree (e.g. `--root <scratch-dir>` for isolated verification), and it generates `CLAUDE.md`/`src/CLAUDE.md` too, since there's nothing to dedupe against yet. `apm install --dry-run` doesn't preview this step either — dry-run only reports on `apm`/`mcp` package dependencies (this repo has none), not the local `.apm/instructions/` integration; a real (non-dry-run) `apm install` is what actually deploys `.claude/rules/`.
+
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation; wiring it up for meguri's own loops is tracked separately (#139).
+
 ## Status / roadmap
 
 Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
+
+**Versioning.** meguri is pre-1.0 (`0.x`) and follows [SemVer](https://semver.org): while on `0.x` the public API and CLI are not yet stable, so a minor bump (`0.y`) may carry breaking changes and patches (`0.y.z`) stay compatible; `1.0.0` is when stability is promised. Pin an exact version if you depend on current behavior.
+
+**Releases.** Releases are tag-driven (ADR 0007): a maintainer bumps the version, refreshes `CHANGELOG.md`, and pushes a `vX.Y.Z` tag; `.github/workflows/release.yml` then builds the macOS arm64 / Linux x86_64 binaries, attaches them to a GitHub Release with git-cliff-generated notes, and (once the crate is set up) publishes to crates.io via OIDC Trusted Publishing. Because a pushed tag *is* the release trigger, tag deliberately — a mistaken tag ships a release.
+
+## Contributing
+
+Bug reports and PRs from humans are welcome — normal fork & PR flow, no
+`meguri:*` labels to worry about. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

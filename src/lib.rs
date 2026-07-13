@@ -11,6 +11,7 @@ pub mod mux;
 pub mod notify;
 pub mod routing;
 pub mod store;
+pub mod tasks;
 pub mod turn;
 
 pub use config::Config;

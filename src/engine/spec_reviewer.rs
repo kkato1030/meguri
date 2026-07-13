@@ -27,6 +27,7 @@ use super::{Deps, Target, canonical_issue, canonical_key};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
 use crate::store::{ROLE_REVIEW, RunRecord, RunStatus};
+use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for spec-reviewer runs. Renamed from `reviewer`
@@ -107,8 +108,11 @@ impl super::Loop for SpecReviewerLoop {
     /// not block re-reviewing the next push — the head-sha marker is the
     /// dedup.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
         let prs = deps
-            .forge
+            .forge()
             .list_prs_with_label(forge::LABEL_SPEC_REVIEWING)
             .await?;
         let mut targets = Vec::new();
@@ -116,7 +120,7 @@ impl super::Loop for SpecReviewerLoop {
             if pr.has_label(forge::LABEL_HOLD) || pr.has_label(forge::LABEL_WORKING) {
                 continue;
             }
-            let comments = deps.forge.pr_comments(pr.number).await?;
+            let comments = deps.forge().pr_comments(pr.number).await?;
             if head_already_reviewed(&comments, &pr.head_sha) {
                 continue;
             }
@@ -130,7 +134,7 @@ impl super::Loop for SpecReviewerLoop {
                 )?;
             }
             targets.push(Target {
-                issue_number: canonical_key(&pr),
+                key: TaskKey::Issue(canonical_key(&pr)),
                 title: pr.title,
             });
         }
@@ -308,7 +312,7 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
     if let Some(pr) = claimed_pr(deps, &run.id) {
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -320,10 +324,13 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 
 /// Failure escalation on the PR (mirrors the worker's issue escalation).
 async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
-    let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
     let _ = deps
-        .forge
+        .forge()
+        .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+        .await;
+    let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+    let _ = deps
+        .forge()
         .comment_pr(
             pr,
             &format!(
@@ -347,7 +354,7 @@ enum Prepared {
 /// ambiguous key are benign races — skip, don't escalate.
 async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
     let mut matches: Vec<PullRequest> = deps
-        .forge
+        .forge()
         .list_prs_with_label(forge::LABEL_SPEC_REVIEWING)
         .await?
         .into_iter()
@@ -384,14 +391,14 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
             forge::LABEL_WORKING
         )));
     }
-    let comments = deps.forge.pr_comments(pr.number).await?;
+    let comments = deps.forge().pr_comments(pr.number).await?;
     if head_already_reviewed(&comments, &pr.head_sha) {
         return Ok(Prepared::Skip(format!(
             "PR #{} head {} already carries a review",
             pr.number, pr.head_sha
         )));
     }
-    deps.forge
+    deps.forge()
         .add_pr_label(pr.number, forge::LABEL_WORKING)
         .await?;
     deps.store.emit(
@@ -415,8 +422,14 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -
         .unwrap_or_else(crate::config::worktrees_root);
     let dir = format!("review-{}", run.issue_number);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
-    gitops::create_review_worktree(&deps.project.repo_path, &wt, &cp.head_branch, &cp.head_sha)
-        .await?;
+    gitops::create_review_worktree(
+        &deps.project.repo_path,
+        &wt,
+        &cp.head_branch,
+        &cp.head_sha,
+        &deps.project.worktree_setup.exclude,
+    )
+    .await?;
     deps.store
         .update_run_worktree(&run.id, &cp.head_branch, &wt.to_string_lossy())?;
     deps.store.emit(
@@ -425,7 +438,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -
         json!({ "branch": cp.head_branch, "head": cp.head_sha,
                 "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    flow::run_worktree_setup(deps, run, &wt).await
 }
 
 fn execute_prompt(cp: &ReviewCheckpoint, language: Option<&str>) -> String {
@@ -496,7 +509,7 @@ async fn execute(
 ) -> Result<flow::StepFlow> {
     let pr = cp.pr_number.context("checkpoint has no PR number")?;
     // Drop the diff where the prompt says it is (idempotent on resume).
-    let diff = deps.forge.pr_diff(pr).await?;
+    let diff = deps.forge().pr_diff(pr).await?;
     std::fs::create_dir_all(worktree.join(crate::turn::prompts::MEGURI_DIR))?;
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
 
@@ -615,9 +628,9 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
     let pr = cp.pr_number.context("checkpoint has no PR number")?;
     let verdict = cp.verdict.context("checkpoint has no review verdict")?;
 
-    let comments = deps.forge.pr_comments(pr).await?;
+    let comments = deps.forge().pr_comments(pr).await?;
     if !head_already_reviewed(&comments, &cp.head_sha) {
-        deps.forge
+        deps.forge()
             .comment_pr(pr, &review_comment(cp, verdict))
             .await?;
         deps.store.emit(
@@ -628,15 +641,17 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
     }
 
     if verdict == ReviewVerdict::Clean {
-        deps.forge.add_pr_label(pr, forge::LABEL_SPEC_READY).await?;
-        deps.forge
+        deps.forge()
+            .add_pr_label(pr, forge::LABEL_SPEC_READY)
+            .await?;
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
             .await
             .ok();
     }
     // Findings: keep `meguri:spec-reviewing` — the next push moves the head
     // past the marker and discovery re-reviews it.
-    deps.forge
+    deps.forge()
         .remove_pr_label(pr, forge::LABEL_WORKING)
         .await
         .ok();
@@ -737,5 +752,96 @@ mod tests {
         );
         assert!(clean.contains(&review_marker("abc")));
         assert!(clean.contains(forge::LABEL_SPEC_READY));
+    }
+
+    /// `prepare_worktree` re-points the same detached checkout onto each new
+    /// review round's head via `reset --hard` + `clean -fd` (see
+    /// `gitops::create_review_worktree`), which wipes untracked files. The
+    /// `worktree_setup` hook must run again on that re-point — not just the
+    /// first time the checkout is created — since its output is exactly the
+    /// kind of untracked artifact `clean -fd` removes (issue #138).
+    #[tokio::test]
+    async fn worktree_setup_reruns_when_the_review_worktree_is_repointed() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["checkout", "-b", "pr-branch"],
+            vec!["commit", "--allow-empty", "-m", "round1"],
+        ] {
+            gitops::run_git(repo.path(), &args).await.unwrap();
+        }
+
+        let worktree_root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", KIND, 5, "Spec: caching (#5)")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            5,
+            "Spec: caching (#5)",
+            "body",
+            &[],
+        ));
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: repo.path().to_path_buf(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(worktree_root.path().to_path_buf()),
+            pr: None,
+            clean: None,
+            worktree_setup: crate::config::WorktreeSetupConfig {
+                commands: vec!["echo ran > marker.txt".into()],
+                ..Default::default()
+            },
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge,
+            crate::config::Config::default(),
+            project,
+        );
+
+        let head1 = gitops::run_git(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let mut cp = ReviewCheckpoint {
+            head_branch: "pr-branch".into(),
+            head_sha: head1,
+            ..Default::default()
+        };
+        prepare_worktree(&deps, &run, &cp).await.unwrap();
+        let wt = PathBuf::from(
+            deps.store
+                .get_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .worktree_path
+                .unwrap(),
+        );
+        assert!(wt.join("marker.txt").exists());
+
+        // A second review round: a new commit lands on the PR branch, the
+        // checkout re-points onto it (reset --hard + clean -fd wipes
+        // marker.txt), and the hook must regenerate it.
+        gitops::run_git(repo.path(), &["commit", "--allow-empty", "-m", "round2"])
+            .await
+            .unwrap();
+        cp.head_sha = gitops::run_git(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        prepare_worktree(&deps, &run, &cp).await.unwrap();
+        assert!(
+            wt.join("marker.txt").exists(),
+            "worktree_setup must rerun after the review worktree re-points"
+        );
     }
 }

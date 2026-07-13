@@ -74,24 +74,26 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: mux.clone(),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -683,6 +685,60 @@ async fn worker_needs_plan_with_existing_spec_escalates_to_human() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"), "{}", comments[0]);
     assert!(comments[0].contains("docs/specs/issue-7.md"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_needs_plan_a_second_time_escalates_to_human() {
+    let env = setup(None).await;
+
+    // A first worker run already retreated to planning on this issue, but no
+    // spec ever landed on disk (issue #135's other vibration-guard leg).
+    let first_run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+    env.deps
+        .store
+        .update_run_status(&first_run.id, RunStatus::NeedsPlan, None)
+        .unwrap();
+
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_result(wt, turn_id, "needs_plan");
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+    agent.abort();
+
+    // The one-shot rule: a second needs-plan on the same issue is not a plan
+    // handoff, even without a spec file present.
+    assert!(
+        result.is_err(),
+        "a second needs-plan on the same issue must fail"
+    );
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_PLAN.to_string()));
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+
+    let comments = env.forge.comments_of(7);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("needs a human"), "{}", comments[0]);
+    assert!(comments[0].contains("already retreated"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
