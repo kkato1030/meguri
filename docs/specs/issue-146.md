@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
   project_id    TEXT NOT NULL,
   name          TEXT NOT NULL,          -- schedule 名(project 内で一意)
   first_seen_at TEXT NOT NULL,          -- 初観測時刻。backfill 防止の窓の下端
-  last_fired_at TEXT,                   -- 最終発火。NULL=未発火
+  last_fired_at TEXT,                   -- 直近に消費した窓の上端(起票 or 重複 skip)。NULL=未消費
   last_key      INTEGER,                -- 直近作成した issue 番号(github)/ task id(local)
   PRIMARY KEY (project_id, name)
 );
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
 1. その schedule の行が無ければ **今回は発火せず** `first_seen_at = now` で seed する。これで新規追加スケジュール(初回起動時 / hot reload での追加)が過去分を一気に起票する事故を防ぐ。
 2. 窓の下端 = `max(last_fired_at, first_seen_at)`。cron 式がこの下端 `now` の間に1回以上ヒットすれば発火する。
 3. **停止をまたいだ未発火分は catch-up せず1回に折りたたむ**(cron デーモンの一般則)。窓内に cron 発火時刻が何個あろうと起票は1件。発火したら `last_fired_at = now` に更新する。
+4. **重複ガードによる skip も窓を消費する**: 窓内に cron ヒットがあったが open 重複でスキップした場合も、起票と同じく `last_fired_at = now` に更新する(`last_key` は据え置き)。つまり `last_fired_at` の意味は正確には「直近に消費した窓の上端(起票 or skip)」。skip 時に窓を進めないと、重複が close された瞬間に過去の発火分が窓に残っていて即起票される — これは「その回は skip した」ではなく backfill であり、折りたたみ方針(3)と矛盾する。skip した回は消え、次の起票は次の cron ヒットを待つ。
 
 ## cron 評価(要レビュー判断)
 
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
 
 ## 重複ガード(要レビュー判断)
 
-同じ schedule 起源の open issue/task が残っていたら既定でスキップ。`allow_overlap = true` で無効化。
+同じ schedule 起源の open issue/task が残っていたら既定でスキップ。`allow_overlap = true` で無効化。**skip はその回の cron occurrence を消費する**(発火判定の (4) — `last_fired_at = now` に進める): 例えば日次 09:00 の schedule が open 重複で skip されたら、その日の分は消え、前回 issue が 15:00 に close されても即起票はされない。次の起票は翌日 09:00 以降の tick。
 
 - **識別子**: 作成物には人間可読の provenance として hidden マーカー `<!-- meguri:schedule name=<name> -->` を本文に埋める(cleaner の head-sha マーカーと同じ流儀)。local task は加えて `origin = schedule:<name>` を持つ。
 - **openness 判定(推奨)**: 重複判定そのものは `schedule_state.last_key` を引き、その issue/task が open かを直接見る — github は `forge.issue_state(last_key)`、local は task の status。GitHub 全文検索を新設せず、決定的で安い。直近発火物の openness だけを見る(直列に発火するので通常これで十分)。
@@ -106,7 +107,7 @@ body_file = "ops/daily-tidy.md" # repo 相対。または body(排他):
 2. 作成物は既存の discovery にそのまま拾われる(FakeForge / local store 上で実証)— github mode は `kind` に応じて worker / planner、local mode は worker。
 3. 最終発火時刻が sqlite(`schedule_state`)に永続化される。プロセスを止めて cron 発火時刻を複数またいで再開しても、起票は **1件に折りたたまれる**(catch-up しない)。
 4. 新規追加スケジュール(初回観測)は過去分を backfill せず、次回発火から起票する。
-5. 重複ガード: 同一 schedule 起源の open issue/task が残っていれば既定でスキップ。`allow_overlap = true` で毎回起票する。
+5. 重複ガード: 同一 schedule 起源の open issue/task が残っていれば既定でスキップ。skip はその回の occurrence を消費する — skip 後に重複が close されても、次の cron ヒットまで起票されない(backfill しない)。`allow_overlap = true` で毎回起票する。
 6. hot reload(#73)でスケジュール定義を足すと、watch 再起動なしに次 tick 以降で有効になる(最終発火は sqlite にあるため定義側の変更で失われない)。
 7. `meguri doctor` が不正な cron 式・存在しない `body_file`・重複 `name`・`body`/`body_file` の同時指定・local mode での `kind = "plan"` を報告する。不正 cron / 本文欠落 / local + plan は `watch` 起動時にも `Config::validate()` で弾かれる。
 8. `meguri schedules` が定義・最終発火・次回発火を表示する。
@@ -115,7 +116,7 @@ body_file = "ops/daily-tidy.md" # repo 相対。または body(排他):
 
 ## テスト計画
 
-`tests/schedule_test.rs` を新設。cron 評価は `src/cron.rs` の純粋関数を単体で網羅(`*` / 範囲 / ステップ / リスト / 曜日、窓内ヒット判定、next-fire)。sweep はメモリ store + FakeForge に固定 `now` を渡して駆動し、受け入れ基準 1〜6 を検証する — 特に (3) 折りたたみ(下端と `now` の間に複数発火時刻を置いて起票1件を確認)、(4) backfill 抑止(first_seen 直後に過去 cron 時刻があっても発火しない)、(5) 重複ガード(`last_key` が open の間はスキップ、close 後に再発火)、(6) hot reload での定義追加。config 検証は `mode = "local"` + `kind = "plan"` の組み合わせが `Config::validate()` で拒否されることを既存の validate テスト群に足す。migration は既存の冪等性テスト(`store/mod.rs`)に `schedule_state` を通す。
+`tests/schedule_test.rs` を新設。cron 評価は `src/cron.rs` の純粋関数を単体で網羅(`*` / 範囲 / ステップ / リスト / 曜日、窓内ヒット判定、next-fire)。sweep はメモリ store + FakeForge に固定 `now` を渡して駆動し、受け入れ基準 1〜6 を検証する — 特に (3) 折りたたみ(下端と `now` の間に複数発火時刻を置いて起票1件を確認)、(4) backfill 抑止(first_seen 直後に過去 cron 時刻があっても発火しない)、(5) 重複ガード(`last_key` が open の間はスキップ、close 後は**次の cron ヒットで**再発火 — skip 直後に close しただけでは起票されないこと、つまり skip が occurrence を消費して `last_fired_at` が進んでいることを確認)、(6) hot reload での定義追加。config 検証は `mode = "local"` + `kind = "plan"` の組み合わせが `Config::validate()` で拒否されることを既存の validate テスト群に足す。migration は既存の冪等性テスト(`store/mod.rs`)に `schedule_state` を通す。
 
 ## スコープ外(将来)
 
