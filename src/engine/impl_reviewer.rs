@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::Deps;
-use super::flow::{self, Checkpoint, NeedsHuman};
+use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
 use crate::gitops;
 use crate::store::RunRecord;
 use crate::turn::prompts::MEGURI_DIR;
@@ -54,6 +54,18 @@ pub struct Finding {
     pub path: String,
     pub line: u64,
     pub body: String,
+    /// Which review lens surfaced it (ADR 0008), if the reviewer tagged one.
+    #[serde(default)]
+    pub lens: Option<String>,
+}
+
+/// One self-review round's outcome, for the PR-body `<details>` (ADR 0008):
+/// the round number and how many findings it raised. Verdict is implicit —
+/// zero findings means clean.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundRecord {
+    pub round: u32,
+    pub findings: usize,
 }
 
 /// What the review turn writes to [`REVIEW_FILE`].
@@ -74,8 +86,12 @@ pub(crate) async fn self_review(
     run: &RunRecord,
     cp: &mut Checkpoint,
     worktree: &Path,
+    flavor: &dyn Flavor,
 ) -> Result<flow::StepFlow> {
-    let max_rounds = deps.config.review.max_rounds;
+    let review_cfg = deps.config.review_for(&deps.project);
+    let max_rounds = review_cfg.max_rounds;
+    let lenses = review_cfg.lenses.clone();
+    let kind = flavor.kind();
     let base = deps.project.default_branch.clone();
     let language = deps.config.language_for(&deps.project);
 
@@ -86,14 +102,18 @@ pub(crate) async fn self_review(
             return mark_unconverged(deps, run, cp);
         }
 
-        // ---- review turn (in the impl-review lane) ----
-        let review = match review_turn(deps, run, cp, worktree, &base, language).await? {
+        // ---- review turn (in the self-review lane) ----
+        let review = match review_turn(deps, run, cp, worktree, &base, kind, &lenses).await? {
             ReviewTurn::Reviewed(review) => review,
             ReviewTurn::Stopped => return Ok(flow::StepFlow::Stopped),
             ReviewTurn::Interrupted(r) => return Ok(flow::StepFlow::Interrupted(r)),
         };
         cp.self_review_rounds += 1;
         cp.self_review_pending = review.findings.clone();
+        cp.self_review_log.push(RoundRecord {
+            round: cp.self_review_rounds,
+            findings: review.findings.len(),
+        });
         persist(deps, run, cp)?;
         deps.store.emit(
             Some(&run.id),
@@ -171,7 +191,8 @@ async fn review_turn(
     cp: &Checkpoint,
     worktree: &Path,
     base: &str,
-    language: Option<&str>,
+    kind: Kind,
+    lenses: &[String],
 ) -> Result<ReviewTurn> {
     // Drop the local diff where the prompt says it is, and clear any stale
     // review file so we read *this* turn's verdict.
@@ -180,8 +201,9 @@ async fn review_turn(
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
     let _ = std::fs::remove_file(worktree.join(REVIEW_FILE));
 
+    let language = deps.config.language_for(&deps.project);
     let head_before = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
-    let mut prompt = review_prompt(run, cp, language);
+    let mut prompt = review_prompt(run, cp, kind, lenses, language);
     let mut corrective_turns = 0u32;
 
     loop {
@@ -330,27 +352,62 @@ async fn fix_turn(
     }
 }
 
-fn review_prompt(run: &RunRecord, cp: &Checkpoint, language: Option<&str>) -> String {
+/// The multi-lens review instruction (ADR 0008): one review turn considers
+/// every configured perspective. For a spec/ADR (Plan) the code lenses are
+/// re-read as document lenses; for code (Impl) they are taken literally.
+fn lens_instruction(kind: Kind, lenses: &[String]) -> String {
+    if lenses.is_empty() {
+        return String::new();
+    }
+    let list = lenses
+        .iter()
+        .map(|l| format!("`{l}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match kind {
+        Kind::Plan => format!(
+            "- Review through each of these lenses, adapted to a design document: {list} \
+             (e.g. `correctness` = are the decisions sound and internally consistent; \
+             `tests` = is the plan verifiable / are acceptance criteria present; \
+             `simplicity` = is the scope minimal; `security` = are risks acknowledged).\n"
+        ),
+        Kind::Impl => format!("- Review through each of these lenses: {list}.\n"),
+    }
+}
+
+fn review_prompt(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    kind: Kind,
+    lenses: &[String],
+    language: Option<&str>,
+) -> String {
     let round = cp.self_review_rounds + 1;
+    let subject = match kind {
+        Kind::Plan => "spec/ADR",
+        Kind::Impl => "implementation",
+    };
     format!(
-        "You are self-reviewing your own implementation of issue #{number} before it is \
+        "You are self-reviewing your own {subject} of issue #{number} before it is \
          published as a pull request (self-review round {round}). The worktree holds the \
          committed work; `{diff}` is its full diff against the base branch.\n\n\
          # Issue: {title}\n\n\
          # Instructions\n\
-         - Read the diff at `{diff}`; browse the checked-out code for context as needed.\n\
-         - Review the implementation for correctness, completeness (tests included), and fit \
-           with the repository's conventions.\n\
+         - Read the diff at `{diff}`; browse the checked-out files for context as needed.\n\
+         {lens_section}\
+         - Review the {subject} for correctness, completeness (tests included where the \
+           change is code), and fit with the repository's conventions.\n\
          - Do NOT modify, commit, or push anything; the review file below is your only \
            deliverable.\n\
          - Write your review to `{review}` as JSON:\n\
            `{{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown summary>\", \
-           \"findings\": [{{\"path\": \"src/x.rs\", \"line\": 42, \"body\": \"<what must change>\"}}]}}`\n\
+           \"findings\": [{{\"path\": \"src/x.rs\", \"line\": 42, \"lens\": \"correctness\", \
+           \"body\": \"<what must change>\"}}]}}`\n\
            - \"clean\": nothing must change before this can be published (pure nitpicks do not \
              block; mention them in `review` and leave `findings` empty).\n\
            - \"findings\": something must change. Each entry must anchor to a line that appears \
-             on the NEW side of the diff; put cross-cutting remarks that fit no single line in \
-             `review` only.\n\
+             on the NEW side of the diff and may name the `lens` it came from; put cross-cutting \
+             remarks that fit no single line in `review` only.\n\
          - A completed review is a success regardless of verdict; report \"failure\"/\"needs_human\" \
            only when you cannot review at all.\
          {lang_section}",
@@ -359,6 +416,7 @@ fn review_prompt(run: &RunRecord, cp: &Checkpoint, language: Option<&str>) -> St
         title = cp.issue_title,
         diff = DIFF_FILE,
         review = REVIEW_FILE,
+        lens_section = lens_instruction(kind, lenses),
         lang_section = flow::language_instruction(language),
     )
     // The completion contract is appended by prepare_turn.
@@ -512,14 +570,38 @@ mod tests {
     #[test]
     fn review_prompt_demands_anchored_findings_not_changes() {
         let run = fake_run();
-        let prompt = review_prompt(&run, &cp_with_title(), None);
+        let lenses = super::super::flow::Kind::Impl;
+        let prompt = review_prompt(
+            &run,
+            &cp_with_title(),
+            lenses,
+            &["correctness".to_string(), "security".to_string()],
+            None,
+        );
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains(DIFF_FILE));
         assert!(prompt.contains(REVIEW_FILE));
         assert!(prompt.contains("Do NOT modify"));
         assert!(prompt.contains("NEW side of the diff"));
         assert!(prompt.contains("self-review round 1"));
+        // The configured lenses are named in the review instruction (ADR 0008).
+        assert!(prompt.contains("`correctness`"));
+        assert!(prompt.contains("`security`"));
         assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn plan_review_prompt_reframes_lenses_for_a_document() {
+        let run = fake_run();
+        let prompt = review_prompt(
+            &run,
+            &cp_with_title(),
+            super::super::flow::Kind::Plan,
+            &["tests".to_string()],
+            None,
+        );
+        assert!(prompt.contains("spec/ADR"));
+        assert!(prompt.contains("design document"));
     }
 
     #[test]
@@ -528,6 +610,7 @@ mod tests {
             path: "src/a.rs".into(),
             line: 7,
             body: "handle the None case".into(),
+            lens: Some("correctness".into()),
         }];
         let prompt = fix_prompt(&findings, Some("日本語"));
         assert!(prompt.contains("`src/a.rs:7`"));

@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 pub use super::WorkerOutcome;
-use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
+use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
 use super::{Deps, Target};
 use crate::forge::{self, Forge};
 use crate::store::RunRecord;
@@ -120,6 +120,26 @@ struct PlannerFlavor;
 impl Flavor for PlannerFlavor {
     fn trigger_label(&self) -> &'static str {
         forge::LABEL_PLAN
+    }
+
+    /// The plan side of the symmetric loop (ADR 0008).
+    fn kind(&self) -> Kind {
+        Kind::Plan
+    }
+
+    /// The planner self-reviews its own spec/ADR before opening the spec PR
+    /// (ADR 0008): the internal multi-lens review→fix loop runs in the run's
+    /// worktree with no forge calls, symmetric with the worker.
+    fn self_reviews(&self) -> bool {
+        true
+    }
+
+    /// The spec PR closes its issue only under combined delivery (where it
+    /// morphs into the implementation PR). Under separate delivery it is a
+    /// standalone PR that merges on its own, so it uses a non-closing `Refs #N`
+    /// and the handoff sweep advances the issue instead (ADR 0008 §6).
+    fn pr_closes_issue(&self, deps: &Deps) -> bool {
+        deps.project.plan_delivery == crate::config::PlanDelivery::Combined
     }
 
     fn execute_prompt(
@@ -208,9 +228,18 @@ impl Flavor for PlannerFlavor {
     /// either fails the run; the `plan` / `working` removals stay best-effort.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         if let Some(pr) = cp.pr_number {
-            deps.forge()
-                .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
-                .await?;
+            // The plan guard is the reviewer gate: with it on, the spec PR
+            // enters `spec-reviewing` (the guard flips it to `spec-ready` when
+            // clean); with it off, no one would flip it, so the PR opens
+            // straight at `spec-ready` — the internal self-review is the only
+            // gate — and the state machine never deadlocks (ADR 0008 §3).
+            let guard_on = deps.config.review_for(&deps.project).guard.plan;
+            let pr_label = if guard_on {
+                forge::LABEL_SPEC_REVIEWING
+            } else {
+                forge::LABEL_SPEC_READY
+            };
+            deps.forge().add_pr_label(pr, pr_label).await?;
         }
         deps.forge()
             .add_label(run.issue_number, forge::LABEL_SPECCING)
@@ -867,6 +896,8 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: Default::default(),
         };
         Deps::with_label_source(

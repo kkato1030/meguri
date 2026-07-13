@@ -205,6 +205,39 @@ pub enum CheckState {
     Pending,
 }
 
+/// The subset of GitHub's commit-status states meguri writes for its inspection
+/// history (`meguri/self-review`, `meguri/guard-review`, ADR 0008). Advisory by
+/// default: a `Failure` status is a red check that does not block a human merge
+/// (GitHub reports the PR `UNSTABLE`) unless the user makes the context a
+/// required check; the auto-merger reads it as its arm gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStatusState {
+    Success,
+    Failure,
+    Pending,
+}
+
+impl CommitStatusState {
+    /// The GitHub `state` string for the statuses API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Pending => "pending",
+        }
+    }
+
+    /// Parse GitHub's lowercase status state; `error` folds into `Failure`.
+    pub fn from_gh(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "success" => Some(Self::Success),
+            "failure" | "error" => Some(Self::Failure),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+}
+
 /// One CI check on the PR's head commit (a GitHub Actions check run or a
 /// classic commit status).
 #[derive(Debug, Clone)]
@@ -468,6 +501,29 @@ pub trait Forge: Send + Sync {
     async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
+
+    /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
+    /// — meguri's inspection history for a review (ADR 0008). `context` is the
+    /// status name (`meguri/self-review` / `meguri/guard-review`), `description`
+    /// the one-line verdict. Idempotent from the caller's view: re-posting the
+    /// same context replaces the visible status.
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        description: &str,
+    ) -> Result<()>;
+
+    /// The latest state of `context` on `head_sha`, or `None` if meguri never
+    /// wrote that context on that commit — the auto-merger's guard gate reads
+    /// it (ADR 0008 §5). `None` means "not decided yet": the caller waits
+    /// rather than escalating.
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>>;
     /// The repository's merge configuration for `base_branch` (ADR 0003
     /// fail-fast + arm gate). When `require_branch_protection` is false the
     /// branch-protection probe is skipped and `protected_with_required_checks`

@@ -7,9 +7,11 @@ use std::sync::Arc;
 use meguri::config::{AutoMergeOptIn, Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::auto_merger::{armed_marker, sweep};
+use meguri::engine::guard::GUARD_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_SPEC_REVIEWING, MergePolicy, MergeStrategy,
+    CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_REVIEWING,
+    MergePolicy, MergeStrategy,
 };
 
 /// A Deps over the given forge with auto-merge enabled (label opt-in, squash).
@@ -28,6 +30,8 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         worktree_root: None,
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
     };
     Deps::with_label_source(
@@ -75,6 +79,82 @@ async fn arms_when_all_conditions_met() {
         "marker comment posted: {comments:?}"
     );
     assert!(comments.iter().any(|c| c.contains("arm しました")));
+}
+
+/// Deps with the impl guard enabled (so the auto-merger applies the guard gate).
+fn deps_with_guard(forge: Arc<FakeForge>) -> Deps {
+    let mut deps = deps_with(forge);
+    deps.config.review.guard.impl_enabled = true;
+    deps
+}
+
+#[tokio::test]
+async fn guard_gate_arms_on_a_success_status() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(pr),
+        Some((MergeStrategy::Squash, "sha-head".into())),
+        "a green guard status lets the arm proceed"
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(forge.armed_of(pr), None, "a red guard status blocks arming");
+    let labels = forge.pr_labels_of(pr);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
+    assert!(
+        forge
+            .pr_comments_of(pr)
+            .iter()
+            .any(|c| c.contains("guard review"))
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_waits_when_status_absent() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head"); // no guard status posted yet
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(forge.armed_of(pr), None, "no status yet: wait, don't arm");
+    // Waiting is silent — no escalation while the guard has not run.
+    assert!(
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "an absent status must not escalate"
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_is_skipped_when_impl_guard_disabled() {
+    // The default (impl guard off): the auto-merger arms without any status,
+    // never demanding one that nothing produces (no ADR-0007 deadlock).
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    let deps = deps_with(forge.clone()); // impl guard stays off
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(pr),
+        Some((MergeStrategy::Squash, "sha-head".into()))
+    );
 }
 
 #[tokio::test]

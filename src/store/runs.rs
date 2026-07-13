@@ -364,6 +364,30 @@ impl Store {
         })
     }
 
+    /// The branch of the most recent run of `loop_kind` for an issue, if one
+    /// recorded a branch. The separate-mode handoff sweep (ADR 0008) uses it to
+    /// find the planner's spec PR branch and check whether it merged.
+    pub fn branch_for_issue(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let branch = c
+                .query_row(
+                    "SELECT branch FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND branch IS NOT NULL
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![project_id, loop_kind, issue_number],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            Ok(branch)
+        })
+    }
+
     /// Whether the issue has already retreated to planning once before, via
     /// an earlier `needs_plan` run of the given loop — the "same issue twice"
     /// leg of the worker's vibration guard (issue #135). A spec-file check
