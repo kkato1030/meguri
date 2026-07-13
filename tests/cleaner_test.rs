@@ -116,6 +116,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         mode: Default::default(),
         deliver: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
 
     let deps = Deps::with_label_source(

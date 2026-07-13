@@ -83,6 +83,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        worktree_setup: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));

@@ -316,6 +316,20 @@ max_rounds = 3    # max self-review rounds per run; past the cap the PR is publi
 
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
 
+### Worktree setup hook (optional)
+
+`[projects.worktree_setup]` runs a project's own commands every time meguri prepares a worktree — not just the first time, but every create/attach/re-point, since `attach_worktree`/`create_review_worktree` can wipe untracked files via `reset --hard` + `clean -fd` on reuse. meguri stays agnostic to what runs here (ADR 0003); apm (see [Agent instructions (apm)](#agent-instructions-apm)) is one example use case, not a built-in integration:
+
+```toml
+[projects.worktree_setup]
+commands = ["apm install --frozen"]        # sh -c, run in order; a failing command stops the rest
+exclude = [".claude/rules", "AGENTS.md"]   # appended to .git/info/exclude, alongside the always-on .meguri/
+required = false                           # true escalates a failing command to a run failure (default: warn + continue)
+timeout_secs = 300                         # per-command; commands may fetch over the network
+```
+
+Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+
 ### Role-based agent routing (optional)
 
 By default every role — planner, spec-reviewer, impl-reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
@@ -372,7 +386,7 @@ apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Cod
 
 Order matters: `apm compile` skips `CLAUDE.md` only because the preceding `apm install` already populated `.claude/rules/` (Claude Code reads that directly, so `apm` dedupes `CLAUDE.md` out). Compile first, or compile against an empty tree (e.g. `--root <scratch-dir>` for isolated verification), and it generates `CLAUDE.md`/`src/CLAUDE.md` too, since there's nothing to dedupe against yet. `apm install --dry-run` doesn't preview this step either — dry-run only reports on `apm`/`mcp` package dependencies (this repo has none), not the local `.apm/instructions/` integration; a real (non-dry-run) `apm install` is what actually deploys `.claude/rules/`.
 
-Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). A `worktree_setup` hook that runs the build automatically for meguri's own loops is tracked separately (#138).
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation; wiring it up for meguri's own loops is tracked separately (#139).
 
 ## Status / roadmap
 

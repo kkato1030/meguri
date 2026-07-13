@@ -397,6 +397,7 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            worktree_setup: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,
