@@ -204,9 +204,18 @@ impl Flavor for PlannerFlavor {
     /// either fails the run; the `plan` / `working` removals stay best-effort.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         if let Some(pr) = cp.pr_number {
-            deps.forge()
-                .add_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
-                .await?;
+            // The plan guard is the reviewer gate: with it on, the spec PR
+            // enters `spec-reviewing` (the guard flips it to `spec-ready` when
+            // clean); with it off, no one would flip it, so the PR opens
+            // straight at `spec-ready` — the internal self-review is the only
+            // gate — and the state machine never deadlocks (ADR 0008 §3).
+            let guard_on = deps.config.review_for(&deps.project).guard.plan;
+            let pr_label = if guard_on {
+                forge::LABEL_SPEC_REVIEWING
+            } else {
+                forge::LABEL_SPEC_READY
+            };
+            deps.forge().add_pr_label(pr, pr_label).await?;
         }
         deps.forge()
             .add_label(run.issue_number, forge::LABEL_SPECCING)

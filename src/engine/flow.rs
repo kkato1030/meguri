@@ -35,9 +35,11 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 /// Which side of the symmetric plan/impl loop a run is on (ADR 0008). The
 /// self-review turn frames its lenses differently for a spec/ADR document
 /// (Plan) than for a code diff (Impl); the guard reads it too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Plan,
+    #[default]
     Impl,
 }
 
