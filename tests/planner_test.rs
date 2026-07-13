@@ -275,7 +275,10 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
         "branch must follow the worker naming convention: {}",
         prs[0].head
     );
-    assert!(prs[0].body.contains("Closes #5"));
+    // Separate delivery (the default, ADR 0008): the spec PR uses a
+    // non-closing reference so merging it does not close the issue.
+    assert!(prs[0].body.contains("Refs #5"));
+    assert!(!prs[0].body.contains("Closes #5"));
     assert!(prs[0].draft, "pr.draft defaults to true");
     assert!(
         prs[0].labels.contains(&LABEL_SPEC_REVIEWING.to_string()),

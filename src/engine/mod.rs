@@ -5,6 +5,7 @@ pub mod conflict_resolver;
 pub mod fixer;
 pub mod flow;
 pub mod guard;
+pub mod handoff;
 pub mod impl_reviewer;
 pub mod merge_watch;
 pub mod planner;

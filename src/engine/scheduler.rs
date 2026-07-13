@@ -109,6 +109,11 @@ impl Scheduler {
                 if let Err(e) = super::merge_watch::sweep(deps).await {
                     tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
+                // flips its issue speccing → ready so the worker implements it.
+                if let Err(e) = super::handoff::sweep(deps).await {
+                    tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {

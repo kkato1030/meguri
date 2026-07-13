@@ -125,6 +125,14 @@ impl Flavor for PlannerFlavor {
         true
     }
 
+    /// The spec PR closes its issue only under combined delivery (where it
+    /// morphs into the implementation PR). Under separate delivery it is a
+    /// standalone PR that merges on its own, so it uses a non-closing `Refs #N`
+    /// and the handoff sweep advances the issue instead (ADR 0008 §6).
+    fn pr_closes_issue(&self, deps: &Deps) -> bool {
+        deps.project.plan_delivery == crate::config::PlanDelivery::Combined
+    }
+
     fn execute_prompt(
         &self,
         deps: &Deps,

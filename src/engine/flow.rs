@@ -86,6 +86,16 @@ pub trait Flavor: Send + Sync {
         false
     }
 
+    /// Whether this loop's PR should auto-close its issue on merge (`Closes #N`
+    /// vs the non-closing `Refs #N`). Default: yes — an implementation PR
+    /// closes its issue. The planner overrides it in separate delivery: the
+    /// spec/ADR PR merges on its own and must NOT close the issue (the handoff
+    /// then flips it to `ready`, ADR 0008 §6).
+    fn pr_closes_issue(&self, deps: &Deps) -> bool {
+        let _ = deps;
+        true
+    }
+
     /// Claim the run's target and fill the checkpoint. Default: the
     /// coordination layer's atomic claim (label re-verification + working
     /// label in github mode, an atomic DB update in local mode).
@@ -1303,11 +1313,12 @@ async fn open_pr(
     post_self_review_status(deps, run, cp, worktree).await;
 
     let lenses = &deps.config.review_for(&deps.project).lenses;
+    let close = flavor.pr_closes_issue(deps);
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
     } else {
         let title = flavor.pr_title(run, cp);
-        let body = compose_pr_body(run, cp, lenses);
+        let body = compose_pr_body(run, cp, lenses, close);
         // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
         // a draft would waste the required-checks run the arm is waiting on
         // (auto-merge 1/3, #41).
@@ -1344,7 +1355,12 @@ async fn open_pr(
 /// the meguri footer. Shared by new-PR creation and the spec worker's
 /// spec→implementation body transition so the two paths render an identical
 /// shape (issue #98). `lenses` names the perspectives the self-review applied.
-pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint, lenses: &[String]) -> String {
+pub(crate) fn compose_pr_body(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    lenses: &[String],
+    close: bool,
+) -> String {
     let description = cp
         .pr_body
         .as_deref()
@@ -1364,7 +1380,7 @@ pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint, lenses: &[String
     format!(
         "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
-        issue_link(run.issue_number),
+        issue_reference(run.issue_number, close),
         description,
         self_review_note,
         self_review_details(cp, lenses),
@@ -1382,10 +1398,6 @@ pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
     } else {
         format!("Refs #{issue}")
     }
-}
-
-fn issue_link(issue: i64) -> String {
-    issue_reference(issue, true)
 }
 
 /// The folded self-review summary that rides the PR body (ADR 0008): the

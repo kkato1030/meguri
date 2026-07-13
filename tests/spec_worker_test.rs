@@ -121,7 +121,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
-            plan_delivery: Default::default(),
+            // The spec worker (branch-takeover morph) is the combined delivery
+            // (ADR 0008); in separate delivery it is inert.
+            plan_delivery: meguri::config::PlanDelivery::Combined,
             review: None,
     };
 
