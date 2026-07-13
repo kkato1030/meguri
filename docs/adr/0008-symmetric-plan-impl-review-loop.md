@@ -82,6 +82,22 @@ ADR 0006 が inline 実装レビューを内部化した理由(reviewer↔fixer 
 戻る。したがって guard(Impl) は旧 `impl_reviewer`(inline + fixer 連結)とは**別物**であり、
 ADR 0006 の「AI 実装レビューは内部ループ」を破らない — guard はサマリのみの任意の上乗せである。
 
+**ただし guard(Plan) は status/`<details>` に加えてラベル遷移を settle する(状態機械の駆動)。**
+現行 `spec_reviewer` は clean 時に `meguri:spec-reviewing → meguri:spec-ready` を張り替え、この
+`spec-ready` が spec_worker(combined)の discover を駆動している(ADR 0005 の二軸ラベル)。guard を
+status のみに畳むとこの遷移が消え、combined mode は永久に進まず、separate でも「人間が spec PR を
+マージしてよい」シグナルが曖昧になる(finding 2)。ラベルは**会話コメントではない**ので ADR 0006 の
+「会話は人間専用」を割らない。したがって guard の settle は kind でパラメタ化する:
+
+- **共通**: `meguri/guard-review` commit status + PR 本文 `<details>`。
+- **kind=Plan の追加**: clean → `spec-reviewing` を除去し `spec-ready` を付与(現行 `spec_reviewer`
+  と同一)/ findings → `spec-reviewing` を維持(次の push で head が動けば再 guard)。
+- **kind=Impl**: 追加のラベル遷移なし(impl PR は spec-* ラベルを持たない)。
+
+**guard(Plan)=OFF のとき**は誰も `spec-ready` へ張り替えないため、planner が spec PR を
+**最初から `spec-ready`(spec-reviewing を経由しない)で開く** — 内部 self-review だけが gate に
+なる。これで OFF でも combined の spec_worker は discover でき、状態機械はデッドロックしない。
+
 ### 4. 検査履歴は「会話タイムライン外」に置く(ADR 0006 の「会話は人間専用」を割らない)
 
 - (a) commit **status** `meguri/self-review`・`meguri/guard-review`(gh ユーザートークンで貼れる、
@@ -118,6 +134,22 @@ status も本文 `<details>` も**会話コメントではない**ため、ADR 0
   worker の exec が拾う。** そのため separate の spec PR は `Closes #N` を**使わない**
   (マージで issue を閉じてはいけない)— `Refs #N` 等の非クローズ参照にし、マージ検出の掃引が
   `speccing → ready` を張り替える。
+- **separate では normal worker が spec のライフサイクルを引き継ぐ(ADR 0001 の不変条件を保つ)。**
+  combined では spec_worker が同一ブランチ内で「planner の add ↔ spec-worker の delete」を相殺し、
+  `docs/specs/` が default branch に残らないことを保証していた(ADR 0001)。separate では spec PR が
+  **先にマージされて `docs/specs/issue-<N>.md` が default branch に着地する**ため、この相殺が 2 本の
+  PR にまたがる。したがって separate の worker は、combined の spec_worker が持っていた 3 責務を
+  そのまま引き継ぐ:
+  - (a) **読み込み**: `ready` を拾ったとき `docs/specs/issue-<N>.md` が存在すれば「Reviewed spec」
+    として exec プロンプトに注入する(spec_worker の既存プロンプトを流用)。存在しなければ従来の
+    spec 無しフローに degrade する(spec 無しの normal issue と区別しない)。
+  - (b) **削除**: 実装完了時に spec を削除して commit するよう指示する。spec は default branch に
+    残ってはならない。
+  - (c) **対称検証**: 実装後に spec が残っていれば `verify_work` が Err を返し corrective ターンで
+    回収する(spec_worker の反転検証と同一)。
+  これにより separate でも「spec-PR マージ〜impl-PR マージ」の窓の外では `docs/specs/` が空に戻り、
+  かつ実装 agent が**必ずレビュー済み spec を参照する**保証(finding 1)が保たれる。窓の内側で
+  spec が一時的に default branch に載るのは意図した挙動であり、impl PR のマージで解消する。
 - **`combined`**: 現行の morph 型(spec-worker が同一ブランチを takeover して spec+実装を 1 PR に、
   ≒ #98)。`spec_worker` は combined のときだけ活きる。
 - 設定名は `ProjectMode`(github/local)に相乗りさせない独立キー。per-issue 上書きは後回し。
@@ -129,7 +161,12 @@ status も本文 `<details>` も**会話コメントではない**ため、ADR 0
   ADR 0003↔0006 の隙間を閉じられる(mechanism を用意し、閉じるかは運用者の選択)。
 - spec レビューが必須ループから任意 guard に格下げされる。既定は guard(Plan)=ON なので既存
   挙動は保たれるが、ラベル状態機械の「spec-ready が spec-worker の takeover を駆動する」性質は
-  `combined` に限定され、`separate` では「ADR PR マージ → ready 張替」に変わる。
+  `combined` に限定され、`separate` では「ADR PR マージ → ready 張替」に変わる。guard(Plan) は
+  status だけでなく `spec-reviewing → spec-ready` の張替も担い続ける(guard OFF 時は planner が
+  直接 spec-ready で開く)ため、combined の driver はどちらの設定でも切れない。
+- `separate` では normal worker が spec_worker の spec 読み込み・削除・対称検証を引き継ぐため、
+  ADR 0001(spec は使い捨て・default branch に残さない)の不変条件は 2 本の PR にまたがっても
+  維持される。spec-PR マージ〜impl-PR マージの窓の内側だけ spec が一時的に default branch に載る。
 - 検査履歴が status + 本文 `<details>` に残り、`meguri top` / GitHub UI から追える。会話は汚さない。
 - 新しい二重判定は増やさない: required 判定は GitHub、guard の advisory/gate 分岐だけを meguri が
   持つ。auto-merger の新条件は「guard が有効かつ failure」でのみ escalate する保守的な形。
