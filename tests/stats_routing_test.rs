@@ -22,6 +22,8 @@ fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
+        plan_delivery: Default::default(),
+        review: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,

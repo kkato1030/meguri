@@ -23,6 +23,7 @@ required status checks(`test`・`cargo-deny`・`zizmor`)がサーバ側で強制
 | リポジトリ visibility | **public** | OSS 公開連作の目的そのもの(#116) |
 | Branch protection(main) | **有効** | required status checks で automerge / 人間 merge 双方をサーバ側で強制する |
 | Branch protection: required status checks | **`test`・`cargo-deny`・`zizmor`** | `.github/workflows/ci.yml` の job 名。全 PR で必ず走る 3 job(ADR 0004 追補) |
+| (任意) `meguri/guard-review` を required check に追加 | **既定では未設定** | ADR 0008 の guard レビューは既定で advisory(赤チェックは出すが human マージは止めない)。human 側も厳密ゲート化したい場合のみ、この context を required に足す。ただし付けるなら該当 kind の guard を必ず ON にすること(`review.guard.impl` 等)— guard が status を出さないと required check が永久 pending になりマージがハングする |
 | Branch protection: Require a pull request before merging | **有効** | main への直 push を禁止する |
 | Branch protection: Require branches to be up to date before merging | **有効** | 「main から遅れているがチェックは緑」の PR が merge されるのを防ぐ |
 | Branch protection: Force push / deletion | **禁止(デフォルト維持)** | 履歴改変・main 削除の防止 |

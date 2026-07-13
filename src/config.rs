@@ -122,14 +122,15 @@ pub struct Config {
     pub workspaces: Vec<WorkspaceConfig>,
 }
 
-/// Settings for the worker's self-review phase (ADR 0006): the internal
-/// review→fix loop that runs before the PR opens. The old `impl_enabled` /
-/// `impl_max_rounds` keys (the forge-based impl-reviewer loop, ADR 0004) are
-/// still accepted as serde aliases so existing configs keep working.
+/// Settings for the internal self-review phase (ADR 0006/0008): the review→fix
+/// loop that runs before the PR opens, now symmetric across plan and impl
+/// (ADR 0008). The old `impl_enabled` / `impl_max_rounds` keys (the forge-based
+/// impl-reviewer loop, ADR 0004) are still accepted as serde aliases so
+/// existing configs keep working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
-    /// Kill switch: false skips the worker's self-review phase entirely
-    /// (e.g. when an external review bot already covers implementation PRs).
+    /// Kill switch: false skips the internal self-review phase entirely
+    /// (e.g. when an external review bot already covers PRs).
     #[serde(default = "default_self_review_enabled", alias = "impl_enabled")]
     pub enabled: bool,
     /// Max self-review rounds per run — the cap that keeps the internal
@@ -137,6 +138,14 @@ pub struct ReviewConfig {
     /// human merge gate is the backstop, ADR 0006).
     #[serde(default = "default_self_review_max_rounds", alias = "impl_max_rounds")]
     pub max_rounds: u32,
+    /// The review lenses the self-review turn applies each round (ADR 0008):
+    /// one review turn considers every configured perspective. Defaults to
+    /// `correctness / tests / simplicity / security`; add or drop to taste.
+    #[serde(default = "default_review_lenses")]
+    pub lenses: Vec<String>,
+    /// External GitHub guard review, enabled per kind (ADR 0008 §1/§3).
+    #[serde(default)]
+    pub guard: GuardConfig,
 }
 
 impl Default for ReviewConfig {
@@ -144,6 +153,8 @@ impl Default for ReviewConfig {
         Self {
             enabled: default_self_review_enabled(),
             max_rounds: default_self_review_max_rounds(),
+            lenses: default_review_lenses(),
+            guard: GuardConfig::default(),
         }
     }
 }
@@ -153,6 +164,40 @@ fn default_self_review_enabled() -> bool {
 }
 fn default_self_review_max_rounds() -> u32 {
     3
+}
+fn default_review_lenses() -> Vec<String> {
+    ["correctness", "tests", "simplicity", "security"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// `[review.guard]` — the optional external GitHub guard review, toggled
+/// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
+/// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
+/// off (opt-in; external-bot compatible). Its output is a `meguri/guard-review`
+/// commit status + a folded PR-body `<details>` — never inline threads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// Guard the plan (spec/ADR) PR — the reviewed-spec gate (default on).
+    #[serde(default = "default_true")]
+    pub plan: bool,
+    /// Guard the implementation PR (default off).
+    #[serde(default, rename = "impl")]
+    pub impl_enabled: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            plan: default_true(),
+            impl_enabled: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -607,6 +652,30 @@ impl ProjectMode {
     }
 }
 
+/// How a plan-first issue is delivered (ADR 0008). Deliberately a separate
+/// key from [`ProjectMode`] (github/local): the two are orthogonal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanDelivery {
+    /// Two PRs: the spec/ADR PR is reviewed and merged on its own, then the
+    /// issue flips `speccing → ready` and the worker implements in a separate
+    /// PR. The spec PR uses a non-closing `Refs #N` reference (default).
+    #[default]
+    Separate,
+    /// One PR: the spec-worker takes over the spec PR's branch and stacks the
+    /// implementation on it (the #98 morph shape); spec and impl merge once.
+    Combined,
+}
+
+impl PlanDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::Combined => "combined",
+        }
+    }
+}
+
 /// The shape of a run's deliverable. `patch` (issue #54 Phase 2) is accepted
 /// by the config but not yet implemented by the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +748,14 @@ pub struct ProjectConfig {
     /// github, `branch` for local — resolved via [`Config::deliver_for`].
     #[serde(default)]
     pub deliver: Option<Deliver>,
+    /// How plan-first issues are delivered (see [`PlanDelivery`], ADR 0008);
+    /// defaults to `separate` (two PRs).
+    #[serde(default)]
+    pub plan_delivery: PlanDelivery,
+    /// Per-project self-review / guard settings; overrides the global
+    /// `[review]` section wholesale (like `pr` / `clean`).
+    #[serde(default)]
+    pub review: Option<ReviewConfig>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -854,6 +931,12 @@ impl Config {
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
+    }
+
+    /// Effective self-review / guard settings for a project (project override
+    /// wins wholesale, like `pr_for`).
+    pub fn review_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a ReviewConfig {
+        project.review.as_ref().unwrap_or(&self.review)
     }
 
     /// Effective deliverable language for a project (project override wins).

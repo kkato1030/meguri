@@ -46,6 +46,12 @@ pub const FIXER_REPLY_MARKER: &str = "🔁 meguri";
 /// and the impl-reviewer only reviews — work meguri opened).
 pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
+/// Whether the project uses combined plan delivery (ADR 0008) — the mode in
+/// which a `spec-ready` PR is the spec worker's, so the fixer keeps off it.
+fn is_combined(deps: &Deps) -> bool {
+    deps.project.plan_delivery == crate::config::PlanDelivery::Combined
+}
+
 /// A thread the fixer still owes a fix: unresolved, and the ball is in
 /// meguri's court (the last comment is not meguri's reply).
 pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
@@ -57,7 +63,11 @@ pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
 }
 
 /// Whether the fixer may touch this PR at all (independent of threads).
-fn pr_is_fixable(pr: &PullRequest) -> Option<String> {
+/// `combined_delivery` gates the `spec-ready` skip: that label means "the spec
+/// worker owns this branch" only under combined delivery (ADR 0008); under
+/// separate delivery a `spec-ready` spec/ADR PR is a standalone PR the fixer
+/// may amend when a human leaves review threads (finding 3).
+fn pr_is_fixable(pr: &PullRequest, combined_delivery: bool) -> Option<String> {
     if pr.state != "open" {
         return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
     }
@@ -67,9 +77,9 @@ fn pr_is_fixable(pr: &PullRequest) -> Option<String> {
             pr.number, pr.head_branch
         ));
     }
-    if pr.has_label(forge::LABEL_SPEC_READY) {
+    if combined_delivery && pr.has_label(forge::LABEL_SPEC_READY) {
         return Some(format!(
-            "PR #{} is {} (the worker owns the branch)",
+            "PR #{} is {} (the spec worker owns the branch)",
             pr.number,
             forge::LABEL_SPEC_READY
         ));
@@ -99,9 +109,10 @@ impl super::Loop for FixerLoop {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // PR loops are inert in local mode
         }
+        let combined = is_combined(deps);
         let mut targets = Vec::new();
         for pr in deps.forge().list_open_prs().await? {
-            if pr_is_fixable(&pr).is_some() || pr.has_label(forge::LABEL_WORKING) {
+            if pr_is_fixable(&pr, combined).is_some() || pr.has_label(forge::LABEL_WORKING) {
                 continue;
             }
             let threads = deps.forge().list_review_threads(pr.number).await?;
@@ -174,7 +185,7 @@ impl Flavor for FixerFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_fixable(&pr) {
+        if let Some(reason) = pr_is_fixable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
         }
         if pr.has_label(forge::LABEL_WORKING) {
@@ -407,39 +418,45 @@ mod tests {
             is_draft: false,
             labels: vec![],
         };
-        assert!(pr_is_fixable(&pr).is_none());
+        assert!(pr_is_fixable(&pr, true).is_none());
 
         let merged = PullRequest {
             state: "merged".into(),
             ..pr.clone()
         };
-        assert!(pr_is_fixable(&merged).unwrap().contains("merged"));
+        assert!(pr_is_fixable(&merged, true).unwrap().contains("merged"));
 
         let human = PullRequest {
             head_branch: "feature/manual".into(),
             ..pr.clone()
         };
         assert!(
-            pr_is_fixable(&human)
+            pr_is_fixable(&human, true)
                 .unwrap()
                 .contains("not opened by meguri")
         );
 
+        // spec-ready: skipped under combined delivery (the spec worker owns
+        // it), but fixable under separate delivery (finding 3).
         let spec_ready = PullRequest {
             labels: vec![forge::LABEL_SPEC_READY.to_string()],
             ..pr.clone()
         };
         assert!(
-            pr_is_fixable(&spec_ready)
+            pr_is_fixable(&spec_ready, true)
                 .unwrap()
                 .contains(forge::LABEL_SPEC_READY)
+        );
+        assert!(
+            pr_is_fixable(&spec_ready, false).is_none(),
+            "separate delivery: a spec-ready PR is fixable"
         );
 
         let held = PullRequest {
             labels: vec![forge::LABEL_HOLD.to_string()],
             ..pr
         };
-        assert!(pr_is_fixable(&held).unwrap().contains("hold"));
+        assert!(pr_is_fixable(&held, true).unwrap().contains("hold"));
     }
 
     #[test]
@@ -481,6 +498,8 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: Default::default(),
         };
         Deps::with_label_source(
