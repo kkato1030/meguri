@@ -179,13 +179,18 @@ fn epoch_now() -> u64 {
 /// Stuck ones. A per-PR failure warns and is retried next poll; it never
 /// aborts the sweep (same shape as the auto-merger).
 pub async fn sweep(deps: &Deps) -> Result<()> {
+    // No forge, no armed PRs to watch (local mode) — same guard as the
+    // auto-merger sweep.
+    if deps.forge.is_none() {
+        return Ok(());
+    }
     // Gated on the same switch as the auto-merger: with auto-merge off there
     // are no fresh arms, and lingering markers are not ours to police.
     if !deps.config.pr_for(&deps.project).auto_merge.enabled {
         return Ok(());
     }
     let now = epoch_now();
-    for pr in deps.forge.list_open_prs().await? {
+    for pr in deps.forge().list_open_prs().await? {
         if let Err(e) = process_pr(deps, &pr, now).await {
             tracing::warn!("merge-watch failed for PR #{}: {e:#}", pr.number);
         }
@@ -207,12 +212,12 @@ async fn process_pr(deps: &Deps, pr: &PullRequest, now: u64) -> Result<()> {
         return Ok(());
     }
     // Watch only PRs #41 armed.
-    let comments = deps.forge.pr_comments_meta(pr.number).await?;
+    let comments = deps.forge().pr_comments_meta(pr.number).await?;
     if !is_armed(&comments) {
         return Ok(());
     }
     // The merge snapshot; a forge error here is the TransientError signal.
-    let merge = match deps.forge.pr_merge_state(pr.number).await {
+    let merge = match deps.forge().pr_merge_state(pr.number).await {
         Ok(m) => Some(m),
         Err(e) => {
             tracing::debug!(
@@ -226,7 +231,7 @@ async fn process_pr(deps: &Deps, pr: &PullRequest, now: u64) -> Result<()> {
     // fetch it only then — one extra API call, and only for blocked PRs.
     let rollup_failure = match &merge {
         Some(m) if m.status == MergeStateStatus::Blocked => deps
-            .forge
+            .forge()
             .pr_check_rollup(pr.number)
             .await
             .map(|r| r.state() == forge::CheckState::Failure)
@@ -260,10 +265,10 @@ async fn process_pr(deps: &Deps, pr: &PullRequest, now: u64) -> Result<()> {
 /// label is the durable "escalated" record — subsequent sweeps skip it — so
 /// this is idempotent without any local state.
 async fn escalate(deps: &Deps, pr: &PullRequest, snap: &Snapshot) -> Result<()> {
-    deps.forge
+    deps.forge()
         .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
         .await?;
-    deps.forge
+    deps.forge()
         .comment_pr(pr.number, &stuck_comment(snap))
         .await?;
     let status = snap

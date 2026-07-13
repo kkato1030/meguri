@@ -26,28 +26,31 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
 }
 
 /// `deps_with`, but with an explicit store — the restart test hands a fresh
-/// one to prove watch keeps no local state.
+/// one to prove watch keeps no local state. Built through the same
+/// `with_label_source` seam production uses (issue #54).
 fn deps_with_store(forge: Arc<FakeForge>, store: meguri::store::Store) -> Deps {
     let mut config = Config::default();
     config.pr.auto_merge.enabled = true;
-    Deps {
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: "/tmp/unused".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: None,
+        pr: None,
+        clean: None,
+    };
+    Deps::with_label_source(
         store,
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(meguri::mux::fake::FakeMux::new(false)),
+        Arc::new(meguri::mux::fake::FakeMux::new(false)),
         forge,
         config,
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: None,
-            pr: None,
-            clean: None,
-        },
-    }
+        project,
+    )
 }
 
 /// A timestamp comfortably older than `STALE_AFTER` (24h) — an armed marker at
