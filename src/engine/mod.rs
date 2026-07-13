@@ -44,6 +44,11 @@ pub struct Deps {
     /// Shared across every run of the project so the per-run notification
     /// throttle survives turn boundaries.
     pub notifier: Arc<Notifier>,
+    /// Builds a forge for a repo slug — how cross-repo decomposition reaches a
+    /// workspace sibling's repository (issue #154). Production is
+    /// `GhForgeFactory`; tests inject fakes. Only ever consulted for siblings;
+    /// the project's own repo uses [`Deps::forge`].
+    pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
 }
@@ -74,9 +79,18 @@ impl Deps {
             forge: Some(forge),
             task_source,
             notifier,
+            forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
         }
+    }
+
+    /// Swap in a custom [`ForgeFactory`] (cross-repo decomposition tests inject
+    /// fakes for workspace siblings). Builder-style so the common
+    /// `with_label_source` path stays a single call.
+    pub fn with_forge_factory(mut self, factory: Arc<dyn crate::forge::ForgeFactory>) -> Self {
+        self.forge_factory = factory;
+        self
     }
 
     /// The forge for github-mode loops. Panics if absent — only the
