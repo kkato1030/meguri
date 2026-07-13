@@ -1034,11 +1034,17 @@ async fn record_agent_session(
 
 /// Applies a verified execute turn's agent-authored fields to the
 /// checkpoint. `sets_subject` gates whether `result.subject` may
-/// (re)establish `cp.subject` (see [`Flavor::sets_subject`]); an absent
-/// `subject` never clears one an earlier turn already set.
+/// (re)establish `cp.subject` (see [`Flavor::sets_subject`]); an absent or
+/// blank (whitespace-only) `subject` never clears one an earlier turn
+/// already set — a blank value would otherwise survive into
+/// `default_pr_title()` as a literal empty title instead of falling back to
+/// the issue title.
 fn apply_execute_result(cp: &mut Checkpoint, result: TurnResultFile, sets_subject: bool) {
-    if sets_subject && let Some(subject) = result.subject {
-        cp.subject = Some(subject);
+    if sets_subject {
+        let subject = result.subject.as_deref().map(str::trim).unwrap_or("");
+        if !subject.is_empty() {
+            cp.subject = Some(subject.to_string());
+        }
     }
     cp.summary = result.summary;
     cp.pr_body = result.pr_body;
@@ -1462,6 +1468,51 @@ mod tests {
 
         // Omitting `subject` never clears an already-established one either.
         apply_execute_result(&mut cp, result_with(None), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
+    #[test]
+    fn apply_execute_result_ignores_a_blank_subject() {
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("   ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(
+            cp.subject, None,
+            "a whitespace-only subject must not become the checkpoint's subject"
+        );
+        // Otherwise default_pr_title() would render a broken " (#N)" title
+        // instead of falling back to the issue title.
+        assert_eq!(default_pr_title(&fake_run(7), &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn apply_execute_result_trims_subject_whitespace() {
+        let mut cp = Checkpoint::default();
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("  Add caching  ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
         assert_eq!(cp.subject.as_deref(), Some("Add caching"));
     }
 
