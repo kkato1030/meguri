@@ -67,7 +67,12 @@ fn body_changed_events(store: &Store) -> Vec<meguri::events::EventRecord> {
 
 #[tokio::test]
 async fn discover_suppresses_shipped_issue_until_its_body_changes() {
-    let forge = Arc::new(FakeForge::with_issue(7, "T", "original body", &[LABEL_READY]));
+    let forge = Arc::new(FakeForge::with_issue(
+        7,
+        "T",
+        "original body",
+        &[LABEL_READY],
+    ));
     let store = Store::open_in_memory().unwrap();
     seed_succeeded_run(&store, 7, "original body");
     let deps = deps_with(forge.clone(), store.clone(), ReconcileConfig::default());
@@ -113,7 +118,12 @@ async fn discover_suppresses_shipped_issue_until_its_body_changes() {
 
 #[tokio::test]
 async fn whitespace_only_edits_do_not_lift_suppression() {
-    let forge = Arc::new(FakeForge::with_issue(7, "T", "line one\nline two", &[LABEL_READY]));
+    let forge = Arc::new(FakeForge::with_issue(
+        7,
+        "T",
+        "line one\nline two",
+        &[LABEL_READY],
+    ));
     let store = Store::open_in_memory().unwrap();
     seed_succeeded_run(&store, 7, "line one\nline two");
     let deps = deps_with(forge.clone(), store.clone(), ReconcileConfig::default());
@@ -145,7 +155,10 @@ async fn body_edits_kill_switch_restores_permanent_suppression() {
     };
     let deps = deps_with(forge.clone(), store.clone(), off);
 
-    forge.update_issue_body(7, "totally rewritten").await.unwrap();
+    forge
+        .update_issue_body(7, "totally rewritten")
+        .await
+        .unwrap();
     assert!(
         deps.task_source
             .discover(TaskKind::Work)
@@ -177,7 +190,10 @@ async fn sweep_signals_a_changed_body_once_and_only_via_the_gate() {
     assert!(body_changed_events(&store).is_empty());
 
     // Edit the body: one event + one comment nudging a human to re-label.
-    forge.update_issue_body(7, "edited by a human").await.unwrap();
+    forge
+        .update_issue_body(7, "edited by a human")
+        .await
+        .unwrap();
     reconcile::sweep(&deps).await.unwrap();
     assert_eq!(body_changed_events(&store).len(), 1);
     let comments = forge.comments_of(7);

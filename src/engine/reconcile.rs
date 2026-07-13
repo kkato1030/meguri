@@ -40,7 +40,10 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
         return Ok(());
     };
 
-    for issue in forge.list_issues_with_label(forge::LABEL_IMPLEMENTING).await? {
+    for issue in forge
+        .list_issues_with_label(forge::LABEL_IMPLEMENTING)
+        .await?
+    {
         // Only issues meguri actually shipped through the worker lane: a
         // succeeded worker run is what recorded a body digest to compare
         // against. (spec-worker-shipped issues keep their spec-ready PR, which

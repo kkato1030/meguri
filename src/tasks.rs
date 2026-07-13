@@ -204,10 +204,12 @@ impl LabelTaskSource {
                 .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number);
         }
         let digest = body_digest(&issue.body);
-        if self
-            .store
-            .issue_processed_current_body(&self.project_id, loop_kind, issue.number, &digest)?
-        {
+        if self.store.issue_processed_current_body(
+            &self.project_id,
+            loop_kind,
+            issue.number,
+            &digest,
+        )? {
             return Ok(true);
         }
         // Not suppressed. If a prior success exists, the body changed since it
@@ -218,8 +220,12 @@ impl LabelTaskSource {
             .store
             .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number)?
         {
-            self.store
-                .signal_body_changed_event(&self.project_id, loop_kind, issue.number, &digest)?;
+            self.store.signal_body_changed_event(
+                &self.project_id,
+                loop_kind,
+                issue.number,
+                &digest,
+            )?;
         }
         Ok(false)
     }
