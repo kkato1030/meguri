@@ -76,6 +76,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         forge: None,
         task_source,
         notifier: meguri::notify::fake::recording_notifier().0,
+        forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config,
         project,
     };

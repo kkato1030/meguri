@@ -315,6 +315,24 @@ max_rounds = 3    # run ごとの self-review ラウンド上限。超えたら 
 
 `[projects.pr]` は `[pr]` セクションを（キー単位ではなく)丸ごと上書きします: `[projects.pr]` を書いたプロジェクトは、省略したキーはデフォルトになり、`[pr.auto_merge]` も含めてそうなります。
 
+### workspace — 関連プロジェクトと cross-repo 分解（オプトイン）
+
+**workspace** は関連プロジェクトの静的なグルーピングです（repo の分割/統合、API とそのクライアント、repo 設計込みの greenfield など）。純粋に宣言的で、**実行系(worktree・pane・branch・検証)には一切現れません**（`run` は単一 repo のまま）。状態も持ちません。オプトイン: `[[workspaces]]` を書かない config の挙動は従来と完全に同じです。
+
+```toml
+[[workspaces]]
+id = "shop"
+projects = ["shop-api", "shop-web", "shop-infra"]   # 各要素は定義済みの [[projects]] id。1 プロジェクトが所属できる workspace は 1 つまで
+```
+
+workspace の用途はちょうど 3 つです:
+
+1. **分解のスコープ** — planner の decompose([spec 先行フロー](#spec-先行フローオプトイン))は、子 issue に `"project": "<sibling id>"` を付けることで workspace 内の別 repo に起票できます(省略時は親と同じ repo)。親(tracking)issue は常に自分の repo に留まります。workspace の外の repo を指す子は拒否されます — 起票スコープは(write 権限で操作できる)issue body ではなく config 側(ホスト運用者)に置くことで、「実行させられる人」と「スコープを決める人」を分離します(ADR 0009)。
+2. **cross-repo の順序付け** — meguri は GitHub ネイティブの `blocked_by` を repo をまたいで張ります。片方の repo の子がもう片方の repo の子をブロックでき、既存の discovery の依存ゲートがそれらを順序づけます(読めない blocker は未解決＝安全側で止まる)。
+3. **表示のグルーピング** — `meguri ps` / `meguri top` が行を workspace 単位で束ねます。
+
+meguri 自身が実行できない操作(repo 作成、公開設定の変更、履歴書き換えなど)には、`"kind": "human"` の子を使います。これは**トリガーラベルなし**で起票され、discovery は決して拾わず、人間が閉じることで依存側が解放されます。`meguri doctor` は各 workspace とメンバーを一覧します。設計の意図は ADR 0009 を参照してください。
+
 ### worktree セットアップフック（オプトイン）
 
 `[projects.worktree_setup]` は、meguri が worktree を準備するたびに(初回だけでなく create/attach/re-point のたびに)プロジェクト独自のコマンドを実行します。`attach_worktree`/`create_review_worktree` は再利用時に `reset --hard` + `clean -fd` で untracked なファイルを消すことがあるため、毎回の実行が必要になります。meguri 自身はここで何を実行するかに関与しません(ADR 0003)。apm(「[エージェント向け指示（apm）](#エージェント向け指示apm)」参照)はその一利用例であり、専用の組み込み連携ではありません:

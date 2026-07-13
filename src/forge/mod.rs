@@ -2,6 +2,8 @@
 //! principle: labels and comments on the forge are the durable source of
 //! truth for workflow state, never in-memory agent output.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -368,9 +370,16 @@ pub trait Forge: Send + Sync {
     /// File a new issue; returns its number (planner decomposition,
     /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
-    /// Record `issue` as blocked by `blocker` in the forge-native dependency
-    /// graph (the same graph [`Forge::blocked_by`] reads).
+    /// Record `issue` (in this forge's repo) as blocked by `blocker` in the
+    /// forge-native dependency graph (the same graph [`Forge::blocked_by`]
+    /// reads).
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
+    /// Like [`Forge::add_blocked_by`] but the blocker lives in `blocker_repo`
+    /// (`owner/repo`), which may differ from this forge's own repo — the
+    /// cross-repo decomposition case (issue #154). The dependent `issue` is
+    /// still in this forge's repo; only the blocker's home repo changes. When
+    /// `blocker_repo` equals this forge's repo the two are equivalent.
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()>;
     /// Overwrite an issue's body wholesale (snapshot-style report updates).
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
@@ -470,6 +479,15 @@ pub trait Forge: Send + Sync {
         base_branch: &str,
         require_branch_protection: bool,
     ) -> Result<MergePolicy>;
+}
+
+/// Builds a [`Forge`] for a given repo slug (`owner/repo`). Cross-repo
+/// decomposition needs a forge for a workspace sibling's repository, which the
+/// per-project `Deps::forge` cannot provide (issue #154). Production returns a
+/// `GhForge`; tests inject fakes so the sibling-repo path is exercised without
+/// hitting GitHub. See ADR 0009.
+pub trait ForgeFactory: Send + Sync {
+    fn for_slug(&self, slug: &str) -> Arc<dyn Forge>;
 }
 
 #[cfg(test)]

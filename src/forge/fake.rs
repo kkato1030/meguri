@@ -42,6 +42,10 @@ pub struct RecordedPr {
 
 #[derive(Default)]
 pub struct FakeForge {
+    /// This fake's own repo slug, if it stands in for a specific repo (issue
+    /// #154 cross-repo tests). `None` = the single-repo default: every
+    /// `add_blocked_by_in` is treated as same-repo.
+    pub slug: Option<String>,
     pub issues: Mutex<Vec<Issue>>,
     /// Closed issues: number → state_reason ("completed", "not_planned", ...).
     pub closed: Mutex<HashMap<i64, String>>,
@@ -108,6 +112,17 @@ impl FakeForge {
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
         forge
+    }
+
+    /// A fake standing in for a specific repo slug (issue #154 cross-repo
+    /// decomposition tests): `add_blocked_by_in` then distinguishes
+    /// same-repo blockers (existence-checked) from cross-repo ones (recorded
+    /// as-is, since the blocker lives in another fake's store).
+    pub fn with_slug(slug: &str) -> Self {
+        Self {
+            slug: Some(slug.to_string()),
+            ..Self::default()
+        }
     }
 
     pub fn close_issue(&self, number: i64) {
@@ -569,6 +584,25 @@ impl Forge for FakeForge {
                 if !issues.iter().any(|i| i.number == number) {
                     bail!("issue #{number} not found");
                 }
+            }
+        }
+        self.block_issue(issue, blocker);
+        Ok(())
+    }
+
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()> {
+        // Same-repo (this fake owns blocker_repo, or is the single-repo
+        // default): existence-checked exactly like add_blocked_by. Cross-repo:
+        // the blocker lives in another fake's store, so only the dependent
+        // issue is checked and the edge is recorded as-is.
+        let same_repo = self.slug.as_deref().is_none_or(|s| s == blocker_repo);
+        if same_repo {
+            return self.add_blocked_by(issue, blocker).await;
+        }
+        {
+            let issues = self.issues.lock().unwrap();
+            if !issues.iter().any(|i| i.number == issue) {
+                bail!("issue #{issue} not found");
             }
         }
         self.block_issue(issue, blocker);
