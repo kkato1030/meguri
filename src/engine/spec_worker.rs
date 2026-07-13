@@ -293,8 +293,9 @@ impl Flavor for SpecWorkerFlavor {
         deps.forge()
             .update_pr_title(pr, &self.pr_title(run, cp))
             .await?;
+        let lenses = &deps.config.review_for(&deps.project).lenses;
         deps.forge()
-            .update_pr_body(pr, &flow::compose_pr_body(run, cp))
+            .update_pr_body(pr, &flow::compose_pr_body(run, cp, lenses))
             .await?;
         deps.store.emit(
             Some(&run.id),
@@ -464,6 +465,8 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 pub use super::WorkerOutcome;
-use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
+use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
 use super::{Deps, Target};
 use crate::forge;
 use crate::store::RunRecord;
@@ -111,6 +111,18 @@ struct PlannerFlavor;
 impl Flavor for PlannerFlavor {
     fn trigger_label(&self) -> &'static str {
         forge::LABEL_PLAN
+    }
+
+    /// The plan side of the symmetric loop (ADR 0008).
+    fn kind(&self) -> Kind {
+        Kind::Plan
+    }
+
+    /// The planner self-reviews its own spec/ADR before opening the spec PR
+    /// (ADR 0008): the internal multi-lens review→fix loop runs in the run's
+    /// worktree with no forge calls, symmetric with the worker.
+    fn self_reviews(&self) -> bool {
+        true
     }
 
     fn execute_prompt(
@@ -548,6 +560,8 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

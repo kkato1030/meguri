@@ -531,6 +531,8 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

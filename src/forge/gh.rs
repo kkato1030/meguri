@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
-    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
+    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// How much of each failed job log survives into the fix prompt (logs can be
@@ -1120,6 +1120,55 @@ impl Forge for GhForge {
         self.gh(&["pr", "ready", &pr.to_string(), "--repo", &self.repo])
             .await?;
         Ok(())
+    }
+
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        description: &str,
+    ) -> Result<()> {
+        // GitHub truncates the description at 140 chars; keep it short.
+        let description: String = description.chars().take(140).collect();
+        self.gh(&[
+            "api",
+            "-X",
+            "POST",
+            &format!("repos/{}/statuses/{head_sha}", self.repo),
+            "-f",
+            &format!("state={}", state.as_str()),
+            "-f",
+            &format!("context={context}"),
+            "-f",
+            &format!("description={description}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>> {
+        // `.../commits/{sha}/statuses` lists statuses newest-first; take the
+        // most recent entry for the requested context.
+        let raw = self
+            .gh(&[
+                "api",
+                &format!("repos/{}/commits/{head_sha}/statuses", self.repo),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing commit statuses output")?;
+        let state = v.as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|s| s.get("context").and_then(Value::as_str) == Some(context))
+                .and_then(|s| s.get("state").and_then(Value::as_str))
+                .and_then(CommitStatusState::from_gh)
+        });
+        Ok(state)
     }
 
     async fn merge_policy(

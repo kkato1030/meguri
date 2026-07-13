@@ -7,9 +7,9 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
-    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
+    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// The FakeForge's default merge policy: everything allowed and the base
@@ -96,6 +96,9 @@ pub struct FakeForge {
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
     /// scenarios; the impl-reviewer falls back to a summary comment).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
+    /// Commit statuses meguri wrote: (head_sha, context) → latest state
+    /// (ADR 0008 inspection history). Re-posting a context overwrites it.
+    pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
 }
 
 impl FakeForge {
@@ -415,6 +418,29 @@ impl FakeForge {
     /// `AlreadyClean` for it, exercising the clean-status finalize path.
     pub fn set_clean(&self, pr: i64) {
         self.clean_prs.lock().unwrap().insert(pr);
+    }
+
+    /// The latest commit-status state meguri wrote for (sha, context), if any.
+    pub fn commit_status_of(&self, head_sha: &str, context: &str) -> Option<CommitStatusState> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .get(&(head_sha.to_string(), context.to_string()))
+            .copied()
+    }
+
+    /// Seed a commit status directly (e.g. a guard verdict a prior run left on
+    /// the PR head), so the auto-merger's guard gate can be exercised.
+    pub fn set_commit_status_direct(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+    ) {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
     }
 
     /// Override the repository's merge policy (default: everything allowed +
@@ -877,6 +903,28 @@ impl Forge for FakeForge {
         rec.state = "merged".into();
         self.merged.lock().unwrap().insert(pr, head_sha.to_string());
         Ok(())
+    }
+
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        _description: &str,
+    ) -> Result<()> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
+        Ok(())
+    }
+
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>> {
+        Ok(self.commit_status_of(head_sha, context))
     }
 
     async fn mark_pr_ready(&self, pr: i64) -> Result<()> {

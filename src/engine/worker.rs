@@ -330,6 +330,8 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
         };
         let deps = Deps::with_label_source(
             store,

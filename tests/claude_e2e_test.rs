@@ -158,6 +158,8 @@ async fn real_claude_implements_issue_in_tmux() {
         worktree_root: Some(root.path().join("worktrees")),
         pr: None,
         clean: None,
+            plan_delivery: Default::default(),
+            review: None,
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
