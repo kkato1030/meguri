@@ -95,6 +95,17 @@ pub trait Flavor: Send + Sync {
         deps.project.default_branch.clone()
     }
 
+    /// Whether this loop's execute turn may (re)establish `cp.subject`
+    /// (issue #136). Implementation-shaping turns — the worker, the
+    /// planner, the spec worker's takeover — do; fix-family turns whose job
+    /// is to amend without changing the nature of the change (the fixer,
+    /// the ci-fixer, the conflict resolver) must not, so the PR title stays
+    /// fixed to whatever turn established it instead of flapping with every
+    /// fix's wording. Default: yes.
+    fn sets_subject(&self) -> bool {
+        true
+    }
+
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String;
 
     /// Settle forge labels once the PR exists. Re-run on resume, so keep it
@@ -190,6 +201,11 @@ pub struct Checkpoint {
     /// (fallback PR body).
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored PR/commit subject from the verified execute turn
+    /// (issue #136); `pr_title()` prefers this over `issue_title` when
+    /// present. Only set by turns whose [`Flavor::sets_subject`] is true.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
@@ -1121,6 +1137,24 @@ async fn record_agent_session(
     Ok(())
 }
 
+/// Applies a verified execute turn's agent-authored fields to the
+/// checkpoint. `sets_subject` gates whether `result.subject` may
+/// (re)establish `cp.subject` (see [`Flavor::sets_subject`]); an absent or
+/// blank (whitespace-only) `subject` never clears one an earlier turn
+/// already set — a blank value would otherwise survive into
+/// `default_pr_title()` as a literal empty title instead of falling back to
+/// the issue title.
+fn apply_execute_result(cp: &mut Checkpoint, result: TurnResultFile, sets_subject: bool) {
+    if sets_subject {
+        let subject = result.subject.as_deref().map(str::trim).unwrap_or("");
+        if !subject.is_empty() {
+            cp.subject = Some(subject.to_string());
+        }
+    }
+    cp.summary = result.summary;
+    cp.pr_body = result.pr_body;
+}
+
 /// execute: agent does the loop's work; the orchestrator independently
 /// verifies that committed work exists (plus the flavor's own check) before
 /// moving on.
@@ -1182,10 +1216,9 @@ async fn execute(
             flavor.verify_work(run, cp, worktree).err()
         };
         let Some(problem) = problem else {
-            // Keep what the agent said for the PR body (persisted by the
-            // caller's step save).
-            cp.summary = result.summary;
-            cp.pr_body = result.pr_body;
+            // Keep what the agent said for the PR title/body (persisted by
+            // the caller's step save).
+            apply_execute_result(cp, result, flavor.sets_subject());
             deps.store.emit(
                 Some(&run.id),
                 "execute.verified",
@@ -1391,6 +1424,18 @@ async fn open_pr(
     Ok(pr_url)
 }
 
+/// The PR-title formula every [`Flavor::pr_title`] shares (issue #136): the
+/// agent-authored `subject` from the turn that established it, or the issue
+/// title when none was ever set (backward compatibility) — followed by the
+/// issue number the forge conventionally carries in a squash-merged repo.
+pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
+    format!(
+        "{} (#{})",
+        cp.subject.as_deref().unwrap_or(&cp.issue_title),
+        run.issue_number
+    )
+}
+
 /// The PR body meguri wraps around the agent's description: a `Closes #N`
 /// header, the agent-authored description (its `pr_body`, or the execute
 /// turn's summary as a fallback), and the meguri footer. Shared by new-PR
@@ -1478,6 +1523,103 @@ pub fn pr_body_instruction(worktree: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_run(issue: i64) -> RunRecord {
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", "test-flavor", issue, "t")
+            .unwrap();
+        store.get_run(&run.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn default_pr_title_prefers_subject_and_falls_back_to_issue_title() {
+        let run = fake_run(7);
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        assert_eq!(default_pr_title(&run, &cp), "Add caching (#7)");
+
+        cp.subject = Some("Cache API responses in memory".into());
+        assert_eq!(
+            default_pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
+
+    #[test]
+    fn apply_execute_result_gates_subject_by_flavor() {
+        let mut cp = Checkpoint::default();
+        let result_with = |subject: Option<&str>| TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: subject.map(str::to_string),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        // Implementation-shaping turn: subject is established.
+        apply_execute_result(&mut cp, result_with(Some("Add caching")), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Fix-family turn (sets_subject = false): a new subject is ignored,
+        // the established one survives (no flapping).
+        apply_execute_result(&mut cp, result_with(Some("Fix flaky test")), false);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+
+        // Omitting `subject` never clears an already-established one either.
+        apply_execute_result(&mut cp, result_with(None), true);
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
+
+    #[test]
+    fn apply_execute_result_ignores_a_blank_subject() {
+        let mut cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("   ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(
+            cp.subject, None,
+            "a whitespace-only subject must not become the checkpoint's subject"
+        );
+        // Otherwise default_pr_title() would render a broken " (#N)" title
+        // instead of falling back to the issue title.
+        assert_eq!(default_pr_title(&fake_run(7), &cp), "Add caching (#7)");
+    }
+
+    #[test]
+    fn apply_execute_result_trims_subject_whitespace() {
+        let mut cp = Checkpoint::default();
+        let result = TurnResultFile {
+            turn_id: "t".into(),
+            status: TurnStatus::Success,
+            summary: "done".into(),
+            subject: Some("  Add caching  ".into()),
+            pr_body: None,
+            agent_session_id: None,
+            children: vec![],
+        };
+
+        apply_execute_result(&mut cp, result, true);
+
+        assert_eq!(cp.subject.as_deref(), Some("Add caching"));
+    }
 
     #[test]
     fn pr_template_discovery_prefers_repo_locations_in_order() {

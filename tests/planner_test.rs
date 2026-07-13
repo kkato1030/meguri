@@ -150,9 +150,16 @@ fn pending_turn(worktree: &Path) -> Option<String> {
 }
 
 fn write_result(worktree: &Path, turn_id: &str, status: &str) {
-    let result = serde_json::json!({
+    write_result_with_subject(worktree, turn_id, status, None);
+}
+
+fn write_result_with_subject(worktree: &Path, turn_id: &str, status: &str, subject: Option<&str>) {
+    let mut result = serde_json::json!({
         "turn_id": turn_id, "status": status, "summary": "scripted spec",
     });
+    if let Some(subject) = subject {
+        result["subject"] = serde_json::Value::String(subject.to_string());
+    }
     std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
 }
 
@@ -238,7 +245,12 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
         let turn_id = turn_id.to_string();
         tokio::spawn(async move {
             commit_spec(&wt).await;
-            write_result(&wt, &turn_id, "success");
+            write_result_with_subject(
+                &wt,
+                &turn_id,
+                "success",
+                Some("Write a spec for the caching layer"),
+            );
         });
     });
 
@@ -259,13 +271,14 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     assert_eq!(record.step, "open-pr");
     assert_eq!(record.loop_kind, planner::KIND);
 
-    // Spec PR shape: Spec-prefixed title, worker branch conventions (the
-    // worker later takes this same branch over), spec-reviewing label on
-    // the PR.
+    // Spec PR shape: the agent-authored subject becomes the title (issue
+    // #136 — no more mechanical `Spec:` prefix hack), worker branch
+    // conventions (the worker later takes this same branch over),
+    // spec-reviewing label on the PR.
     let prs = env.forge.prs();
     assert_eq!(prs.len(), 1);
     assert_eq!(prs[0].base, "main");
-    assert_eq!(prs[0].title, "Spec: Add caching layer (#5)");
+    assert_eq!(prs[0].title, "Write a spec for the caching layer (#5)");
     assert!(
         prs[0].head.starts_with("meguri/5-add-caching-layer-"),
         "branch must follow the worker naming convention: {}",

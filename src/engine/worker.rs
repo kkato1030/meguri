@@ -147,7 +147,7 @@ impl Flavor for WorkerFlavor {
     }
 
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
     }
 
     /// Phase transition (ADR 0005) + claim release. In github mode the issue's
@@ -169,9 +169,11 @@ impl Flavor for WorkerFlavor {
     /// needs-plan demotion (issue #22): release the claim and swap the issue
     /// to `meguri:plan`, leaving the agent's findings as a comment for the
     /// planner to pick up on the next poll. Ping-pong guard (the one-shot
-    /// rule): an issue whose spec already exists has been through planning —
-    /// a second needs-plan means the machine loop isn't converging, so hand
-    /// it to a human instead.
+    /// rule, hardened by issue #135): a spec on disk means the issue has been
+    /// through planning already; a prior `needs_plan` run on record means it
+    /// retreated once already even if no spec landed. Either trips the
+    /// guard — a second needs-plan hands the issue to a human instead of
+    /// bouncing `ready` ⇄ `plan` forever.
     async fn on_needs_plan(
         &self,
         deps: &Deps,
@@ -193,6 +195,18 @@ impl Flavor for WorkerFlavor {
             return Err(NeedsHuman(format!(
                 "agent asked for a plan on issue #{} but a spec (`{spec}`) \
                  already exists — planning did not resolve it: {reason}",
+                run.issue_number
+            ))
+            .into());
+        }
+        if deps
+            .store
+            .issue_has_needs_plan_run(&deps.project.id, KIND, run.issue_number)?
+        {
+            return Err(NeedsHuman(format!(
+                "agent asked for a plan on issue #{} but this issue already \
+                 retreated to planning once before — the ready/plan cycle \
+                 isn't converging: {reason}",
                 run.issue_number
             ))
             .into());
@@ -241,6 +255,26 @@ mod tests {
     use crate::config::{Config, ProjectConfig};
     use crate::forge::fake::FakeForge;
     use crate::store::Store;
+
+    #[test]
+    fn pr_title_prefers_subject_and_falls_back_to_issue_title() {
+        let (_deps, run, _forge) = fake_env(&[forge::LABEL_READY]);
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        assert_eq!(WorkerFlavor.pr_title(&run, &cp), "Add caching (#7)");
+
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            subject: Some("Cache API responses in memory".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            WorkerFlavor.pr_title(&run, &cp),
+            "Cache API responses in memory (#7)"
+        );
+    }
 
     #[test]
     fn prompt_invites_needs_plan() {
@@ -297,6 +331,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("docs/specs/issue-7.md"), "{err}");
+
+        // The hook only reports; run_flow's failure path does the labeling.
+        let labels = forge.labels_of(7);
+        assert!(
+            !labels.contains(&forge::LABEL_PLAN.to_string()),
+            "{labels:?}"
+        );
+        assert!(forge.comments_of(7).is_empty());
+    }
+
+    /// The vibration guard's other leg (issue #135): even when no spec ever
+    /// landed on disk, an issue that already retreated to planning once
+    /// before must not bounce `ready` ⇄ `plan` a second time.
+    #[tokio::test]
+    async fn needs_plan_a_second_time_escalates_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, first_run, forge) = fake_env(&[forge::LABEL_READY, forge::LABEL_WORKING]);
+        deps.store
+            .update_run_status(&first_run.id, crate::store::RunStatus::NeedsPlan, None)
+            .unwrap();
+
+        // A later worker run reclaims the same issue after planning sent it
+        // back to `ready` without ever writing a spec file.
+        let second_run = deps
+            .store
+            .create_run_for_loop("proj", KIND, 7, "t")
+            .unwrap();
+
+        let err = WorkerFlavor
+            .on_needs_plan(&deps, &second_run, dir.path(), "still unclear")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already retreated"), "{err}");
 
         // The hook only reports; run_flow's failure path does the labeling.
         let labels = forge.labels_of(7);
