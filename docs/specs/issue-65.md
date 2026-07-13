@@ -21,7 +21,7 @@
 - 成功率の分母 = `succeeded`+`failed`+`cancelled` のみ(`skipped`/`needs_plan`/`decomposed` は除外)。この定義をテストで固定。
 - コスト代理 = ターン数 × 所要時間。トークン会計はスコープ外。
 - 読み取り(stats/doctor/top)は sqlite 直読み。ドリフト**検知**だけ scheduler の sweep が担う。sweep は (project, 役割, プロファイル) 単位の**現在の drift 状態**を `routing_drift` テーブルに UPSERT し(現状態のソースオブトゥルース)、状態が遷移したときだけ `routing.drift` / `routing.drift_cleared` イベントを履歴として追記する。doctor/top/stats は `routing_drift` を `project_id` で絞って未解消(`active`)行を読むだけ。`events` は `project_id` を持たず drift は run 非依存の集計なので、read 側のスコープ・解消判定はイベントではなく状態テーブルで担保する。
-- 閾値は `[routing.drift]`。既定 = 成功率 -20pt または平均ターン数 +50%。テストで固定。
+- 閾値は**トップレベル** `[drift]` セクション(`[routing.drift]` にはしない)。既定 = 成功率 -20pt または平均ターン数 +50%。テストで固定。`[routing]` は書けば role routing が発動する switch(`Config.routing: Option<RoutingConfig>`、`src/config.rs:78` / `src/routing.rs:180`、ADR 0003)なので、TOML で `[routing]` テーブルを暗黙生成する `[routing.drift]` に閾値を置くと、legacy のまま drift だけ締めたいユーザーが意図せず `mode = auto` を発動させてしまう。drift 検知は routing の active/legacy と独立(legacy でも全 run は `default` プロファイルなので (役割, default) 単位で成績悪化を検出できる)なので、設定も routing から切り離す。
 - プローブは「モデル不正 → ❌」「ネットワーク/認証失敗 → ⚠️」を区別。注入クロージャ + fake agent でテスト。
 
 ## 実装内容
@@ -43,7 +43,7 @@
 
 ### 設定(`src/config.rs`)
 
-8. `RoutingConfig` に `#[serde(default)] drift: DriftConfig` を追加。`DriftConfig { success_rate_drop_pt: f64 = 20.0, turns_increase_pct: f64 = 50.0, window: usize = 20 }`(既定値関数 + `Default`)。`[routing]` 無し(legacy)でも既定が引けること。
+8. **`Config` に**トップレベル `#[serde(default)] drift: DriftConfig`(TOML `[drift]`)を追加する。`RoutingConfig` の中には**入れない** — `Config.routing` は `Option<RoutingConfig>` で `[routing]` の存在そのものが role routing の switch(`src/config.rs:78`, `src/routing.rs:180`, ADR 0003)なので、TOML で `[routing]` を暗黙生成する `[routing.drift]` に閾値を置くと legacy ユーザーが意図せず routing を active 化してしまう。`DriftConfig { success_rate_drop_pt: f64 = 20.0, turns_increase_pct: f64 = 50.0, window: usize = 20 }`(既定値関数 + `Default`)。トップレベルかつ `#[serde(default)]` なので `[drift]` 無し(既定運用)でも `[routing]` 無し(legacy)でも既定が引け、どちらも routing の active 判定に影響しないことをテストで固定する(`[drift]` だけの config で `cfg.routing` が `None` のまま)。
 
 ### スキーマ(`src/store/migrations/0007_routing_freshness.sql`)
 
@@ -84,7 +84,7 @@
 - `src/engine/routing_drift.rs`(新規)+ `src/engine/scheduler.rs` — poll に drift sweep を追加、`super::routing_drift` を配線
 - `src/store/runs.rs`(または新 `src/store/stats.rs`) — `routing_stats()`、CLI バージョン UPSERT/読み出し、`routing_drift` の UPSERT / project 別未解消行の読み出し
 - `src/store/migrations/0007_routing_freshness.sql` + `src/store/mod.rs` — `cli_versions` + `routing_drift` の移行登録
-- `src/config.rs` — `[routing.drift]`(`DriftConfig`)
+- `src/config.rs` — トップレベル `[drift]`(`DriftConfig`)。`RoutingConfig` の外に置き routing の activation に影響させない
 - `docs/adr/0007-routing-freshness-and-outcome-drift.md` — 本 PR 同梱
 - tests: `tests/stats_routing_test.rs`(集計 + ドリフト閾値)、doctor プローブ/バージョンのユニットテスト(`main.rs`/`routing.rs`/`store`)
 

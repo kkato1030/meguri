@@ -50,9 +50,11 @@ ADR 0003 で「auto の推奨表はバイナリに焼き込み、生成日(`GENE
 
 同じドリフトを毎 tick 書かないための dedup は、この状態テーブルに自然な置き場を得る: sweep は判定結果をテーブルの現在値と突き合わせ、`active` が遷移したときだけイベントを追記する(0→1 で `routing.drift`、1→0 で `routing.drift_cleared`)。テストで「同一状態の連続 sweep でイベントが 1 度だけ / 回復で cleared が 1 度だけ / 複数 project が混ざらない」を固定する。
 
-### 5. 閾値は `[routing.drift]` で調整可能。既定は成功率 -20pt / 平均ターン数 +50%
+### 5. 閾値はトップレベル `[drift]` で調整可能。既定は成功率 -20pt / 平均ターン数 +50%
 
 「相場観の陳腐化」は環境で速さが違うのでユーザーが締められるべき。既定値はテストの期待値として固定する。
+
+閾値セクションは **`RoutingConfig` の中(`[routing.drift]`)には置かず、トップレベル `[drift]` に置く**。ADR 0003 で `[routing]` は「書けば role routing の推奨解決が発動する switch」と決めており、実装も `Config.routing: Option<RoutingConfig>` で `[routing]` の存在そのものを active 判定に使う(`src/routing.rs::resolve` は `cfg.routing` が `Some` かどうかで legacy と分岐)。TOML では `[routing.drift]` を書くと `[routing]` テーブルが暗黙生成され `routing` が `Some` になるため、**legacy のまま drift 閾値だけ締めたいユーザーが意図せず `mode = auto` の推奨プロファイル解決を発動させてしまう**。drift 検知は routing の active/legacy に依存しない(legacy でも全 run は `default` プロファイルで走るので (役割, default) 単位の成績悪化は検出できる)ので、設定も routing から切り離してトップレベルに置くのが筋。これで `[drift]` の有無は routing の active 判定に一切影響しない。
 
 ### 6. 実起動プローブはネットワーク/認証失敗と「モデル不正」を区別する
 
