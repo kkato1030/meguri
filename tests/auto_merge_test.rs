@@ -163,6 +163,62 @@ async fn guard_gate_is_skipped_when_impl_guard_disabled() {
 }
 
 #[tokio::test]
+async fn attended_escalates_a_guard_failure_without_arming() {
+    // ADR 0012 §5: escalation is mode-independent — autonomy changes only the
+    // final arm. Under the default `attended`, a guard-failed head still gets
+    // its `needs-human` backstop, but nothing is ever armed.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
+    let mut deps = deps_with_guard(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended never arms, guard failure or not"
+    );
+    let labels = forge.pr_labels_of(pr);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the guard-failed backstop escalates even under attended: {labels:?}"
+    );
+    assert!(
+        forge
+            .comments_of(pr)
+            .iter()
+            .any(|c| c.contains("guard review"))
+    );
+}
+
+#[tokio::test]
+async fn attended_leaves_a_green_pr_unarmed_and_unescalated() {
+    // Attended stops only the final arm: a green guard status means nothing to
+    // escalate, and the PR is left for a human to merge.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
+    let mut deps = deps_with_guard(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended: green PR left for a human to merge"
+    );
+    assert!(
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "a green head has nothing to escalate"
+    );
+}
+
+#[tokio::test]
 async fn does_not_arm_when_disabled() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha");

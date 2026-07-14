@@ -133,13 +133,6 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     if !am.enabled {
         return Ok(());
     }
-    // Autonomy gate (issue #176, ADR 0012): meguri only arms auto-merge when the
-    // project is `full` — under `attended` (the default) a human is the merge
-    // gate, so a green PR is left for a person to merge. Orthogonal to
-    // `auto_merge.opt_in`, which selects *which* PRs are eligible.
-    if deps.config.autonomy_for(&deps.project) != Autonomy::Full {
-        return Ok(());
-    }
     // Fetched at most once per sweep (only when a candidate reaches
     // condition 7), then reused for every candidate in the same project.
     let mut policy: Option<MergePolicy> = None;
@@ -208,6 +201,17 @@ async fn process_pr(
             escalate_guard_failed(deps, pr).await;
             return Ok(());
         }
+    }
+    // 6c: the autonomy gate (issue #176, ADR 0012). meguri only arms/merges
+    // when the project is `full` — under `attended` (the default) a human is
+    // the merge gate, so a green PR is left for a person to merge. Placed
+    // *after* the guard gate on purpose: escalation is mode-independent (ADR
+    // 0012 §5 — autonomy changes only the final arm), so a guard-failed head
+    // still gets its `needs-human` backstop above even when arming is off.
+    // Orthogonal to `auto_merge.opt_in`, which selects *which* PRs are
+    // eligible.
+    if deps.config.autonomy_for(&deps.project) != Autonomy::Full {
+        return Ok(());
     }
     // 7: repository merge settings (fetched once per sweep, reused across PRs).
     // A mismatch here means the config passed startup fail-fast but the repo
