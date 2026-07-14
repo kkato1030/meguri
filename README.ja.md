@@ -515,6 +515,21 @@ planner = "ops/agents/planner.md"
 - **欠落は致命ではない** — 存在しないパスや worktree 外へ抜ける symlink は warn + `prompt.preamble_missing` イベントで飛ばし、turn は続行します。`meguri doctor` は clone 内に解決しないパスを報告します。
 - **`CLAUDE.md` との使い分け**: 全ロール同一の常時コンテキストで足り、Claude だけで回すなら [エージェント向け指示(apm)](#エージェント向け指示apm) / `CLAUDE.md` で十分です。ロール別テキストや CLI 非依存の配達が要るときだけ `[prompts]` を使い、ファイルは短く保ってください(かさばる内容は `CLAUDE.md` の担当)。
 
+### collab アドバイザ(`[collab]`、オプトイン)
+
+routing は「どの役割をどのモデルに振るか」を決めました。collab アドバイザはその**次段**です。振り分けた役割モデル同士を、**実行中に喋らせます**。worker が実装している間、meguri は plan を書いた役割(`planner`)を**アドバイザ**として同じ issue に再具現し、worker は [agmsg](https://github.com/fujibee/agmsg) 越しに「この方針で spec の要件を満たすか/ブレていないか」を相談できます。ドリフトを PR より前に、安く摘む層です(内部 self-review・pr-reviewer とは畳まず補完。[ADR 0006](docs/adr/0006-collab-advisor-role-reembodiment.md))。
+
+```toml
+[collab]
+mode = "advisor"          # "off"(既定)| "advisor"
+advisor_role = "planner"  # アドバイザが借りる routing ロール
+```
+
+- **`[collab]` がスイッチ、`mode = "advisor"` が ON。** セクション無し(または `mode = "off"`)は現状とバイト単位で同一です — アドバイザは立たず、worker のプロンプトも不変。`mode = "advisor"` のときだけ有効になります。
+- **起動時に大きな音で落ちる。** `mode = "advisor"` で agmsg skill(`~/.agents/skills/agmsg/scripts/version.sh`)が見つからなければ、`meguri watch` / `meguri run` は起動時に明示エラーで止まります(routing と同じ流儀、silent fallback しない)。`[collab]` は process-bound で、編集は再起動で反映されます(稼働中の hot reload は warn して起動時の値を維持)。
+- **アドバイザは ephemeral。** worker の実装開始で spawn、run 終了で reap(`keep_pane` に依存しない)、resume・再起動では adopt せず捨てて張り直し、書き込み可能な checkout を持ちません — 助言するだけでコードは書きません。プロファイルは plan 作者が実際に使ったものを継ぎます。collab 有効の worker run はスケジューラ枠を 2 消費します。
+- **相談は助言であって完了条件ではありません。** meguri は agmsg のやり取りを読まない・待たない・検証しません — run の成否は従来どおり `result.json` + git 検証だけで決まります。プロトコルは両エージェントのプロンプトに置かれます。v1 の対象は `worker` / `spec-worker` です。
+
 ## 開発
 
 ```bash

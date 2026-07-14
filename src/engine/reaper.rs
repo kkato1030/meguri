@@ -20,6 +20,11 @@ use crate::store::{LANE_AUTHOR, LANE_PR_REVIEW, LANE_SELF_REVIEW, PaneRecord};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
+/// An advisor pane (issue #111) with no active run: the ephemeral advisor
+/// outlives its worker run only by leak, so the sweep reclaims it even while
+/// the issue is open — a different discipline from the author/pr-review lanes
+/// that live until the issue closes.
+pub const REASON_ADVISOR_ORPHAN: &str = "advisor-orphan";
 /// Reclamation reason for a pane whose issue closed on the forge.
 pub const REASON_ISSUE_CLOSED: &str = "issue-closed";
 
@@ -408,6 +413,13 @@ pub async fn plan_panes(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Pan
             candidates.push(candidate(Verdict::ActiveRun, ""));
             continue;
         }
+        // The advisor lane is ephemeral (issue #111): once no run is active it
+        // has already outlived its worker run, so reclaim it even on an open
+        // issue — never keep it until the issue closes.
+        if record.lane == crate::store::LANE_ADVISOR {
+            candidates.push(candidate(Verdict::Reclaim, REASON_ADVISOR_ORPHAN));
+            continue;
+        }
         candidates.push(match states.get(deps, record.issue_number).await {
             Some(IssueState::Open) => candidate(Verdict::Open, ""),
             Some(IssueState::Closed) => candidate(Verdict::Reclaim, REASON_ISSUE_CLOSED),
@@ -477,11 +489,21 @@ async fn release_pane_record(
     // pane goes, so an early reclaim or a reopened issue can resume. The
     // turn path already saves it after every completed turn; this is the
     // last-resort net for panes that die mid-turn.
+    //
+    // The advisor lane (issue #111) is the deliberate exception: it is never
+    // adopted or resumed ("捨てて張り直す"), so its row must never carry a
+    // session id. Guarding the save here — the single choke point every
+    // release path funnels through (run-end reap, reaper safety-net sweep,
+    // respawn fold) — keeps that invariant for all of them at once.
     let session_root = agent_session::session_root(&deps.config.agent);
-    let agent_session_id = record
-        .worktree_path
-        .as_deref()
-        .and_then(|wt| agent_session::latest_session_id(&session_root, Path::new(wt)));
+    let agent_session_id = if lane == crate::store::LANE_ADVISOR {
+        None
+    } else {
+        record
+            .worktree_path
+            .as_deref()
+            .and_then(|wt| agent_session::latest_session_id(&session_root, Path::new(wt)))
+    };
     if let Some(session) = &agent_session_id {
         deps.store
             .save_pane_session(&deps.project.id, issue, lane, Some(session))?;

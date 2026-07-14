@@ -11,7 +11,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneSpec;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{LANE_AUTHOR, RunStatus, Store};
+use meguri::store::{LANE_ADVISOR, LANE_AUTHOR, RunStatus, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -553,6 +553,76 @@ async fn sweep_clears_stale_mapping_of_dead_pane() {
         .unwrap();
     assert_eq!(record.mux_pane_id, None, "stale mapping cleared");
     assert!(wt.exists(), "open issue's worktree untouched");
+}
+
+/// Collab advisor (issue #111): the advisor lane is ephemeral, so the sweep
+/// reclaims it even while the issue is open and no run is active — and the
+/// guard in `release_pane_record` means no session id is persisted, even when
+/// a transcript exists for the advisor's cwd.
+#[tokio::test]
+async fn advisor_pane_is_reclaimed_on_open_issue_without_saving_a_session_id() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(20, "Open", "", &[]));
+    let mut deps = setup(root.path(), forge.clone()).await;
+    let session_root = root.path().join("claude");
+    deps.config.agent.session_dir = Some(session_root.clone());
+
+    // A bare advisor dir with a fabricated transcript, as if the advisor agent
+    // had run a session there.
+    let advisor_dir = root
+        .path()
+        .join("worktrees")
+        .join("proj")
+        .join("advisor-20");
+    std::fs::create_dir_all(&advisor_dir).unwrap();
+    let tdir = session_root.join("projects").join(munged(&advisor_dir));
+    std::fs::create_dir_all(&tdir).unwrap();
+    std::fs::write(tdir.join("sess-adv.jsonl"), "{}\n").unwrap();
+
+    // A live advisor pane on the (open) issue.
+    let pane = deps
+        .mux
+        .spawn_pane(&PaneSpec {
+            title: "meguri#20:advisor".into(),
+            cwd: advisor_dir.clone(),
+            command: vec!["agent".into()],
+            env: vec![],
+        })
+        .await
+        .unwrap();
+    deps.store
+        .upsert_pane(
+            "proj",
+            20,
+            LANE_ADVISOR,
+            deps.mux.kind().as_str(),
+            "meguri",
+            &pane.0,
+            &advisor_dir.to_string_lossy(),
+        )
+        .unwrap();
+
+    // Reclaimed even on an open issue with no active run — the ephemeral rule.
+    let mut states = reaper::IssueStates::default();
+    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].verdict, Verdict::Reclaim);
+    assert_eq!(candidates[0].reason, reaper::REASON_ADVISOR_ORPHAN);
+
+    reaper::sweep(&deps).await.unwrap();
+
+    // Pane gone, and — despite the transcript — no session id was saved.
+    assert!(!deps.mux.pane_alive(&pane).await.unwrap());
+    let record = deps
+        .store
+        .get_pane("proj", 20, LANE_ADVISOR)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.mux_pane_id, None);
+    assert_eq!(
+        record.agent_session_id, None,
+        "the advisor lane never persists a session id"
+    );
 }
 
 #[tokio::test]
