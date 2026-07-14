@@ -708,21 +708,38 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
             .ok();
     }
 
-    match verdict {
-        ReviewVerdict::Clean => {
+    match (cp.kind, verdict) {
+        (_, ReviewVerdict::Clean) => {
             deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
         }
-        // The pr-reviewer is the human gate (ADR 0012): findings on either
-        // side (plan or impl) mean a person must decide — the self-review
-        // already handled everything auto-fixable, so escalate instead of
-        // leaving a red status nobody acts on. This is P1/P3 for the
-        // pr-reviewer sites. `escalate_pr` drops the working claim and adds
+        // Plan findings: `spec_fixer` (ADR 0013) is the plan-side human gate —
+        // it discovers `spec-reviewing` PRs whose head `meguri/pr-review` is
+        // `Failure` and drives the fix itself, escalating on its own if its
+        // round budget runs out. Adding `needs-human` here would starve that
+        // discover query (it skips escalated PRs) before spec_fixer ever
+        // runs — the same lockout ADR 0007 avoids by having merge_watch defer
+        // to fixer loops instead of escalating first. Drop the working claim
+        // (this settle's turn is done) but leave the label/status as-is.
+        (Kind::Plan, ReviewVerdict::Findings) => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+            deps.store.emit(
+                Some(&run.id),
+                "pr_review.deferred_to_spec_fixer",
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+            )?;
+        }
+        // Impl findings: no auto-fix loop drives impl PRs off pr-reviewer
+        // findings, so the pr-reviewer stays the human gate here (ADR 0012
+        // P1/P3). `escalate_pr` drops the working claim and adds
         // needs-human (which also stops discover from re-reviewing until a
         // human clears it).
-        ReviewVerdict::Findings => {
+        (Kind::Impl, ReviewVerdict::Findings) => {
             let lead = format!(
                 "PR review ({}) found issues that need a human before this PR can proceed.",
                 cp.kind.as_str()
@@ -919,13 +936,77 @@ mod tests {
         );
 
         // Findings: spec-reviewing kept (spec_fixer's re-drive target), no
-        // spec-ready, status failure.
+        // spec-ready, status failure, and — issue #192 — no needs-human, or
+        // spec_fixer's discover (which skips escalated PRs) would never fire.
         let forge = settle_verdict(ReviewVerdict::Findings).await;
         let labels = forge.pr_labels(7);
         assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
         assert!(!labels.contains(&forge::LABEL_SPEC_READY.to_string()));
+        assert!(
+            !labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            "plan findings must not escalate — spec_fixer (ADR 0013) owns the fix loop: {labels:?}"
+        );
         assert_eq!(
             forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Failure)
+        );
+    }
+
+    /// Impl findings are unchanged by issue #192: no auto-fix loop drives
+    /// impl PRs, so the pr-reviewer stays the human gate (ADR 0012).
+    #[tokio::test]
+    async fn impl_findings_still_escalate_to_needs_human() {
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+        forge.add_pr(
+            9,
+            "Add caching (#5)",
+            "Refs #5.",
+            &[forge::LABEL_IMPLEMENTING, forge::LABEL_WORKING],
+            "meguri/5-add-caching-def",
+            "cafef00d",
+        );
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        let deps = Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+        let run = deps
+            .store
+            .create_run_for_loop("proj", KIND, 5, "Add caching (#5)")
+            .unwrap();
+        let mut c = cp(Kind::Impl, "cafef00d");
+        c.pr_number = Some(9);
+        c.pr_url = "https://fake.example/pr/9".into();
+        c.verdict = Some(ReviewVerdict::Findings);
+        settle(&deps, &run, &c).await.unwrap();
+
+        let labels = forge.pr_labels(9);
+        assert!(labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()));
+        assert!(!labels.contains(&forge::LABEL_WORKING.to_string()));
+        assert_eq!(
+            forge.commit_status_of("cafef00d", PR_REVIEW_STATUS),
             Some(CommitStatusState::Failure)
         );
     }
