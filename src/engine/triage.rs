@@ -23,13 +23,17 @@
 //!
 //! Opt-in: `[triage] mode` defaults to `off`; the loop sweeps on `report` and
 //! `advise` (`auto`, v2 #88, still parses but stays idle). Re-scan is
-//! rate-limited like the cleaner (default-branch head + interval) but adds a
-//! new-issue signal — an open issue numbered above the last scan's max
+//! rate-limited like the cleaner (default-branch head + interval) but adds
+//! two more discovery signals, each independently checked and each still
+//! interval-limited: an open issue numbered above the last scan's max
 //! triggers a fresh sweep even while the head is still, so a new issue is
-//! triaged without waiting for the next push (ADR 0006). A previously
-//! proposed issue (still carrying only a `triage-*` proposal label — a real
-//! workflow label always wins) is re-triaged the same way once its content
-//! (title + body) changes; an unchanged one is not resent to the agent.
+//! triaged without waiting for the next push (ADR 0006); and, in `advise`
+//! mode, a previously proposed issue (still carrying only a `triage-*`
+//! proposal label — a real workflow label always wins) whose content (title +
+//! body) has drifted from its evidence comment's marker also triggers a
+//! sweep, even with the head still and no new issue, so an edited proposal
+//! is not stuck behind the next unrelated trigger. An unchanged proposed
+//! issue is never resent to the agent.
 //!
 //! `advise`'s writes are idempotent and reversible: the evidence comment
 //! carries a hidden `<!-- meguri:triage-advise hash=... -->` marker over the
@@ -123,22 +127,25 @@ pub fn parse_triage_marker(body: &str) -> Option<TriageMarker> {
 }
 
 /// The discovery decision, pure so it unit-tests without a forge. Sweep when
-/// nothing was ever recorded, or when *something changed* — the head moved or
-/// an open issue numbered above the last scan appeared — **and** the interval
-/// elapsed. The interval rate-limits every signal, so a failed sweep that only
-/// advances `scanned` still paces the retry. A truly unchanged state (same
-/// head, no new issue) is never re-swept, however old.
+/// nothing was ever recorded, or when *something changed* — the head moved,
+/// an open issue numbered above the last scan appeared, or (`advise` mode)
+/// a previously proposed issue's content drifted from its evidence-comment
+/// marker — **and** the interval elapsed. The interval rate-limits every
+/// signal, so a failed sweep that only advances `scanned` still paces the
+/// retry. A truly unchanged state is never re-swept, however old.
 pub fn needs_triage_scan(
     marker: Option<&TriageMarker>,
     current_head: &str,
     max_open_issue: i64,
     now: u64,
     interval_secs: u64,
+    advise_content_changed: bool,
 ) -> bool {
     match marker {
         None => true,
         Some(m) => {
-            let changed = m.head != current_head || max_open_issue > m.max_issue;
+            let changed =
+                m.head != current_head || max_open_issue > m.max_issue || advise_content_changed;
             changed && now.saturating_sub(m.scanned) >= interval_secs
         }
     }
@@ -149,6 +156,33 @@ fn epoch_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The full discovery-due decision: [`needs_triage_scan`] plus the
+/// per-project interval, shared by `discover` and `prepare_work` so both
+/// re-verify the exact same condition. The `advise` content-drift signal
+/// (`advise_backlog_changed`) is checked lazily — only when the cheap
+/// signals (head, new-issue) don't already justify a sweep — since it costs
+/// a full open-issues scan.
+async fn scan_due(
+    deps: &Deps,
+    marker: Option<&TriageMarker>,
+    head: &str,
+    max_open: i64,
+) -> Result<bool> {
+    let interval = deps.config.triage_for(&deps.project).interval_hours * 3600;
+    if needs_triage_scan(marker, head, max_open, epoch_now(), interval, false) {
+        return Ok(true);
+    }
+    let advise_changed = advise_backlog_changed(deps).await?;
+    Ok(needs_triage_scan(
+        marker,
+        head,
+        max_open,
+        epoch_now(),
+        interval,
+        advise_changed,
+    ))
 }
 
 /// How meguri should handle an issue (v0 recommendation, never applied).
@@ -281,8 +315,7 @@ impl super::Loop for TriageLoop {
                 .await?;
         let max_open = max_open_issue(deps).await?;
         let marker = report.as_ref().and_then(|i| parse_triage_marker(&i.body));
-        let interval = deps.config.triage_for(&deps.project).interval_hours * 3600;
-        if !needs_triage_scan(marker.as_ref(), &head, max_open, epoch_now(), interval) {
+        if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
             return Ok(Vec::new());
         }
         Ok(vec![Target {
@@ -528,8 +561,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut TriageCheckpoint) -
     let head =
         gitops::default_branch_head(&deps.project.repo_path, &deps.project.default_branch).await?;
     let max_open = max_open_issue(deps).await?;
-    let interval = deps.config.triage_for(&deps.project).interval_hours * 3600;
-    if !needs_triage_scan(marker.as_ref(), &head, max_open, epoch_now(), interval) {
+    if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
         return Ok(Prepared::Skip(format!(
             "head {head} needs no sweep (already scanned, within interval, or no new issue)"
         )));
@@ -628,6 +660,29 @@ async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool
         return Ok(true);
     };
     Ok(marker.hash != content_hash(issue))
+}
+
+/// The discovery-time counterpart of `content_changed_since_advise`: whether
+/// *any* open, proposed issue has drifted from its evidence-comment marker.
+/// Without this, editing a proposed issue's title/body alone (no new issue
+/// filed, no default-branch push) never sets `needs_triage_scan`'s `changed`
+/// flag, so the sweep that would notice the drift — and `gather_candidates`'s
+/// own per-issue check — is never even scheduled. `off`/`report` never
+/// propose, so this always short-circuits to `false` there.
+async fn advise_backlog_changed(deps: &Deps) -> Result<bool> {
+    if deps.config.triage_for(&deps.project).mode != TriageMode::Advise {
+        return Ok(false);
+    }
+    for issue in deps.forge().list_open_issues().await? {
+        let proposed = issue
+            .labels
+            .iter()
+            .any(|l| forge::TRIAGE_PROPOSAL_LABELS.contains(&l.as_str()));
+        if proposed && content_changed_since_advise(deps, &issue).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Dependency gate (looper ADR-0004): a GitHub-native `blocked_by` that isn't
@@ -1267,14 +1322,16 @@ mod tests {
             max_issue,
         };
         // No marker: always scan.
-        assert!(needs_triage_scan(None, "abc", 5, 1000, day));
-        // Same head, no new issue: never rescan, however much time passed.
+        assert!(needs_triage_scan(None, "abc", 5, 1000, day, false));
+        // Same head, no new issue, no advise drift: never rescan, however
+        // much time passed.
         assert!(!needs_triage_scan(
             Some(&m("abc", 0, 5)),
             "abc",
             5,
             10 * day,
-            day
+            day,
+            false,
         ));
         // Head moved but within the interval: wait.
         assert!(!needs_triage_scan(
@@ -1282,7 +1339,8 @@ mod tests {
             "abc",
             5,
             1000 + day - 1,
-            day
+            day,
+            false,
         ));
         // Head moved and the interval elapsed: scan.
         assert!(needs_triage_scan(
@@ -1290,7 +1348,8 @@ mod tests {
             "abc",
             5,
             1000 + day,
-            day
+            day,
+            false,
         ));
         // Same head but a new issue appeared (max_issue grew) after the
         // interval: scan — the new-issue signal, head-independent.
@@ -1299,7 +1358,8 @@ mod tests {
             "abc",
             6,
             1000 + day,
-            day
+            day,
+            false,
         ));
         // New issue but still within the interval: wait (interval rate-limits
         // every signal).
@@ -1308,7 +1368,8 @@ mod tests {
             "abc",
             6,
             1000 + day - 1,
-            day
+            day,
+            false,
         ));
         // Initializing marker `head=none max_issue=0` behaves like a moved
         // head: rescans once the interval elapses, not before.
@@ -1317,14 +1378,35 @@ mod tests {
             "abc",
             0,
             1500,
-            day
+            day,
+            false,
         ));
         assert!(needs_triage_scan(
             Some(&m(MARKER_HEAD_NONE, 1000, 0)),
             "abc",
             0,
             1000 + day,
-            day
+            day,
+            false,
+        ));
+        // advise content drift, head/new-issue signals both quiet: scan once
+        // the interval elapsed, just like the other two signals — and not
+        // before.
+        assert!(!needs_triage_scan(
+            Some(&m("abc", 1000, 5)),
+            "abc",
+            5,
+            1000 + day - 1,
+            day,
+            true,
+        ));
+        assert!(needs_triage_scan(
+            Some(&m("abc", 1000, 5)),
+            "abc",
+            5,
+            1000 + day,
+            day,
+            true,
         ));
     }
 

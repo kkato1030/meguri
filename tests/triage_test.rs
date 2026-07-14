@@ -752,3 +752,43 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
         "the content change must produce a fresh evidence comment"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_content_edit_alone_triggers_rediscovery() {
+    // interval_hours = 0: isolates the advise-drift signal from the interval
+    // rate-limit so this test can assert on discovery directly, the way
+    // `new_issue_triggers_rescan_even_with_a_still_head` does for the
+    // new-issue signal.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1: propose `ready` on the candidate.
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, READY_REC);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // Head still, no new issue, content unchanged: quiet, as usual.
+    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // The candidate's title/body changes — no push, no new issue — and
+    // discovery alone must still notice: `report`/`advise`'s README/ADR
+    // promise ("content change re-triages") has to hold even when neither
+    // of the other two signals fires.
+    env.forge
+        .update_issue_body(CANDIDATE, "totally different ask now")
+        .await
+        .unwrap();
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
