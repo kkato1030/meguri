@@ -198,6 +198,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
     };
     let deps = Deps {
         store: Store::open_in_memory().unwrap(),

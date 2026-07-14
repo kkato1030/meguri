@@ -89,6 +89,8 @@ pub struct Config {
     #[serde(default)]
     pub clean: CleanConfig,
     #[serde(default)]
+    pub triage: TriageConfig,
+    #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
@@ -156,6 +158,57 @@ fn default_clean_interval_hours() -> u64 {
 }
 fn default_stale_branch_days() -> u64 {
     30
+}
+
+/// How far the triage loop is allowed to act (issue #85). The series stages
+/// the automation of triage from read-only up: `off` (the opt-in default) →
+/// `report` (v0, this issue) → `advise` (v1 #87) → `auto` (v2 #88). v0 only
+/// acts on `report`; `advise`/`auto` parse for forward-compat but stay idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TriageMode {
+    /// Triage is disabled — discovery returns nothing (the default).
+    #[default]
+    Off,
+    /// v0: read-only sweep into a single `meguri:triage-report` issue.
+    Report,
+    /// v1 #87: proposal comments / `meguri:triage-*` labels (not yet built).
+    Advise,
+    /// v2 #88: apply `meguri:ready`/`meguri:plan` directly (not yet built).
+    Auto,
+}
+
+/// Settings for the triage loop (read-only recommendation sweeps, issue #85).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageConfig {
+    /// How far triage may act. Default `off`: triage is fully opt-in (cleaner
+    /// runs always, but triage automates a decision, so it stays quiet until
+    /// asked). v0 sweeps only when this is `report`.
+    #[serde(default)]
+    pub mode: TriageMode,
+    /// Minimum hours between sweeps; a moved head or a new issue alone does not
+    /// trigger one before the interval elapses.
+    #[serde(default = "default_triage_interval_hours")]
+    pub interval_hours: u64,
+    /// False-positive silencer: recommendations whose rendered row contains any
+    /// of these substrings are dropped from the report at render time (same
+    /// idea as `clean.ignore`).
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        Self {
+            mode: TriageMode::default(),
+            interval_hours: default_triage_interval_hours(),
+            ignore: Vec::new(),
+        }
+    }
+}
+
+fn default_triage_interval_hours() -> u64 {
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +534,10 @@ pub struct ProjectConfig {
     /// (the ignore list in particular is inherently project-specific).
     #[serde(default)]
     pub clean: Option<CleanConfig>,
+    /// Per-project triage settings; overrides the global `[triage]` section
+    /// (opt-in per project, and the ignore list is project-specific).
+    #[serde(default)]
+    pub triage: Option<TriageConfig>,
 }
 
 fn default_branch() -> String {
@@ -538,6 +595,11 @@ impl Config {
     /// Effective cleaner settings for a project (project override wins).
     pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
         project.clean.as_ref().unwrap_or(&self.clean)
+    }
+
+    /// Effective triage settings for a project (project override wins).
+    pub fn triage_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a TriageConfig {
+        project.triage.as_ref().unwrap_or(&self.triage)
     }
 }
 
@@ -678,6 +740,8 @@ mod tests {
         assert_eq!(back.notifications.throttle_secs, 60);
         assert!(back.review.impl_enabled);
         assert_eq!(back.review.impl_max_rounds, 3);
+        assert_eq!(back.triage.mode, TriageMode::Off);
+        assert_eq!(back.triage.interval_hours, 6);
     }
 
     #[test]
@@ -1005,6 +1069,61 @@ language = "English"
         assert_eq!(cfg.clean.interval_hours, 24);
         assert_eq!(cfg.clean.stale_branch_days, 30);
         assert!(cfg.clean.ignore.is_empty());
+    }
+
+    #[test]
+    fn triage_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.triage.mode, TriageMode::Off);
+        assert_eq!(cfg.triage.interval_hours, 6);
+        assert!(cfg.triage.ignore.is_empty());
+    }
+
+    #[test]
+    fn triage_mode_parses_all_stages() {
+        for (raw, mode) in [
+            ("off", TriageMode::Off),
+            ("report", TriageMode::Report),
+            ("advise", TriageMode::Advise),
+            ("auto", TriageMode::Auto),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[triage]\nmode = \"{raw}\"\n")).unwrap();
+            assert_eq!(cfg.triage.mode, mode, "mode: {raw}");
+        }
+    }
+
+    #[test]
+    fn triage_project_override_wins() {
+        let raw = r##"
+[triage]
+mode = "report"
+interval_hours = 6
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "quiet"
+repo_path = "/tmp/quiet"
+repo_slug = "me/quiet"
+
+[projects.triage]
+mode = "off"
+ignore = ["#42"]
+"##;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.triage_for(demo).mode, TriageMode::Report);
+        assert_eq!(cfg.triage_for(demo).interval_hours, 6);
+
+        let quiet = cfg.project("quiet").unwrap();
+        assert_eq!(cfg.triage_for(quiet).mode, TriageMode::Off);
+        // The override replaces the whole section; omitted keys fall back to
+        // the built-in defaults, not the global section.
+        assert_eq!(cfg.triage_for(quiet).interval_hours, 6);
+        assert_eq!(cfg.triage_for(quiet).ignore, vec!["#42"]);
     }
 
     #[test]

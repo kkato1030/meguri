@@ -92,6 +92,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         language: None,
         pr: None,
         clean: None,
+        triage: None,
     };
 
     let deps = Deps {

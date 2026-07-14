@@ -9,6 +9,7 @@ pub mod reaper;
 pub mod reviewer;
 pub mod scheduler;
 pub mod spec_worker;
+pub mod triage;
 pub mod worker;
 
 use std::sync::Arc;
@@ -175,6 +176,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
+        Arc::new(triage::TriageLoop),
     ]
 }
 
@@ -279,6 +281,7 @@ mod tests {
             "ci-fixer",
             "conflict-resolver",
             "cleaner",
+            "triage",
         ] {
             assert_eq!(role_for_loop(kind), ROLE_AUTHOR, "loop: {kind}");
         }

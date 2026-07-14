@@ -114,6 +114,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
     };
 
     let deps = Deps {

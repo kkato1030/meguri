@@ -458,6 +458,7 @@ mod tests {
                 language: None,
                 pr: None,
                 clean: None,
+                triage: None,
             },
         }
     }

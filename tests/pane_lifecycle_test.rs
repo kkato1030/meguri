@@ -80,6 +80,7 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));

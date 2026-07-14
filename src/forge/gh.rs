@@ -347,6 +347,27 @@ impl Forge for GhForge {
             .unwrap_or_default())
     }
 
+    async fn list_open_issues(&self) -> Result<Vec<Issue>> {
+        let raw = self
+            .gh(&[
+                "issue",
+                "list",
+                "--repo",
+                &self.repo,
+                "--state",
+                "open",
+                "--limit",
+                "50",
+                "--json",
+                "number,title,body,labels",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue list output")?;
+        Ok(v.as_array()
+            .map(|items| items.iter().filter_map(Self::issue_from_json).collect())
+            .unwrap_or_default())
+    }
+
     /// GitHub-native issue dependencies. Missing fields degrade to an
     /// unresolved blocker (never to resolved), matching the gate's
     /// "unreadable means unresolved" rule.

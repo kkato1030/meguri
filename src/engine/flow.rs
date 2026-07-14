@@ -233,7 +233,7 @@ pub async fn discover_by_label(deps: &Deps, loop_kind: &str, label: &str) -> Res
 /// not_planned/duplicate closes, and blockers we cannot read all keep the
 /// issue out of discovery. The skip is silent — no label, no comment: the
 /// dependency graph on the forge already tells a human why nothing starts.
-async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
+pub(crate) async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
     match deps.forge.blocked_by(issue).await {
         Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
         Err(_) => true,

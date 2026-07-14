@@ -142,7 +142,7 @@ meguri's issue labels form **two axes** (see [ADR 0005](docs/adr/0005-issue-labe
 | `meguri:needs-human` | 🔴 red | a human needs to look; a comment explains why (the phase label stays, so you can see *whether it stalled in spec or in implementation*) |
 | `meguri:hold` | ⚪ grey | intentionally paused by a human; discovery skips it |
 
-Plus one bookkeeping label: `meguri:clean-report` marks the cleaner loop's per-project report issue (put `meguri:hold` on it to pause the sweep).
+Plus two bookkeeping labels: `meguri:clean-report` and `meguri:triage-report` mark the cleaner and triage loops' per-project report issues (put `meguri:hold` on either to pause that sweep).
 
 The **PR side** stays as it was: a spec PR carries `meguri:spec-reviewing` (awaiting review) then `meguri:spec-ready` (review passed; implementation continues) — these live on the PR, independent of the issue's phase label. CI-red and merge-readiness aren't mirrored to labels (GitHub shows them natively); a `meguri:awaiting-merge` PR label can be added later if needed.
 
@@ -162,6 +162,10 @@ meguri's AI review covers **both the spec PR and the implementation diff**. Once
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
+### Triage (read-only recommendation sweeps)
+
+Discovery still waits on a human to label issues `meguri:ready` / `meguri:plan`. The **triage** loop is the first step toward automating that last bit of hand-labeling — and, like the cleaner, it starts read-only (ADR 0006). It looks at every *untriaged* open issue (open, no `meguri:` label, not held, no unresolved blocker) and writes a recommendation for each — how meguri should handle it (`ready` / `plan` / `needs-human` / `hold` / `skip`), its confidence, and the rough size — into a single per-project issue labeled `meguri:triage-report`. In v0 it **only recommends**: it never labels or comments on the issues it triages, so a wrong call breaks nothing. You adopt a recommendation by applying `meguri:ready` / `meguri:plan` yourself; the existing loops take it from there. The body is a snapshot table rewritten on every sweep, rate-limited by `triage.interval_hours`; a new issue triggers a fresh sweep even while the default-branch head is still (so a freshly filed issue is triaged without waiting for the next push). To silence a bad recommendation, add a substring to `triage.ignore`; to pause the loop, put `meguri:hold` on the report issue. Triage is **opt-in**: it does nothing until you set `triage.mode = "report"` (default `off`, because it automates a decision, not just an observation). Applying labels automatically (`advise`, then `auto`) is future work.
+
 Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the reviewer. After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
 
 Per-loop lifetimes at a glance:
@@ -176,6 +180,7 @@ Per-loop lifetimes at a glance:
 | ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
 | conflict resolver (author) | CONFLICTING meguri PR | issue (from branch) | attached to the PR head | base merged & pushed (≤3) | kept — continues the author pane |
 | cleaner (standalone) | report issue + default-branch movement | report issue | read-only detached | report issue rewritten | self-reclaimed |
+| triage (standalone) | report issue + default-branch/new-issue movement (opt-in) | report issue | read-only detached | report issue rewritten | self-reclaimed |
 
 ## Configuration
 
@@ -236,6 +241,11 @@ interval_hours = 24     # min hours between cleaner sweeps (a moved head alone d
 stale_branch_days = 30  # remote branches older than this are reported as stale
 ignore = []             # substrings that silence false positives; override per project with [projects.clean]
 
+[triage]
+mode = "off"            # off (default, opt-in) | report (v0 read-only) | advise (v1) | auto (v2)
+interval_hours = 6      # min hours between triage sweeps
+ignore = []             # substrings that silence bad recommendations; override per project with [projects.triage]
+
 [review]
 impl_enabled = true    # kill switch for the impl-reviewer loop (AI review of implementation PRs)
 impl_max_rounds = 3    # max impl-review rounds per PR; past the cap the PR is left to the humans
@@ -286,7 +296,7 @@ The test suite drives the full loop with a scripted fake agent TUI (`tests/fixtu
 
 ## Status / roadmap
 
-Nine loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **impl reviewer** (quiet green meguri implementation PR → AI review as inline threads feeding the fixer), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue).
+Ten loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → PR), the **planner** (`meguri:plan` issue → spec PR), the **reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **impl reviewer** (quiet green meguri implementation PR → AI review as inline threads feeding the fixer), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue), and the **triage** loop (opt-in read-only sweep → recommendations for untriaged open issues in a single `meguri:triage-report` issue).
 
 ## License
 

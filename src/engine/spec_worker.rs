@@ -464,6 +464,7 @@ mod tests {
                 worktree_root: None,
                 pr: None,
                 clean: None,
+                triage: None,
             },
         }
     }

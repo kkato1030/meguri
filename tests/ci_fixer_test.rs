@@ -95,6 +95,7 @@ async fn setup() -> TestEnv {
         language: None,
         pr: None,
         clean: None,
+        triage: None,
     };
 
     let deps = Deps {

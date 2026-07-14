@@ -77,6 +77,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
             worktree_root: Some(root.join("worktrees")),
             pr: None,
             clean: None,
+            triage: None,
         },
     }
 }
