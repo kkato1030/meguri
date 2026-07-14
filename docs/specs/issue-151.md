@@ -18,11 +18,15 @@ apm 0.24.0 で確認済み:
 - `skills/meguri/` は `SKILL.md` を含むので、**専用の `apm.yml` なしに** apm が Claude skill
   パッケージとして自動検出する。
 - GitHub サブパス参照が通る: `apm install kkato1030/meguri/skills/meguri` →
-  `github.com/kkato1030/meguri/skills/meguri @<sha>` を解決し `.claude/skills/meguri/` へ展開。
-  ロックには `virtual_path: skills/meguri` が記録される。ルートの `apm.yml`(meguri 開発用)とは
-  干渉しない。
+  `github.com/kkato1030/meguri/skills/meguri @<sha>` を解決し(`--target claude` 時)
+  `.claude/skills/meguri/` へ展開。ロックには `virtual_path: skills/meguri` が記録される。
+  ルートの `apm.yml`(meguri 開発用)とは干渉しない。
 - ターゲット別展開: `claude` → `.claude/skills/`、`codex` / `copilot` / `agent-skills` → 共有の
   `.agents/skills/`。`SKILL.md` は変換されず素通しで配られる(二重管理なし)。
+- **ユーザースコープのデフォルトターゲットは Claude ではない**: クリーンな `HOME` でターゲット
+  未指定の `apm install -g` を実行すると、共有の `~/.agents/skills/` にのみ展開され
+  `~/.claude/skills/` には入らない。Claude Code で確実に発火させるには `--target claude` の
+  明示が必要(ADR 0012)。よって README の配布コマンドは必ず `--target claude` を含める。
 - unpinned 参照には apm が「`#tag`/`#sha` を付けろ」と警告する → 配布例は必ずタグにピンする。
 
 ## やること(受け入れ条件)
@@ -31,9 +35,11 @@ apm 0.24.0 で確認済み:
 `## Install & set up` 配下、既存の `### Agent instructions (apm)`(L457 付近)とは別項として、
 配布の 2 チャネルを書く:
 
-- [ ] **未導入者向け(獲得)**: `apm install -g kkato1030/meguri/skills/meguri#<tag>` を提示。
-      これで meguri 未導入のリポジトリでもユーザーレベルでスキルが発火する、と 1〜2 行で説明。
-      タグは最新リリース(ADR 0007 の `vX.Y.Z`)にピンする旨を添える(unpinned 警告の回避)。
+- [ ] **未導入者向け(獲得)**: `apm install -g --target claude kkato1030/meguri/skills/meguri#<tag>`
+      を提示。これで meguri 未導入のリポジトリでもユーザーレベルでスキルが発火する、と 1〜2 行で
+      説明。`--target claude` は省略不可(省略すると `~/.agents/skills/` に入り Claude Code で
+      発火しない — 上記検証)。タグは最新リリース(ADR 0007 の `vX.Y.Z`)にピンする旨を添える
+      (unpinned 警告の回避)。
 - [ ] **導入済み向け(定着)**: `meguri agent-skills install`(#150)を提示。
       → #150 未マージなら「(#150 で提供予定)」と明記し、コマンド行だけ先に置くかは実装判断。
 - [ ] 日本語 README(`README.ja.md` があれば)にも同じ 2 チャネルを反映。
@@ -43,6 +49,9 @@ apm 0.24.0 で確認済み:
       インストール/コンパイルできることを確認する軽量ジョブを 1 本足す。スクラッチディレクトリへの
       install(`--root <dir>` か使い捨て cwd)が成功し、`SKILL.md` が展開されることを assert する
       程度でよい(症状: apm のバージョン更新で獲得チャネルが黙って壊れるのを検知する)。
+      `claude` ターゲットは展開先が `.claude/skills/meguri/SKILL.md` であることまで assert する
+      (apm のターゲット別配置が将来変わったときも README の配布コマンドの約束が守られているかを
+      ここで検知する)。
 - [ ] **要判断(実装時)**: CI での apm 導入方法とピン。ADR 0007 のサプライチェーン衛生
       (SHA ピン / harden-runner / 最小 permissions)を保つこと。apm バージョンは `apm.lock.yaml`
       の `apm_version`(現在 0.24.0)と揃える。curl 一発インストールは衛生に反するので、
