@@ -160,15 +160,35 @@ async fn github_plan_kind_gets_the_plan_label() {
     assert!(targets.iter().any(|t| t.key.number() == 1));
 }
 
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
 #[tokio::test]
-async fn body_file_is_read_from_the_repo() {
+async fn body_file_is_read_from_the_default_branch_not_working_tree() {
+    // body_file is read from the default branch (ADR 0015): the committed
+    // content fires, a working-tree-only edit does not.
     let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "t@example.com"]);
+    git(dir.path(), &["config", "user.name", "t"]);
     std::fs::create_dir_all(dir.path().join("ops")).unwrap();
     std::fs::write(
         dir.path().join("ops/task.md"),
         "# From a file\nrun the tidy",
     )
     .unwrap();
+    git(dir.path(), &["add", "ops/task.md"]);
+    git(dir.path(), &["commit", "-m", "add task"]);
+    // Uncommitted tamper: must be ignored by the default-branch read.
+    std::fs::write(dir.path().join("ops/task.md"), "TAMPERED work-tree only").unwrap();
+
     let forge = Arc::new(FakeForge::default());
     let mut s = sched("filed", "0 9 * * *", ScheduleKind::Ready, false);
     s.body = None;
@@ -183,7 +203,16 @@ async fn body_file_is_read_from_the_repo() {
     sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap();
     sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap();
     let issues = forge.issues.lock().unwrap();
-    assert!(issues[0].body.contains("run the tidy"));
+    assert!(
+        issues[0].body.contains("run the tidy"),
+        "{}",
+        issues[0].body
+    );
+    assert!(
+        !issues[0].body.contains("TAMPERED"),
+        "working-tree edit must not reach the issue body: {}",
+        issues[0].body
+    );
     assert!(
         issues[0]
             .body
