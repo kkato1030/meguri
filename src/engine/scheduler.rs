@@ -405,6 +405,8 @@ mod tests {
             schedules: Vec::new(),
             cadence: Vec::new(),
             prompts: Default::default(),
+            triage: None,
+            autonomy: None,
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),

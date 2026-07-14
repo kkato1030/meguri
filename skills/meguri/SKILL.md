@@ -61,8 +61,8 @@ This is what keeps the pitch honest — say it plainly, don't bury it in fine pr
 - **Already running here** (labels like `meguri:ready` / `meguri:working` exist, or a
   `.meguri/` directory, or `config.toml` already lists this repo) → follow
   `references/operate.md` for day-to-day use (queuing work, watching runs, taking over,
-  triage, cleanup). If you also maintain this repo's `AGENTS.md` / `CLAUDE.md`, consider
-  proposing `references/repo-rule-fragment.md` be folded in, so future sessions treat
+  triage, cleanup). Also propose `meguri agent-skills install --project` (idempotent; writes
+  `.claude/rules/meguri.md` from `references/repo-rule-fragment.md`) so future sessions treat
   `meguri:*` labels and `meguri/` branches correctly and default to proposing delegation for
   independent chunks of work instead of doing everything inline.
 

@@ -15,6 +15,7 @@ use meguri::config::{AgentProfile, Config, LaunchMode, ProjectConfig};
 use meguri::engine::pr_reviewer::{
     self, DIFF_FILE, PR_REVIEW_STATUS, PrReviewerLoop, REVIEW_FILE, run_pr_reviewer,
 };
+use meguri::engine::spec_fixer::SpecFixerLoop;
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
@@ -134,10 +135,12 @@ async fn setup_with(
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
@@ -317,11 +320,15 @@ async fn plan_review_clean_flips_to_spec_ready_via_status_and_body() {
     assert!(wt.join(DIFF_FILE).exists());
 }
 
-/// pr-reviewer(Plan) findings: a failure status, the summary in the body, and
-/// spec-reviewing kept for the next push. The reviewed head is deduped (the
-/// status is the key); a new head is re-reviewed.
+/// pr-reviewer(Plan) findings do NOT escalate (issue #192, ADR 0013): a
+/// failure status, the summary in the body, spec-reviewing kept, working
+/// released, and no needs-human — `spec_fixer` owns the plan-side fix loop
+/// and its discover must be able to pick the PR up on the very next poll.
+/// Escalating here would starve spec_fixer's discover (which skips
+/// needs-human PRs) before it ever ran (the #176/#188 integration bug this
+/// issue fixes).
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_review_findings_keep_reviewing_and_dedup_by_status() {
+async fn plan_review_findings_defer_to_spec_fixer_without_escalating() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     let run = create_pr_reviewer_run(&env);
 
@@ -344,6 +351,15 @@ async fn plan_review_findings_keep_reviewing_and_dedup_by_status() {
         "{labels:?}"
     );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "plan findings must not escalate — spec_fixer owns the fix loop: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert!(
+        env.forge.comments_of(PR).is_empty(),
+        "no escalation comment for plan findings"
+    );
     assert_eq!(
         env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
         Some(CommitStatusState::Failure)
@@ -356,23 +372,25 @@ async fn plan_review_findings_keep_reviewing_and_dedup_by_status() {
         .unwrap();
     assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
 
-    // Idempotency: the reviewed head (now carrying a pr-review status) is skipped.
+    // pr_reviewer itself does not re-review a head it already settled...
     assert!(
         PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "same head must not be reviewed twice"
+        "an already-reviewed head is not re-reviewed"
     );
-    // A new push moves the head past the status → re-reviewed.
-    env.forge.set_pr_head(PR, "feedfacefeedface");
-    let targets = PrReviewerLoop.discover(&env.deps).await.unwrap();
+    // ...but spec_fixer's discover fires on the very next poll (issue #192,
+    // acceptance criterion 1): no needs-human means it is free to pick up
+    // the PR whose head pr-review status it just saw settle to Failure.
+    let targets = SpecFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![ISSUE]
+        vec![ISSUE],
+        "spec_fixer must discover the findings PR now that it is not escalated"
     );
 }
 
 /// pr-reviewer(Impl): reviews an implementation PR, writes the pr-review
-/// status + body summary, and NEVER touches spec-* labels (criterion 3a). No
-/// inline threads.
+/// status + body summary, escalates findings to needs-human (issue #176), and
+/// NEVER touches spec-* labels (criterion 3a). No inline threads.
 #[tokio::test(flavor = "multi_thread")]
 async fn impl_review_reviews_without_touching_spec_labels() {
     // An impl PR: no spec-reviewing label, impl review enabled.
@@ -406,6 +424,11 @@ async fn impl_review_reviews_without_touching_spec_labels() {
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
     assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    // Findings escalate: the impl PR is parked on needs-human (issue #176).
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
     let pr = env
         .forge
         .prs()
@@ -414,7 +437,8 @@ async fn impl_review_reviews_without_touching_spec_labels() {
         .unwrap();
     assert!(pr.body.contains("pr review (impl)"), "body: {}", pr.body);
     assert!(env.forge.threads_of(PR).is_empty());
-    assert!(env.forge.pr_comments_of(PR).is_empty());
+    // The escalation comment is a normal PR comment (not an inline review thread).
+    assert_eq!(env.forge.comments_of(PR).len(), 1);
 }
 
 /// pr-reviewer(Impl) OFF (the default): impl PRs are not discovered.
@@ -515,7 +539,7 @@ async fn needs_human_escalates_on_the_pr() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
-    let comments = env.forge.pr_comments_of(PR);
+    let comments = env.forge.comments_of(PR);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
 }
@@ -568,6 +592,12 @@ async fn second_round_reuses_pane_and_worktree() {
     let head2 = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
     run_git(&clone, &["checkout", "main"]).await.unwrap();
     env.forge.set_pr_head(PR, &head2);
+    // Round 1's findings escalated to needs-human (issue #176); a human clears
+    // the label so the pushed fix can be re-guarded on the review lane.
+    env.forge
+        .remove_pr_label(PR, LABEL_NEEDS_HUMAN)
+        .await
+        .unwrap();
 
     let run2 = create_pr_reviewer_run(&env);
     let outcome = tokio::time::timeout(
@@ -658,7 +688,9 @@ async fn direct_pr_reviewer_escalation_comment_does_not_advertise_attach() {
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
         "{labels:?}"
     );
-    let comments = env.forge.pr_comments_of(PR);
+    // The central escalation helper posts via `pr_comment` (→ `comments`),
+    // issue #176.
+    let comments = env.forge.comments_of(PR);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"), "{}", comments[0]);
     assert!(

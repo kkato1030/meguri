@@ -569,6 +569,18 @@ impl Forge for FakeForge {
             .collect())
     }
 
+    async fn list_open_issues(&self) -> Result<Vec<Issue>> {
+        let closed = self.closed.lock().unwrap();
+        Ok(self
+            .issues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| !closed.contains_key(&i.number))
+            .cloned()
+            .collect())
+    }
+
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>> {
         if self.blocked_by_errors.lock().unwrap().contains(&issue) {
             bail!("blocked_by of issue #{issue} is unreadable");

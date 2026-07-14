@@ -136,7 +136,13 @@ pub struct Config {
     #[serde(default)]
     pub clean: CleanConfig,
     #[serde(default)]
+    pub triage: TriageConfig,
+    #[serde(default)]
     pub review: ReviewConfig,
+    /// How autonomous meguri may be (issue #176). Global default; a project may
+    /// override wholesale via its own `autonomy`. See [`Autonomy`].
+    #[serde(default)]
+    pub autonomy: Autonomy,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -234,6 +240,22 @@ fn default_true() -> bool {
     true
 }
 
+/// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
+/// The mode's single runtime effect is the auto-merge arm gate: `Full` lets the
+/// auto-merger arm a green PR (meguri may reach a merge with no human), `Attended`
+/// stops at green for a human to merge. Escalation is **mode-independent** — the
+/// "human-needed ⇒ needs-human" invariant holds in both modes. Orthogonal to
+/// `auto_merge.opt_in` (that selects *which* PRs; this permits arming *at all*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Autonomy {
+    /// A human is the merge gate: meguri never arms auto-merge (default).
+    #[default]
+    Attended,
+    /// meguri may arm auto-merge on a green, guard-clean PR.
+    Full,
+}
+
 /// Settings for the reconcile loop (issue #142): detecting that a once-shipped
 /// issue's body was edited and treating it as a re-attention signal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -298,6 +320,57 @@ fn default_clean_interval_hours() -> u64 {
 }
 fn default_stale_branch_days() -> u64 {
     30
+}
+
+/// How far the triage loop is allowed to act (issue #85). The series stages
+/// the automation of triage from read-only up: `off` (the opt-in default) →
+/// `report` (v0, this issue) → `advise` (v1 #87) → `auto` (v2 #88). v0 only
+/// acts on `report`; `advise`/`auto` parse for forward-compat but stay idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TriageMode {
+    /// Triage is disabled — discovery returns nothing (the default).
+    #[default]
+    Off,
+    /// v0: read-only sweep into a single `meguri:triage-report` issue.
+    Report,
+    /// v1 #87: proposal comments / `meguri:triage-*` labels (not yet built).
+    Advise,
+    /// v2 #88: apply `meguri:ready`/`meguri:plan` directly (not yet built).
+    Auto,
+}
+
+/// Settings for the triage loop (read-only recommendation sweeps, issue #85).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageConfig {
+    /// How far triage may act. Default `off`: triage is fully opt-in (cleaner
+    /// runs always, but triage automates a decision, so it stays quiet until
+    /// asked). v0 sweeps only when this is `report`.
+    #[serde(default)]
+    pub mode: TriageMode,
+    /// Minimum hours between sweeps; a moved head or a new issue alone does not
+    /// trigger one before the interval elapses.
+    #[serde(default = "default_triage_interval_hours")]
+    pub interval_hours: u64,
+    /// False-positive silencer: recommendations whose rendered row contains any
+    /// of these substrings are dropped from the report at render time (same
+    /// idea as `clean.ignore`).
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        Self {
+            mode: TriageMode::default(),
+            interval_hours: default_triage_interval_hours(),
+            ignore: Vec::new(),
+        }
+    }
+}
+
+fn default_triage_interval_hours() -> u64 {
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1052,6 +1125,10 @@ pub struct ProjectConfig {
     /// `[review]` section wholesale (like `pr` / `clean`).
     #[serde(default)]
     pub review: Option<ReviewConfig>,
+    /// Per-project autonomy mode; overrides the global `autonomy` wholesale
+    /// (issue #176). See [`Autonomy`].
+    #[serde(default)]
+    pub autonomy: Option<Autonomy>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -1070,6 +1147,10 @@ pub struct ProjectConfig {
     /// (the ignore list in particular is inherently project-specific).
     #[serde(default)]
     pub clean: Option<CleanConfig>,
+    /// Per-project triage settings; overrides the global `[triage]` section
+    /// (opt-in per project, and the ignore list is project-specific).
+    #[serde(default)]
+    pub triage: Option<TriageConfig>,
     /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
     #[serde(default)]
     pub worktree_setup: WorktreeSetupConfig,
@@ -1146,9 +1227,16 @@ impl RepoConfig {
                 return Err(e).with_context(|| format!("cannot read {}", path.display()));
             }
         };
-        let cfg: RepoConfig = toml::from_str(&raw)
-            .with_context(|| format!("invalid repo config at {}", path.display()))?;
-        Ok(Some(cfg))
+        Self::parse_str(&raw)
+            .map(Some)
+            .with_context(|| format!("invalid repo config at {}", path.display()))
+    }
+
+    /// Parse repo config from raw TOML text — the shared core of
+    /// [`load_from_worktree`] and the default-branch read path (`meguri doctor`
+    /// lints the on-default-branch bytes, which have no filesystem home).
+    pub fn parse_str(raw: &str) -> Result<Self> {
+        toml::from_str(raw).context("invalid repo config")
     }
 
     /// Whether this repo config actually carries an override worth folding in
@@ -1336,7 +1424,13 @@ impl Config {
                     p.id,
                     s.name
                 ),
-                _ => {}
+                // `body_file` is read from the default branch at fire time
+                // (ADR 0015); reject `..`/absolute/trailing-slash here so the
+                // read can trust the path is a repo-relative regular file.
+                (None, Some(rel)) => validate_repo_relative(rel).with_context(|| {
+                    format!("project {:?} schedule {:?} body_file", p.id, s.name)
+                })?,
+                (Some(_), None) => {}
             }
             if p.mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
                 anyhow::bail!(
@@ -1430,6 +1524,12 @@ impl Config {
         project.review.as_ref().unwrap_or(&self.review)
     }
 
+    /// Effective autonomy mode for a project (project override wins wholesale,
+    /// issue #176).
+    pub fn autonomy_for(&self, project: &ProjectConfig) -> Autonomy {
+        project.autonomy.unwrap_or(self.autonomy)
+    }
+
     /// Effective deliverable language for a project (project override wins).
     pub fn language_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a str> {
         project.language.as_deref().or(self.language.as_deref())
@@ -1450,6 +1550,11 @@ impl Config {
     /// Effective cleaner settings for a project (project override wins).
     pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
         project.clean.as_ref().unwrap_or(&self.clean)
+    }
+
+    /// Effective triage settings for a project (project override wins).
+    pub fn triage_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a TriageConfig {
+        project.triage.as_ref().unwrap_or(&self.triage)
     }
 
     /// The preamble paths to inject for a role, in injection order: the shared
@@ -1553,6 +1658,12 @@ pub fn validate_repo_relative(rel: &str) -> Result<()> {
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         anyhow::bail!("preamble path {rel:?} must not contain `..`");
+    }
+    // A trailing slash would make `git ls-tree` list a directory's children
+    // instead of the entry itself, letting a directory pass as a regular file
+    // in the default-branch read (ADR 0015).
+    if rel.ends_with('/') {
+        anyhow::bail!("path {rel:?} must not end with `/`");
     }
     Ok(())
 }
@@ -1750,6 +1861,8 @@ mod tests {
         assert_eq!(back.notifications.throttle_secs, 60);
         assert!(back.review.enabled);
         assert_eq!(back.review.max_rounds, 3);
+        assert_eq!(back.triage.mode, TriageMode::Off);
+        assert_eq!(back.triage.interval_hours, 6);
     }
 
     #[test]
@@ -2007,6 +2120,50 @@ draft = false
         assert!(
             !cfg.pr_for(p).auto_merge.enabled,
             "project [pr] wins wholesale, so auto_merge falls back to default (disabled)"
+        );
+    }
+
+    #[test]
+    fn autonomy_defaults_to_attended() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.autonomy, Autonomy::Attended);
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let p = cfg.project("demo").unwrap();
+        assert_eq!(cfg.autonomy_for(p), Autonomy::Attended);
+    }
+
+    #[test]
+    fn autonomy_project_override_wins() {
+        // Global full, one project pins itself back to attended (issue #176).
+        let raw = r#"
+autonomy = "full"
+
+[[projects]]
+id = "auto"
+repo_path = "/tmp/auto"
+repo_slug = "me/auto"
+
+[[projects]]
+id = "manual"
+repo_path = "/tmp/manual"
+repo_slug = "me/manual"
+autonomy = "attended"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.autonomy, Autonomy::Full);
+        assert_eq!(
+            cfg.autonomy_for(cfg.project("auto").unwrap()),
+            Autonomy::Full
+        );
+        assert_eq!(
+            cfg.autonomy_for(cfg.project("manual").unwrap()),
+            Autonomy::Attended
         );
     }
 
@@ -2277,6 +2434,61 @@ language = "English"
         assert_eq!(cfg.clean.interval_hours, 24);
         assert_eq!(cfg.clean.stale_branch_days, 30);
         assert!(cfg.clean.ignore.is_empty());
+    }
+
+    #[test]
+    fn triage_defaults_apply_without_section() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.triage.mode, TriageMode::Off);
+        assert_eq!(cfg.triage.interval_hours, 6);
+        assert!(cfg.triage.ignore.is_empty());
+    }
+
+    #[test]
+    fn triage_mode_parses_all_stages() {
+        for (raw, mode) in [
+            ("off", TriageMode::Off),
+            ("report", TriageMode::Report),
+            ("advise", TriageMode::Advise),
+            ("auto", TriageMode::Auto),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[triage]\nmode = \"{raw}\"\n")).unwrap();
+            assert_eq!(cfg.triage.mode, mode, "mode: {raw}");
+        }
+    }
+
+    #[test]
+    fn triage_project_override_wins() {
+        let raw = r##"
+[triage]
+mode = "report"
+interval_hours = 6
+
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects]]
+id = "quiet"
+repo_path = "/tmp/quiet"
+repo_slug = "me/quiet"
+
+[projects.triage]
+mode = "off"
+ignore = ["#42"]
+"##;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let demo = cfg.project("demo").unwrap();
+        assert_eq!(cfg.triage_for(demo).mode, TriageMode::Report);
+        assert_eq!(cfg.triage_for(demo).interval_hours, 6);
+
+        let quiet = cfg.project("quiet").unwrap();
+        assert_eq!(cfg.triage_for(quiet).mode, TriageMode::Off);
+        // The override replaces the whole section; omitted keys fall back to
+        // the built-in defaults, not the global section.
+        assert_eq!(cfg.triage_for(quiet).interval_hours, 6);
+        assert_eq!(cfg.triage_for(quiet).ignore, vec!["#42"]);
     }
 
     #[test]
@@ -2620,6 +2832,22 @@ allow_overlap = true
     }
 
     #[test]
+    fn schedule_body_file_must_be_repo_relative() {
+        // body_file is read from the default branch (ADR 0015); `..`/absolute/
+        // trailing-slash are rejected at load like preamble paths.
+        for bad in ["../escape.md", "/etc/passwd", "ops/"] {
+            let raw = format!(
+                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                 [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
+                 body_file = \"{bad}\"\n"
+            );
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("body_file"), "path {bad:?}: {err}");
+        }
+    }
+
+    #[test]
     fn schedule_with_neither_body_nor_body_file_is_rejected() {
         let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
                    [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n";
@@ -2855,6 +3083,9 @@ allow_overlap = true
         assert!(validate_repo_relative("/etc/passwd").is_err());
         assert!(validate_repo_relative("../escape").is_err());
         assert!(validate_repo_relative("a/../../escape").is_err());
+        // A trailing slash would make the default-branch read list a
+        // directory's children (ADR 0015).
+        assert!(validate_repo_relative("ops/").is_err());
     }
 
     #[test]

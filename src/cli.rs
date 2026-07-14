@@ -143,6 +143,51 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Distribute the embedded meguri skill/rule fragment to agent CLIs, so
+    /// an agent working nearby can learn about and propose meguri on its own
+    AgentSkills {
+        #[command(subcommand)]
+        command: AgentSkillsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentSkillsCommand {
+    /// Install the user-level skill (default), or the project-level rule
+    /// fragment with `--project`
+    Install {
+        /// Agent CLI to target (currently only "claude")
+        #[arg(long, default_value = "claude")]
+        target: String,
+        /// Install the repo-level rule fragment (`.claude/rules/meguri.md`
+        /// for the claude target) instead of the user-level skill
+        /// (`~/.claude/skills/meguri/`)
+        #[arg(long)]
+        project: bool,
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Overwrite files that differ from the embedded source (without
+        /// this, a diff is shown and differing files are left untouched)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show whether the skill/rule fragment is installed and matches this
+    /// binary's embedded version
+    Status {
+        /// Agent CLI to target (currently only "claude")
+        #[arg(long, default_value = "claude")]
+        target: String,
+        /// Check the project-level rule fragment instead of the user-level
+        /// skill
+        #[arg(long)]
+        project: bool,
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -212,5 +257,74 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("prune"));
         assert!(!help.contains("clean"));
+    }
+
+    #[test]
+    fn agent_skills_install_defaults_to_user_level_claude_target() {
+        let cli = Cli::try_parse_from(["meguri", "agent-skills", "install"]).unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Install {
+                        target,
+                        project,
+                        repo,
+                        force,
+                    },
+            } => {
+                assert_eq!(target, "claude");
+                assert!(!project);
+                assert_eq!(repo, None);
+                assert!(!force);
+            }
+            other => panic!("expected AgentSkills(Install), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_skills_install_parses_project_flags() {
+        let cli = Cli::try_parse_from([
+            "meguri",
+            "agent-skills",
+            "install",
+            "--project",
+            "--repo",
+            "/tmp/some-repo",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Install {
+                        project,
+                        repo,
+                        force,
+                        ..
+                    },
+            } => {
+                assert!(project);
+                assert_eq!(repo.as_deref(), Some("/tmp/some-repo"));
+                assert!(force);
+            }
+            other => panic!("expected AgentSkills(Install), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_skills_status_parses() {
+        let cli = Cli::try_parse_from(["meguri", "agent-skills", "status", "--project"]).unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Status {
+                        target, project, ..
+                    },
+            } => {
+                assert_eq!(target, "claude");
+                assert!(project);
+            }
+            other => panic!("expected AgentSkills(Status), got {other:?}"),
+        }
     }
 }
