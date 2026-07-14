@@ -641,6 +641,17 @@ fn pr_review_details(cp: &PrReviewCheckpoint, verdict: ReviewVerdict) -> String 
     )
 }
 
+/// The pr-reviewer's folded `<details>` block within a PR body, if present:
+/// everything from [`PR_REVIEW_BODY_MARKER`] to the end (the block is always
+/// last — see [`upsert_pr_review_details`]). `spec_fixer` reads it to feed the
+/// plan findings back to the fixing agent (issue #188); returns `None` when the
+/// body carries no review block.
+pub fn extract_pr_review_details(body: &str) -> Option<String> {
+    let idx = body.find(PR_REVIEW_BODY_MARKER)?;
+    let block = body[idx..].trim();
+    (!block.is_empty()).then(|| block.to_string())
+}
+
 /// Replace (or append) the pr-review `<details>` in a PR body. The pr-review
 /// block is always last: everything from the marker to the end is the block,
 /// so a re-review truncates there and re-appends.
@@ -819,6 +830,104 @@ mod tests {
         assert!(second.contains("clean at `bbb`"));
         assert!(!second.contains("findings at `aaa`"));
         assert!(second.starts_with("Refs #5."));
+    }
+
+    #[test]
+    fn extract_pr_review_details_pulls_the_folded_block() {
+        // No block: nothing to feed a fixer.
+        assert_eq!(extract_pr_review_details("Refs #5.\n\nBody text."), None);
+
+        // With a block: everything from the marker to the end (issue #188).
+        let body = upsert_pr_review_details(
+            "Refs #5.",
+            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Findings),
+        );
+        let block = extract_pr_review_details(&body).unwrap();
+        assert!(block.starts_with(PR_REVIEW_BODY_MARKER));
+        assert!(block.contains("- missing acceptance criteria"));
+        assert!(
+            !block.contains("Refs #5."),
+            "only the review block: {block}"
+        );
+    }
+
+    /// The plan review's settle drives the spec label state machine (ADR 0008
+    /// §3): clean flips `spec-reviewing → spec-ready`, findings keep
+    /// `spec-reviewing` so the next push (spec_fixer, issue #188) triggers a
+    /// re-review.
+    #[tokio::test]
+    async fn plan_settle_drives_the_spec_label_state_machine() {
+        async fn settle_verdict(
+            verdict: ReviewVerdict,
+        ) -> std::sync::Arc<crate::forge::fake::FakeForge> {
+            let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+            forge.add_pr(
+                7,
+                "Spec: caching (#5)",
+                "Refs #5.",
+                &[forge::LABEL_SPEC_REVIEWING],
+                "meguri/5-add-caching-abc",
+                "deadbeef",
+            );
+            let project = crate::config::ProjectConfig {
+                id: "proj".into(),
+                repo_path: "/tmp/unused".into(),
+                repo_slug: Some("me/proj".into()),
+                mode: Default::default(),
+                deliver: None,
+                default_branch: "main".into(),
+                check_command: None,
+                worktree_root: None,
+                language: None,
+                pr: None,
+                clean: None,
+                plan_delivery: Default::default(),
+                review: None,
+                worktree_setup: Default::default(),
+                schedules: Vec::new(),
+                autonomy: None,
+                cadence: Vec::new(),
+                prompts: Default::default(),
+            };
+            let deps = Deps::with_label_source(
+                crate::store::Store::open_in_memory().unwrap(),
+                std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+                forge.clone(),
+                crate::config::Config::default(),
+                project,
+            );
+            let run = deps
+                .store
+                .create_run_for_loop("proj", KIND, 5, "Spec: caching (#5)")
+                .unwrap();
+            let mut c = cp(Kind::Plan, "deadbeef");
+            c.pr_number = Some(7);
+            c.pr_url = "https://fake.example/pr/7".into();
+            c.verdict = Some(verdict);
+            settle(&deps, &run, &c).await.unwrap();
+            forge
+        }
+
+        // Clean: spec-reviewing removed, spec-ready added.
+        let forge = settle_verdict(ReviewVerdict::Clean).await;
+        let labels = forge.pr_labels(7);
+        assert!(labels.contains(&forge::LABEL_SPEC_READY.to_string()));
+        assert!(!labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
+        assert_eq!(
+            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Success)
+        );
+
+        // Findings: spec-reviewing kept (spec_fixer's re-drive target), no
+        // spec-ready, status failure.
+        let forge = settle_verdict(ReviewVerdict::Findings).await;
+        let labels = forge.pr_labels(7);
+        assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
+        assert!(!labels.contains(&forge::LABEL_SPEC_READY.to_string()));
+        assert_eq!(
+            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Failure)
+        );
     }
 
     #[test]
