@@ -102,6 +102,8 @@ fn collision_on_id_or_slug_is_rejected() {
     assert!(plan_add_project(&cfg, Some("owner/repo"), None, None).is_err());
     // Different id but same slug.
     assert!(plan_add_project(&cfg, Some("owner/repo"), Some("other"), None).is_err());
+    // Same repo in different case is the same GitHub repo — also rejected.
+    assert!(plan_add_project(&cfg, Some("Owner/Repo"), Some("other"), None).is_err());
     // Different id and different slug is fine.
     assert!(plan_add_project(&cfg, Some("owner/fresh"), Some("fresh"), None).is_ok());
 }

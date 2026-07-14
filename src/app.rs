@@ -553,11 +553,16 @@ fn check_project_collision(cfg: &Config, draft: &config::ProjectDraft) -> Result
     if cfg.projects.iter().any(|p| p.id == draft.id) {
         bail!("project id {:?} already exists in config", draft.id);
     }
+    // GitHub slugs are case-insensitive: `Owner/Repo` and `owner/repo` are the
+    // same repository. Compare case-insensitively (as `gitops::clone_health`
+    // does) so the same repo can't be watched as two projects racing for the
+    // same issues/labels.
     if let Some(slug) = &draft.repo_slug
-        && cfg
-            .projects
-            .iter()
-            .any(|p| p.repo_slug.as_deref() == Some(slug.as_str()))
+        && cfg.projects.iter().any(|p| {
+            p.repo_slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(slug))
+        })
     {
         bail!("repo_slug {slug:?} is already configured (project exists)");
     }
