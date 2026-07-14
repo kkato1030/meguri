@@ -51,6 +51,10 @@ repo_slug = "owner/repo"
 # id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
 # projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
 
+# プロジェクト内在の設定(check_command / language / pr.draft)は repo ルートの
+# meguri.toml にも書ける。値は run 開始時にそのブランチから読まれて run に固定され、
+# host [projects.*] があれば host が勝つ。詳細は README の Configuration / ADR 0011。
+
 # [prompts]                            # ロール別 preamble: turn プロンプト冒頭に埋め込む恒常規律(issue #149)
 # all = "ops/agents/guardrails.md"     # 全ロール共通。値は repo 相対パス(絶対パス/`..` は不可)
 # worker = "ops/agents/worker.md"      # キーは routing のロール名(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
@@ -963,6 +967,75 @@ pub struct ProjectConfig {
 
 fn default_branch() -> String {
     "main".into()
+}
+
+/// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
+/// the "project-intrinsic facts" subset of [`ProjectConfig`] a repo may carry
+/// for itself. Read from the run's worktree once at claim time and pinned to
+/// the run (see [`crate::engine::flow`] and ADR 0011); host `config.toml`
+/// always wins last (see [`Deps::with_repo_config`]).
+///
+/// `#[serde(deny_unknown_fields)]` is the boundary's enforcement: a host-only
+/// key (`repo_slug`, `agent`, `[[workspaces]]`, …) in `meguri.toml` is a parse
+/// error, surfaced by `meguri doctor` rather than silently ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoConfig {
+    /// Deliverable language; folds under host `language` / project `language`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Independent-verification command; folds under the project's
+    /// `check_command`. Pinned at claim time so a run cannot weaken its own
+    /// completion contract mid-run (ADR 0011 §security).
+    #[serde(default)]
+    pub check_command: Option<String>,
+    /// The repo-eligible slice of `[pr]` (only `draft`; `auto_merge` is
+    /// host-only and absent here, so writing it under `[pr]` is a parse error).
+    #[serde(default)]
+    pub pr: Option<RepoPrConfig>,
+}
+
+/// The repo-eligible subset of `[pr]`. Carries `draft` but not `auto_merge`:
+/// arming GitHub-native auto-merge uses the host's `gh` token, so it stays
+/// host-only. `deny_unknown_fields` makes `[pr] auto_merge = …` in a
+/// `meguri.toml` a parse error — the first key-level boundary inside one
+/// section (ADR 0011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoPrConfig {
+    #[serde(default)]
+    pub draft: Option<bool>,
+}
+
+impl RepoConfig {
+    /// Read `<worktree>/meguri.toml`.
+    /// - absent → `Ok(None)` (opt-in default: no repo config).
+    /// - present but invalid TOML / host-only key → `Err` (the caller warns,
+    ///   emits `repo_config.invalid`, and falls back to "as if absent").
+    ///
+    /// Reads the working-tree file directly (no git); the run scopes which
+    /// branch's `meguri.toml` this is by which branch the worktree checked out.
+    pub fn load_from_worktree(worktree: &Path) -> Result<Option<Self>> {
+        let path = worktree.join("meguri.toml");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", path.display()));
+            }
+        };
+        let cfg: RepoConfig = toml::from_str(&raw)
+            .with_context(|| format!("invalid repo config at {}", path.display()))?;
+        Ok(Some(cfg))
+    }
+
+    /// Whether this repo config actually carries an override worth folding in
+    /// (all `None` means the file was empty — nothing to layer over the host).
+    pub fn has_values(&self) -> bool {
+        self.language.is_some()
+            || self.check_command.is_some()
+            || self.pr.as_ref().is_some_and(|p| p.draft.is_some())
+    }
 }
 
 /// `[[workspaces]]` — a static grouping of related projects (issue #154).
@@ -2394,6 +2467,19 @@ allow_overlap = true
         assert!(err.contains("no projects"), "{err}");
     }
 
+    // ---- repo config (issue #165) ----
+
+    #[test]
+    fn repo_config_absent_is_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // No meguri.toml in the worktree → opt-out, not an error.
+        assert!(
+            RepoConfig::load_from_worktree(dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     const A_PROJECT: &str =
         "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";
 
@@ -2460,6 +2546,80 @@ allow_overlap = true
         assert_eq!(
             cfg.preambles_for(p, "planner"),
             vec![("all".to_string(), "all.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn repo_config_parses_eligible_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "language = \"日本語\"\ncheck_command = \"cargo test\"\n\n[pr]\ndraft = false\n",
+        )
+        .unwrap();
+        let repo = RepoConfig::load_from_worktree(dir.path())
+            .unwrap()
+            .expect("meguri.toml present");
+        assert_eq!(repo.language.as_deref(), Some("日本語"));
+        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
+        assert_eq!(repo.pr.and_then(|p| p.draft), Some(false));
+    }
+
+    #[test]
+    fn repo_config_rejects_host_only_key() {
+        // A host-only key (the doctor's failure case) is a parse error, not a
+        // silent drop — `deny_unknown_fields`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "check_command = \"cargo test\"\nrepo_slug = \"me/x\"\n",
+        )
+        .unwrap();
+        let err = RepoConfig::load_from_worktree(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("repo_slug")
+                || format!("{err:#}").contains("unknown field"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn repo_config_rejects_auto_merge_under_pr() {
+        // The key-level boundary: `[pr] draft` is fine, `[pr] auto_merge` is
+        // host-only and must be rejected inside meguri.toml.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "[pr]\ndraft = false\n\n[pr.auto_merge]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn repo_config_has_values() {
+        assert!(!RepoConfig::default().has_values());
+        assert!(
+            RepoConfig {
+                check_command: Some("x".into()),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        assert!(
+            RepoConfig {
+                pr: Some(RepoPrConfig { draft: Some(true) }),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        // An empty [pr] table (draft = None) is not itself an override.
+        assert!(
+            !RepoConfig {
+                pr: Some(RepoPrConfig { draft: None }),
+                ..Default::default()
+            }
+            .has_values()
         );
     }
 
