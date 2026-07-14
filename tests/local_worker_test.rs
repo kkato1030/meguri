@@ -83,6 +83,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config,
         project,
+        open_prs: Default::default(),
     };
     TestEnv {
         deps,

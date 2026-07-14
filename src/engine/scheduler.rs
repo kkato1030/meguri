@@ -46,13 +46,6 @@ impl Scheduler {
         let mut running: JoinSet<String> = JoinSet::new();
         let mut active_run_ids: HashSet<String> = HashSet::new();
 
-        // Re-dispatch interrupted runs before discovering new work.
-        for run in store.list_runs(true)? {
-            if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
-                self.dispatch(&run, &mut running, &mut active_run_ids);
-            }
-        }
-
         loop {
             // Pick up config edits before this tick's discovery, so a change
             // applies to every run spawned from here on.
@@ -81,6 +74,15 @@ impl Scheduler {
                 if let Ok(run_id) = res {
                     active_run_ids.remove(&run_id);
                 }
+            }
+
+            // Re-dispatch interrupted/queued runs before discovering new
+            // work, every tick rather than only at watch startup (#183): a
+            // pane that died mid-execute resumes from its checkpoint within
+            // one poll_interval instead of staying stuck until the next
+            // `meguri daemon restart`.
+            if let Err(e) = self.redispatch_interrupted(&store, &mut running, &mut active_run_ids) {
+                tracing::warn!("redispatch failed: {e:#}");
             }
 
             if active_run_ids.len() < self.max_concurrent
@@ -157,6 +159,12 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) -> Result<()> {
+        // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
+        // conflict_resolver) below share one `list_open_prs` call per
+        // project this tick instead of one each (issue #170).
+        for deps in &self.projects {
+            deps.open_prs.clear().await;
+        }
         for lp in &self.loops {
             for deps in &self.projects {
                 if active.len() >= self.max_concurrent {
@@ -201,6 +209,31 @@ impl Scheduler {
                     )?;
                     self.dispatch(&run, running, active);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Redispatch runs left `interrupted` (pane died mid-execute) or
+    /// `queued` (never got a slot), respecting the slot budget. `active`
+    /// also guards against double-dispatching a run this loop already
+    /// spawned earlier in the same tick, or in a still-running previous
+    /// tick, whose store status hasn't caught up to `running` yet.
+    fn redispatch_interrupted(
+        &self,
+        store: &Store,
+        running: &mut JoinSet<String>,
+        active: &mut HashSet<String>,
+    ) -> Result<()> {
+        for run in store.list_runs(true)? {
+            if active.len() >= self.max_concurrent {
+                break;
+            }
+            if active.contains(&run.id) {
+                continue;
+            }
+            if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
+                self.dispatch(&run, running, active);
             }
         }
         Ok(())

@@ -18,6 +18,13 @@
 //! (a base that keeps re-conflicting that often deserves a human;
 //! `meguri run --issue N` can force another round).
 //!
+//! Touchability (open / meguri branch / `spec-ready` / hold / working /
+//! needs-human) is [`super::pr_is_touchable`], shared with fixer and
+//! ci_fixer: until issue #170 this loop carried its own copy that never
+//! gained the `spec-ready` gate the other two got under ADR 0008, so a
+//! resolver could merge the base into a branch the spec worker still owned
+//! under combined delivery. Lifting it here closed that gap.
+//!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
 //! (recovered from the `meguri/<issue>-…` head branch), so conflicts are
 //! resolved in the issue's author lane — same pane, same live session as
@@ -31,8 +38,11 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, open_pr_for_issue};
-use crate::forge::{self, MergeableState, PullRequest};
+use super::{
+    Deps, MEGURI_BRANCH_PREFIX, Target, canonical_key, is_combined, open_pr_for_issue,
+    pr_is_touchable,
+};
+use crate::forge::{self, MergeableState};
 use crate::gitops;
 use crate::store::RunRecord;
 use crate::tasks::TaskKey;
@@ -44,28 +54,6 @@ pub const KIND: &str = "conflict-resolver";
 /// Successful resolves budgeted per PR; beyond this, discovery stays quiet
 /// (see the module docs on convergence).
 pub const MAX_RESOLVE_RUNS: i64 = 3;
-
-/// Head-branch prefix identifying meguri's own PRs (the resolver only
-/// touches work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
-
-/// Whether the resolver may touch this PR at all (independent of its
-/// mergeability).
-fn pr_is_resolvable(pr: &PullRequest) -> Option<String> {
-    if pr.state != "open" {
-        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
-    }
-    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
-        return Some(format!(
-            "PR #{} head `{}` was not opened by meguri",
-            pr.number, pr.head_branch
-        ));
-    }
-    if pr.has_label(forge::LABEL_HOLD) {
-        return Some(format!("PR #{} is on hold", pr.number));
-    }
-    None
-}
 
 /// The conflict resolver as a schedulable loop: CONFLICTING meguri PRs in,
 /// pushed merge commits out.
@@ -85,12 +73,10 @@ impl super::Loop for ConflictResolverLoop {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // PR loops are inert in local mode
         }
+        let combined = is_combined(deps);
         let mut targets = Vec::new();
-        for pr in deps.forge().list_open_prs().await? {
-            if pr_is_resolvable(&pr).is_some()
-                || pr.has_label(forge::LABEL_WORKING)
-                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-            {
+        for pr in deps.open_prs.get(deps).await? {
+            if pr_is_touchable(&pr, combined).is_some() {
                 continue;
             }
             let issue = canonical_key(&pr);
@@ -171,22 +157,8 @@ impl Flavor for ConflictResolverFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_resolvable(&pr) {
+        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
-        }
-        if pr.has_label(forge::LABEL_WORKING) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is already claimed ({})",
-                pr.number,
-                forge::LABEL_WORKING
-            )));
-        }
-        if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is escalated ({})",
-                pr.number,
-                forge::LABEL_NEEDS_HUMAN
-            )));
         }
         if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
             return Ok(PreparedWork::Skip(format!(
@@ -385,43 +357,9 @@ mod tests {
         assert!(!ConflictResolverFlavor.sets_subject());
     }
 
-    #[test]
-    fn resolvable_guards_state_ownership_and_hold() {
-        let pr = PullRequest {
-            number: 3,
-            title: "Add feature (#9)".into(),
-            body: String::new(),
-            url: "https://fake.example/pr/3".into(),
-            head_branch: "meguri/9-add-feature-abc123".into(),
-            head_sha: String::new(),
-            state: "open".into(),
-            is_draft: false,
-            labels: vec![],
-        };
-        assert!(pr_is_resolvable(&pr).is_none());
-
-        let merged = PullRequest {
-            state: "merged".into(),
-            ..pr.clone()
-        };
-        assert!(pr_is_resolvable(&merged).unwrap().contains("merged"));
-
-        let human = PullRequest {
-            head_branch: "feature/manual".into(),
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_resolvable(&human)
-                .unwrap()
-                .contains("not opened by meguri")
-        );
-
-        let held = PullRequest {
-            labels: vec![forge::LABEL_HOLD.to_string()],
-            ..pr
-        };
-        assert!(pr_is_resolvable(&held).unwrap().contains("hold"));
-    }
+    // Touchability (open / meguri branch / spec-ready / hold / working /
+    // needs-human) is the shared `pr_is_touchable` guard's job — see its
+    // tests in `engine::mod`.
 
     #[test]
     fn prompt_pins_the_base_and_forbids_push_and_rebase() {

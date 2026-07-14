@@ -30,7 +30,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, open_pr_for_issue};
+use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, CheckRollup, CheckState, PullRequest};
 use crate::store::RunRecord;
 use crate::tasks::TaskKey;
@@ -43,10 +43,6 @@ pub const KIND: &str = "ci-fixer";
 /// this many pushed fixes escalates to `meguri:needs-human` (see the module
 /// docs on convergence).
 pub const MAX_CI_FIX_RUNS: i64 = 3;
-
-/// Head-branch prefix identifying meguri's own PRs (the ci-fixer only amends
-/// work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 /// Prefix of meguri's own commit-status contexts (`meguri/self-review`,
 /// `meguri/guard-review`). The ci-fixer must not treat these as fixable CI:
@@ -65,38 +61,6 @@ fn without_meguri_statuses(rollup: CheckRollup) -> CheckRollup {
             .filter(|c| !c.name.starts_with(MEGURI_STATUS_PREFIX))
             .collect(),
     }
-}
-
-/// Whether the project uses combined plan delivery (ADR 0008).
-fn is_combined(deps: &Deps) -> bool {
-    deps.project.plan_delivery == crate::config::PlanDelivery::Combined
-}
-
-/// Whether the ci-fixer may touch this PR at all (independent of its CI
-/// state). The `spec-ready` skip only applies under combined delivery (ADR
-/// 0008): under separate delivery a `spec-ready` spec/ADR PR is standalone and
-/// its red CI is the ci-fixer's to fix (finding 3).
-fn pr_is_ci_fixable(pr: &PullRequest, combined_delivery: bool) -> Option<String> {
-    if pr.state != "open" {
-        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
-    }
-    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
-        return Some(format!(
-            "PR #{} head `{}` was not opened by meguri",
-            pr.number, pr.head_branch
-        ));
-    }
-    if combined_delivery && pr.has_label(forge::LABEL_SPEC_READY) {
-        return Some(format!(
-            "PR #{} is {} (the spec worker owns the branch)",
-            pr.number,
-            forge::LABEL_SPEC_READY
-        ));
-    }
-    if pr.has_label(forge::LABEL_HOLD) {
-        return Some(format!("PR #{} is on hold", pr.number));
-    }
-    None
 }
 
 /// The ci-fixer as a schedulable loop: red meguri PRs in, fix pushes out.
@@ -121,11 +85,8 @@ impl super::Loop for CiFixerLoop {
         }
         let combined = is_combined(deps);
         let mut targets = Vec::new();
-        for pr in deps.forge().list_open_prs().await? {
-            if pr_is_ci_fixable(&pr, combined).is_some()
-                || pr.has_label(forge::LABEL_WORKING)
-                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-            {
+        for pr in deps.open_prs.get(deps).await? {
+            if pr_is_touchable(&pr, combined).is_some() {
                 continue;
             }
             let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
@@ -232,22 +193,8 @@ impl Flavor for CiFixerFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_ci_fixable(&pr, is_combined(deps)) {
+        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
-        }
-        if pr.has_label(forge::LABEL_WORKING) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is already claimed ({})",
-                pr.number,
-                forge::LABEL_WORKING
-            )));
-        }
-        if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is escalated ({})",
-                pr.number,
-                forge::LABEL_NEEDS_HUMAN
-            )));
         }
         let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
         if rollup.state() != CheckState::Failure {
@@ -422,55 +369,9 @@ mod tests {
         assert!(!CiFixerFlavor.sets_subject());
     }
 
-    #[test]
-    fn fixable_guards_state_ownership_and_labels() {
-        let pr = PullRequest {
-            number: 3,
-            title: "Add feature (#9)".into(),
-            body: String::new(),
-            url: "https://fake.example/pr/3".into(),
-            head_branch: "meguri/9-add-feature-abc123".into(),
-            head_sha: String::new(),
-            state: "open".into(),
-            is_draft: false,
-            labels: vec![],
-        };
-        assert!(pr_is_ci_fixable(&pr, true).is_none());
-
-        let merged = PullRequest {
-            state: "merged".into(),
-            ..pr.clone()
-        };
-        assert!(pr_is_ci_fixable(&merged, true).unwrap().contains("merged"));
-
-        let human = PullRequest {
-            head_branch: "feature/manual".into(),
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_ci_fixable(&human, true)
-                .unwrap()
-                .contains("not opened by meguri")
-        );
-
-        // spec-ready: skipped under combined, ci-fixable under separate (finding 3).
-        let spec_ready = PullRequest {
-            labels: vec![forge::LABEL_SPEC_READY.to_string()],
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_ci_fixable(&spec_ready, true)
-                .unwrap()
-                .contains(forge::LABEL_SPEC_READY)
-        );
-        assert!(pr_is_ci_fixable(&spec_ready, false).is_none());
-
-        let held = PullRequest {
-            labels: vec![forge::LABEL_HOLD.to_string()],
-            ..pr
-        };
-        assert!(pr_is_ci_fixable(&held, true).unwrap().contains("hold"));
-    }
+    // Touchability (open / meguri branch / spec-ready / hold / working /
+    // needs-human) is the shared `pr_is_touchable` guard's job — see its
+    // tests in `engine::mod`.
 
     fn red_rollup() -> CheckRollup {
         CheckRollup {
