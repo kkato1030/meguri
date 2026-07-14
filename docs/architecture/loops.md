@@ -94,10 +94,10 @@ cleaner (standalone) ── パイプラインの外を独立に回る
 現行の `default_loops()`(`src/engine/mod.rs`)の**登録順そのものが優先度**である。プリエンプションは無く、`Loop` trait に `priority()` のような機構も無い — 並び順そのものが仕様([ADR 0001-scheduler-priority-wip-first](../adr/0001-scheduler-priority-wip-first.md))。
 
 ```
-conflict_resolver → ci_fixer → fixer → spec_worker → spec_reviewer → worker → planner → cleaner
+conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → spec_reviewer → worker → planner → cleaner
 ```
 
-これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
+これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。`spec_fixer`(issue #188)は plan 側の fixer 系 — guard の findings で parked した spec PR を進める仕掛かり完了ループなので、他の fixer 系と同じく新規着手ループ(spec_worker 以降)より上に置かれる。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
 
 ### 帯域外(out-of-band)sweep
 
@@ -120,6 +120,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 |---|---|---|---|---|---|---|
 | planner | author | `meguri:plan` issue | issue | 新 branch | spec PR 作成、issue: `plan`→`speccing` | 維持(author pane) |
 | spec_reviewer | review(独立) | `spec-reviewing` PR、head 未レビュー | issue + `review` lane | read-only detached、`review-<issue>` 固定 | clean → PR: `spec-ready` / findings → PR コメント、次の push 待ち | 維持(独立 pane) |
+| spec_fixer | author(継続) | `spec-reviewing` PR の head の `meguri/guard-review` が failure | issue(branch から復元) | PR head に attach | spec 修正 push(≤3 round)、超過は `needs-human`。guard が新 head を再レビュー | 維持、author pane を継続 |
 | spec_worker | author(継続) | `spec-ready` PR | issue(branch から復元) | 既存 branch を継ぐ | 実装 commit → 同一 PR、issue: `speccing`→`implementing` | 維持、author pane を継続 |
 | worker | author | `meguri:ready` issue | issue | 新 branch | self-review(内部)→ PR `Closes #N`、issue: `ready`→`implementing` | 維持(author pane) |
 | fixer | author(継続) | PR の未解決スレッド(人間/外部bot) | issue(branch から復元) | PR head に attach | スレッドに返信、再レビュー待ち | 維持、author pane を継続 |
@@ -129,7 +130,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 
 補足:
 
-- **author lane** は同じ branch を編集する loop 全員(planner → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。**review lane** は spec_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
+- **author lane** は同じ branch を編集する loop 全員(planner → spec_fixer → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。spec_fixer は run を PR の canonical issue で鍵るため、spec を書いた planner と同じ author pane・同一 session で修正が走り、planning の文脈を保つ(issue #92 の lane モデルどおり)。**review lane** は spec_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
 - pane・worktree はいずれも issue が寿命の単位で、issue が close されると `reaper::sweep` が回収する(watch 実行中はポーリングのたびに、一発実行では `meguri prune`)。
 - 表に無い `auto_merger.sweep` / `merge_watch.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
 
