@@ -39,9 +39,16 @@ async fn main() -> Result<()> {
             project,
             plan,
             file,
+            not_before,
             title,
-        } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
-        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
+        } => app::cmd_add(
+            project.as_deref(),
+            plan,
+            file.as_deref(),
+            title.as_deref(),
+            not_before.as_deref(),
+        ),
+        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
         Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
@@ -196,6 +203,12 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
             ok &= doctor_schedules(cfg);
+            // Cadence rules (issue #148): shape is already validated at load;
+            // here we show each rule's current window consumption.
+            doctor_cadence(cfg, store.as_ref());
+            // Repo config (issue #165): lint each project's `meguri.toml`,
+            // failing on a host-only key or TOML error (deny_unknown_fields).
+            ok &= doctor_repo_configs(cfg);
             // Role preambles (issue #149): each configured path must resolve to
             // a real file inside the project's clone (and not escape it via a
             // symlink) — the same containment gate the turn uses.
@@ -327,6 +340,79 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 s.kind.as_str(),
                 s.cron,
             );
+        }
+    }
+    ok
+}
+
+/// Doctor's cadence section (issue #148): the config shape (label uniqueness,
+/// period mode, positive values) already fail-fasts at load, so here we simply
+/// show each rule's current window consumption — "N/M used, K left" — so an
+/// operator can see why a labelled issue is being held back. Projects without
+/// cadence rules print nothing; a missing store just omits the counts.
+fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
+    use meguri::cadence;
+
+    let has_any = cfg.projects.iter().any(|p| !p.cadence.is_empty());
+    if !has_any {
+        return;
+    }
+    let now = meguri::engine::scheduler_fire::epoch_now();
+    println!("\ncadence:");
+    for project in &cfg.projects {
+        for rule in &project.cadence {
+            let mode = match rule.per_hours {
+                Some(h) => format!("per {h}h"),
+                None => "per day (UTC)".to_string(),
+            };
+            let max = cadence::limit(rule);
+            let usage = match store {
+                Some(store) => {
+                    let start = cadence::window_start(rule, now);
+                    match store.cadence_consumed(&project.id, &rule.label, start) {
+                        Ok(consumed) => {
+                            let left = (max as i64 - consumed).max(0);
+                            format!("{consumed}/{max} used, {left} left")
+                        }
+                        Err(_) => format!("max {max} (count unavailable)"),
+                    }
+                }
+                None => format!("max {max}"),
+            };
+            println!("  ✅ {}/{} ({mode}) — {usage}", project.id, rule.label);
+        }
+    }
+}
+
+/// Doctor's repo-config section (issue #165): lint each project's repo root
+/// `meguri.toml`. Doctor holds no run, so it reads the primary clone's working
+/// tree (`<repo_path>/meguri.toml`) — advisory, not the run's pinned value. A
+/// host-only key or malformed TOML fails (deny_unknown_fields); an absent file
+/// is the silent, valid opt-out. Follows routing/schedules' "never silently
+/// fall back" principle so a boundary violation surfaces here, not as a no-op.
+fn doctor_repo_configs(cfg: &Config) -> bool {
+    use meguri::config::RepoConfig;
+
+    let mut printed_header = false;
+    let mut ok = true;
+    for project in &cfg.projects {
+        match RepoConfig::load_from_worktree(&project.repo_path) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ✅ {}: meguri.toml OK", project.id);
+            }
+            Err(e) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ❌ {}: {e:#}", project.id);
+                ok = false;
+            }
         }
     }
     ok
@@ -489,6 +575,25 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+    ok &= doctor_launch(cfg);
+    ok
+}
+
+/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
+/// resolved (no legacy/off state, unlike routing). Explicit launch config
+/// errors (an unknown role key) are startup errors, surfaced here like
+/// routing's.
+fn doctor_launch(cfg: &Config) -> bool {
+    use meguri::{launch, routing};
+    let mut ok = true;
+    if let Err(e) = launch::validate(cfg) {
+        println!("  ❌ launch config: {e:#}");
+        ok = false;
+    }
+    println!("launch mode:");
+    for role in routing::KNOWN_ROLES {
+        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    }
     ok
 }
 
@@ -609,6 +714,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
         }

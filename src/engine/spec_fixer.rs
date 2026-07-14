@@ -1,28 +1,28 @@
 //! The spec-fixer loop: the plan-side mirror of the ci-fixer (issue #188).
-//! An open spec/ADR PR whose plan guard came back with findings
-//! (`meguri:spec-reviewing`, `meguri/guard-review = failure` on its head) →
-//! worktree attached to the PR's existing branch → agent reads the guard's
-//! folded `<details>` findings and revises the spec/ADR → verified commits
-//! pushed to the same PR. A fixer-family loop: the push moves the head, the
-//! guard re-reviews the new head, and the verdict comes back through the next
-//! discovery poll — clean flips the PR to `spec-ready`, findings start another
-//! round.
+//! An open spec/ADR PR whose plan review came back with findings
+//! (`meguri:spec-reviewing`, `meguri/pr-review = failure` on its head) →
+//! worktree attached to the PR's existing branch → agent reads the
+//! pr-reviewer's folded `<details>` findings and revises the spec/ADR →
+//! verified commits pushed to the same PR. A fixer-family loop: the push moves
+//! the head, the pr-reviewer re-reviews the new head, and the verdict comes
+//! back through the next discovery poll — clean flips the PR to `spec-ready`,
+//! findings start another round.
 //!
-//! Why this loop exists: ADR 0008 defined guard(Plan) findings as "keep
-//! `spec-reviewing`, re-guard on the next push", but never assigned the push.
+//! Why this loop exists: ADR 0008 defined plan-review findings as "keep
+//! `spec-reviewing`, re-review on the next push", but never assigned the push.
 //! The impl side has a symmetric driver (a red rollup → the ci-fixer; human /
 //! external-bot threads → the fixer); the plan side had none, so every spec PR
 //! parked on its first findings (ADR 0013). `spec_fixer` is that missing
 //! driver.
 //!
 //! Convergence dedups on the head sha, more cleanly than the ci-fixer: after a
-//! fix push the new head carries no `meguri/guard-review` status yet, so
-//! discovery's "head status is failure" condition is false until the guard
-//! re-runs — the loop cannot re-fire on a head it already fixed. Three brakes
+//! fix push the new head carries no `meguri/pr-review` status yet, so
+//! discovery's "head status is failure" condition is false until the
+//! pr-reviewer re-runs — the loop cannot re-fire on a head it already fixed. Three brakes
 //! still bound it: a `Pending`/absent status is never picked up, escalated PRs
 //! (`meguri:needs-human`) wait for a human, and a PR already fixed
-//! [`MAX_SPEC_FIX_RUNS`] times escalates to `meguri:needs-human` — a guard that
-//! keeps emitting *fresh* findings after that many rounds is diverging and
+//! [`MAX_SPEC_FIX_RUNS`] times escalates to `meguri:needs-human` — a reviewer
+//! that keeps emitting *fresh* findings after that many rounds is diverging and
 //! needs a person (`meguri run --issue N` can force another round).
 //!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*, so the
@@ -38,7 +38,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, guard, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable, pr_reviewer};
 use crate::forge::{self, CommitStatusState, PullRequest};
 use crate::store::RunRecord;
 use crate::tasks::TaskKey;
@@ -47,12 +47,12 @@ use serde_json::json;
 /// `runs.loop_kind` value for spec-fixer runs.
 pub const KIND: &str = "spec-fixer";
 
-/// Fix rounds budgeted per spec PR; a PR whose plan guard is still red after
+/// Fix rounds budgeted per spec PR; a PR whose plan review is still red after
 /// this many pushed revisions escalates to `meguri:needs-human` (see the
 /// module docs on convergence). Same budget as the ci-fixer.
 pub const MAX_SPEC_FIX_RUNS: i64 = 3;
 
-/// Whether `pr` is a plan-guard findings target: an open, meguri-owned,
+/// Whether `pr` is a plan-review findings target: an open, meguri-owned,
 /// unclaimed spec PR (`meguri:spec-reviewing`) that is not held/escalated.
 /// `spec-reviewing` precedes the `spec-ready` divergence, so the touchability
 /// gate is delivery-mode independent — `skip_spec_ready` never matters here
@@ -65,7 +65,7 @@ fn is_findings_target(pr: &PullRequest, combined: bool) -> Option<String> {
     pr_is_touchable(pr, combined)
 }
 
-/// The spec-fixer as a schedulable loop: spec PRs whose plan guard flagged
+/// The spec-fixer as a schedulable loop: spec PRs whose plan review flagged
 /// findings in, revised specs pushed out.
 pub struct SpecFixerLoop;
 
@@ -76,9 +76,10 @@ impl super::Loop for SpecFixerLoop {
     }
 
     /// Open spec-reviewing PRs whose *current head* has a failing
-    /// `meguri/guard-review` status. Absent/`Pending` statuses wait (the head
-    /// is freshly pushed or the guard is still running), escalated PRs wait for
-    /// a human, and a PR whose fix budget is spent while the guard is still red
+    /// `meguri/pr-review` status. Absent/`Pending` statuses wait (the head is
+    /// freshly pushed or the pr-reviewer is still running), escalated PRs wait
+    /// for a human, and a PR whose fix budget is spent while the review is
+    /// still red
     /// escalates right here — its rounds all *succeeded* (revisions pushed), so
     /// the flow's failure escalation never fired, yet a human must look. The
     /// needs-human guard runs before the status poll, so the escalation fires
@@ -95,7 +96,7 @@ impl super::Loop for SpecFixerLoop {
             }
             if deps
                 .forge()
-                .commit_status(&pr.head_sha, guard::GUARD_STATUS)
+                .commit_status(&pr.head_sha, pr_reviewer::PR_REVIEW_STATUS)
                 .await?
                 != Some(CommitStatusState::Failure)
             {
@@ -113,6 +114,7 @@ impl super::Loop for SpecFixerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -127,8 +129,8 @@ pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> 
     flow::run_flow(deps, run_id, &SpecFixerFlavor).await
 }
 
-/// The retry-limit escalation: every budgeted round pushed a revision, the plan
-/// guard is still red — park the PR on `meguri:needs-human`. Best-effort like
+/// The retry-limit escalation: every budgeted round pushed a revision, the
+/// plan review is still red — park the PR on `meguri:needs-human`. Best-effort like
 /// the ci-fixer's; the label is what stops rediscovery. This does NOT page a
 /// human via the `turn.awaiting_human` notifier (no turn is running at
 /// discovery time); notifying the park is #153's job (ADR 0013).
@@ -147,7 +149,7 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
             pr.number,
             &format!(
                 "🔁 **meguri** pushed {MAX_SPEC_FIX_RUNS} revisions to this spec PR but \
-                 the plan guard is still finding issues, and needs a human.\n\n\
+                 the plan review is still finding issues, and needs a human.\n\n\
                  Clear the `{}` label (and re-run with `meguri run --issue {}` \
                  if wanted) once the findings are understood.",
                 forge::LABEL_NEEDS_HUMAN,
@@ -167,16 +169,16 @@ struct SpecFixerFlavor;
 #[async_trait]
 impl Flavor for SpecFixerFlavor {
     /// Unused: the spec-fixer's [`Flavor::prepare_work`] override claims by PR
-    /// state and guard status, not by an issue label.
+    /// state and pr-review status, not by an issue label.
     fn trigger_label(&self) -> &'static str {
         ""
     }
 
     /// Re-resolve the PR from the run's canonical issue, claim it (labels live
-    /// on the PR, not the issue) and snapshot the guard's folded findings into
-    /// the checkpoint. Any change that makes the PR untouchable — or its guard
-    /// status green/absent again — between discovery and claim is a benign
-    /// race: skip, don't escalate.
+    /// on the PR, not the issue) and snapshot the pr-reviewer's folded findings
+    /// into the checkpoint. Any change that makes the PR untouchable — or its
+    /// pr-review status green/absent again — between discovery and claim is a
+    /// benign race: skip, don't escalate.
     async fn prepare_work(
         &self,
         deps: &Deps,
@@ -194,22 +196,22 @@ impl Flavor for SpecFixerFlavor {
         }
         if deps
             .forge()
-            .commit_status(&pr.head_sha, guard::GUARD_STATUS)
+            .commit_status(&pr.head_sha, pr_reviewer::PR_REVIEW_STATUS)
             .await?
             != Some(CommitStatusState::Failure)
         {
             return Ok(PreparedWork::Skip(format!(
-                "PR #{}'s plan guard is no longer failing",
+                "PR #{}'s plan review is no longer failing",
                 pr.number
             )));
         }
-        // Findings live in the guard's folded `<details>` in the PR body (ADR
-        // 0006: the guard posts no inline threads). Fall back to the whole body
-        // if the block is missing — the agent can still read the PR.
-        let findings = guard::extract_guard_details(&pr.body).unwrap_or_else(|| {
+        // Findings live in the pr-reviewer's folded `<details>` in the PR body
+        // (ADR 0006: the pr-reviewer posts no inline threads). Fall back to the
+        // whole body if the block is missing — the agent can still read the PR.
+        let findings = pr_reviewer::extract_pr_review_details(&pr.body).unwrap_or_else(|| {
             format!(
-                "(the guard's findings block was not found in the PR body; read \
-                 the PR #{} description and its guard review directly.)\n\n{}",
+                "(the plan review's findings block was not found in the PR body; \
+                 read the PR #{} description and its plan review directly.)\n\n{}",
                 pr.number, pr.body
             )
         });
@@ -244,9 +246,9 @@ impl Flavor for SpecFixerFlavor {
         format!(
             "You are revising the spec/ADR on pull request #{number} \"{title}\" \
              in this repository (branch `{branch}`, a dedicated worktree attached \
-             to the PR's branch). The independent plan guard reviewed this spec \
-             and returned findings.\n\n\
-             # Guard findings\n\n{findings}\n\n\
+             to the PR's branch). The independent plan reviewer (pr-reviewer) \
+             reviewed this spec and returned findings.\n\n\
+             # Plan review findings\n\n{findings}\n\n\
              # Instructions\n\
              - Address every finding above by revising the spec (`docs/specs/…`) \
                and any ADR/domain document it touches. If a finding is wrong or \
@@ -260,7 +262,8 @@ impl Flavor for SpecFixerFlavor {
              - Follow the repository's existing conventions.\n\
              - COMMIT all your work to the current branch with clear messages. \
                Leave the working tree clean.\n\
-             - Do NOT push; meguri handles that (the push re-runs the guard).\n\
+             - Do NOT push; meguri handles that (the push re-runs the plan \
+               review).\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
                worktrees.{lang_section}",
             number = cp.pr_number.unwrap_or(run.issue_number),
@@ -274,8 +277,8 @@ impl Flavor for SpecFixerFlavor {
     }
 
     /// Committed revisions are all the spec-fixer requires locally: the real
-    /// verdict is the guard's re-review of the pushed head, which discovery
-    /// reads back from the forge.
+    /// verdict is the pr-reviewer's re-review of the pushed head, which
+    /// discovery reads back from the forge.
     fn verify_work(
         &self,
         _run: &RunRecord,
@@ -306,9 +309,9 @@ impl Flavor for SpecFixerFlavor {
     }
 
     /// After the push: leave a durable trace on the PR, then release the claim.
-    /// The label stays `spec-reviewing` — the pushed head has no guard status,
-    /// so the guard re-reviews it (clean → spec-ready, findings → another
-    /// round). Best-effort comment.
+    /// The label stays `spec-reviewing` — the pushed head has no pr-review
+    /// status, so the pr-reviewer re-reviews it (clean → spec-ready, findings →
+    /// another round). Best-effort comment.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         let pr = cp
             .pr_number
@@ -319,7 +322,8 @@ impl Flavor for SpecFixerFlavor {
                 pr,
                 &format!(
                     "🔁 **meguri** pushed a spec revision addressing the plan \
-                     guard's findings (run `{}`); the guard re-reviews the new head.",
+                     review's findings (run `{}`); the pr-reviewer re-reviews \
+                     the new head.",
                     run.id
                 ),
             )
@@ -359,7 +363,7 @@ impl Flavor for SpecFixerFlavor {
                 pr,
                 &format!(
                     "🔁 **meguri** could not revise this spec to satisfy the plan \
-                     guard and needs a human.\n\n> {reason}\n\n\
+                     review and needs a human.\n\n> {reason}\n\n\
                      The agent's pane (if still open) has the full context — \
                      see `meguri ps` / `meguri attach` on the host running meguri."
                 ),
@@ -400,7 +404,8 @@ mod tests {
         // A plain spec-reviewing meguri PR is a target.
         assert!(is_findings_target(&spec_pr(1, &[forge::LABEL_SPEC_REVIEWING]), false).is_none());
 
-        // Not spec-reviewing: the guard's plan state machine hasn't put it here.
+        // Not spec-reviewing: the plan review's label state machine hasn't put
+        // it here.
         assert!(
             is_findings_target(&spec_pr(2, &[]), false)
                 .unwrap()
@@ -438,6 +443,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         Deps::with_label_source(
@@ -449,12 +455,12 @@ mod tests {
         )
     }
 
-    /// A spec-reviewing PR at head `sha` with the given guard verdict recorded
-    /// on that head, plus the guard's folded findings in its body.
+    /// A spec-reviewing PR at head `sha` with the given review verdict recorded
+    /// on that head, plus the pr-reviewer's folded findings in its body.
     fn seed_spec_pr(forge: &crate::forge::fake::FakeForge, number: i64, head: &str) {
         let body = format!(
-            "Refs #{number}.\n\n<!-- meguri:guard-review -->\n<details>\n\
-             <summary>🛡️ guard review (plan) — findings at `{head}`</summary>\n\n\
+            "Refs #{number}.\n\n<!-- meguri:pr-review -->\n<details>\n\
+             <summary>🛡️ pr review (plan) — findings at `{head}`</summary>\n\n\
              - the acceptance criteria are missing\n</details>"
         );
         forge.add_pr(
@@ -468,22 +474,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_picks_only_failing_guard_heads() {
+    async fn discover_picks_only_failing_review_heads() {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
-        // #1: spec-reviewing, guard failure at its head → a target.
+        // #1: spec-reviewing, plan review failure at its head → a target.
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", guard::GUARD_STATUS, CommitStatusState::Failure);
-        // #2: spec-reviewing but guard is green → not a target.
+        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        // #2: spec-reviewing but the review is green → not a target.
         seed_spec_pr(&forge, 2, "h2");
-        forge.set_commit_status_direct("h2", guard::GUARD_STATUS, CommitStatusState::Success);
-        // #3: spec-reviewing, guard pending → not a target (still settling).
+        forge.set_commit_status_direct("h2", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Success);
+        // #3: spec-reviewing, review pending → not a target (still settling).
         seed_spec_pr(&forge, 3, "h3");
-        forge.set_commit_status_direct("h3", guard::GUARD_STATUS, CommitStatusState::Pending);
-        // #4: spec-reviewing but no guard status yet (freshly pushed) → skip.
+        forge.set_commit_status_direct("h3", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Pending);
+        // #4: spec-reviewing but no review status yet (freshly pushed) → skip.
         seed_spec_pr(&forge, 4, "h4");
-        // #5: guard failure but not spec-reviewing → skip.
+        // #5: review failure but not spec-reviewing → skip.
         forge.add_pr(5, "impl (#5)", "body", &[], "meguri/5-impl-abc", "h5");
-        forge.set_commit_status_direct("h5", guard::GUARD_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct("h5", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
 
         let deps = fake_deps(forge);
         let targets = SpecFixerLoop.discover(&deps).await.unwrap();
@@ -506,7 +512,7 @@ mod tests {
             "meguri/7-add-caching-abc",
             "h1",
         );
-        forge.set_commit_status_direct("h1", guard::GUARD_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
         let deps = fake_deps(forge.clone());
 
         // Record MAX succeeded spec-fixer runs for the canonical issue #7.
@@ -560,7 +566,7 @@ mod tests {
     async fn prepare_work_claims_and_loads_findings() {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", guard::GUARD_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
         let deps = fake_deps(forge.clone());
         let run = deps
             .store
@@ -608,26 +614,28 @@ mod tests {
         assert!(!prompt.contains("# Output language"));
     }
 
-    /// The crux of issue #188: the plan-side handoff between the guard and the
-    /// spec-fixer converges without a human. Exercised at the discovery/settle
-    /// seam (no real tmux) so any scheduling order closes the chain.
+    /// The crux of issue #188: the plan-side handoff between the pr-reviewer
+    /// and the spec-fixer converges without a human. Exercised at the
+    /// discovery/settle seam (no real tmux) so any scheduling order closes the
+    /// chain.
     #[tokio::test]
-    async fn cross_loop_handoff_guard_to_spec_fixer_and_back() {
+    async fn cross_loop_handoff_pr_reviewer_to_spec_fixer_and_back() {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
-        // A spec PR the guard already reviewed with findings at head h1.
+        // A spec PR the pr-reviewer already reviewed with findings at head h1.
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", guard::GUARD_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
         let deps = fake_deps(forge.clone());
 
-        // 1. spec-fixer picks it up; the guard does not (h1 is already guarded).
+        // 1. spec-fixer picks it up; the pr-reviewer does not (h1 is already
+        //    reviewed).
         let sf = SpecFixerLoop.discover(&deps).await.unwrap();
         assert_eq!(sf.len(), 1, "spec-fixer targets the parked PR");
         deps.open_prs.clear().await;
-        let g = guard::GuardLoop.discover(&deps).await.unwrap();
-        assert!(g.is_empty(), "guard skips the already-guarded head h1");
+        let g = pr_reviewer::PrReviewerLoop.discover(&deps).await.unwrap();
+        assert!(g.is_empty(), "pr-reviewer skips the already-reviewed head h1");
 
         // 2. After the spec-fixer settles, working is gone and spec-reviewing
-        //    stays (nothing flips the label until the guard re-reviews).
+        //    stays (nothing flips the label until the pr-reviewer re-reviews).
         forge.add_pr_label(1, forge::LABEL_WORKING).await.unwrap();
         let run = deps
             .store
@@ -645,17 +653,19 @@ mod tests {
         assert!(!labels.contains(&forge::LABEL_WORKING.to_string()));
         assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
 
-        // 3. The fix push moves the head to h2 (no guard status yet): the
-        //    spec-fixer no longer fires (head-sha dedup), the guard now does.
+        // 3. The fix push moves the head to h2 (no review status yet): the
+        //    spec-fixer no longer fires (head-sha dedup), the pr-reviewer now
+        //    does.
         forge.set_pr_head(1, "h2");
         deps.open_prs.clear().await;
         let sf = SpecFixerLoop.discover(&deps).await.unwrap();
         assert!(sf.is_empty(), "spec-fixer waits — h2 has no failing status");
         deps.open_prs.clear().await;
-        let g = guard::GuardLoop.discover(&deps).await.unwrap();
-        assert_eq!(g.len(), 1, "guard re-reviews the new head h2");
+        let g = pr_reviewer::PrReviewerLoop.discover(&deps).await.unwrap();
+        assert_eq!(g.len(), 1, "pr-reviewer re-reviews the new head h2");
 
-        // 4. The guard's clean settle on h2 flips spec-reviewing → spec-ready
-        //    is covered by guard.rs's `plan_settle_drives_the_spec_label_state_machine`.
+        // 4. The pr-reviewer's clean settle on h2 flips spec-reviewing →
+        //    spec-ready, covered by pr_reviewer.rs's
+        //    `plan_settle_drives_the_spec_label_state_machine`.
     }
 }

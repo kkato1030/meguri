@@ -11,7 +11,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneSpec;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_AUTHOR, RunStatus, Store};
+use meguri::store::{LANE_AUTHOR, RunStatus, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -55,6 +55,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     Deps::with_label_source(
@@ -423,7 +424,7 @@ async fn register_pane(deps: &Deps, issue: i64, wt: &Path) -> meguri::mux::PaneI
         .upsert_pane(
             "proj",
             issue,
-            ROLE_AUTHOR,
+            LANE_AUTHOR,
             deps.mux.kind().as_str(),
             "meguri",
             &pane.0,
@@ -469,7 +470,7 @@ async fn sweep_reclaims_pane_then_worktree_of_closed_issue() {
     assert!(!deps.mux.pane_alive(&pane).await.unwrap());
     let record = deps
         .store
-        .get_pane("proj", 11, ROLE_AUTHOR)
+        .get_pane("proj", 11, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     assert_eq!(record.mux_pane_id, None);
@@ -545,7 +546,7 @@ async fn sweep_clears_stale_mapping_of_dead_pane() {
     reaper::sweep(&deps).await.unwrap();
     let record = deps
         .store
-        .get_pane("proj", 14, ROLE_AUTHOR)
+        .get_pane("proj", 14, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     assert_eq!(record.mux_pane_id, None, "stale mapping cleared");

@@ -1,12 +1,12 @@
-//! The impl reviewer: no longer a schedulable loop, but the worker's
+//! The self-review phase: no longer a schedulable loop, but the worker's
 //! **internal** self-review phase (ADR 0006). It runs inside the run's own
 //! worktree, between `validate` and `open-pr`, and **never touches the
 //! forge** — the review→fix ping-pong that used to travel as PR threads now
 //! stays entirely local:
 //!
 //! 1. **review turn** — reads `git diff <base>...HEAD` locally (dropped at
-//!    [`DIFF_FILE`]) in a separate `impl-review` lane under the
-//!    `impl-reviewer` routing profile (model separation survives), and writes
+//!    [`DIFF_FILE`]) in a separate `self-review` lane under the
+//!    `self-reviewer` routing profile (model separation survives), and writes
 //!    `{verdict, findings[]}` to [`REVIEW_FILE`]. `clean` ends the phase.
 //! 2. **fix turn** — the author lane addresses the findings and commits;
 //!    the project check is re-run; then back to a review turn.
@@ -70,7 +70,7 @@ pub struct RoundRecord {
 
 /// What the review turn writes to [`REVIEW_FILE`].
 #[derive(Debug, Deserialize)]
-pub struct ImplReviewFile {
+pub struct SelfReviewFile {
     pub verdict: ReviewVerdict,
     #[serde(default)]
     pub review: String,
@@ -177,13 +177,13 @@ fn mark_unconverged(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result
 }
 
 enum ReviewTurn {
-    Reviewed(ImplReviewFile),
+    Reviewed(SelfReviewFile),
     Stopped,
     Interrupted(String),
 }
 
 /// One review turn (plus at most one corrective turn). The review runs in the
-/// `impl-review` lane; verification is the orchestrator's: the checkout must
+/// `self-review` lane; verification is the orchestrator's: the checkout must
 /// stay pristine and at the same HEAD, and the review file must parse.
 async fn review_turn(
     deps: &Deps,
@@ -451,11 +451,11 @@ fn fix_prompt(findings: &[Finding], language: Option<&str>) -> String {
 }
 
 /// Parse and validate the review file. The Err text feeds a corrective prompt.
-fn read_review(worktree: &Path) -> std::result::Result<ImplReviewFile, String> {
+fn read_review(worktree: &Path) -> std::result::Result<SelfReviewFile, String> {
     let raw = std::fs::read_to_string(worktree.join(REVIEW_FILE)).map_err(|_| {
         format!("- review file `{REVIEW_FILE}` does not exist (write it as instructed)")
     })?;
-    let review: ImplReviewFile = serde_json::from_str(raw.trim()).map_err(|e| {
+    let review: SelfReviewFile = serde_json::from_str(raw.trim()).map_err(|e| {
         format!(
             "- review file `{REVIEW_FILE}` is not valid JSON ({e}); expected \
              {{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown>\", \
