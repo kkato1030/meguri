@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, PlanDelivery, ProjectConfig};
 use meguri::engine::conflict_resolver::{
     self, ConflictResolverLoop, MAX_RESOLVE_RUNS, run_conflict_resolver,
 };
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_WORKING, MergeableState};
+use meguri::forge::{
+    LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING, MergeableState,
+};
 use meguri::gitops::{is_ancestor, run_git};
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -371,6 +373,32 @@ async fn resolver_discovery_wants_conflicting_unclaimed_meguri_prs_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn resolver_discovery_skips_spec_ready_prs_under_combined_delivery() {
+    // Under combined plan delivery (ADR 0008 §6) a `spec-ready` PR's branch
+    // belongs to the spec worker's takeover; the resolver must keep off it
+    // even though it conflicts. Until issue #170 this was the one gate the
+    // resolver's guard was missing relative to fixer/ci-fixer.
+    let mut env = setup(None).await;
+    env.deps.project.plan_delivery = PlanDelivery::Combined;
+
+    let pr = env.forge.push_pr(
+        "meguri/12-spec-def456",
+        "Spec: thing (#12)",
+        &[LABEL_SPEC_READY],
+    );
+    env.forge.set_pr_mergeable(pr, MergeableState::Conflicting);
+
+    // PR #1 (from `setup`) still conflicts and is ordinary — only the
+    // spec-ready PR must be skipped.
+    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
+    assert_eq!(
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        vec![9],
+        "a spec-ready PR belongs to the spec worker under combined delivery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resolver_stops_rediscovering_after_the_resolve_budget() {
     let env = setup(None).await;
     assert_eq!(
@@ -391,6 +419,9 @@ async fn resolver_stops_rediscovering_after_the_resolve_budget() {
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
     }
+    // A new tick: the scheduler would clear the shared open-PR cache here
+    // (issue #170) before calling discover again.
+    env.deps.open_prs.clear().await;
     assert!(
         ConflictResolverLoop
             .discover(&env.deps)

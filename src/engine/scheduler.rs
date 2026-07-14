@@ -157,6 +157,12 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) -> Result<()> {
+        // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
+        // conflict_resolver) below share one `list_open_prs` call per
+        // project this tick instead of one each (issue #170).
+        for deps in &self.projects {
+            deps.open_prs.clear().await;
+        }
         for lp in &self.loops {
             for deps in &self.projects {
                 if active.len() >= self.max_concurrent {
