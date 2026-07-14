@@ -62,7 +62,7 @@ pub fn supports_advisor_loop_kind(loop_kind: &str) -> bool {
 
 **spawn(execute 前)**:`drive` の `STEP_EXECUTE` ブロック(`flow.rs:339` 付近、worktree 再読込の直後・`execute(...)` の直前)で、`config.collab` が有効 かつ `collab::supports_advisor_loop_kind(&run.loop_kind)` のとき `ensure_advisor(deps, run, cp)` を呼ぶ。
 
-- advisor pane は `(project, issue, ROLE_ADVISOR)` を鍵に確保するが、`ensure_pane` と違い **adopt / resume はしない — 捨てて張り直す**(#121):既存の live advisor pane が居たら `reaper::release_pane` で畳んでから新規 spawn する(resume 復帰・meguri 再起動を跨いだ生き残りも同じ扱い)。advisor の文脈は seed(spec 全文)だけで再現できるので、古い個体の途中状態を信用するより捨てる方が安い。同じ理由で advisor row の `agent_session_id` は常に空に保つ — 保存経路は reap 側で塞ぐ(下記 reap、plan review 指摘 1)。
+- advisor pane は `(project, issue, ROLE_ADVISOR)` を鍵に確保するが、`ensure_pane` と違い **adopt / resume はしない — 捨てて張り直す**(#121):既存の live advisor pane が居たら `reaper::release_pane` で畳んでから新規 spawn する(resume 復帰・meguri 再起動を跨いだ生き残りも同じ扱い)。advisor の文脈は seed(spec 全文)だけで再現できるので、古い個体の途中状態を信用するより捨てる方が安い。同じ理由で advisor row の `agent_session_id` は常に空に保つ — `release_pane_record` の保存を advisor lane でガードして塞ぐ(下記 reap)ので、この respawn 時の畳みでも id は残らない。
 - **profile は「plan を実際に作ったモデル」を継ぐ**:run の profile は初回 spawn 時に `runs.agent_profile` へ pin される(`flow.rs:771` `resolve_run_profile`、`src/store/runs.rs:148`)ので、その issue の**直近に成功した `advisor_role`(既定 planner)run の pin** を最優先で使う(store に issue × loop_kind の直近成功 run の `agent_profile` を引く読み取りクエリを 1 本足す)。`routing::resolve` をその場でやり直すだけだと、planning 後に routing 設定や auto 検出結果が変わった場合に plan 作者と別 profile になる。pin が無い(`meguri:ready` 直行で planner run が存在しない)/ pin した profile 名が config から消えている場合は、`routing::resolve(cfg, cfg.collab.advisor_role, detect)` の現在解決にフォールバックし `collab.advisor_profile_fallback` を emit する(run 本体の `resolve_run_profile` は「消えた pin は loud error」だが、advisor は best-effort なので落とさない)。いずれも **worker 自身の profile ピンとは無関係**。
 - cwd は **worktree を持たせない**(#121:read-only は配線で保証)。advisor の cwd は repo の checkout ではなく、`<worktree_root>/<project>/advisor-<issue>` に spawn 時に作る**素の空ディレクトリ**(`git worktree` 登録なし)。書き込み可能な repo コピーがそもそも存在しないので、「コードを書くな」はプロンプトの願いではなく配線の事実になる。当初案の「review lane と同じ detached checkout」は退けた:detached でも checkout は書ける(read-only は慣習に過ぎない)し、run を持たない checkout は reaper の worktree 走査で issue を復元できず(`classify` は branch 名か `runs_for_worktree` に頼る — `src/engine/reaper.rs:150` 付近)orphan として残り続ける。素のディレクトリなら `git worktree list` に現れず reaper と干渉しない。削除は下記 reap で行い、万一漏れても空ディレクトリが残るだけで無害。相談の材料は seed の spec 全文と worker が送ってくる説明で足りる(コードレビューではなく要件充足の相談、という充て方と一致)。
 - seed は spec 全文をプロンプトに inline(spec-worker が spec を読み込むのと同型、`spec_worker.rs:194-235`。読むのは meguri であり advisor に repo アクセスは要らない)。spec ファイルが無い `meguri:ready` 直行 issue では issue 本文を seed にフォールバック。
@@ -73,10 +73,10 @@ pub fn supports_advisor_loop_kind(loop_kind: &str) -> bool {
 **reap(run 終了)**:`run_flow` の終端 match(`flow.rs:257-308` の全 arm:成功 / needs-plan / decompose / 中断 / 失敗)で `release_advisor(deps, &run)` を呼ぶ。
 
 - 中身は `reaper::release_pane(deps, issue, ROLE_ADVISOR, "worker run ended")` + advisor ディレクトリの削除(`remove_dir_all`、best-effort)。`keep_pane` を見ない(常に reap。ADR 0006 原則 3)。
-- **release の直後に session id を null 化する**(plan review 指摘 1)。現行の `release_pane`(→ `release_pane_record`)は pane を殺す前に `worktree_path` から最新 session id を拾い、あれば `panes.agent_session_id` に保存する(`reaper.rs:480-488`、resume 可能性の担保)。advisor は adopt / resume しない前提で session id を残さないのが原則(上記 spawn)なので、`release_advisor` は `release_pane` の直後に `store.save_pane_session(&project.id, issue, ROLE_ADVISOR, None)` を呼んで id を消す。これで advisor row に session id が durable に残る経路が無くなる — 「捨てて張り直す」(#121 / ADR 0006 原則 3)と等価。advisor 専用の release helper を新設して save 段をそもそも通さない案もあるが、既存 release の再利用 + 明示クリアの方が差分が小さい。
+- **session id は release の choke point で保存させない**(plan review 指摘 1/2)。`release_pane_record` は pane を殺す前に cwd から最新 session id を拾い `panes.agent_session_id` に保存する(`reaper.rs:480-488`、resume の可逆性)。advisor を畳む経路は 3 つ — `release_advisor`(run 終端)・reaper の `reclaim_panes`(安全網、下記)・`ensure_advisor` の respawn(捨てて張り直し、上記)— が、いずれもこの `release_pane_record` を通る。だから塞ぐのは 1 箇所:**`release_pane_record` の session 保存ブロックを `lane != ROLE_ADVISOR` でガードする** — advisor lane では拾わない・保存しない。これで 3 経路のどこで advisor pane を畳んでも session id は durable に残らない。呼び出し側で release 後に `save_pane_session(..., None)` する案(前回の `release_advisor` 限定クリア)は、まさに reaper 経路を漏らした通り経路ごとに取りこぼす;choke point 1 箇所のガードなら将来の caller も自動で守られる。session 保存の唯一の目的は resume の可逆性で、advisor は resume しないのだから、advisor で保存しないのは意味的にも正しい。
 - collab 無効 or advisor pane 不在なら no-op(冪等・安全)。
 
-**reaper 安全網** — `src/engine/reaper.rs`:pane 走査(`plan_panes`)は `list_panes` で**全 lane を role 無差別に**列挙する(`reaper.rs:370` 付近、`src/store/panes.rs:115`)ので、dead pane の mapping 掃除と issue close 時の回収は advisor lane にもコード変更なしで効く。worktree 走査の pane-alive guard(`classify` の `[ROLE_AUTHOR, ROLE_REVIEW]`、`reaper.rs:192`)は advisor が worktree を持たないので触らない。足すのは role 条件 1 つ:**issue が open でも、active run の無い advisor pane は `Reclaim`** にする(author / review が issue close まで生きるのと別規律)。sweep は毎 tick + 起動時 recovery として回る(`scheduler.rs` の sweep 呼び出し)ので、run 終端 reap の取りこぼしも meguri 再起動を跨いだ生き残りも、ここで「捨てて張り直す」(#121)に収束する。正常経路では run 終端で先に消えている。
+**reaper 安全網** — `src/engine/reaper.rs`:pane 走査(`plan_panes`)は `list_panes` で**全 lane を role 無差別に**列挙する(`reaper.rs:370` 付近、`src/store/panes.rs:115`)ので、dead pane の mapping 掃除と issue close 時の回収は advisor lane にもコード変更なしで効く。worktree 走査の pane-alive guard(`classify` の `[ROLE_AUTHOR, ROLE_REVIEW]`、`reaper.rs:192`)は advisor が worktree を持たないので触らない。足すのは role 条件 1 つ:**issue が open でも、active run の無い advisor pane は `Reclaim`** にする(author / review が issue close まで生きるのと別規律)。この Reclaim は `reclaim_panes` → `release_pane_record` を通るが、上記のガード(`lane != ROLE_ADVISOR`)により advisor の session id はこの安全網経路でも保存されない。sweep は毎 tick + 起動時 recovery として回る(`scheduler.rs` の sweep 呼び出し)ので、run 終端 reap の取りこぼしも meguri 再起動を跨いだ生き残りも、ここで「捨てて張り直す」(#121)に収束する。正常経路では run 終端で先に消えている。
 
 ### 4. プロトコルはプロンプトに置く — worker 相談ブロック + advisor seed
 
@@ -111,7 +111,7 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 2. `[collab] mode = "advisor"` かつ agmsg 検出あり → worker run で `advisor` lane の pane が `(project, issue, advisor)` に立ち、その profile は直近成功 planner run の pin を継ぐ(pin 不在 / 失効時は `advisor_role` の現在解決にフォールバック + event)。**spawn が成功した時だけ** worker プロンプトに team 名・相談先 id `advisor`・`send.sh` / `inbox.sh` の呼び出し形が入る。
 3. `mode = "advisor"` + agmsg 未検出 → `meguri watch` / `meguri run` が起動時に明示エラーで停止(silent fallback しない)。`collab::validate` の単体テストで担保。
 4. 完了契約は不変:run 時の advisor spawn が失敗しても worker run は止まらず(best-effort)、**その run の worker プロンプトに相談ブロックは入らない**(存在しない待機先を案内しない)。成否は `result.json` + git 検証だけで決まる(テストで担保)。
-5. advisor は worker run の終了(成功 / needs-plan / decompose / 中断 / 失敗のいずれでも)で確実に reap され(pane + advisor ディレクトリ)、`keep_pane = "until-issue-closed"` でも常駐しない。resume・meguri 再起動では既存 advisor を adopt せず、捨てて張り直す。
+5. advisor は worker run の終了(成功 / needs-plan / decompose / 中断 / 失敗のいずれでも)で確実に reap され(pane + advisor ディレクトリ)、`keep_pane = "until-issue-closed"` でも常駐しない。resume・meguri 再起動では既存 advisor を adopt せず、捨てて張り直す。どの release 経路(run 終端 / reaper 安全網 / respawn の畳み)でも advisor row に `agent_session_id` は保存されない。
 6. 対象は worker / spec-worker のみ。他 loop(planner / reviewer / fixer / …)は collab 有効でも advisor を spawn しない(`collab::supports_advisor_loop_kind` = false)。
 7. advisor は書き込み可能な worktree を持たない:cwd は git 登録の無い空ディレクトリで、repo の checkout を一切渡さない(read-only は配線で保証)。
 8. collab 有効時、worker / spec-worker の run はスケジューラ予算を 2 スロット消費する(`max_concurrent_runs = 1` でも単独なら起動できる)。collab 無効時の会計は現状と同一。
@@ -126,7 +126,7 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 - `worker.rs` / `spec_worker.rs`:execute プロンプトが collab off で不変(基準 1)、spawn 成功時のみ相談ブロックを含む(基準 2)、spawn 失敗時は off と文字列一致(基準 4)。既存の `prompt_invites_needs_plan` パターン(`worker.rs:196`)に倣う。
 - flow 統合(FakeMux + FakeForge):collab on で advisor pane が spawn され run 終端で release される(pane + ディレクトリ、基準 5)、advisor spawn 失敗を注入しても run が成功しプロンプトが不変(基準 4)、resume 時に既存 advisor が捨てられ張り直される(基準 5)、collab off で pane 数不変(基準 1)。`supports_advisor_loop_kind` が false の loop_kind で spawn されない(基準 6)。あわせて `collab::supports_advisor_loop_kind` の単体テスト(worker / spec-worker のみ true)。
 - scheduler:collab on で worker run が 2 スロット消費し、`max_concurrent = 1` でも単独起動できる(基準 8)。
-- reaper:open issue × active run 無しの advisor pane が Reclaim になる(基準 5 の安全網)。
+- reaper:open issue × active run 無しの advisor pane が Reclaim になる(基準 5 の安全網)。その Reclaim 経路(`reclaim_panes` → `release_pane_record`)を通した後も advisor row の `agent_session_id` が空のまま(ガードの検証、指摘 1/2)。author / review lane では従来どおり session id が保存されること(ガードの非破壊)。
 
 ## 触るファイル
 
@@ -134,10 +134,10 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 - `src/collab.rs` — 新規。`validate`(agmsg script 検出 = routing 流用)、`supports_advisor_loop_kind`(flow と scheduler が共有する対象判定)、`team_name`、seed / 相談ブロックのプロンプトビルダ
 - `src/store/panes.rs` — `ROLE_ADVISOR = "advisor"` 定数
 - `src/store/runs.rs` — 読み取りクエリ 1 本(issue × loop_kind の直近成功 run の `agent_profile`)
-- `src/engine/flow.rs` — `ensure_advisor`(execute 前 spawn、捨てて張り直し、best-effort、成否を execute へ。対象判定は `collab::supports_advisor_loop_kind(&run.loop_kind)`)、`release_advisor`(run 終端 reap + ディレクトリ削除 + `save_pane_session(None)`)
+- `src/engine/flow.rs` — `ensure_advisor`(execute 前 spawn、捨てて張り直し、best-effort、成否を execute へ。対象判定は `collab::supports_advisor_loop_kind(&run.loop_kind)`)、`release_advisor`(run 終端 reap + ディレクトリ削除)
 - `src/engine/worker.rs` / `src/engine/spec_worker.rs` — execute プロンプトへの相談ブロック append(advisor spawn 成功時のみ)。opt-in は `loop_kind` 側で決まるので `Flavor` メソッドは足さない
 - `src/engine/scheduler.rs` — 加重スロット会計(`collab::supports_advisor_loop_kind` が true な collab 有効 run = 2)
-- `src/engine/reaper.rs` — advisor pane の role 条件(open issue でも active run 無しなら Reclaim)。lane 列挙自体は `list_panes` が全 role を返すので変更不要
+- `src/engine/reaper.rs` — advisor pane の role 条件(open issue でも active run 無しなら Reclaim)+ `release_pane_record` の session 保存を `lane != ROLE_ADVISOR` でガード(全 release 経路で advisor に session id を残さない、指摘 1/2)。lane 列挙自体は `list_panes` が全 role を返すので変更不要
 - 起動経路(`routing::validate` 呼び出し元)— `collab::validate` を併せて呼ぶ
 - `README.md` / `README.ja.md` — `[collab]` 節(routing 節の後ろ、`README.md:279` 付近)
 - `docs/adr/0006-collab-advisor-role-reembodiment.md` — 決定の記録(本 PR に同梱済み)
