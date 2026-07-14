@@ -11,9 +11,13 @@ meguri が人間の注意を要する状態(needs-human エスカレーション
 issue 起票)になっても、人間へ push で届く経路が無かった。人間は GitHub をポーリングして気づくしかない。
 
 一方、通知の下地は既にあった。issue #7 の `src/notify/`(NotifyGateway / throttle する Notifier /
-macOS + `curl` webhook の SystemGateway)。ただし配線は `turn.awaiting_human` 1 イベント・payload 1 形状に
-固定されていた。needs-human ラベルのエスカレーション(`escalation.raised`)もスケジュール異常も、この
-シンクには繋がっていない。
+macOS + `curl` webhook の SystemGateway)。ただし配線は payload 1 形状に固定され、しかも「人間を今
+ページする」通知が 3 経路に散っていた — `turn.awaiting_human`、parked review の
+`review.awaiting_human`、spec-fixer ラウンド上限の `spec_fixer.budget_exhausted`。3 つとも
+`webhook_url` 設定時に無条件で飛び、絞る手段が無い。一方 needs-human ラベルのエスカレーション
+(`escalation.raised`)もスケジュール異常(`schedule.failed` は未定義、`schedule.skipped` は emit
+済だが未接続)も、このシンクには繋がっていない。「配信されすぎる既存通知」と「配信されない新規通知」が
+同居していた。
 
 ## 決定
 
@@ -31,6 +35,12 @@ macOS + `curl` webhook の SystemGateway)。ただし配線は `turn.awaiting_hu
 
 3. **既存 `[notifications]` を拡張し、新セクションをフォークしない**(ADR 0001 の最小主義)。`events`
    allowlist の既定は `["awaiting_human"]` で、既存 config を無改変のまま現行挙動に保つ(後方互換)。
+   ここで `awaiting_human` トークンは**「人間を今ページする」既存 3 経路(`turn.awaiting_human` /
+   `review.awaiting_human` / `spec_fixer.budget_exhausted`)を一つに束ねる**。store kind と 1:1 では
+   なく、ユーザにとって意味が同じ通知を 1 トークンで扱う。これにより、今まで直接 notifier を叩いて
+   allowlist の外にあった parked/budget 通知も同じ判定に乗り、既定では 1 つも落ちず、絞りたい人だけ
+   `awaiting_human` を外せる。schedule は異常の粒度が違うので `schedule.failed`(発火失敗)と
+   `schedule.skipped`(overlap スキップ)を別トークンにし、片方だけ購読できるようにする。
 
 4. **webhook 種別は URL から自動判別、`kind` で明示上書き**。sink ごとに本文が違う(Slack /
    ntfy / 汎用 JSON)ため判別は必須だが、素の運用は URL だけで済ませ、非典型 endpoint だけ 1 行で救う。
