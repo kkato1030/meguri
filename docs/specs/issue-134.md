@@ -185,7 +185,12 @@ fenced code block をちょうど1個**置く:
   2. **未リンク検出(reservation-first で作成⇄リンクの窓を塞ぐ)**: graph に無いとき、
      - この idx が**未 reserve**(親 body に `<!-- meguri:decompose-reserve idx=<i> -->` が無い)なら
        真に新規。reserve を親 body に追記 → `create_issue`(key 入り body)→ 直後に
-       `add_blocked_by(parent, child)` でリンク。ここで正典(graph)に載る。
+       **`add_blocked_by_in(parent, child_slug, child)`** でリンク(`child_slug` は
+       `resolve_child_target` が返す子の起票先 repo slug。既存即時 decompose の
+       `add_blocked_by_in(run.issue_number, &slug, number)`、`src/engine/planner.rs` と同じ張り方 —
+       **同一 repo 前提の `add_blocked_by` では sibling 子で wrong repo を参照して失敗する**)。これで
+       cross-repo 子も親の正典 graph に載り、再掃引の既存判定(step 1、`Blocker.repo` + `Blocker.number`)が
+       採用できる。
      - この idx が**既 reserve だが graph に無い**なら、作成⇄リンクの窓で落ちた疑い。**再作成しない**。
        backstop の all-state key 検索(§7 `find_issue_by_marker`、`--state all`。repo 単位の API
        なので、その idx の起票先 forge — cross-repo 子なら sibling forge — で引く)で子を探し、あれば
@@ -364,8 +369,13 @@ reaper / auto_merger と同じく、`src/engine/scheduler.rs` の poll tick(`for
   スコープ外 `project`)の各異常系で **issue を1つも作らず**、冪等なエラーコメント1回 + skip に
   なること。optional `project` が parse で保持されること。通常の ```json 例示ブロックを誤検出
   しないこと。
-- **cross-repo 子(#154 非退行)**: `project` 指定の子が sibling forge(FakeForge factory)に起き、
-  親の graph 採用が `Blocker.repo` + `Blocker.number` で正しい repo の子を同定し再作成しないこと。
+- **cross-repo 子(#154 非退行)**: `project` 指定の子が sibling forge(FakeForge factory)に起きること。
+  親→子 edge が **`add_blocked_by_in(parent, child_slug, child)`** で張られ(同一 repo 前提の
+  `add_blocked_by` ではない)、その結果 sibling 子が `blocked_by(parent)` の graph に
+  `Blocker.repo`(= sibling slug)+ `Blocker.number` として現れること。
+- **cross-repo 再開(finding 直結)**: sibling 子を作成・parent→子リンク済みの状態から再掃引し、
+  親 graph の採用が `Blocker.repo` + `Blocker.number` で sibling 子を正しく同定して**再作成しない**
+  こと(cross-repo でも重複防止の正典が graph で成立することの実証)。
 - **冪等(クラッシュ窓ごとに)**: FakeForge の記録で「**重複 issue が増えない**」を確認(受入 4):
   1. **作成+リンク済み・台帳前に crash**: `blocked_by(parent)` に子が載る状態から再掃引 → graph で
      採用し、`create_issue` を再発行しない。
