@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::Deps;
-use super::guard::GUARD_STATUS;
+use super::pr_reviewer::PR_REVIEW_STATUS;
 use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn};
 use crate::forge::{
     self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, MergeableState, PullRequest,
@@ -187,18 +187,18 @@ async fn process_pr(
     if threads.iter().any(|t| !t.resolved) {
         return Ok(());
     }
-    // 6b: the guard gate (ADR 0008 §5). When the impl guard is enabled, the
-    // auto-merger only proceeds on a head whose `meguri/guard-review` status is
-    // success — a failure is escalated to a human, and an absent/pending
-    // status simply waits (no-op, retried next sweep). When the impl guard is
+    // 6b: the pr-review gate (ADR 0008 §5). When the impl review is enabled,
+    // the auto-merger only proceeds on a head whose `meguri/pr-review` status
+    // is success — a failure is escalated to a human, and an absent/pending
+    // status simply waits (no-op, retried next sweep). When the impl review is
     // disabled there is no status to require, so this condition is skipped
     // (never demand a status nothing produces — the ADR 0007 deadlock trap).
     // Applies to both native (arm) and orchestrator (direct merge) modes.
-    match guard_gate(deps, pr).await? {
-        GuardGate::Proceed => {}
-        GuardGate::Wait => return Ok(()),
-        GuardGate::Failed => {
-            escalate_guard_failed(deps, pr).await;
+    match pr_review_gate(deps, pr).await? {
+        PrReviewGate::Proceed => {}
+        PrReviewGate::Wait => return Ok(()),
+        PrReviewGate::Failed => {
+            escalate_pr_review_failed(deps, pr).await;
             return Ok(());
         }
     }
@@ -249,39 +249,39 @@ async fn opted_in(
     Ok(issue.has_label(forge::LABEL_AUTOMERGE))
 }
 
-/// The guard gate's verdict for one PR (ADR 0008 §5).
-enum GuardGate {
-    /// Guard disabled, or a success status on the head — arming may proceed.
+/// The pr-review gate's verdict for one PR (ADR 0008 §5).
+enum PrReviewGate {
+    /// Review disabled, or a success status on the head — arming may proceed.
     Proceed,
-    /// Guard enabled but the status is absent/pending — wait (retry next sweep).
+    /// Review enabled but the status is absent/pending — wait (retry next sweep).
     Wait,
-    /// Guard enabled and the head's status is a failure — escalate, don't arm.
+    /// Review enabled and the head's status is a failure — escalate, don't arm.
     Failed,
 }
 
-/// Read the impl guard status on `pr`'s head. Auto-merge only ever touches impl
-/// PRs (spec-phase labels are blocking), so the relevant toggle is the impl
-/// guard.
-async fn guard_gate(deps: &Deps, pr: &PullRequest) -> Result<GuardGate> {
+/// Read the impl pr-review status on `pr`'s head. Auto-merge only ever
+/// touches impl PRs (spec-phase labels are blocking), so the relevant toggle
+/// is the impl review.
+async fn pr_review_gate(deps: &Deps, pr: &PullRequest) -> Result<PrReviewGate> {
     if !deps.config.review_for(&deps.project).guard.impl_enabled {
-        return Ok(GuardGate::Proceed);
+        return Ok(PrReviewGate::Proceed);
     }
     match deps
         .forge()
-        .commit_status(&pr.head_sha, GUARD_STATUS)
+        .commit_status(&pr.head_sha, PR_REVIEW_STATUS)
         .await?
     {
-        Some(CommitStatusState::Success) => Ok(GuardGate::Proceed),
-        Some(CommitStatusState::Failure) => Ok(GuardGate::Failed),
-        Some(CommitStatusState::Pending) | None => Ok(GuardGate::Wait),
+        Some(CommitStatusState::Success) => Ok(PrReviewGate::Proceed),
+        Some(CommitStatusState::Failure) => Ok(PrReviewGate::Failed),
+        Some(CommitStatusState::Pending) | None => Ok(PrReviewGate::Wait),
     }
 }
 
-/// A guard-failed head with auto-merge opted in: park the PR on
-/// `meguri:needs-human` (a human resolves the guard's findings before it can
-/// merge). Reached only when the label is absent (condition 2 blocks it
+/// A review-failed head with auto-merge opted in: park the PR on
+/// `meguri:needs-human` (a human resolves the pr-review's findings before it
+/// can merge). Reached only when the label is absent (condition 2 blocks it
 /// otherwise), so the escalation and its comment fire once.
-async fn escalate_guard_failed(deps: &Deps, pr: &PullRequest) {
+async fn escalate_pr_review_failed(deps: &Deps, pr: &PullRequest) {
     let _ = deps
         .forge()
         .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
@@ -291,7 +291,7 @@ async fn escalate_guard_failed(deps: &Deps, pr: &PullRequest) {
         .comment_pr(
             pr.number,
             &format!(
-                "🔁 **meguri** — auto-merge は `{}` の guard review が失敗しているため arm しません。\n\
+                "🔁 **meguri** — auto-merge は `{}` の PR review が失敗しているため arm しません。\n\
                  指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
                 short_sha(&pr.head_sha)
             ),
@@ -299,7 +299,7 @@ async fn escalate_guard_failed(deps: &Deps, pr: &PullRequest) {
         .await;
     let _ = deps.store.emit(
         None,
-        "automerge.guard_failed",
+        "automerge.pr_review_failed",
         json!({ "pr": pr.number, "head": pr.head_sha }),
     );
 }

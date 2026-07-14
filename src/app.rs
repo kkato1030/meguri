@@ -16,7 +16,9 @@ use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
-use crate::store::{DesiredState, DriftRow, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
+use crate::store::{
+    DesiredState, DriftRow, LANE_AUTHOR, LANE_PR_REVIEW, RunRecord, RunStatus, Store,
+};
 use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
@@ -887,12 +889,12 @@ fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
 /// Resolve the pane an active run drives, following the same precedence as
 /// [`resolve_attach_pane`]: the issue's persistent lane pane (panes table) wins
 /// over the pane id a run once recorded, which can be a stale start-of-run
-/// snapshot. The lane comes from the run's loop kind (the reviewer keeps its
-/// own `review` lane). Returns `(mux_kind, pane_id)`, or `None` when the run
-/// has no pane yet.
+/// snapshot. The lane comes from the run's loop kind (the pr-reviewer keeps
+/// its own `pr-review` lane). Returns `(mux_kind, pane_id)`, or `None` when
+/// the run has no pane yet.
 fn run_pane(store: &Store, run: &RunRecord) -> Result<Option<(String, String)>> {
-    let role = engine::role_for_loop(&run.loop_kind);
-    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
+    let lane = engine::lane_for_loop(&run.loop_kind);
+    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, lane)?
         && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
     {
         return Ok(Some((kind, id)));
@@ -1217,17 +1219,18 @@ pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
 }
 
 /// Resolve what `meguri attach <needle> [--review]` should attach to. Panes
-/// belong to the issue's lanes (author + review, kept until the issue
+/// belong to the issue's lanes (author + pr-review, kept until the issue
 /// closes), so the issue's persistent lane pane wins over whatever pane id
 /// a run once recorded — and a bare issue number keeps working after its
 /// runs finished. A run id derives its lane from the run's loop kind;
-/// `--review` picks the review lane for issue numbers.
+/// `--review` picks the pr-review lane for issue numbers.
 fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
-    let wanted_role = if review { ROLE_REVIEW } else { ROLE_AUTHOR };
+    let wanted_lane = if review { LANE_PR_REVIEW } else { LANE_AUTHOR };
     if let Some(run) = store.find_run(needle)? {
-        // `run_pane` derives the run's lane from its loop kind, so a review-lane
-        // run resolves its review pane and everything else the author pane —
-        // `--review` only matters for the bare-issue-number path below.
+        // `run_pane` derives the run's lane from its loop kind, so a
+        // pr-review-lane run resolves its pr-review pane and everything else
+        // the author pane — `--review` only matters for the
+        // bare-issue-number path below.
         if let Some(pane) = run_pane(store, &run)? {
             return Ok(pane);
         }
@@ -1237,7 +1240,7 @@ fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(Str
         let panes: Vec<_> = store
             .panes_for_issue(issue)?
             .into_iter()
-            .filter(|p| p.role == wanted_role)
+            .filter(|p| p.lane == wanted_lane)
             .collect();
         match panes.as_slice() {
             [] => {
@@ -1253,7 +1256,7 @@ fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(Str
             many => {
                 let projects: Vec<&str> = many.iter().map(|p| p.project_id.as_str()).collect();
                 bail!(
-                    "issue #{issue} has {wanted_role} panes in multiple projects ({}) — \
+                    "issue #{issue} has {wanted_lane} panes in multiple projects ({}) — \
                      pass a run id instead",
                     projects.join(", ")
                 );
@@ -1328,7 +1331,7 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                 let released = reaper::release_pane(
                     &deps,
                     run.issue_number,
-                    engine::role_for_loop(&run.loop_kind),
+                    engine::lane_for_loop(&run.loop_kind),
                     "stopped by user",
                 )
                 .await;
@@ -1450,7 +1453,7 @@ mod tests {
             .upsert_pane(
                 "demo",
                 7,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "wD:pN",
@@ -1467,7 +1470,7 @@ mod tests {
             .upsert_pane(
                 "demo",
                 8,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "wD:pR",
