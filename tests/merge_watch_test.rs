@@ -82,8 +82,10 @@ fn seed_armed(forge: &FakeForge, number: i64, created_at: &str) {
 /// How many merge-watch stuck escalations landed on the PR (by comment
 /// signature).
 fn stuck_comments(forge: &FakeForge, pr: i64) -> usize {
+    // The central escalation helper posts via `pr_comment` (→ `comments`),
+    // issue #176.
     forge
-        .pr_comments_of(pr)
+        .comments_of(pr)
         .iter()
         .filter(|c| c.contains("止まっています"))
         .count()

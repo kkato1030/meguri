@@ -336,26 +336,14 @@ impl Flavor for FixerFlavor {
     /// gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let Some(pr) = flow::claimed_pr(deps, &run.id) else {
-            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps
-            .forge()
-            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-            .await;
-        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-        let _ = deps
-            .forge()
-            .pr_comment(
-                pr,
-                &format!(
-                    "🔁 **meguri** could not address the review comments on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
-                ),
-            )
-            .await;
+        let comment = super::escalation::pr_needs_human_comment(
+            "could not address the review comments on this PR and needs a human.",
+            reason,
+        );
+        super::escalation::escalate_pr(deps, pr, &comment).await;
     }
 }
 
