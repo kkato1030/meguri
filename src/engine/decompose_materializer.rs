@@ -27,11 +27,37 @@ use crate::forge::{self, CommitStatusState};
 use crate::gitops;
 use crate::turn::ChildIssue;
 
-/// Hidden reservation marker: "an attempt to create child `idx` is in flight".
-/// Written to the parent body *before* the create, so recovery never blindly
-/// re-creates a child whose create may have landed but not yet linked.
-fn reserve_marker(idx: usize) -> String {
-    format!("<!-- meguri:decompose-reserve idx={idx} -->")
+/// How many sweeps to keep deferring a reserved-but-unfound child before
+/// concluding its create never landed and re-creating it. Bounds the reserve so
+/// a crash between the reserve write and `create_issue` cannot deadlock forever,
+/// while staying far above GitHub's search-index lag (sweeps are minutes apart,
+/// indexing is seconds) so a child that *was* created is found first.
+const MAX_DEFER_ATTEMPTS: u32 = 3;
+
+/// The parent-body reservation marker's prefix (without the attempt count) —
+/// "an attempt to create child `idx` is in flight". Written *before* the
+/// create, so recovery never blindly re-creates a child whose create may have
+/// landed but not yet linked.
+fn reserve_prefix(idx: usize) -> String {
+    format!("<!-- meguri:decompose-reserve idx={idx} attempt=")
+}
+
+/// The full reservation marker at a given attempt count.
+fn reserve_marker(idx: usize, attempt: u32) -> String {
+    format!("{}{attempt} -->", reserve_prefix(idx))
+}
+
+/// The recorded attempt count for `idx`'s reservation, if reserved.
+fn parse_reserve_attempt(body: &str, idx: usize) -> Option<u32> {
+    let prefix = reserve_prefix(idx);
+    body.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix(&prefix)?
+            .strip_suffix("-->")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    })
 }
 
 /// Hidden ledger line: a human-readable record that child `idx` is filed as
@@ -61,6 +87,16 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     {
         // Only open, marked proposal PRs whose branch encodes an issue.
         if pr.state != "open" || !planner::is_decompose_proposal(&pr.body) {
+            continue;
+        }
+        // Respect the stop / ball labels like every other PR loop: a human
+        // pausing (`hold`) or escalating (`needs-human`) an approved proposal,
+        // or another run claiming it (`working`), must halt the irreversible
+        // child-creation. `hold` in particular is the operator's brake.
+        if pr.has_label(forge::LABEL_HOLD)
+            || pr.has_label(forge::LABEL_WORKING)
+            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
+        {
             continue;
         }
         let Some(parent) = gitops::issue_from_branch(&pr.head_branch) else {
@@ -220,34 +256,29 @@ async fn adopt_or_create(
         )?;
         existing
     } else {
-        // 2. Not linked yet. Reserve-first so a crash between create and link is
-        //    never re-created blindly.
-        let reserved = deps
-            .forge()
-            .get_issue(parent)
-            .await?
-            .body
-            .contains(&reserve_marker(idx));
-        if !reserved {
-            append_parent_marker(deps, parent, &reserve_marker(idx)).await?;
-            let body = format!(
-                "{}{}\n{key}",
-                child.body.trim(),
-                decompose_child_footer_ref(&child_parent_ref(parent, parent_slug, &child_slug)),
-            );
-            let labels: Vec<&str> = planner::child_label(child).into_iter().collect();
-            let number = child_forge
-                .create_issue(&child.title, &body, &labels)
+        // 2. Not linked in the parent graph yet.
+        let parent_body = deps.forge().get_issue(parent).await?.body;
+        match parse_reserve_attempt(&parent_body, idx) {
+            // First encounter: reserve *before* creating, so a crash between the
+            // create and the link is not blindly re-created next time.
+            None => {
+                set_reserve(deps, parent, idx, 0).await?;
+                let number = create_child(
+                    deps,
+                    &child_forge,
+                    parent,
+                    parent_slug,
+                    &child_slug,
+                    child,
+                    &key,
+                )
                 .await?;
-            deps.forge()
-                .add_blocked_by_in(parent, &child_slug, number)
-                .await?;
-            (number, child_slug.clone())
-        } else {
-            // 3. Reserved but not in the graph: the create may have landed but
+                (number, child_slug.clone())
+            }
+            // 3. Reserved but not in the graph: the create may have landed and
             //    not linked, or may never have landed. Backstop: all-state key
             //    search on the child's own repo.
-            match child_forge.find_issue_by_marker(&key).await? {
+            Some(attempt) => match child_forge.find_issue_by_marker(&key).await? {
                 Some(number) => {
                     deps.forge()
                         .add_blocked_by_in(parent, &child_slug, number)
@@ -259,8 +290,28 @@ async fn adopt_or_create(
                     )?;
                     (number, child_slug.clone())
                 }
-                None => return Ok(None), // defer — never re-create
-            }
+                // Neither graph nor search sees it. Wait one more sweep (search
+                // lag) rather than risk a duplicate — but only up to the bound.
+                None if attempt + 1 < MAX_DEFER_ATTEMPTS => {
+                    set_reserve(deps, parent, idx, attempt + 1).await?;
+                    return Ok(None); // defer; the caller records it
+                }
+                // Waited long past the search-index lag: the create never
+                // landed. Safe to re-create — no living child exists.
+                None => {
+                    let number = create_child(
+                        deps,
+                        &child_forge,
+                        parent,
+                        parent_slug,
+                        &child_slug,
+                        child,
+                        &key,
+                    )
+                    .await?;
+                    (number, child_slug.clone())
+                }
+            },
         }
     };
 
@@ -278,6 +329,60 @@ async fn adopt_or_create(
     append_parent_marker(deps, parent, &ledger_marker(idx, &slug, number)).await?;
 
     Ok(Some(Filed { number, slug }))
+}
+
+/// Create child `child` in its target repo with the stable key + parent footer
+/// in its body, then link it into the parent's dependency graph. The key is
+/// written atomically with the create, so "created" and "findable" are
+/// inseparable.
+async fn create_child(
+    deps: &Deps,
+    child_forge: &std::sync::Arc<dyn forge::Forge>,
+    parent: i64,
+    parent_slug: &str,
+    child_slug: &str,
+    child: &ChildIssue,
+    key: &str,
+) -> Result<i64> {
+    let body = format!(
+        "{}{}\n{key}",
+        child.body.trim(),
+        decompose_child_footer_ref(&child_parent_ref(parent, parent_slug, child_slug)),
+    );
+    let labels: Vec<&str> = planner::child_label(child).into_iter().collect();
+    let number = child_forge
+        .create_issue(&child.title, &body, &labels)
+        .await?;
+    // Cross-repo children need the slug-qualified add (issue #154): the parent
+    // graph must include the sibling child so a resume can adopt it.
+    deps.forge()
+        .add_blocked_by_in(parent, child_slug, number)
+        .await?;
+    Ok(number)
+}
+
+/// Upsert the reservation marker for `idx` at `attempt` in the parent body
+/// (replace the existing reserve line, else append it). Idempotent per attempt.
+async fn set_reserve(deps: &Deps, parent: i64, idx: usize, attempt: u32) -> Result<()> {
+    let body = deps.forge().get_issue(parent).await?.body;
+    let prefix = reserve_prefix(idx);
+    let marker = reserve_marker(idx, attempt);
+    let mut replaced = false;
+    let mut lines: Vec<String> = Vec::new();
+    for l in body.lines() {
+        if l.trim().starts_with(&prefix) {
+            lines.push(marker.clone());
+            replaced = true;
+        } else {
+            lines.push(l.to_string());
+        }
+    }
+    let new_body = if replaced {
+        lines.join("\n")
+    } else {
+        format!("{}\n{marker}", body.trim_end())
+    };
+    deps.forge().update_issue_body(parent, &new_body).await
 }
 
 /// The slug-aware parent reference for a child's human-visible footer — `#N`
@@ -712,6 +817,67 @@ mod tests {
         let labels = forge.pr_labels_of(10);
         assert!(labels.contains(&crate::forge::LABEL_SPEC_REVIEWING.to_string()));
         assert!(!labels.contains(&crate::forge::LABEL_SPEC_READY.to_string()));
+    }
+
+    fn one_child() -> String {
+        spec_with(r#"[{"title":"Only","body":"x","kind":"ready","blocked_by":[]}]"#)
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_a_held_proposal() {
+        // A human `hold` on an approved proposal halts the irreversible
+        // child-creation (finding: stop labels).
+        let (forge, deps) = setup();
+        forge
+            .add_pr_label(10, crate::forge::LABEL_HOLD)
+            .await
+            .unwrap();
+        sweep(&deps).await.unwrap();
+        assert_eq!(
+            forge.all_issues().len(),
+            1,
+            "held proposal is not materialized"
+        );
+        assert_eq!(forge.get_pr(10).await.unwrap().state, "open");
+    }
+
+    #[tokio::test]
+    async fn reserved_but_uncreated_defers_then_recreates_without_deadlock() {
+        // Crash after the reserve write but before create_issue: the child does
+        // not exist and is not in the graph. Early attempts defer (never risk a
+        // duplicate); past the bound the sweep concludes the create never landed
+        // and re-creates — no permanent stall (finding: reserve deadlock).
+        let (forge, deps) = setup();
+        let pr = pr_of(&forge).await;
+
+        // Low attempt → defer, no child, reserve bumped.
+        forge
+            .update_issue_body(1, &reserve_marker(0, 0))
+            .await
+            .unwrap();
+        materialize(&deps, &pr, 1, "me/proj", &one_child())
+            .await
+            .unwrap();
+        assert_eq!(forge.all_issues().len(), 1, "deferred: no child yet");
+        assert!(
+            parse_reserve_attempt(&forge.get_issue(1).await.unwrap().body, 0).unwrap() >= 1,
+            "attempt bumped"
+        );
+
+        // At the bound → re-create (the create had truly never landed).
+        forge
+            .update_issue_body(1, &reserve_marker(0, MAX_DEFER_ATTEMPTS - 1))
+            .await
+            .unwrap();
+        materialize(&deps, &pr, 1, "me/proj", &one_child())
+            .await
+            .unwrap();
+        assert_eq!(forge.all_issues().len(), 2, "re-created after the bound");
+        assert_eq!(
+            forge.blockers_of(1),
+            vec![2],
+            "parent now waits on the child"
+        );
     }
 
     #[test]
