@@ -188,8 +188,9 @@ pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
     }
 }
 
-/// Map a (possibly deprecated) config role key to its canonical name.
-fn canonical_role(role: &str) -> &str {
+/// Map a (possibly deprecated) config role key to its canonical name. Public
+/// so `config` can canonicalize `[prompts]` keys the same way (issue #149).
+pub fn canonical_role(role: &str) -> &str {
     DEPRECATED_ROLE_ALIASES
         .iter()
         .find(|(old, _)| *old == role)

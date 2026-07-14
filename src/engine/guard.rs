@@ -971,6 +971,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,
