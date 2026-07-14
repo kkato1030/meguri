@@ -1,5 +1,5 @@
-//! The triage loop: a read-only detector that periodically looks at every
-//! untriaged open issue and rewrites a single per-project report issue
+//! The triage loop: a detector that periodically looks at every untriaged
+//! open issue and rewrites a single per-project report issue
 //! (`meguri:triage-report`) with a recommendation for each — how meguri
 //! should handle it (`ready` / `plan` / `needs-human` / `hold` / `skip`),
 //! how confident it is, and how big the work looks.
@@ -8,16 +8,36 @@
 //! automates *observation* (code/issue divergence), triage automates a
 //! *decision* (what to do with an issue). So it stays read-only in v0 — its
 //! write boundary is exactly that one report issue: no pushes, no branch
-//! operations, and (unlike v1/v2) no labels or comments on the triaged issues
-//! themselves. Humans act on the report: adopt a recommendation by applying
-//! `meguri:ready`/`meguri:plan` yourself, silence a bad one via
-//! `triage.ignore`, pause the sweep with `meguri:hold` on the report issue.
+//! operations, and no labels or comments on the triaged issues themselves.
+//! `advise` (v1, issue #87) carries the recommendation one step further onto
+//! each recommended issue: a proposal label (`meguri:triage-ready` /
+//! `-plan` / `-needs-human`) plus one evidence comment (confidence /
+//! complexity / rationale / missing info) — still not a decision, since the
+//! proposal labels are outside worker/planner discovery's vocabulary
+//! (discovery keys on the exact real labels, never a `meguri:` prefix scan),
+//! so a wrong proposal cannot start work on its own. Humans act on either
+//! surface: adopt a recommendation by applying `meguri:ready`/`meguri:plan`
+//! yourself (in `advise`, promoting the proposal label already there),
+//! silence a bad one via `triage.ignore`, pause the sweep with `meguri:hold`
+//! on the report issue.
 //!
-//! Opt-in: `[triage] mode` defaults to `off`; the loop only sweeps on
-//! `report`. Re-scan is rate-limited like the cleaner (default-branch head +
-//! interval) but adds a new-issue signal — an open issue numbered above the
-//! last scan's max triggers a fresh sweep even while the head is still, so a
-//! new issue is triaged without waiting for the next push (ADR 0006).
+//! Opt-in: `[triage] mode` defaults to `off`; the loop sweeps on `report` and
+//! `advise` (`auto`, v2 #88, still parses but stays idle). Re-scan is
+//! rate-limited like the cleaner (default-branch head + interval) but adds a
+//! new-issue signal — an open issue numbered above the last scan's max
+//! triggers a fresh sweep even while the head is still, so a new issue is
+//! triaged without waiting for the next push (ADR 0006). A previously
+//! proposed issue (still carrying only a `triage-*` proposal label — a real
+//! workflow label always wins) is re-triaged the same way once its content
+//! (title + body) changes; an unchanged one is not resent to the agent.
+//!
+//! `advise`'s writes are idempotent and reversible: the evidence comment
+//! carries a hidden `<!-- meguri:triage-advise hash=... -->` marker over the
+//! recommended issue's content, so the same recommendation is never
+//! re-proposed, and removing the proposal label (a human's rejection) is
+//! respected until the content actually changes. `triage.max_actions_per_tick`
+//! (default 3) caps how many issues a single sweep proposes to; the rest
+//! carry over to the next sweep untouched.
 //!
 //! Lifetime mirrors the cleaner (issue #92): standalone, keyed by the report
 //! issue, read-only detached worktree, self-reclaiming — the report issue
@@ -38,7 +58,7 @@ use crate::config::TriageMode;
 use crate::forge::{self, Issue};
 use crate::gitops;
 use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
-use crate::tasks::TaskKey;
+use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for triage runs.
@@ -231,13 +251,17 @@ impl super::Loop for TriageLoop {
 
     /// One target at most: the project's report issue (or `0` when it does not
     /// exist yet — settle creates it; discovery itself stays read-only).
-    /// Gated on `[triage] mode == report`: the loop is opt-in, so it is a
-    /// no-op until a human turns it on.
+    /// Gated on `[triage] mode` being `report` or `advise`: the loop is
+    /// opt-in, so it is a no-op until a human turns it on (`auto`, v2 #88,
+    /// still parses but stays idle here too).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // forge-driven loop; inert in local mode
         }
-        if deps.config.triage_for(&deps.project).mode != TriageMode::Report {
+        if !matches!(
+            deps.config.triage_for(&deps.project).mode,
+            TriageMode::Report | TriageMode::Advise
+        ) {
             return Ok(Vec::new());
         }
         let issues = deps
@@ -551,26 +575,59 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -
     flow::run_worktree_setup(deps, run, &wt).await
 }
 
-/// The untriaged open issues this sweep considers: open, no `meguri:` label
-/// (so not held and not otherwise engaged), no unresolved blocker. Sorted by
-/// number for a stable prompt and report.
+/// A "real" meguri workflow label (any `meguri:` label except triage's own
+/// `advise` proposal labels): an issue carrying one is already engaged by
+/// another loop, or held, so triage leaves it alone regardless of content.
+/// Excluding the proposal labels from this check is what lets a
+/// proposed-but-not-yet-decided issue come back for re-triage once its
+/// content changes (ADR 0006 point 2 / issue #87).
+fn is_engaged_label(label: &str) -> bool {
+    label.starts_with(WORKFLOW_LABEL_PREFIX) && !forge::TRIAGE_PROPOSAL_LABELS.contains(&label)
+}
+
+/// The open issues this sweep considers: not engaged by another loop or held,
+/// no unresolved blocker, and — for an issue already carrying one of our own
+/// `advise` proposal labels — only if its content changed since that
+/// proposal (recovering v0's ADR-0006 point 2 TODO: re-triage follows content,
+/// not just label absence). Sorted by number for a stable prompt and report.
 async fn gather_candidates(deps: &Deps) -> Result<Vec<Issue>> {
     let mut candidates = Vec::new();
     for issue in deps.forge().list_open_issues().await? {
-        if issue
-            .labels
-            .iter()
-            .any(|l| l.starts_with(WORKFLOW_LABEL_PREFIX))
-        {
+        if issue.labels.iter().any(|l| is_engaged_label(l)) {
             continue;
         }
         if has_unresolved_blockers(deps, issue.number).await {
+            continue;
+        }
+        let proposed = issue
+            .labels
+            .iter()
+            .any(|l| forge::TRIAGE_PROPOSAL_LABELS.contains(&l.as_str()));
+        if proposed && !content_changed_since_advise(deps, &issue).await? {
             continue;
         }
         candidates.push(issue);
     }
     candidates.sort_by_key(|i| i.number);
     Ok(candidates)
+}
+
+/// SHA-256 fingerprint of an issue's title + body — what counts as "the same
+/// content" for `advise`'s idempotency marker (reuses the reconcile loop's
+/// whitespace-normalized digest, issue #142).
+fn content_hash(issue: &Issue) -> String {
+    tasks::body_digest(&format!("{}\n{}", issue.title, issue.body))
+}
+
+/// Whether a previously proposed issue's content has moved on since its
+/// evidence comment's hidden marker. No marker at all (a proposal label
+/// applied by hand, or a marker that predates this feature) counts as
+/// changed, so the issue is still offered for a fresh recommendation.
+async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool> {
+    let Some(marker) = latest_advise_marker(deps, issue.number).await? else {
+        return Ok(true);
+    };
+    Ok(marker.hash != content_hash(issue))
 }
 
 /// Dependency gate (looper ADR-0004): a GitHub-native `blocked_by` that isn't
@@ -868,11 +925,18 @@ fn replace_marker(body: &str, marker: &str) -> String {
     format!("{}{}{}", &body[..start], marker, &body[start + len..])
 }
 
-/// settle: render the snapshot body and write the report issue — the loop's
-/// only forge write. `max_issue` is recorded fresh here (so the just-created
-/// report issue does not re-trigger the next sweep). Returns the issue number.
+/// settle: in `advise` mode, first propose (label + evidence comment) on the
+/// recommended issues themselves; then, always, render the snapshot body and
+/// write the report issue. `max_issue` is recorded fresh here (so the
+/// just-created report issue does not re-trigger the next sweep). Returns the
+/// report issue number.
 async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i64> {
-    let ignore = deps.config.triage_for(&deps.project).ignore.clone();
+    let triage_cfg = deps.config.triage_for(&deps.project);
+    let ignore = triage_cfg.ignore.clone();
+    let mode = triage_cfg.mode;
+    if mode == TriageMode::Advise {
+        apply_advise(deps, run, &cp.recommendations).await;
+    }
     let max_open = max_open_issue(deps).await.unwrap_or(cp.prev_max_issue);
     let body = render_report(
         &cp.head_sha,
@@ -881,6 +945,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
         max_open,
         &cp.recommendations,
         &ignore,
+        mode,
     );
 
     let issue = if cp.report_issue == 0 {
@@ -913,6 +978,162 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
     Ok(issue)
 }
 
+/// `advise` write path: propose (label + evidence comment) on up to
+/// `triage.max_actions_per_tick` recommended issues. Best-effort — one
+/// issue's failure (closed mid-run, forge hiccup, ...) is logged and skipped
+/// rather than failing the whole sweep; the report and the scan marker still
+/// get written regardless.
+async fn apply_advise(deps: &Deps, run: &RunRecord, recommendations: &[TriageItem]) {
+    let cfg = deps.config.triage_for(&deps.project);
+    let ignore = cfg.ignore.clone();
+    let budget = cfg.max_actions_per_tick;
+    let mut used = 0u64;
+    for item in recommendations {
+        if used >= budget {
+            break;
+        }
+        match propose_one(deps, item, &ignore).await {
+            Ok(true) => {
+                used += 1;
+                let _ = deps.store.emit(
+                    Some(&run.id),
+                    "triage.advised",
+                    json!({ "issue": item.issue, "recommendation": item.recommendation.as_str() }),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("triage advise on issue #{}: {e:#}", item.issue),
+        }
+    }
+}
+
+/// One issue's proposal attempt: label + evidence comment, gated by `ignore`,
+/// a human override check re-read fresh (not the possibly-stale candidate
+/// snapshot from gather time), and the hidden-marker idempotency check.
+/// Returns whether an action was actually taken (this is what counts against
+/// `max_actions_per_tick`).
+async fn propose_one(deps: &Deps, item: &TriageItem, ignore: &[String]) -> Result<bool> {
+    let Some(label) = proposal_label(item.recommendation) else {
+        return Ok(false); // hold/skip: report-only, no per-issue action
+    };
+    if ignored(
+        ignore,
+        &[
+            &format!("#{}", item.issue),
+            item.recommendation.as_str(),
+            &item.rationale,
+            item.missing_info.as_deref().unwrap_or(""),
+        ],
+    ) {
+        return Ok(false);
+    }
+    let issue = deps.forge().get_issue(item.issue).await?;
+    if issue.labels.iter().any(|l| is_engaged_label(l)) {
+        return Ok(false); // a human already acted, or the issue is held
+    }
+    let hash = content_hash(&issue);
+    if let Some(prev) = latest_advise_marker(deps, item.issue).await?
+        && prev.hash == hash
+    {
+        // Unchanged since the last proposal — already proposed (label may
+        // still be there) or rejected (a human removed it). Either way, the
+        // content hasn't moved, so there is nothing new to say.
+        return Ok(false);
+    }
+    for stale in forge::TRIAGE_PROPOSAL_LABELS {
+        if stale != label && issue.has_label(stale) {
+            deps.forge().remove_label(item.issue, stale).await?;
+        }
+    }
+    deps.forge().add_label(item.issue, label).await?;
+    deps.forge()
+        .comment(item.issue, &render_advise_comment(item, &hash))
+        .await?;
+    Ok(true)
+}
+
+/// The `advise` proposal label for a recommendation, or `None` for `hold`/
+/// `skip` — those stay report-only, there is nothing actionable to propose.
+fn proposal_label(rec: Recommendation) -> Option<&'static str> {
+    match rec {
+        Recommendation::Ready => Some(forge::LABEL_TRIAGE_READY),
+        Recommendation::Plan => Some(forge::LABEL_TRIAGE_PLAN),
+        Recommendation::NeedsHuman => Some(forge::LABEL_TRIAGE_NEEDS_HUMAN),
+        Recommendation::Hold | Recommendation::Skip => None,
+    }
+}
+
+/// The real workflow label a human promotes the proposal to.
+fn real_label(rec: Recommendation) -> Option<&'static str> {
+    match rec {
+        Recommendation::Ready => Some(forge::LABEL_READY),
+        Recommendation::Plan => Some(forge::LABEL_PLAN),
+        Recommendation::NeedsHuman => Some(forge::LABEL_NEEDS_HUMAN),
+        Recommendation::Hold | Recommendation::Skip => None,
+    }
+}
+
+/// Hidden marker embedded in the advise evidence comment: the content hash
+/// the proposal was made against. Both idempotency (don't re-propose the same
+/// content) and rejection-respect (don't re-propose after a human removes the
+/// label, as long as the content hasn't moved) read off this one field.
+fn advise_marker(hash: &str, recommendation: Recommendation) -> String {
+    format!(
+        "<!-- meguri:triage-advise hash={hash} recommendation={} -->",
+        recommendation.as_str()
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdviseMarker {
+    hash: String,
+}
+
+fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
+    let rest = comment.split("<!-- meguri:triage-advise ").nth(1)?;
+    let fields = rest.split("-->").next()?;
+    let hash = fields
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("hash="))?;
+    Some(AdviseMarker {
+        hash: hash.to_string(),
+    })
+}
+
+/// The most recent advise marker on `issue`, if any — last-wins, since only
+/// the latest proposal's hash matters for idempotency.
+async fn latest_advise_marker(deps: &Deps, issue: i64) -> Result<Option<AdviseMarker>> {
+    let comments = deps.forge().issue_comments(issue).await?;
+    Ok(comments.iter().rev().find_map(|c| parse_advise_marker(c)))
+}
+
+/// The evidence comment posted alongside a proposal label: the hidden marker
+/// first, then the human-readable rationale (confidence / complexity /
+/// rationale / missing info) and how to adopt or reject it.
+fn render_advise_comment(item: &TriageItem, hash: &str) -> String {
+    let label = proposal_label(item.recommendation).unwrap_or_default();
+    let mut body = format!(
+        "{marker}\n🔀 **meguri triage 提案** — `{label}` を提案します(確信度 {confidence:.2}、\
+         複雑度: {complexity})。\n\n{rationale}\n",
+        marker = advise_marker(hash, item.recommendation),
+        confidence = item.confidence,
+        complexity = item.estimated_complexity.as_str(),
+        rationale = item.rationale,
+    );
+    if let Some(mi) = &item.missing_info
+        && !mi.is_empty()
+    {
+        body.push_str(&format!("\n⚠️ 要確認: {mi}\n"));
+    }
+    body.push_str(&format!(
+        "\n---\n採用する場合はこの issue に `{real}` を人間の手で付与してください(meguri は\
+         自動昇格しません)。却下する場合は `{label}` ラベルを外すだけで構いません — 内容が変わる\
+         まで再提案しません。誤検知が続くなら `triage.ignore` へどうぞ。\n",
+        real = real_label(item.recommendation).unwrap_or_default(),
+    ));
+    body
+}
+
 fn ignored(patterns: &[String], haystacks: &[&str]) -> bool {
     patterns
         .iter()
@@ -931,6 +1152,7 @@ pub fn render_report(
     max_issue: i64,
     items: &[TriageItem],
     ignore: &[String],
+    mode: TriageMode,
 ) -> String {
     let mut items: Vec<&TriageItem> = items
         .iter()
@@ -979,17 +1201,34 @@ pub fn render_report(
         }
     }
 
-    body.push_str(&format!(
-        "\n---\nTo adopt a recommendation, apply `{ready}` / `{plan}` to that \
-         issue yourself — the existing loops take it from there (v0 triage \
-         never labels or comments on issues). To silence a bad recommendation, \
-         add a substring pattern to `triage.ignore` in the meguri config \
-         (editing this body doesn't stick; it is rewritten every sweep). Pause \
-         the sweep with `{hold}` on this issue.\n",
-        ready = forge::LABEL_READY,
-        plan = forge::LABEL_PLAN,
-        hold = forge::LABEL_HOLD,
-    ));
+    if mode == TriageMode::Advise {
+        body.push_str(&format!(
+            "\n---\n`ready` / `plan` / `needs-human` recommendations above also get a \
+             proposal label (`meguri:triage-*`) and an evidence comment directly on \
+             that issue — promote a proposal by applying `{ready}` / `{plan}` / \
+             `{needs_human}` yourself, or reject it by removing the proposal label \
+             (meguri won't re-propose it until the issue's content changes). To \
+             silence a bad recommendation entirely, add a substring pattern to \
+             `triage.ignore` (editing this body doesn't stick; it is rewritten every \
+             sweep). Pause the sweep with `{hold}` on this issue.\n",
+            ready = forge::LABEL_READY,
+            plan = forge::LABEL_PLAN,
+            needs_human = forge::LABEL_NEEDS_HUMAN,
+            hold = forge::LABEL_HOLD,
+        ));
+    } else {
+        body.push_str(&format!(
+            "\n---\nTo adopt a recommendation, apply `{ready}` / `{plan}` to that \
+             issue yourself — the existing loops take it from there (triage never \
+             labels or comments on issues in `report` mode). To silence a bad \
+             recommendation, add a substring pattern to `triage.ignore` in the \
+             meguri config (editing this body doesn't stick; it is rewritten every \
+             sweep). Pause the sweep with `{hold}` on this issue.\n",
+            ready = forge::LABEL_READY,
+            plan = forge::LABEL_PLAN,
+            hold = forge::LABEL_HOLD,
+        ));
+    }
     body
 }
 
@@ -1232,6 +1471,7 @@ mod tests {
             90,
             &sample_items(),
             &[],
+            TriageMode::Report,
         );
         assert!(body.starts_with(&triage_marker("0123456789abcdef", 1_700_000_000, 90)));
         assert!(body.contains("`0123456789ab`"), "{body}");
@@ -1243,8 +1483,31 @@ mod tests {
     }
 
     #[test]
+    fn advise_mode_footer_mentions_proposal_labels() {
+        let body = render_report(
+            "head",
+            1,
+            "now",
+            90,
+            &sample_items(),
+            &[],
+            TriageMode::Advise,
+        );
+        assert!(body.contains("meguri:triage-"));
+        assert!(body.contains("triage.ignore"));
+    }
+
+    #[test]
     fn ignore_list_drops_rows() {
-        let body = render_report("head", 1, "now", 90, &sample_items(), &["#81".to_string()]);
+        let body = render_report(
+            "head",
+            1,
+            "now",
+            90,
+            &sample_items(),
+            &["#81".to_string()],
+            TriageMode::Report,
+        );
         assert!(!body.contains("| #81 |"));
         assert!(body.contains("| #90 |"));
 
@@ -1256,6 +1519,7 @@ mod tests {
             90,
             &sample_items(),
             &["auth backend".to_string()],
+            TriageMode::Report,
         );
         assert!(!body.contains("| #90 |"));
         assert!(body.contains("| #81 |"));
@@ -1263,8 +1527,58 @@ mod tests {
 
     #[test]
     fn empty_report_still_carries_the_marker() {
-        let body = render_report("h", 7, "now", 0, &[], &[]);
+        let body = render_report("h", 7, "now", 0, &[], &[], TriageMode::Report);
         assert!(body.contains(&triage_marker("h", 7, 0)));
         assert!(body.contains("_No open issues to triage._"));
+    }
+
+    #[test]
+    fn advise_marker_roundtrip_and_content_hash_detects_changes() {
+        let hash = content_hash(&Issue {
+            number: 1,
+            title: "t".into(),
+            body: "b".into(),
+            labels: vec![],
+        });
+        let marker = advise_marker(&hash, Recommendation::Ready);
+        let parsed = parse_advise_marker(&format!("{marker}\nsome rationale")).unwrap();
+        assert_eq!(parsed.hash, hash);
+        assert_eq!(parse_advise_marker("no marker here"), None);
+
+        let changed_hash = content_hash(&Issue {
+            number: 1,
+            title: "t".into(),
+            body: "different body".into(),
+            labels: vec![],
+        });
+        assert_ne!(hash, changed_hash);
+    }
+
+    #[test]
+    fn advise_comment_carries_marker_and_adoption_instructions() {
+        let item = TriageItem {
+            issue: 81,
+            recommendation: Recommendation::Ready,
+            confidence: 0.82,
+            estimated_complexity: Complexity::Small,
+            rationale: "clear scope, one file".into(),
+            missing_info: Some("confirm the target module".into()),
+        };
+        let body = render_advise_comment(&item, "deadbeef");
+        assert!(body.starts_with("<!-- meguri:triage-advise hash=deadbeef"));
+        assert!(body.contains("meguri:triage-ready"));
+        assert!(body.contains("clear scope, one file"));
+        assert!(body.contains("⚠️ 要確認: confirm the target module"));
+        assert!(body.contains(forge::LABEL_READY));
+    }
+
+    #[test]
+    fn is_engaged_label_excludes_only_proposal_labels() {
+        assert!(is_engaged_label(forge::LABEL_READY));
+        assert!(is_engaged_label(forge::LABEL_HOLD));
+        assert!(!is_engaged_label(forge::LABEL_TRIAGE_READY));
+        assert!(!is_engaged_label(forge::LABEL_TRIAGE_PLAN));
+        assert!(!is_engaged_label(forge::LABEL_TRIAGE_NEEDS_HUMAN));
+        assert!(!is_engaged_label("not-a-meguri-label"));
     }
 }
