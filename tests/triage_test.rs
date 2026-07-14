@@ -981,6 +981,66 @@ async fn auto_mode_promotes_above_threshold_and_leaves_the_rest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_rolls_back_the_label_when_the_reason_comment_fails() {
+    // A real label with no reason comment would engage the issue for
+    // worker/planner while breaking auto's "reason comment mandatory /
+    // removable to revert" invariant — so a comment failure must roll the
+    // label back, not leave it bare.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Auto,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.fail_comment(CANDIDATE);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    // The sweep as a whole still succeeds (per-issue promotion is best-effort).
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // The label was rolled back: no bare real label, and no comment landed.
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert!(
+        c60.labels.is_empty(),
+        "the real label must be rolled back when the reason comment fails: {:?}",
+        c60.labels
+    );
+    assert!(env.forge.comments_of(CANDIDATE).is_empty());
+
+    // No `triage.promoted` event was recorded (the promotion did not complete).
+    let promoted = env
+        .deps
+        .store
+        .events_for_run(&run.id, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "triage.promoted")
+        .count();
+    assert_eq!(promoted, 0);
+
+    // The failed-but-promotable recommendation is recorded as backlog so the
+    // next sweep retries it.
+    let report = report_issue(&env).await.unwrap();
+    assert!(
+        parse_triage_marker(&report.body).unwrap().backlog,
+        "{}",
+        report.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auto_mode_apply_ready_and_plan_promotes_both() {
     let env = setup_with_triage(TriageConfig {
         mode: TriageMode::Auto,

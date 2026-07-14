@@ -1315,16 +1315,49 @@ async fn promote_one(
             AppliedLevel::Proposal => {}
         }
     }
-    // Supersede any triage proposal labels with the real one.
+    // Apply the real label, then the reason comment, then (only on success)
+    // supersede the proposal labels. Ordering guards auto's "reason comment
+    // mandatory / removable to revert" invariant against a partial write: a
+    // bare real label with no reason comment would still engage the issue for
+    // worker/planner while leaving nothing to explain or audit it. So if the
+    // comment fails we roll the label back and let the next sweep retry from a
+    // clean state — and the proposal labels are removed last, so a comment
+    // failure leaves them untouched (nothing to restore) rather than making the
+    // issue look rejected.
+    deps.forge().add_label(item.issue, label).await?;
+    if let Err(e) = deps
+        .forge()
+        .comment(item.issue, &render_promote_comment(item, label, &hash))
+        .await
+    {
+        if let Err(re) = deps.forge().remove_label(item.issue, label).await {
+            tracing::warn!(
+                "triage auto-promote #{}: reason comment failed and rolling back \
+                 the {label} label also failed ({re:#}) — the issue may carry \
+                 {label} without a reason comment",
+                item.issue
+            );
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "posting the auto-promote reason comment for #{}",
+                item.issue
+            )
+        });
+    }
+    // The label + comment landed. Superseding the proposal labels is cosmetic
+    // now (the real label already engages the issue), so a failure here is
+    // logged, not propagated — it must not undo a completed promotion.
     for stale in forge::TRIAGE_PROPOSAL_LABELS {
-        if issue.has_label(stale) {
-            deps.forge().remove_label(item.issue, stale).await?;
+        if issue.has_label(stale)
+            && let Err(e) = deps.forge().remove_label(item.issue, stale).await
+        {
+            tracing::warn!(
+                "triage auto-promote #{}: removing superseded proposal label {stale}: {e:#}",
+                item.issue
+            );
         }
     }
-    deps.forge().add_label(item.issue, label).await?;
-    deps.forge()
-        .comment(item.issue, &render_promote_comment(item, label, &hash))
-        .await?;
     Ok(true)
 }
 
