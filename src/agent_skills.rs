@@ -255,11 +255,95 @@ pub fn install_project_fragment(
     force: bool,
 ) -> Result<InstallReport> {
     let path = target.project_rule_path(repo_root);
-    let report = write_managed(&path, &rule_fragment_block(), force)?;
+    let report = write_managed_fragment(&path, &rule_fragment_block(), force)?;
     Ok(InstallReport {
         target,
         files: vec![report],
     })
+}
+
+/// If `existing` contains our exact `MARKER_BEGIN..MARKER_END` span, return
+/// `existing` with that span replaced by `block` (which itself starts with
+/// `MARKER_BEGIN` and ends with `MARKER_END\n`) — everything outside the
+/// span is left untouched. `None` if the markers aren't both present in
+/// order, meaning there's nothing recognizable to merge into.
+fn upsert_marked_span(existing: &str, block: &str) -> Option<String> {
+    let start = existing.find(MARKER_BEGIN)?;
+    let end_marker_at = existing.find(MARKER_END)?;
+    if end_marker_at < start {
+        return None;
+    }
+    let mut end = end_marker_at + MARKER_END.len();
+    // `block` already supplies the newline that terminates its own
+    // MARKER_END line, so fold the existing one into the replaced span too
+    // — otherwise a well-formed prior file (nothing after the marker but
+    // its own trailing newline) would gain a duplicate blank line.
+    if existing[end..].starts_with('\n') {
+        end += 1;
+    }
+    Some(format!("{}{block}{}", &existing[..start], &existing[end..]))
+}
+
+/// Write the project-level rule fragment. A previous install's marker span
+/// is always safe to replace on a normal (re-)install — it's our own
+/// managed content, and a version bump changing its body isn't a hand edit.
+/// Only content outside the markers (or a file with no recognizable markers
+/// at all) is treated as user-owned and gated behind `--force`.
+fn write_managed_fragment(path: &Path, block: &str, force: bool) -> Result<FileReport> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let Some(prev) = std::fs::read_to_string(path).ok() else {
+        std::fs::write(path, block).with_context(|| format!("writing {}", path.display()))?;
+        return Ok(FileReport {
+            path: path.to_path_buf(),
+            outcome: FileOutcome::Created,
+            diff: None,
+        });
+    };
+    if prev == block {
+        return Ok(FileReport {
+            path: path.to_path_buf(),
+            outcome: FileOutcome::Unchanged,
+            diff: None,
+        });
+    }
+    match upsert_marked_span(&prev, block) {
+        Some(new_full) if new_full == prev => Ok(FileReport {
+            path: path.to_path_buf(),
+            outcome: FileOutcome::Unchanged,
+            diff: None,
+        }),
+        Some(new_full) => {
+            let diff = line_diff(&prev, &new_full);
+            std::fs::write(path, &new_full)
+                .with_context(|| format!("writing {}", path.display()))?;
+            Ok(FileReport {
+                path: path.to_path_buf(),
+                outcome: FileOutcome::Updated,
+                diff: Some(diff),
+            })
+        }
+        None => {
+            let diff = line_diff(&prev, block);
+            if force {
+                std::fs::write(path, block)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Ok(FileReport {
+                    path: path.to_path_buf(),
+                    outcome: FileOutcome::Updated,
+                    diff: Some(diff),
+                })
+            } else {
+                Ok(FileReport {
+                    path: path.to_path_buf(),
+                    outcome: FileOutcome::Blocked,
+                    diff: Some(diff),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -387,6 +471,62 @@ mod tests {
 
         let second = install_project_fragment(Target::Claude, repo.path(), false).unwrap();
         assert_eq!(second.files[0].outcome, FileOutcome::Unchanged);
+    }
+
+    #[test]
+    fn install_project_fragment_reinstalls_over_a_prior_managed_block_without_force() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        // Simulate a file written by an older meguri: same markers, older body.
+        let stale =
+            format!("{MARKER_BEGIN}\nold body from a previous meguri version\n{MARKER_END}\n");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &stale).unwrap();
+
+        let report = install_project_fragment(Target::Claude, repo.path(), false).unwrap();
+        assert_eq!(report.files[0].outcome, FileOutcome::Updated);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, rule_fragment_block());
+    }
+
+    #[test]
+    fn install_project_fragment_preserves_content_outside_the_markers() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        let stale = format!(
+            "# repo-specific notes\n\nkeep this.\n\n{MARKER_BEGIN}\nold body\n{MARKER_END}\n\nkeep this too.\n"
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &stale).unwrap();
+
+        let report = install_project_fragment(Target::Claude, repo.path(), false).unwrap();
+        assert_eq!(report.files[0].outcome, FileOutcome::Updated);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("# repo-specific notes\n\nkeep this.\n\n"));
+        assert!(written.ends_with("\n\nkeep this too.\n"));
+        assert!(written.contains(&rule_fragment_block()));
+    }
+
+    #[test]
+    fn install_project_fragment_without_markers_needs_force() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "hand-written, no markers at all").unwrap();
+
+        let blocked = install_project_fragment(Target::Claude, repo.path(), false).unwrap();
+        assert_eq!(blocked.files[0].outcome, FileOutcome::Blocked);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hand-written, no markers at all"
+        );
+
+        let forced = install_project_fragment(Target::Claude, repo.path(), true).unwrap();
+        assert_eq!(forced.files[0].outcome, FileOutcome::Updated);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            rule_fragment_block()
+        );
     }
 
     #[test]

@@ -1218,15 +1218,16 @@ pub fn cmd_agent_skills_install(
 /// `meguri agent-skills status` (issue #150): report install state without
 /// touching disk.
 pub fn cmd_agent_skills_status(target: &str, project: bool, repo: Option<&str>) -> Result<()> {
-    let target = Target::parse(target)?;
+    let remedy = agent_skills_install_remedy(target, project, repo);
+    let parsed_target = Target::parse(target)?;
     if project {
         let repo_root = agent_skills_repo_root(repo)?;
-        let entry = agent_skills::status_project_fragment(target, &repo_root);
-        print_agent_skills_status(std::slice::from_ref(&entry));
+        let entry = agent_skills::status_project_fragment(parsed_target, &repo_root);
+        print_agent_skills_status(std::slice::from_ref(&entry), &remedy);
     } else {
         let home = agent_skills::resolve_home()?;
-        let entries = agent_skills::status_user_skill(target, &home);
-        print_agent_skills_status(&entries);
+        let entries = agent_skills::status_user_skill(parsed_target, &home);
+        print_agent_skills_status(&entries, &remedy);
     }
     Ok(())
 }
@@ -1236,6 +1237,23 @@ fn agent_skills_repo_root(repo: Option<&str>) -> Result<PathBuf> {
         Some(r) => Ok(PathBuf::from(r)),
         None => std::env::current_dir().context("resolving current directory"),
     }
+}
+
+/// The exact `install` invocation that fixes drift reported by `status` for
+/// this same `--target`/`--project`/`--repo` combination.
+fn agent_skills_install_remedy(target: &str, project: bool, repo: Option<&str>) -> String {
+    let mut cmd = String::from("meguri agent-skills install");
+    if target != "claude" {
+        cmd.push_str(&format!(" --target {target}"));
+    }
+    if project {
+        cmd.push_str(" --project");
+        if let Some(r) = repo {
+            cmd.push_str(&format!(" --repo {r}"));
+        }
+    }
+    cmd.push_str(" --force");
+    cmd
 }
 
 pub fn print_agent_skills_install_report(report: &InstallReport) {
@@ -1258,16 +1276,17 @@ pub fn print_agent_skills_install_report(report: &InstallReport) {
     }
 }
 
-fn print_agent_skills_status(entries: &[StatusEntry]) {
+fn print_agent_skills_status(entries: &[StatusEntry], remedy: &str) {
     for e in entries {
         let (mark, label) = match e.state {
             StatusState::Missing => ("❌", "not installed".to_string()),
             StatusState::UpToDate => ("✅", "up to date".to_string()),
             StatusState::Drifted => (
                 "⚠️ ",
-                "installed but differs from this binary's embedded version — run \
-                 `meguri agent-skills install --force` to update"
-                    .to_string(),
+                format!(
+                    "installed but differs from this binary's embedded version — run \
+                     `{remedy}` to update"
+                ),
             ),
         };
         println!("{mark} {} — {label}", e.path.display());
@@ -1509,5 +1528,21 @@ mod tests {
         assert_eq!(groups[1].0, "no workspace");
         // No config → flat (None).
         assert!(group_by_workspace(None, &runs).is_none());
+    }
+
+    #[test]
+    fn agent_skills_install_remedy_matches_the_status_invocation() {
+        assert_eq!(
+            agent_skills_install_remedy("claude", false, None),
+            "meguri agent-skills install --force"
+        );
+        assert_eq!(
+            agent_skills_install_remedy("claude", true, None),
+            "meguri agent-skills install --project --force"
+        );
+        assert_eq!(
+            agent_skills_install_remedy("claude", true, Some("/tmp/some-repo")),
+            "meguri agent-skills install --project --repo /tmp/some-repo --force"
+        );
     }
 }
