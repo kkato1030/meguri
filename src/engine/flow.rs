@@ -297,6 +297,14 @@ pub struct Checkpoint {
     /// the history it already built.
     #[serde(default)]
     pub self_review_log: Vec<super::impl_reviewer::RoundRecord>,
+    /// The repo `meguri.toml` values pinned at claim time (issue #165): read
+    /// once from the worktree at the first worktree-ready point, then reused
+    /// unchanged for the run's life (a since-tampered worktree or ref cannot
+    /// weaken the completion contract; ADR 0011). `None` = not yet resolved;
+    /// `Some(RepoConfig::default())` = read, but no `meguri.toml` (or it was
+    /// invalid and fell back to "as if absent").
+    #[serde(default)]
+    pub repo_config: Option<crate::config::RepoConfig>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -410,6 +418,49 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             .clone()
             .context("run has no worktree path")?,
     );
+
+    // Repo config (issue #165): read the worktree's `meguri.toml` exactly once,
+    // here at the first worktree-ready point, and pin it to the checkpoint. The
+    // pin persists *before* any agent turn runs, so a run cannot weaken its own
+    // completion contract by editing `meguri.toml` (or `update-ref`-ing a ref)
+    // mid-run, and a crash→resume reuses the pin instead of re-reading a
+    // since-tampered worktree. See ADR 0011.
+    if checkpoint.repo_config.is_none() {
+        let pinned = match crate::config::RepoConfig::load_from_worktree(&worktree) {
+            Ok(opt) => opt.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    "run {}: ignoring invalid {}/meguri.toml: {e:#} — continuing with host config only",
+                    run.id,
+                    worktree.display()
+                );
+                deps.store.emit(
+                    Some(&run.id),
+                    "repo_config.invalid",
+                    json!({ "error": format!("{e:#}") }),
+                )?;
+                crate::config::RepoConfig::default()
+            }
+        };
+        checkpoint.repo_config = Some(pinned);
+        // Persist the pin at the current step before proceeding: the completion
+        // contract must be fixed before the first agent turn can touch it.
+        save_step(deps, &run, &step, &checkpoint)?;
+    }
+
+    // Fold the pinned repo config into a run-scoped `Deps` so every downstream
+    // step (execute / validate / self-review / deliver) resolves the effective
+    // 4-layer project config through the unchanged `*_for` / `deps.project`
+    // consumers. `deps_owned` outlives the borrow; when there's nothing to fold,
+    // the original `deps` is kept as-is.
+    let deps_owned;
+    let deps: &Deps = match checkpoint.repo_config.as_ref() {
+        Some(repo) if repo.has_values() => {
+            deps_owned = deps.with_repo_config(repo);
+            &deps_owned
+        }
+        _ => deps,
+    };
 
     if step == STEP_EXECUTE {
         match execute(deps, &run, &mut checkpoint, &worktree, flavor).await? {
