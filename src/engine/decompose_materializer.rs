@@ -1,4 +1,4 @@
-//! The decomposition materializer sweep (issue #134 / ADR 0012).
+//! The decomposition materializer sweep (issue #134 / ADR 0016).
 //!
 //! The planner writes a *decomposition proposal* spec (prose + a machine-readable
 //! `children` block) and marks its PR body. Once the spec-review gate approves
@@ -73,7 +73,7 @@ fn ledger_marker(idx: usize, slug: &str, number: i64) -> String {
 /// so without this pin a partially materialized proposal whose head was
 /// re-pushed and re-approved would adopt the *old* head's children as the new
 /// head's same-index children — silently breaking "the reviewed children block
-/// is what gets materialized" (ADR 0012 §5). Written before the first child is
+/// is what gets materialized" (ADR 0016 §5). Written before the first child is
 /// created; a mismatch halts the sweep and escalates to a human.
 const HEAD_PIN_PREFIX: &str = "<!-- meguri:decompose-head sha=";
 
@@ -107,7 +107,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
         return Ok(()); // local mode has no planner / PRs
     }
     if !deps.config.decompose.materialize_enabled {
-        return Ok(()); // kill switch (ADR 0012 rollback lever)
+        return Ok(()); // kill switch (ADR 0016 rollback lever)
     }
     for pr in deps
         .forge()
@@ -158,7 +158,7 @@ async fn process(deps: &Deps, pr: &forge::PullRequest, parent: i64) -> Result<()
     }
 
     // Head-motion gate: only materialize the head the pr-reviewer actually reviewed
-    // (ADR 0012 §5). The approval trail is the per-head pr-review status.
+    // (ADR 0016 §5). The approval trail is the per-head pr-review status.
     let guard_on = deps.config.review_for(&deps.project).guard.plan;
     if guard_on {
         let approved = deps
@@ -232,7 +232,7 @@ async fn materialize(
         return report_error(deps, pr, &format!("children block is invalid: {problem}")).await;
     }
 
-    // Head pin (cross-sweep half of the head-motion gate, ADR 0012 §5): the
+    // Head pin (cross-sweep half of the head-motion gate, ADR 0016 §5): the
     // per-sweep guard-status check proves the *current* head was reviewed, but
     // a materialization that started under an earlier approved head may have
     // already created children keyed only by `parent + idx`. Adopting those as

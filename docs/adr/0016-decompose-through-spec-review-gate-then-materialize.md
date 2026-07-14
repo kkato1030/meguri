@@ -1,4 +1,4 @@
-# ADR 0012: 分解は spec-review ゲートを通す — planner が「分解提案 spec」を出し、承認後に専用の materialization ステップが子 issue + GitHub dependencies を起こす
+# ADR 0016: 分解は spec-review ゲートを通す — planner が「分解提案 spec」を出し、承認後に専用の materialization ステップが子 issue + GitHub dependencies を起こす
 
 - Status: proposed
 - Date: 2026-07-14

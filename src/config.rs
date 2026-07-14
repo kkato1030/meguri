@@ -77,7 +77,7 @@ repo_slug = "owner/repo"
 # throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
 #
 # [decompose]
-# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0012)
+# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -248,7 +248,7 @@ pub struct DecomposeConfig {
     /// Kill switch (default on): false makes the materialization sweep inert,
     /// so an approved proposal is not materialized — it stays `spec-ready`
     /// awaiting a human. The operational lever for rolling back the
-    /// irreversible child-creation step (ADR 0012).
+    /// irreversible child-creation step (ADR 0016).
     #[serde(default = "default_true")]
     pub materialize_enabled: bool,
 }
