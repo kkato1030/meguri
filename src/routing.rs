@@ -1,8 +1,12 @@
-//! Role-based agent routing (issue #64, routing 1/3).
+//! Role-based agent routing (issue #64, routing 1/3; roles re-scoped to a
+//! 6-way "kind of work" grouping in issue #167 — ADR 0003 revision).
 //!
-//! Each loop has a role (`runs.loop_kind`) whose cost/quality profile is
-//! stable, so we route a role — not an estimated issue difficulty — to a
-//! launch profile. Two rules are load-bearing (ADR 0003):
+//! `[routing.roles]` steers 6 coarse roles ([`KNOWN_ROLES`]), not the
+//! finer-grained internal loop kinds (`runs.loop_kind`): several loop kinds
+//! share a role's cost/quality profile ([`routing_role_for_loop`] is the
+//! mapping), so we route the role — not an estimated issue difficulty, and
+//! not the loop kind directly — to a launch profile. Two rules are
+//! load-bearing (ADR 0003):
 //!
 //! - **Explicit always beats auto.** A role listed in `[routing.roles]` uses
 //!   exactly that profile; a missing profile, a failed CLI detection, or an
@@ -27,27 +31,159 @@ use crate::config::{AgentProfile, Config, RoutingMode};
 /// into a machine freshness check; for now it is documentation with teeth.
 pub const GENERATED_AT: &str = "2026-07-12";
 
+/// Age past which doctor warns the recommendation table may be stale. The
+/// table is a "2026-07 snapshot"; models turn over on roughly this cadence.
+pub const TABLE_STALE_DAYS: i64 = 90;
+
+/// Age in days of the recommendation table (`GENERATED_AT`) relative to
+/// `now_ts` (an RFC3339 UTC stamp, e.g. from `store::now`). None if either
+/// date is malformed. Clamped at 0 for a future/skewed clock.
+pub fn table_age_days_at(now_ts: &str) -> Option<i64> {
+    let generated = format!("{GENERATED_AT}T00:00:00Z");
+    let g = crate::store::parse_ts(&generated)?;
+    let n = crate::store::parse_ts(now_ts)?;
+    Some((n.saturating_sub(g) / 86_400) as i64)
+}
+
+/// Age in days of the recommendation table as of now.
+pub fn table_age_days() -> Option<i64> {
+    table_age_days_at(&crate::store::now())
+}
+
+/// The major version number in a CLI `--version` line: the integer at the
+/// first digit run. "gh version 2.40.1" → 2, "v1.2.3" → 1, "codex 0.5" → 0,
+/// a line with no digits → None. Used to flag a CLI major-version drift.
+pub fn major_version(version_line: &str) -> Option<u64> {
+    let start = version_line.find(|c: char| c.is_ascii_digit())?;
+    let rest = &version_line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|e| start + e)
+        .unwrap_or(version_line.len());
+    version_line[start..end].parse().ok()
+}
+
+/// The result of doctor's live-launch probe: does the profile's model alias
+/// still resolve? The three cases carry different doctor severities (ADR
+/// 0007) — a bad model is actionable (❌); a transport/auth failure is not
+/// routing's fault (⚠️).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The alias resolved and the CLI produced a reply.
+    Ok,
+    /// The CLI ran but rejected the model — alias retired/renamed.
+    ModelInvalid,
+    /// Network / auth / spawn failure — indistinguishable from a bad model
+    /// only by fault, not by routing: don't fail doctor on it.
+    Unavailable,
+}
+
+/// Production live-launch probe: fire a one-shot, ~1-token turn to check the
+/// profile's model alias is still valid. Only the `claude` CLI has a known
+/// probe form today; other commands report `Unavailable` (⚠️, non-fatal)
+/// rather than a false `ModelInvalid`. Injected as a closure in doctor so
+/// tests exercise the classification without spawning a real CLI.
+pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
+    // Match the CLI by basename so an absolute path to a `claude` binary (or a
+    // test fake) still counts.
+    let base = std::path::Path::new(&profile.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&profile.command);
+    if base != "claude" {
+        return ProbeOutcome::Unavailable;
+    }
+    // Reuse the profile's own args (which carry `--model <alias>`) plus a
+    // trivial one-shot prompt.
+    let mut args = profile.args.clone();
+    args.push("-p".into());
+    args.push("reply: ok".into());
+    match std::process::Command::new(&profile.command)
+        .args(&args)
+        .output()
+    {
+        Ok(out) if out.status.success() => ProbeOutcome::Ok,
+        Ok(out) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .to_lowercase();
+            // A model-rejection message names the model and an invalidity;
+            // everything else (auth, rate limit, network) is Unavailable.
+            let model_rejected = text.contains("model")
+                && (text.contains("invalid")
+                    || text.contains("unknown")
+                    || text.contains("not found")
+                    || text.contains("does not exist")
+                    || text.contains("no such"));
+            if model_rejected {
+                ProbeOutcome::ModelInvalid
+            } else {
+                ProbeOutcome::Unavailable
+            }
+        }
+        Err(_) => ProbeOutcome::Unavailable,
+    }
+}
+
 /// The reserved profile name for the historical `[agent]` section. Users
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// Roles routing knows about. Most are loop kinds (= `runs.loop_kind`);
-/// `impl-reviewer` is not a loop but the profile of the worker's internal
-/// self-review turn (ADR 0006). Explicit entries for anything outside this
+/// Roles routing knows about: the 6 *kinds of work* a user answers "which
+/// model should do this?" for, independent from the finer-grained internal
+/// loop kinds (`runs.loop_kind`) — see [`routing_role_for_loop`] for that
+/// mapping (ADR 0003 revision, issue #167). `self-reviewer` and `pr-reviewer`
+/// are not loop kinds at all but the profiles of the internal self-review
+/// turn (ADR 0006/0008) and the advisory guard-loop review on a published PR
+/// (ADR 0008); both are shared across the plan and impl kinds (spec and impl
+/// are managed by the same model). Explicit entries for anything outside this
 /// set are a startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
-    "spec-reviewer",
-    "impl-reviewer",
     "worker",
-    "spec-worker",
     "fixer",
-    "conflict-resolver",
+    "self-reviewer",
+    "pr-reviewer",
+    "cleaner",
 ];
 
-/// Deprecated routing role keys → their current name (issue #108). A config
-/// still using the old key resolves as if it named the new one.
-const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[("reviewer", "spec-reviewer")];
+/// Deprecated routing role keys → their current name (ADR 0003 revision,
+/// issue #167 — folds in the ADR 0008 review-role rename too). A config
+/// still using an old key resolves as if it named the new one: the review
+/// pair `reviewer`/`spec-reviewer`/`guard` → `pr-reviewer`, `impl-reviewer`/
+/// `self-review` → `self-reviewer`, the worker pair `spec-worker` → `worker`,
+/// and the fixer family `conflict-resolver`/`ci-fixer` → `fixer`.
+const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[
+    ("reviewer", "pr-reviewer"),
+    ("spec-reviewer", "pr-reviewer"),
+    ("guard", "pr-reviewer"),
+    ("impl-reviewer", "self-reviewer"),
+    ("self-review", "self-reviewer"),
+    ("spec-worker", "worker"),
+    ("conflict-resolver", "fixer"),
+    ("ci-fixer", "fixer"),
+];
+
+/// Map a loop kind (`runs.loop_kind`) to its routing role — the fine↔coarse
+/// bridge this ADR revision introduces (same pattern as `role_for_loop` for
+/// pane lanes, `src/engine/mod.rs`). Internal loop kinds stay
+/// fine-grained (budget/stats stay observable per loop); routing only cares
+/// about the 6-role grouping. `self-reviewer` has no loop kind of its own —
+/// it is resolved directly by name where the internal self-review turn runs
+/// (`impl_review_lane`).
+pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
+    match loop_kind {
+        "planner" => "planner",
+        "fixer" | "ci-fixer" | "conflict-resolver" => "fixer",
+        "guard" => "pr-reviewer",
+        "cleaner" => "cleaner",
+        // "worker" | "spec-worker", and anything unrecognized.
+        _ => "worker",
+    }
+}
 
 /// Map a (possibly deprecated) config role key to its canonical name.
 fn canonical_role(role: &str) -> &str {
@@ -59,7 +195,8 @@ fn canonical_role(role: &str) -> &str {
 }
 
 /// Look up a canonical role in a user's `[routing.roles]` map, honoring the
-/// deprecated aliases (so `reviewer = …` still steers `spec-reviewer`).
+/// deprecated aliases (so a config still keyed on `reviewer = …` steers the
+/// same profile as `pr-reviewer = …`).
 fn role_override<'a>(roles: &'a HashMap<String, String>, role: &str) -> Option<&'a String> {
     if let Some(name) = roles.get(role) {
         return Some(name);
@@ -124,14 +261,16 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         // Small consumption, top leverage: best spec = fewest downstream turns.
         "planner" => &["claude-opus", DEFAULT_PROFILE],
         // Cross-vendor on purpose: reviewing with the author's model shares its
-        // blind spots (and spares the Claude quota). Both the external spec
-        // reviewer and the worker's internal self-review turn key off this.
-        "spec-reviewer" | "impl-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
-        // The bulk of consumption; Sonnet lands close to Opus on coding at
+        // blind spots (and spares the Claude quota). Both the internal
+        // self-review turn and the advisory pr-reviewer (guard loop) review
+        // key off this.
+        "self-reviewer" | "pr-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
+        // The bulk of consumption (worker, incl. the spec-triggered worker)
+        // and the narrow-scope fix-up work (fixer, incl. ci-fixer / conflict
+        // resolution) both land on Sonnet — close to Opus on coding at
         // roughly half the quota/price.
-        "worker" | "spec-worker" => &["claude-sonnet", DEFAULT_PROFILE],
-        // Narrow scope, small diffs — Sonnet is plenty.
-        "fixer" | "conflict-resolver" => &["claude-sonnet", DEFAULT_PROFILE],
+        "worker" | "fixer" => &["claude-sonnet", DEFAULT_PROFILE],
+        // cleaner (read-only hygiene sweep) and anything unrecognized.
         _ => &[DEFAULT_PROFILE],
     }
 }
@@ -299,7 +438,7 @@ args = ["--yolo"]
         );
         let never = |_: &str| panic!("detection must not run when profiles are inert");
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &never).unwrap(),
+            resolve(&cfg, "pr-reviewer", &never).unwrap(),
             DEFAULT_PROFILE
         );
         assert_eq!(resolve(&cfg, "worker", &never).unwrap(), DEFAULT_PROFILE);
@@ -327,30 +466,30 @@ worker = "claude-opus"
     #[test]
     fn auto_falls_back_along_the_chain() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
-        // codex present → spec-reviewer uses codex.
+        // codex present → pr-reviewer uses codex.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
-        // codex absent → spec-reviewer falls to claude-opus.
+        // codex absent → pr-reviewer falls to claude-opus.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["claude"])).unwrap(),
             "claude-opus"
         );
-        // neither present → spec-reviewer falls to default.
+        // neither present → pr-reviewer falls to default.
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&[])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&[])).unwrap(),
             DEFAULT_PROFILE
         );
-        // The internal-review role shares the cross-vendor chain.
+        // The internal self-reviewer role shares the cross-vendor chain.
         assert_eq!(
-            resolve(&cfg, "impl-reviewer", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "self-reviewer", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
     }
 
     #[test]
-    fn auto_worker_prefers_sonnet_then_default() {
+    fn auto_worker_and_fixer_prefer_sonnet_then_default() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
         assert_eq!(
             resolve(&cfg, "worker", &only(&["claude"])).unwrap(),
@@ -358,6 +497,22 @@ worker = "claude-opus"
         );
         assert_eq!(
             resolve(&cfg, "worker", &only(&[])).unwrap(),
+            DEFAULT_PROFILE
+        );
+        assert_eq!(
+            resolve(&cfg, "fixer", &only(&["claude"])).unwrap(),
+            "claude-sonnet"
+        );
+    }
+
+    #[test]
+    fn auto_cleaner_stays_on_default() {
+        // cleaner has no model lean — it always lands on the default profile,
+        // same as before it was registered (issue #167 fixed the omission,
+        // not the outcome).
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        assert_eq!(
+            resolve(&cfg, "cleaner", &only(&["codex", "claude"])).unwrap(),
             DEFAULT_PROFILE
         );
     }
@@ -370,13 +525,13 @@ worker = "claude-opus"
 mode = "manual"
 
 [routing.roles]
-spec-reviewer = "codex"
+pr-reviewer = "codex"
 "#,
         );
         // Listed role uses its explicit profile; unlisted roles go to default
         // with no detection (chain is off in manual).
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex"])).unwrap(),
             "codex"
         );
         let never = |_: &str| panic!("manual unlisted roles must not detect");
@@ -384,9 +539,12 @@ spec-reviewer = "codex"
     }
 
     #[test]
-    fn deprecated_reviewer_key_steers_spec_reviewer() {
-        // A config still using the old `reviewer` key resolves as if it named
-        // `spec-reviewer`, and validate() accepts it.
+    fn deprecated_role_keys_steer_the_renamed_roles() {
+        // Configs still using pre-#167 keys resolve to the current 6 roles:
+        // `reviewer` / `spec-reviewer` / `guard` → `pr-reviewer`,
+        // `impl-reviewer` / `self-review` → `self-reviewer`, `spec-worker` →
+        // `worker`, `conflict-resolver` / `ci-fixer` → `fixer`. validate()
+        // accepts them all.
         let cfg = cfg_from(
             r#"
 [routing]
@@ -394,13 +552,85 @@ mode = "manual"
 
 [routing.roles]
 reviewer = "codex"
+impl-reviewer = "claude-opus"
+spec-worker = "claude-sonnet"
+ci-fixer = "claude-opus"
 "#,
         );
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex"])).unwrap(),
             "codex"
         );
-        validate(&cfg, &only(&["codex"])).unwrap();
+        assert_eq!(
+            resolve(&cfg, "self-reviewer", &only(&["claude"])).unwrap(),
+            "claude-opus"
+        );
+        assert_eq!(
+            resolve(&cfg, "worker", &only(&["claude"])).unwrap(),
+            "claude-sonnet"
+        );
+        assert_eq!(
+            resolve(&cfg, "fixer", &only(&["claude"])).unwrap(),
+            "claude-opus"
+        );
+        validate(&cfg, &only(&["codex", "claude"])).unwrap();
+
+        // The current `spec-reviewer` key and the old `guard`/`conflict-resolver`
+        // keys also still steer their new roles.
+        let cfg2 = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+spec-reviewer = "codex"
+guard = "codex"
+conflict-resolver = "codex"
+"#,
+        );
+        assert_eq!(
+            resolve(&cfg2, "pr-reviewer", &only(&["codex"])).unwrap(),
+            "codex"
+        );
+        assert_eq!(resolve(&cfg2, "fixer", &only(&["codex"])).unwrap(), "codex");
+        validate(&cfg2, &only(&["codex"])).unwrap();
+    }
+
+    #[test]
+    fn routing_role_for_loop_groups_loop_kinds_by_kind_of_work() {
+        // The 6-role grouping (issue #167): fixer's family, worker's family,
+        // and the previously-unregistered ci-fixer / cleaner all resolve.
+        assert_eq!(routing_role_for_loop("planner"), "planner");
+        assert_eq!(routing_role_for_loop("worker"), "worker");
+        assert_eq!(routing_role_for_loop("spec-worker"), "worker");
+        assert_eq!(routing_role_for_loop("fixer"), "fixer");
+        assert_eq!(routing_role_for_loop("ci-fixer"), "fixer");
+        assert_eq!(routing_role_for_loop("conflict-resolver"), "fixer");
+        assert_eq!(routing_role_for_loop("guard"), "pr-reviewer");
+        assert_eq!(routing_role_for_loop("cleaner"), "cleaner");
+    }
+
+    #[test]
+    fn ci_fixer_and_cleaner_join_their_family_auto_chain() {
+        // Before #167, ci-fixer/cleaner were missing from KNOWN_ROLES and
+        // recommended_chain, so auto routing silently dropped them to
+        // `default` while their siblings rode the family chain, and an
+        // explicit `[routing.roles] ci-fixer = ...` failed at startup. Now
+        // both loop kinds resolve through their role's chain like the rest
+        // of the family.
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        for kind in ["fixer", "ci-fixer", "conflict-resolver"] {
+            assert_eq!(
+                resolve(&cfg, routing_role_for_loop(kind), &only(&["claude"])).unwrap(),
+                "claude-sonnet",
+                "loop: {kind}"
+            );
+        }
+        validate(
+            &cfg_from("[routing]\nmode = \"manual\"\n[routing.roles]\nfixer = \"claude-sonnet\"\ncleaner = \"claude-sonnet\"\n"),
+            &only(&["claude"]),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -496,6 +726,36 @@ args = ["--foo"]
         let p = profile_by_name(&cfg, "codex").unwrap();
         assert_eq!(p.command, "my-codex");
         assert_eq!(p.args, vec!["--foo"]);
+    }
+
+    #[test]
+    fn table_age_days_counts_from_generated_at() {
+        // GENERATED_AT is 2026-07-12. 90 days later crosses the stale line.
+        assert_eq!(table_age_days_at("2026-07-12T00:00:00Z"), Some(0));
+        assert_eq!(table_age_days_at("2026-07-13T00:00:00Z"), Some(1));
+        assert_eq!(table_age_days_at("2026-10-11T00:00:00Z"), Some(91));
+        assert!(table_age_days_at("2026-10-11T00:00:00Z").unwrap() > TABLE_STALE_DAYS);
+        // A date before the table's own date clamps to 0, never negative.
+        assert_eq!(table_age_days_at("2026-01-01T00:00:00Z"), Some(0));
+        assert_eq!(table_age_days_at("garbage"), None);
+    }
+
+    #[test]
+    fn major_version_extracts_leading_integer() {
+        assert_eq!(major_version("gh version 2.40.1 (2024-01-01)"), Some(2));
+        assert_eq!(major_version("git version 2.39.2"), Some(2));
+        assert_eq!(major_version("v1.2.3"), Some(1));
+        assert_eq!(major_version("codex 0.5.0"), Some(0));
+        assert_eq!(major_version("claude 13.0.1"), Some(13));
+        assert_eq!(major_version("reply: ok"), None);
+    }
+
+    #[test]
+    fn probe_non_claude_is_unavailable_not_a_false_negative() {
+        // We can't drive an arbitrary CLI's one-shot form, so report a
+        // non-fatal Unavailable rather than a false ModelInvalid.
+        let codex = builtin_profiles().remove("codex").unwrap();
+        assert_eq!(probe_profile(&codex), ProbeOutcome::Unavailable);
     }
 
     #[test]

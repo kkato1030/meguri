@@ -47,6 +47,10 @@ repo_slug = "owner/repo"
 # required = false                           # true にすると失敗時に run が失敗扱いになる(既定は warn で続行)
 # timeout_secs = 300
 
+# [[workspaces]]                       # 関連 project の静的グルーピング(cross-repo 分解のスコープ + 表示単位)
+# id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
+# projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
+
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
@@ -84,6 +88,15 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
+    /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
+    /// presence switches role routing on (see [`routing`]), so a
+    /// `[routing.drift]` table would silently activate routing for a user who
+    /// only wanted to tune drift. Drift detection is independent of routing
+    /// being active — legacy runs all use `default`, so `(role, default)`
+    /// regressions are still caught.
+    #[serde(default)]
+    pub drift: DriftConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -99,17 +112,27 @@ pub struct Config {
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
+    pub reconcile: ReconcileConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+    /// Static groupings of related projects (issue #154). Purely declarative —
+    /// no runtime state, never touches run/turn — and used for exactly three
+    /// things: the decompose issue-filing scope, the cross-repo blocker
+    /// resolution scope, and `ps`/`top` display grouping. Opt-in: a config
+    /// without `[[workspaces]]` behaves exactly as before. See ADR 0009.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceConfig>,
 }
 
-/// Settings for the worker's self-review phase (ADR 0006): the internal
-/// review→fix loop that runs before the PR opens. The old `impl_enabled` /
-/// `impl_max_rounds` keys (the forge-based impl-reviewer loop, ADR 0004) are
-/// still accepted as serde aliases so existing configs keep working.
+/// Settings for the internal self-review phase (ADR 0006/0008): the review→fix
+/// loop that runs before the PR opens, now symmetric across plan and impl
+/// (ADR 0008). The old `impl_enabled` / `impl_max_rounds` keys (the forge-based
+/// impl-reviewer loop, ADR 0004) are still accepted as serde aliases so
+/// existing configs keep working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
-    /// Kill switch: false skips the worker's self-review phase entirely
-    /// (e.g. when an external review bot already covers implementation PRs).
+    /// Kill switch: false skips the internal self-review phase entirely
+    /// (e.g. when an external review bot already covers PRs).
     #[serde(default = "default_self_review_enabled", alias = "impl_enabled")]
     pub enabled: bool,
     /// Max self-review rounds per run — the cap that keeps the internal
@@ -117,6 +140,14 @@ pub struct ReviewConfig {
     /// human merge gate is the backstop, ADR 0006).
     #[serde(default = "default_self_review_max_rounds", alias = "impl_max_rounds")]
     pub max_rounds: u32,
+    /// The review lenses the self-review turn applies each round (ADR 0008):
+    /// one review turn considers every configured perspective. Defaults to
+    /// `correctness / tests / simplicity / security`; add or drop to taste.
+    #[serde(default = "default_review_lenses")]
+    pub lenses: Vec<String>,
+    /// External GitHub guard review, enabled per kind (ADR 0008 §1/§3).
+    #[serde(default)]
+    pub guard: GuardConfig,
 }
 
 impl Default for ReviewConfig {
@@ -124,6 +155,8 @@ impl Default for ReviewConfig {
         Self {
             enabled: default_self_review_enabled(),
             max_rounds: default_self_review_max_rounds(),
+            lenses: default_review_lenses(),
+            guard: GuardConfig::default(),
         }
     }
 }
@@ -133,6 +166,72 @@ fn default_self_review_enabled() -> bool {
 }
 fn default_self_review_max_rounds() -> u32 {
     3
+}
+fn default_review_lenses() -> Vec<String> {
+    ["correctness", "tests", "simplicity", "security"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// `[review.guard]` — the optional external GitHub guard review, toggled
+/// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
+/// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
+/// off (opt-in; external-bot compatible). Its output is a `meguri/guard-review`
+/// commit status + a folded PR-body `<details>` — never inline threads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// Guard the plan (spec/ADR) PR — the reviewed-spec gate (default on).
+    #[serde(default = "default_true")]
+    pub plan: bool,
+    /// Guard the implementation PR (default off).
+    #[serde(default, rename = "impl")]
+    pub impl_enabled: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            plan: default_true(),
+            impl_enabled: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Settings for the reconcile loop (issue #142): detecting that a once-shipped
+/// issue's body was edited and treating it as a re-attention signal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ReconcileConfig {
+    /// Kill switch: false restores the pre-#142 behavior — a succeeded run
+    /// suppresses the issue permanently regardless of later body edits (half A
+    /// and half B both go inert).
+    #[serde(default = "default_reconcile_body_edits")]
+    pub body_edits: bool,
+    /// Whether the poll sweep (half B) posts the "本文が更新されました" signal
+    /// comment on a changed-body issue. False emits the `issue.body_changed`
+    /// event only (no forge write).
+    #[serde(default = "default_reconcile_signal_comment")]
+    pub signal_comment: bool,
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self {
+        Self {
+            body_edits: default_reconcile_body_edits(),
+            signal_comment: default_reconcile_signal_comment(),
+        }
+    }
+}
+
+fn default_reconcile_body_edits() -> bool {
+    true
+}
+fn default_reconcile_signal_comment() -> bool {
+    true
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -378,11 +477,51 @@ pub enum RoutingMode {
 pub struct RoutingConfig {
     #[serde(default)]
     pub mode: RoutingMode,
-    /// Explicit per-role overrides. Keys are loop kinds (`planner`,
-    /// `reviewer`, `worker`, `spec-worker`, `fixer`, `conflict-resolver`);
-    /// values are profile names. An explicit entry always beats auto.
+    /// Explicit per-role overrides. Keys are the 6 routing roles (`planner`,
+    /// `worker`, `fixer`, `self-reviewer`, `pr-reviewer`, `cleaner`) — a
+    /// "kind of work" grouping, independent from the finer-grained internal
+    /// loop kinds (`runs.loop_kind`); see `crate::routing::KNOWN_ROLES`.
+    /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+}
+
+/// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
+/// The scheduler compares the most recent `window` runs of each
+/// `(role, profile)` against the preceding `window` and flags a regression
+/// when the success rate drops by `success_rate_drop_pt` points OR the mean
+/// turn count rises by `turns_increase_pct` percent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftConfig {
+    /// Success-rate drop (in percentage points, 0–100) that trips a warning.
+    #[serde(default = "default_success_rate_drop_pt")]
+    pub success_rate_drop_pt: f64,
+    /// Mean-turn-count increase (in percent) that trips a warning.
+    #[serde(default = "default_turns_increase_pct")]
+    pub turns_increase_pct: f64,
+    /// Runs per comparison window (recent vs. preceding).
+    #[serde(default = "default_drift_window")]
+    pub window: usize,
+}
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            success_rate_drop_pt: default_success_rate_drop_pt(),
+            turns_increase_pct: default_turns_increase_pct(),
+            window: default_drift_window(),
+        }
+    }
+}
+
+fn default_success_rate_drop_pt() -> f64 {
+    20.0
+}
+fn default_turns_increase_pct() -> f64 {
+    50.0
+}
+fn default_drift_window() -> usize {
+    20
 }
 
 fn default_agent_command() -> String {
@@ -571,6 +710,30 @@ impl ProjectMode {
     }
 }
 
+/// How a plan-first issue is delivered (ADR 0008). Deliberately a separate
+/// key from [`ProjectMode`] (github/local): the two are orthogonal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanDelivery {
+    /// Two PRs: the spec/ADR PR is reviewed and merged on its own, then the
+    /// issue flips `speccing → ready` and the worker implements in a separate
+    /// PR. The spec PR uses a non-closing `Refs #N` reference (default).
+    #[default]
+    Separate,
+    /// One PR: the spec-worker takes over the spec PR's branch and stacks the
+    /// implementation on it (the #98 morph shape); spec and impl merge once.
+    Combined,
+}
+
+impl PlanDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::Combined => "combined",
+        }
+    }
+}
+
 /// The shape of a run's deliverable. `patch` (issue #54 Phase 2) is accepted
 /// by the config but not yet implemented by the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +791,59 @@ fn default_worktree_setup_timeout_secs() -> u64 {
     300
 }
 
+/// Which loop a fired schedule targets. `ready` enqueues worker work
+/// (`meguri:ready` / task kind `work`); `plan` enqueues planner work
+/// (`meguri:plan`) and is github-only (local mode has no planner yet, so the
+/// task would never be consumed — rejected by [`Config::validate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleKind {
+    #[default]
+    Ready,
+    Plan,
+}
+
+impl ScheduleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// One `[[projects.schedules]]` entry (issue #146): a cron definition that
+/// periodically enqueues an issue (github mode) or local task (local mode).
+/// Firing only puts one item on the queue — the existing worker/planner loops
+/// consume it (ADR 0009). The last-fired time is *not* here; it lives in
+/// sqlite (`schedule_state`) so a hot-reload edit to the definition never
+/// loses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    /// Unique within the project; the sqlite state key and the body marker id.
+    pub name: String,
+    /// Standard 5-field cron expression (minute hour day-of-month month
+    /// day-of-week), interpreted as UTC. Parsed by [`crate::cron`].
+    pub cron: String,
+    /// Worker-bound (`ready`, default) or planner-bound (`plan`, github-only).
+    #[serde(default)]
+    pub kind: ScheduleKind,
+    /// Title template. The only variable is `{{date}}` (the fire date,
+    /// `YYYY-MM-DD` UTC).
+    pub title: String,
+    /// Repo-relative path to a file whose contents become the body. Mutually
+    /// exclusive with `body`; exactly one is required.
+    #[serde(default)]
+    pub body_file: Option<String>,
+    /// Inline body. Mutually exclusive with `body_file`.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// When false (default), skip firing if the schedule's last-created
+    /// issue/task is still open; true fires every occurrence.
+    #[serde(default)]
+    pub allow_overlap: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -643,6 +859,14 @@ pub struct ProjectConfig {
     /// github, `branch` for local — resolved via [`Config::deliver_for`].
     #[serde(default)]
     pub deliver: Option<Deliver>,
+    /// How plan-first issues are delivered (see [`PlanDelivery`], ADR 0008);
+    /// defaults to `separate` (two PRs).
+    #[serde(default)]
+    pub plan_delivery: PlanDelivery,
+    /// Per-project self-review / guard settings; overrides the global
+    /// `[review]` section wholesale (like `pr` / `clean`).
+    #[serde(default)]
+    pub review: Option<ReviewConfig>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -664,10 +888,36 @@ pub struct ProjectConfig {
     /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
     #[serde(default)]
     pub worktree_setup: WorktreeSetupConfig,
+    /// Cron schedules that periodically enqueue issues/tasks (issue #146).
+    #[serde(default)]
+    pub schedules: Vec<ScheduleConfig>,
 }
 
 fn default_branch() -> String {
     "main".into()
+}
+
+/// `[[workspaces]]` — a static grouping of related projects (issue #154).
+///
+/// ```toml
+/// [[workspaces]]
+/// id = "shop"
+/// projects = ["shop-api", "shop-web", "shop-infra"]
+/// ```
+///
+/// A workspace never appears in the execution path (worktree / pane / branch /
+/// verification are unchanged) and carries no runtime state. It only bounds
+/// where a decomposition may file cross-repo child issues, which sibling repos
+/// discovery is willing to resolve blockers in, and how `ps` / `top` group
+/// their rows. See ADR 0009.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub id: String,
+    /// Member project ids. Each must reference a defined `[[projects]]` entry,
+    /// and a project may belong to at most one workspace (both enforced by
+    /// [`Config::validate`]).
+    #[serde(default)]
+    pub projects: Vec<String>,
 }
 
 impl Config {
@@ -734,6 +984,91 @@ impl Config {
                     p.id
                 );
             }
+            self.validate_schedules(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject schedule definitions that would break `watch` startup / hot
+    /// reload or silently never fire: a bad cron expression, a duplicate
+    /// `name`, both/neither of `body`/`body_file`, or a local-mode `plan`
+    /// schedule (no local planner — the task would never be consumed).
+    fn validate_schedules(&self, p: &ProjectConfig) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for s in &p.schedules {
+            if !seen.insert(s.name.as_str()) {
+                anyhow::bail!(
+                    "project {:?} has duplicate schedule name {:?}",
+                    p.id,
+                    s.name
+                );
+            }
+            if let Err(e) = crate::cron::Cron::parse(&s.cron) {
+                anyhow::bail!(
+                    "project {:?} schedule {:?} has invalid cron {:?}: {e}",
+                    p.id,
+                    s.name,
+                    s.cron
+                );
+            }
+            match (&s.body, &s.body_file) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "project {:?} schedule {:?} sets both `body` and `body_file` (mutually exclusive)",
+                    p.id,
+                    s.name
+                ),
+                (None, None) => anyhow::bail!(
+                    "project {:?} schedule {:?} sets neither `body` nor `body_file` (one is required)",
+                    p.id,
+                    s.name
+                ),
+                _ => {}
+            }
+            if p.mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
+                anyhow::bail!(
+                    "project {:?} is mode = \"local\" but schedule {:?} has kind = \"plan\" \
+                     (local mode has no planner, so the task would never be consumed)",
+                    p.id,
+                    s.name
+                );
+            }
+        }
+        self.validate_workspaces()?;
+        Ok(())
+    }
+
+    /// Workspace invariants (issue #154): every referenced project is defined,
+    /// no project belongs to two workspaces, and workspace ids are unique and
+    /// non-empty. Hard-fail like the other structural checks so a typo surfaces
+    /// at load time (and `meguri doctor`) rather than as a silent no-op scope.
+    fn validate_workspaces(&self) -> Result<()> {
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut owner: HashMap<&str, &str> = HashMap::new();
+        for ws in &self.workspaces {
+            if !seen_ids.insert(ws.id.as_str()) {
+                anyhow::bail!("workspace id {:?} is defined more than once", ws.id);
+            }
+            if ws.projects.is_empty() {
+                anyhow::bail!("workspace {:?} has no projects", ws.id);
+            }
+            for pid in &ws.projects {
+                if self.project(pid).is_none() {
+                    anyhow::bail!(
+                        "workspace {:?} references undefined project {:?}",
+                        ws.id,
+                        pid
+                    );
+                }
+                if let Some(other) = owner.insert(pid.as_str(), ws.id.as_str()) {
+                    anyhow::bail!(
+                        "project {:?} belongs to both workspace {:?} and {:?} \
+                         (a project may join at most one workspace)",
+                        pid,
+                        other,
+                        ws.id
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -742,9 +1077,43 @@ impl Config {
         self.projects.iter().find(|p| p.id == id)
     }
 
+    /// The workspace with this id, if any.
+    pub fn workspace(&self, id: &str) -> Option<&WorkspaceConfig> {
+        self.workspaces.iter().find(|w| w.id == id)
+    }
+
+    /// The workspace a project belongs to, if any. `None` for a project that
+    /// joined no workspace (the opt-out default).
+    pub fn workspace_of(&self, project_id: &str) -> Option<&WorkspaceConfig> {
+        self.workspaces
+            .iter()
+            .find(|w| w.projects.iter().any(|p| p == project_id))
+    }
+
+    /// The other projects sharing `project_id`'s workspace (self excluded),
+    /// resolved to their [`ProjectConfig`]. Empty when the project joined no
+    /// workspace. Drives both the decompose issue-filing scope and the
+    /// cross-repo blocker resolution scope (issue #154).
+    pub fn workspace_siblings(&self, project_id: &str) -> Vec<&ProjectConfig> {
+        let Some(ws) = self.workspace_of(project_id) else {
+            return Vec::new();
+        };
+        ws.projects
+            .iter()
+            .filter(|p| p.as_str() != project_id)
+            .filter_map(|p| self.project(p))
+            .collect()
+    }
+
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
+    }
+
+    /// Effective self-review / guard settings for a project (project override
+    /// wins wholesale, like `pr_for`).
+    pub fn review_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a ReviewConfig {
+        project.review.as_ref().unwrap_or(&self.review)
     }
 
     /// Effective deliverable language for a project (project override wins).
@@ -933,6 +1302,22 @@ impl_max_rounds = 5
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(!cfg.review.enabled);
         assert_eq!(cfg.review.max_rounds, 5);
+    }
+
+    #[test]
+    fn reconcile_defaults_are_on_and_overridable() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.reconcile.body_edits);
+        assert!(cfg.reconcile.signal_comment);
+
+        let raw = r#"
+[reconcile]
+body_edits = false
+signal_comment = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.reconcile.body_edits);
+        assert!(!cfg.reconcile.signal_comment);
     }
 
     #[test]
@@ -1395,6 +1780,34 @@ ignore = ["docs/legacy"]
     }
 
     #[test]
+    fn drift_defaults_and_does_not_activate_routing() {
+        // Defaults hold with no `[drift]` section.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.drift.success_rate_drop_pt, 20.0);
+        assert_eq!(cfg.drift.turns_increase_pct, 50.0);
+        assert_eq!(cfg.drift.window, 20);
+
+        // A `[drift]` section tunes the thresholds but is top-level: it must
+        // NOT imply `[routing]` (which would silently switch role routing on).
+        let cfg: Config = toml::from_str(
+            r#"
+[drift]
+success_rate_drop_pt = 10.0
+turns_increase_pct = 25.0
+window = 50
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.drift.success_rate_drop_pt, 10.0);
+        assert_eq!(cfg.drift.turns_increase_pct, 25.0);
+        assert_eq!(cfg.drift.window, 50);
+        assert!(
+            cfg.routing.is_none(),
+            "[drift] must stay legacy for routing"
+        );
+    }
+
+    #[test]
     fn parses_profiles_and_routing() {
         let raw = r#"
 [agents.profiles.claude-opus]
@@ -1556,5 +1969,188 @@ timeout_secs = 60
         assert_eq!(ws.exclude, vec![".claude/rules", "AGENTS.md"]);
         assert!(ws.required);
         assert_eq!(ws.timeout_secs, 60);
+    }
+
+    #[test]
+    fn schedules_parse_as_array_of_project_tables() {
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[[projects.schedules]]
+name = "daily-tidy"
+cron = "0 9 * * *"
+title = "Daily tidy {{date}}"
+body = "do the thing"
+
+[[projects.schedules]]
+name = "weekly-plan"
+cron = "0 9 * * 1"
+kind = "plan"
+title = "Weekly plan"
+body_file = "ops/plan.md"
+allow_overlap = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let schedules = &cfg.project("demo").unwrap().schedules;
+        assert_eq!(schedules.len(), 2);
+        assert_eq!(schedules[0].name, "daily-tidy");
+        assert_eq!(schedules[0].kind, ScheduleKind::Ready); // default
+        assert_eq!(schedules[0].body.as_deref(), Some("do the thing"));
+        assert_eq!(schedules[1].kind, ScheduleKind::Plan);
+        assert_eq!(schedules[1].body_file.as_deref(), Some("ops/plan.md"));
+        assert!(schedules[1].allow_overlap);
+    }
+
+    #[test]
+    fn schedule_with_invalid_cron_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"* * *\"\n\
+                   title = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cron"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_duplicate_name_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
+                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate schedule name"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_both_body_and_body_file_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
+                   body = \"b\"\nbody_file = \"f.md\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn schedule_with_neither_body_nor_body_file_is_rejected() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn local_mode_plan_schedule_is_rejected() {
+        // local mode has no planner; a plan schedule would enqueue a task that
+        // never gets consumed (spec §doctor / ADR 0009).
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\n\
+                   kind = \"plan\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no planner"), "{err}");
+    }
+
+    #[test]
+    fn local_mode_ready_schedule_is_accepted() {
+        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
+                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
+        let cfg = Config::parse(raw, Path::new("cfg")).unwrap();
+        assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
+    }
+
+    /// Minimal valid config carrying the given projects plus the extra lines.
+    fn config_with_projects(ids: &[&str], extra: &str) -> String {
+        let mut raw = String::new();
+        for id in ids {
+            raw.push_str(&format!(
+                "[[projects]]\nid = \"{id}\"\nrepo_path = \"/tmp/{id}\"\nrepo_slug = \"me/{id}\"\n\n"
+            ));
+        }
+        raw.push_str(extra);
+        raw
+    }
+
+    #[test]
+    fn workspaces_default_to_empty() {
+        // Opt-in: a config without [[workspaces]] has none, and behavior is
+        // unchanged (acceptance criterion 5).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.workspaces.is_empty());
+        assert!(cfg.workspace_of("anything").is_none());
+        assert!(cfg.workspace_siblings("anything").is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_and_resolves_membership() {
+        let raw = config_with_projects(
+            &["shop-api", "shop-web", "shop-infra", "loner"],
+            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"shop-web\", \"shop-infra\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.workspace("shop").unwrap().projects.len(), 3);
+        assert_eq!(
+            cfg.workspace_of("shop-web").map(|w| w.id.as_str()),
+            Some("shop")
+        );
+        assert!(cfg.workspace_of("loner").is_none());
+
+        let siblings: Vec<&str> = cfg
+            .workspace_siblings("shop-api")
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(siblings, vec!["shop-web", "shop-infra"]);
+        assert!(cfg.workspace_siblings("loner").is_empty());
+    }
+
+    #[test]
+    fn workspace_referencing_undefined_project_is_rejected() {
+        let raw = config_with_projects(
+            &["shop-api"],
+            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"ghost\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("undefined project") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_in_two_workspaces_is_rejected() {
+        let raw = config_with_projects(
+            &["a", "b"],
+            "[[workspaces]]\nid = \"w1\"\nprojects = [\"a\", \"b\"]\n\
+             [[workspaces]]\nid = \"w2\"\nprojects = [\"b\"]\n",
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("at most one workspace"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_workspace_id_and_empty_projects_are_rejected() {
+        let dup = config_with_projects(
+            &["a"],
+            "[[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n\
+             [[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n",
+        );
+        let cfg: Config = toml::from_str(&dup).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+
+        let empty = config_with_projects(&["a"], "[[workspaces]]\nid = \"w\"\nprojects = []\n");
+        let cfg: Config = toml::from_str(&empty).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no projects"), "{err}");
     }
 }

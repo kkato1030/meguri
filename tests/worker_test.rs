@@ -83,7 +83,10 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -943,10 +946,16 @@ async fn self_review_clean_publishes_without_touching_the_forge() {
         env.forge.pr_comments_of(pr).is_empty(),
         "self-review must post no comments"
     );
-    // A clean review leaves no footer on the PR body.
+    // A clean review still records its inspection history in a folded
+    // <details> (ADR 0008) — but no non-convergence warning.
     assert!(
-        !prs[0].body.contains("self-review"),
-        "body: {}",
+        prs[0].body.contains("<details>") && prs[0].body.contains("self-review"),
+        "clean review still folds a self-review summary: {}",
+        prs[0].body
+    );
+    assert!(
+        !prs[0].body.contains("収束しませんでした"),
+        "a clean review must not warn about non-convergence: {}",
         prs[0].body
     );
 }

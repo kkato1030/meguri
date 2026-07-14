@@ -95,10 +95,11 @@ meguri run --project myproj --issue 42
 meguri watch
 
 meguri ps                 # runs, interaction state, panes
+meguri schedules          # cron schedules: definition, last fire, next fire
 meguri top                # build a dashboard workspace of tiled agent panes & attach
 meguri logs <run>         # event trail + live pane tail
 meguri attach <issue>     # jump into the issue's agent pane (or pass a run id)
-meguri attach <issue> --review  # the spec reviewer's independent pane
+meguri attach <issue> --review  # the guard reviewer's independent pane
 meguri pause <run>        # stop injecting prompts; pane stays alive
 meguri resume <run>
 meguri takeover <run>     # orchestrator hands-off; you drive
@@ -197,27 +198,42 @@ Discovery also honors GitHub-native issue dependencies (looper's ADR-0004): an i
 
 ### Spec-first flow (opt-in)
 
-Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The **spec reviewer** loop then reviews the spec PR: findings are posted as a summary comment (push fixes and it re-reviews the new head; each head is reviewed only once), and a clean review flips the label to `meguri:spec-ready` — you can also flip it yourself. The worker then continues implementation **on the same branch and PR** — the spec and the implementation merge once, together. The spec itself is disposable review scaffolding: the spec worker deletes it as part of the implementation, so `docs/specs/` never accumulates on the default branch — anything worth keeping (design decisions, domain rules) is routed to an ADR (`docs/adr/`) or a permanent domain document instead.
+Label an issue `meguri:plan` instead of `meguri:ready` and the **planner** loop investigates the repository and opens a *spec PR* (`Spec: <title>`) containing a single lightweight file, `docs/specs/issue-<N>.md` (acceptance criteria, files to touch, key decisions), labeled `meguri:spec-reviewing`. The spec's depth is **adaptive** ([ADR 0010](docs/adr/0010-adaptive-spec-depth.md)): the planner picks `normal` or a deeper `design` spec by uncertainty × blast radius, and any change that touches persistent state or a public contract is vetoed into carrying migration & rollback sections — the reason for the chosen depth is recorded in the spec or PR. The optional **guard** review (below) reviews the spec PR and, when clean, flips the label to `meguri:spec-ready` — you can also flip it yourself. What happens next depends on `plan_delivery` (ADR 0008):
 
-### Self-review (internal AI review of the diff)
+- **`separate`** (default) — two PRs. The spec/ADR PR is reviewed and **merged on its own** (it references its issue with a non-closing `Refs #N`, so merging it does not close the issue); a merged spec PR flips the issue `speccing → ready` and the **worker** implements it in a fresh PR, reading the landed spec and pruning it as part of the implementation.
+- **`combined`** — one PR. The **spec worker** takes over the spec PR's branch and stacks the implementation on it (the #98 morph); spec and implementation merge once, together.
 
-The AI review of the **implementation diff** is an *internal loop* (ADR 0006): the worker reviews its own diff before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` the worker runs a self-review phase in its own worktree — a **review turn** reads `git diff <base>...HEAD` locally and writes `{verdict, findings[]}`; if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; if the cap is hit without a clean verdict the PR is published anyway (the human merge gate is the backstop) with a single footer line noting the non-convergence. Nothing is posted: no threads, no comments, no polling — the human opens a PR that has already been self-reviewed, and the PR conversation stays a clean human/external-review-only space. The review turn runs under the `impl-reviewer` routing profile, so it can still be a different model than the author doing the fixes. Running an external review bot instead? Set `review.enabled = false`.
+Either way the spec itself is disposable review scaffolding: it is deleted as part of the implementation, so `docs/specs/` never accumulates on the default branch — anything worth keeping (design decisions, domain rules) is routed to an ADR (`docs/adr/`) or a permanent domain document instead.
 
-Because the AI no longer creates review threads, the **fixer** naturally picks up only human and external-bot threads — GitHub stays the review transport exactly where a human sits.
+### Review: internal self-review (always) + GitHub guard (optional)
+
+Spec and implementation are symmetric (ADR 0008): both run a **mandatory internal self-review** before the PR opens, and both can enable an **optional external guard** on the opened PR.
+
+**Internal self-review** is an *internal loop* (ADR 0006): the author reviews its own work before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` a **review turn** reads the local diff and writes `{verdict, findings[]}`, applying every configured lens (`review.lenses`, default `correctness / tests / simplicity / security`); if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; past the cap the PR is published anyway (the guard / human merge gate is the backstop). Nothing is posted to the conversation — the review turn runs under the `self-reviewer` routing role (so it can be a different model than the author), and the outcome is recorded off the conversation timeline: a `meguri/self-review` commit status on the pushed head and a folded `<details>` in the PR body. Set `review.enabled = false` to skip it (e.g. an external bot covers reviews).
+
+**GitHub guard** is the optional external review, toggled per project × kind (`review.guard.plan` — on by default, the old spec reviewer — and `review.guard.impl` — off by default). It reviews the opened PR under an independent `pr-reviewer` routing role and records its verdict the same way — a `meguri/guard-review` commit status + a folded PR-body `<details>` — **never inline threads**, so the **fixer** never reacts to it and the AI↔AI ping-pong stays retired. The plan guard also drives the spec labels (clean → `spec-ready`). For a human, a red guard check is *advisory* (it does not block the merge unless you make `meguri/guard-review` a required check); for auto-merge it is a *gate* (below).
+
+Because the AI never creates review threads, the **fixer** naturally picks up only human and external-bot threads — GitHub stays the review transport exactly where a human sits.
 
 ### Cleaner (read-only repository sweeps)
 
 The **cleaner** loop periodically walks the default branch head and reports accumulated divergence — spec/implementation drift, dead-code candidates, convention violations, stranded TODOs, stale remote branches, orphaned `meguri:working` labels — into a single per-project issue labeled `meguri:clean-report`. It never fixes anything: its only write is creating/updating that one issue (no pushes, no branch operations, no labels or comments elsewhere). The body is a snapshot rewritten on every sweep, with a hidden head-sha marker so the same head is never swept twice; a moved head triggers a new sweep only after `clean.interval_hours`. To act on a finding, open a regular issue and label it `meguri:plan` / `meguri:ready`; to silence a false positive, add a substring to `clean.ignore`; to pause the loop, put `meguri:hold` on the report issue.
 
-Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the spec reviewer (and a transient **impl-review** pane while the worker self-reviews). After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
+### Reconcile (issue body edits are a re-attention signal)
+
+Once an issue has been shipped by a succeeded run, meguri stops rediscovering it — otherwise every poll would re-file the same work. But that suppression used to be permanent: editing the issue's description afterwards changed nothing. The **reconcile** loop makes the suppression *body-aware* (comparing a whitespace-normalized digest of the body, so a mere label change — which also bumps GitHub's `updatedAt` — is ignored, and a whitespace-only edit doesn't count). A materially edited body lifts the suppression and emits a durable `issue.body_changed` event (visible in `meguri logs`); a poll sweep also leaves one comment on the already-`implementing` issue nudging you to re-label it `meguri:ready` if a re-run is wanted.
+
+**A body edit is a signal, not a trigger.** It never launches an agent on its own — the execution gate stays the collaborator-applied phase label (the same [label gate](#labels) that bounds prompt-injection: "who can get an agent to execute" = "who has write access"). Editing the body only makes the issue *eligible* again; a collaborator still has to (re-)apply `meguri:ready`. Both the signal and the comment fire at most once per distinct new body, so a pending edit never floods the log. Turn the whole loop off with `reconcile.body_edits = false`, or keep detection but silence the comment with `reconcile.signal_comment = false`.
+
+Labels and comments on GitHub are the durable workflow state (looper's "Authority" principle); the local sqlite (`~/.meguri/meguri.sqlite`) only tracks run execution. Kill meguri any time — `meguri watch` recovers: live panes are re-adopted, dead runs resume from their last checkpointed step. Panes, sessions, and worktrees live per issue — one **author** pane shared by every branch-editing loop (planner → worker/spec worker → fixer/ci fixer/conflict resolver continue in the same live claude session) plus one independent **review** pane for the guard (and a transient **impl-review** pane while a run self-reviews). After every completed turn meguri saves the agent's native session id on the issue's lane, so even if a pane dies while idle, the next run resumes the same conversation (`claude --resume <id>`); while watching, meguri reclaims the panes, worktree, and merged local branch of every issue that closes. `meguri prune` does the same on demand for one-shot usage.
 
 Per-loop lifetimes at a glance:
 
 | loop | trigger | key | worktree | normal end | pane |
 |---|---|---|---|---|---|
-| planner (author) | `meguri:plan` issue | issue | new branch | spec PR → `spec-reviewing` | kept |
-| spec reviewer (review) | `spec-reviewing` PR, head unreviewed | issue + `review` | read-only detached, fixed at `review-<issue>` | clean → `spec-ready` / findings → wait for push | kept (independent) |
-| spec worker (author) | `spec-ready` PR | issue (from branch) | takes over the PR branch | implementation → same PR | kept — continues the author pane |
+| planner (author) | `meguri:plan` issue | issue | new branch | self-review → spec PR → `spec-reviewing` | kept |
+| guard (review) | guardable PR (spec or impl), head unguarded | issue + `review` | read-only detached, fixed at `guard-<issue>` | `meguri/guard-review` status + PR-body `<details>`; plan clean → `spec-ready` | kept (independent) |
+| spec worker (author) | `spec-ready` PR (combined delivery only) | issue (from branch) | takes over the PR branch | implementation → same PR | kept — continues the author pane |
 | worker (author) | `meguri:ready` issue | issue | new branch | self-review → PR `Closes #N` | kept |
 | fixer (author) | unresolved PR threads | issue (from branch) | attached to the PR head | replies on threads for re-review | kept — continues the author pane |
 | ci fixer (author) | red CI on a meguri PR | issue (from branch) | attached to the PR head | fix pushed (≤3 rounds) | kept — continues the author pane |
@@ -228,7 +244,7 @@ Per-loop lifetimes at a glance:
 
 meguri never decides "safe to merge" — it arms GitHub-native auto-merge (`gh pr merge --auto`) on eligible PRs and lets GitHub (branch protection + required checks) decide when to merge (see `docs/adr/0003-auto-merge-github-native-arm-only.md`). It is off by default and gated behind two opt-ins: the master switch `[pr.auto_merge].enabled`, and (unless `opt_in = "all"`) the `meguri:automerge` label. Put the label on an *issue* and the worker copies it onto the PR (opening that PR non-draft); put it straight on a PR and it works too.
 
-Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meguri/` branch linked to its issue via `Closes #N.`; it carries no `meguri:hold` / `meguri:needs-human` / `meguri:working` / `meguri:spec-reviewing` / `meguri:spec-ready` label (auto-merge never fires mid-spec); it has zero unresolved review threads; and the repository allows auto-merge with the configured strategy (and, when required, required-checks branch protection). The arm is pinned to the reviewed head with `--match-head-commit`, and a marker comment (`<!-- meguri:automerge armed head=<sha> -->`) makes it idempotent and respects a human who later disables auto-merge — that head is never re-armed (a new push re-evaluates). If GitHub already reports the PR mergeable when meguri goes to arm it, meguri finalizes the merge on GitHub's own verdict instead.
+Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meguri/` branch linked to its issue via `Closes #N.`; it carries no `meguri:hold` / `meguri:needs-human` / `meguri:working` / `meguri:spec-reviewing` / `meguri:spec-ready` label (auto-merge never fires mid-spec); it has zero unresolved review threads; and the repository allows auto-merge with the configured strategy (and, when required, required-checks branch protection). When the **impl guard** is enabled it is a gate (ADR 0008): the sweep only arms a head whose `meguri/guard-review` status is success — a failure escalates to `meguri:needs-human`, an absent/pending status simply waits (and with the guard disabled there is no status to require, so nothing deadlocks). The arm is pinned to the reviewed head with `--match-head-commit`, and a marker comment (`<!-- meguri:automerge armed head=<sha> -->`) makes it idempotent and respects a human who later disables auto-merge — that head is never re-armed (a new push re-evaluates). If GitHub already reports the PR mergeable when meguri goes to arm it, meguri finalizes the merge on GitHub's own verdict instead.
 
 ```toml
 [pr.auto_merge]
@@ -239,7 +255,7 @@ require_branch_protection = true # refuse to arm without required-checks branch 
 opt_in = "label"                 # label (needs meguri:automerge) | all (every eligible meguri PR)
 ```
 
-When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). Note also the review gap until auto-merge 3/3: the reviewer gate (`require_clean_review`) that makes meguri's own review a precondition arrives in a later issue, so until then an opt-in PR can merge on green required checks before meguri has reviewed it — rely on branch protection for the bar you want.
+When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). To make meguri's own review a merge precondition, enable the **impl guard** (`review.guard.impl = true`): auto-merge then only arms a PR whose `meguri/guard-review` status is success (ADR 0008). With the impl guard off there is no such gate, so an opt-in PR can merge on green required checks before meguri has externally reviewed it — rely on branch protection (and the mandatory internal self-review) for the bar you want.
 
 **`mode` — native vs orchestrator.** The default `native` is described above: meguri only arms, GitHub decides. But **private repos on the Free plan cannot enable "Allow auto-merge" at all** (the API silently ignores the PATCH) and have no branch protection, so `native` always fails fast there — the same constraint meguri itself hit in `docs/adr/0004-automerge-gate-renovate-side-on-free-private.md`. `mode = "orchestrator"` is the fallback for exactly those repos: the eligibility gate is identical (same branch / link / label / thread checks), but instead of arming, **meguri merges the PR itself** (`gh pr merge --squash`-equivalent, pinned to the reviewed head) as soon as GitHub reports it `MERGEABLE`. `CONFLICTING` goes to the conflict-resolver and `UNKNOWN` waits for the next sweep. Because there is no server-side gate, orchestrator mode **explicitly accepts meguri's own pre-PR verification (`check_command` + self-review) as the only gate** (`docs/adr/0009-auto-merge-orchestrator-side-merge-on-free-private.md`); `meguri doctor` prints a reminder to that effect. Orchestrator mode requires `require_branch_protection = false` (config validation rejects the contradiction). Keep `native` wherever "Allow auto-merge" *can* be enabled — a server-side gate is always stronger than an in-process one.
 
@@ -312,12 +328,41 @@ stale_branch_days = 30  # remote branches older than this are reported as stale
 ignore = []             # substrings that silence false positives; override per project with [projects.clean]
 
 [review]
-enabled = true    # kill switch for the worker's self-review phase (internal AI review of the diff)
+enabled = true    # kill switch for the internal self-review phase (plan + impl)
 max_rounds = 3    # max self-review rounds per run; past the cap the PR is published as-is
+lenses = ["correctness", "tests", "simplicity", "security"]  # the multi-lens perspectives (ADR 0008)
 # (the old impl_enabled / impl_max_rounds keys still load as aliases)
+
+[review.guard]    # the optional external GitHub guard review, per kind (ADR 0008)
+plan = true       # guard the spec/ADR PR (the old mandatory spec reviewer) — on by default
+impl = false      # guard the implementation PR — off by default (opt-in; external-bot compatible)
+
+[reconcile]
+body_edits = true      # detect that a shipped issue's body was edited and treat it as a re-attention signal
+signal_comment = true  # also leave a "re-label meguri:ready" nudge comment (false = the durable event only)
 ```
 
+Plan-first delivery is chosen per project with `plan_delivery` (default `separate` = two PRs; `combined` = the #98 one-PR morph); like `[pr]` and `[clean]`, `[projects.review]` overrides the whole `[review]` section at once.
+
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
+
+### Workspaces — related projects, cross-repo decomposition (optional)
+
+A **workspace** is a static grouping of related projects (a repo split/merge, an API + its client, a repo-designed greenfield). It is purely declarative — no runtime state, and it **never appears in the execution path** (worktree, pane, branch, and verification are unchanged; a `run` stays single-repo). Opt-in: a config with no `[[workspaces]]` behaves exactly as before.
+
+```toml
+[[workspaces]]
+id = "shop"
+projects = ["shop-api", "shop-web", "shop-infra"]   # each must be a defined [[projects]] id; a project joins at most one workspace
+```
+
+A workspace does exactly three things:
+
+1. **Decompose scope** — the planner's decompose ending ([spec-first flow](#spec-first-flow-opt-in)) may file a child issue into a workspace sibling by setting `"project": "<sibling id>"` on the child (default: the parent's own repo). The parent (tracking) issue always stays in its own repo. A child that names a repo outside the workspace is rejected — issue-filing scope lives in config (the host operator), never in the issue body (a write-privileged input), which keeps "who runs work" and "who decides scope" separate (ADR 0009).
+2. **Cross-repo ordering** — meguri wires GitHub-native `blocked_by` across sibling repos, so a child in one repo can block a child in another; discovery's existing dependency gate then sequences them (an unreadable blocker stays blocking, the safe side).
+3. **Display grouping** — `meguri ps` / `meguri top` group their rows by workspace.
+
+For a step meguri cannot perform itself (creating a repo, changing visibility, rewriting history, …), a decompose child with `"kind": "human"` is filed with **no trigger label**: discovery never drives it, and a human closes it — unblocking its dependents. `meguri doctor` lists each workspace and its members. See ADR 0009 for the rationale.
 
 ### Worktree setup hook (optional)
 
@@ -331,11 +376,44 @@ required = false                           # true escalates a failing command to
 timeout_secs = 300                         # per-command; commands may fetch over the network
 ```
 
-Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `guard`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+
+### Scheduled enqueue (`[[projects.schedules]]`, optional)
+
+For time-driven operation — a daily production task, a weekly tidy — a project can carry cron **schedules** that periodically enqueue work. A schedule only *puts one item on the queue* (a labeled issue in github mode, a local task in local mode); the existing worker/planner loops consume it exactly as if you had filed it by hand. meguri does **not** run arbitrary commands on a timer — enqueue is the whole job, execution stays the loops' (ADR 0009). This makes it the recurring-work counterpart to `meguri add`, evaluated by `meguri watch` on every poll tick.
+
+```toml
+[[projects.schedules]]
+name = "daily-tidy"              # unique within the project
+cron = "0 9 * * *"              # standard 5-field cron, interpreted as UTC
+kind = "ready"                  # "ready" → worker (meguri:ready) | "plan" → planner (meguri:plan, github only)
+title = "Daily tidy {{date}}"  # template; the only variable is {{date}} (the fire date, YYYY-MM-DD UTC)
+body_file = "ops/daily-tidy.md" # repo-relative body file — or `body = "..."` inline (exactly one)
+# allow_overlap = false         # default: skip firing while this schedule's last issue/task is still open
+```
+
+- **Cron is UTC** and evaluated at poll-interval granularity (5 fields: minute hour day-of-month month day-of-week; `*`, ranges, `*/n` steps, and lists supported). Want local time? Offset the expression yourself; a per-schedule timezone is a later addition.
+- **Catch-up is folded.** The last-fired time is persisted in sqlite (not config, so a hot-reload edit to the definition never loses it). If `watch` was down across several occurrences, the schedule fires **once** on the next tick, not once per missed occurrence — the cron-daemon rule. A newly-added schedule never backfills the past: its first tick just records "seen".
+- **Overlap guard.** By default a schedule skips (but still consumes that occurrence — no backfill when it later closes) while its previous issue/task is still open, so a slow item doesn't pile up duplicates. Set `allow_overlap = true` to fire every occurrence regardless.
+- **Provenance.** Each fired item carries a hidden `<!-- meguri:schedule name=<name> -->` marker in its body (local tasks also get `origin = schedule:<name>`).
+- Definitions are hot-reloaded (#73): add or change a schedule and it takes effect on the next tick, no `watch` restart. `meguri doctor` validates the cron expression, name uniqueness, body exclusivity, and `body_file` existence; `meguri schedules` lists each definition with its last and next fire.
+
+Since local mode has no planner, `kind = "plan"` is github-only — a local `plan` schedule is rejected at config load (the task would never be consumed).
 
 ### Role-based agent routing (optional)
 
-By default every role — planner, spec-reviewer, impl-reviewer, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+`[routing.roles]` steers **6 routing roles** — the "which model should do this kind of work?" question a human actually asks. They are coarser than the internal loop kinds (`runs.loop_kind`, still tracked one-per-loop for budget counting and `meguri stats routing`); several loop kinds share a role's cost/quality shape:
+
+| role | question | internal loop(s) / phase |
+|---|---|---|
+| `planner` | plan / write the spec | `planner` |
+| `worker` | implement | `worker`, `spec-worker` |
+| `fixer` | make a PR mergeable | `fixer`, `ci-fixer`, `conflict-resolver` |
+| `self-reviewer` | internal review before the PR is public | the self-review phase (inside the worker/planner flow) |
+| `pr-reviewer` | advisory review on a published PR (auto-merge gate) | the guard loop |
+| `cleaner` | hygiene sweep | `cleaner` |
+
+By default every role runs the single `[agent]` profile (now named the `default` profile); you can define **named profiles** and route each role to a different CLI/model. The planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs — so routing keys on the role, not on an estimated issue difficulty.
 
 ```toml
 # A profile is one CLI's launch bundle — same shape as [agent].
@@ -357,15 +435,15 @@ resume_args = ["resume"]
 mode = "auto"        # auto | manual (default auto once [routing] exists)
 
 [routing.roles]      # explicit picks always beat auto; per-role overrides
-spec-reviewer = "codex"   # (the old `reviewer` key still works as an alias)
-# impl-reviewer = "codex"  # the model for the worker's internal self-review turn
+pr-reviewer = "codex"     # (the old `reviewer` / `spec-reviewer` / `guard` keys still work as aliases)
+# self-reviewer = "codex"  # the model for the internal self-review turn (plan + impl)
 # worker = "claude-sonnet"
 ```
 
 - **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
-- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, spec-reviewer/impl-reviewer → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **auto** applies a built-in 2026-07 recommendation table (`planner` → `claude-opus`, `self-reviewer`/`pr-reviewer` → `codex` then `claude-opus`, `worker`/`fixer` → `claude-sonnet`, `cleaner` → `default`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
 - **manual** turns the table off: roles you don't list run `default`.
-- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
+- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected). Config keys from before the role redesign (`reviewer`, `spec-reviewer`, `guard`, `impl-reviewer`, `self-review`, `spec-worker`, `conflict-resolver`, `ci-fixer`) still resolve as aliases of the new names.
 - The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
 
 ## Development
@@ -395,7 +473,7 @@ Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A re
 
 ## Status / roadmap
 
-Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → spec PR), the **spec reviewer** (`meguri:spec-reviewing` PR → summary review → `meguri:spec-ready`), the **spec worker** (`meguri:spec-ready` PR → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). AI review of the *implementation* diff is no longer a loop but an internal phase of the worker (**self-review**, ADR 0006): it runs in the run's worktree and never touches the forge.
+Eight loops run on GitHub today, mirroring looper's role model as `Loop` implementations sharing the same turn engine: the **worker** (issue → self-review → PR), the **planner** (`meguri:plan` issue → self-review → spec PR), the **guard** (a guardable PR, spec or impl → summary review recorded as a `meguri/guard-review` commit status + a folded PR-body `<details>`; the plan guard also flips `spec-reviewing → spec-ready`), the **spec worker** (`meguri:spec-ready` PR under combined delivery → implementation commits on the same branch and PR), the **fixer** (unresolved review comments on a meguri PR → fix commits pushed to it), the **ci fixer** (a meguri PR whose CI checks settled red → failed job logs fed to the agent → fix commits pushed; a PR still red after 3 fix rounds escalates to `meguri:needs-human`), the **conflict resolver** (a CONFLICTING meguri PR → the base branch merged, conflicts resolved, merge commit pushed), and the **cleaner** (periodic read-only sweep → divergence report in a single `meguri:clean-report` issue). The mandatory internal **self-review** (ADR 0006/0008) is not a loop but a phase both the worker and planner run in the run's worktree before the PR opens; a light **handoff** sweep advances separate-delivery specs (`speccing → ready` once the spec PR merges). Both are off the conversation timeline.
 
 **Versioning.** meguri is pre-1.0 (`0.x`) and follows [SemVer](https://semver.org): while on `0.x` the public API and CLI are not yet stable, so a minor bump (`0.y`) may carry breaking changes and patches (`0.y.z`) stay compatible; `1.0.0` is when stability is promised. Pin an exact version if you depend on current behavior.
 

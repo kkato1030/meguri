@@ -59,6 +59,13 @@ impl super::Loop for SpecWorkerLoop {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // PR loops are inert in local mode
         }
+        // The branch-takeover morph is the *combined* delivery (ADR 0008). In
+        // separate delivery the spec PR is standalone (the handoff sweep flips
+        // the issue to `ready` and the worker implements in a fresh PR), so the
+        // spec worker stays out.
+        if deps.project.plan_delivery != crate::config::PlanDelivery::Combined {
+            return Ok(Vec::new());
+        }
         let prs = deps
             .forge()
             .list_prs_with_label(forge::LABEL_SPEC_READY)
@@ -74,7 +81,30 @@ impl super::Loop for SpecWorkerLoop {
             let Some(issue) = gitops::issue_from_branch(&pr.head_branch) else {
                 continue; // human-made head: not meguri's to take over
             };
-            if deps
+            // Body-aware suppression (issue #142, half A): a succeeded takeover
+            // suppresses re-discovery only while the issue body is unchanged.
+            // Editing the issue body lifts it (and signals the edit once), so a
+            // human re-triggering the spec-ready takeover after a body edit is
+            // no longer permanently blocked. `body_edits = false` restores the
+            // old permanent suppression.
+            if deps.config.reconcile.body_edits {
+                let digest = crate::tasks::body_digest(&deps.forge().get_issue(issue).await?.body);
+                if deps.store.issue_processed_current_body(
+                    &deps.project.id,
+                    KIND,
+                    issue,
+                    &digest,
+                )? {
+                    continue;
+                }
+                if deps
+                    .store
+                    .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
+                {
+                    deps.store
+                        .signal_body_changed_event(&deps.project.id, KIND, issue, &digest)?;
+                }
+            } else if deps
                 .store
                 .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
             {
@@ -97,6 +127,37 @@ pub async fn run_spec_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome>
     flow::run_flow(deps, run_id, &SpecWorkerFlavor).await
 }
 
+/// The "# Reviewed spec" prompt section for a worktree that carries a landed
+/// spec (separate delivery, ADR 0008 finding 1), including the deletion
+/// instruction; `None` when no spec file is present (a normal issue with no
+/// plan, which degrades to the ordinary flow). Shared with the normal worker so
+/// both entrances read and prune the spec identically.
+pub fn reviewed_spec_section(worktree: &Path, issue: i64) -> Option<String> {
+    let spec_path = super::planner::spec_rel_path(issue);
+    let spec = std::fs::read_to_string(worktree.join(&spec_path)).ok()?;
+    Some(format!(
+        "# Reviewed spec (`{spec_path}`)\n\n{spec}\n\n\
+         The approach above was already reviewed and merged — follow it. The \
+         spec is disposable review scaffolding: once the implementation is \
+         complete, delete `{spec_path}` and commit the deletion (it must not \
+         survive onto the default branch).\n\n"
+    ))
+}
+
+/// The disposable-spec check: a spec that survived implementation gets a
+/// corrective turn. Shared with the normal worker under separate delivery.
+pub fn verify_spec_pruned(worktree: &Path, issue: i64) -> std::result::Result<(), String> {
+    let spec = super::planner::spec_rel_path(issue);
+    if worktree.join(&spec).is_file() {
+        Err(format!(
+            "- spec file `{spec}` still exists (it is disposable review \
+             scaffolding: delete it and commit the deletion)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The open spec-ready PR whose head branch encodes `issue`, if any.
 async fn spec_ready_pr(deps: &Deps, issue: i64) -> Result<Option<PullRequest>> {
     Ok(deps
@@ -115,6 +176,20 @@ impl Flavor for SpecWorkerFlavor {
     /// it on the PR (not an issue).
     fn trigger_label(&self) -> &'static str {
         forge::LABEL_SPEC_READY
+    }
+
+    /// The combined-delivery takeover self-reviews its implementation diff
+    /// before advancing the spec PR into an implementation PR (ADR 0011).
+    /// ADR 0008 made the internal self-review mandatory on both sides of the
+    /// symmetric loop, but the spec worker opens no PR of its own, so the
+    /// literal "once before the PR opens" left the combined impl diff
+    /// unreviewed. Reading the rule as "once before advancing the public
+    /// state" puts this takeover on the review side too: the self-review reads
+    /// the diff against the default branch, and since the spec is pruned in
+    /// `execute`, that diff is the combined content actually shipped (ADR +
+    /// implementation code). Symmetric with the worker and the planner.
+    fn self_reviews(&self) -> bool {
+        true
     }
 
     /// Claim the spec PR (labels live on the PR, the run is keyed by the
@@ -296,8 +371,9 @@ impl Flavor for SpecWorkerFlavor {
         deps.forge()
             .update_pr_title(pr, &self.pr_title(run, cp))
             .await?;
+        let lenses = &deps.config.review_for(&deps.project).lenses;
         deps.forge()
-            .update_pr_body(pr, &flow::compose_pr_body(run, cp))
+            .update_pr_body(pr, &flow::compose_pr_body(run, cp, lenses, true))
             .await?;
         deps.store.emit(
             Some(&run.id),
@@ -460,6 +536,14 @@ mod tests {
     }
 
     #[test]
+    fn spec_worker_self_reviews_its_combined_impl_diff() {
+        // ADR 0011: the combined-delivery takeover must run the internal
+        // self-review over its implementation diff, symmetric with the worker
+        // and planner. A false here reopens the gap ADR 0008 set out to close.
+        assert!(SpecWorkerFlavor.self_reviews());
+    }
+
+    #[test]
     fn verify_base_is_the_pr_branch_tip() {
         let deps = fake_deps();
         let run = fake_run(7);
@@ -495,7 +579,10 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: Default::default(),
+            schedules: Vec::new(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

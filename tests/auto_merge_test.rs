@@ -7,10 +7,11 @@ use std::sync::Arc;
 use meguri::config::{AutoMergeMode, AutoMergeOptIn, Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::auto_merger::{ARMED_MARKER_PREFIX, armed_marker, sweep};
+use meguri::engine::guard::GUARD_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_SPEC_REVIEWING, MergePolicy, MergeStrategy,
-    MergeableState,
+    CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_REVIEWING,
+    MergePolicy, MergeStrategy, MergeableState,
 };
 
 /// A Deps over the given forge with auto-merge enabled (label opt-in, squash).
@@ -29,7 +30,10 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         worktree_root: None,
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
@@ -76,6 +80,82 @@ async fn arms_when_all_conditions_met() {
         "marker comment posted: {comments:?}"
     );
     assert!(comments.iter().any(|c| c.contains("arm しました")));
+}
+
+/// Deps with the impl guard enabled (so the auto-merger applies the guard gate).
+fn deps_with_guard(forge: Arc<FakeForge>) -> Deps {
+    let mut deps = deps_with(forge);
+    deps.config.review.guard.impl_enabled = true;
+    deps
+}
+
+#[tokio::test]
+async fn guard_gate_arms_on_a_success_status() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(pr),
+        Some((MergeStrategy::Squash, "sha-head".into())),
+        "a green guard status lets the arm proceed"
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(forge.armed_of(pr), None, "a red guard status blocks arming");
+    let labels = forge.pr_labels_of(pr);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
+    assert!(
+        forge
+            .pr_comments_of(pr)
+            .iter()
+            .any(|c| c.contains("guard review"))
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_waits_when_status_absent() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head"); // no guard status posted yet
+    let deps = deps_with_guard(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(forge.armed_of(pr), None, "no status yet: wait, don't arm");
+    // Waiting is silent — no escalation while the guard has not run.
+    assert!(
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "an absent status must not escalate"
+    );
+}
+
+#[tokio::test]
+async fn guard_gate_is_skipped_when_impl_guard_disabled() {
+    // The default (impl guard off): the auto-merger arms without any status,
+    // never demanding one that nothing produces (no ADR-0007 deadlock).
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    let deps = deps_with(forge.clone()); // impl guard stays off
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(pr),
+        Some((MergeStrategy::Squash, "sha-head".into()))
+    );
 }
 
 #[tokio::test]
@@ -490,10 +570,24 @@ async fn orchestrator_does_not_merge_blocked_or_threaded_prs() {
     let forge = Arc::new(FakeForge::default());
 
     // On hold, but otherwise mergeable.
-    forge.add_pr(1, "Held", "Closes #1.\n", &[LABEL_AUTOMERGE, LABEL_HOLD], "meguri/1-x", "s1");
+    forge.add_pr(
+        1,
+        "Held",
+        "Closes #1.\n",
+        &[LABEL_AUTOMERGE, LABEL_HOLD],
+        "meguri/1-x",
+        "s1",
+    );
     forge.set_pr_mergeable(1, MergeableState::Mergeable);
     // Unresolved review thread (self-review not accepted), otherwise mergeable.
-    forge.add_pr(2, "Threaded", "Closes #2.\n", &[LABEL_AUTOMERGE], "meguri/2-x", "s2");
+    forge.add_pr(
+        2,
+        "Threaded",
+        "Closes #2.\n",
+        &[LABEL_AUTOMERGE],
+        "meguri/2-x",
+        "s2",
+    );
     forge.set_pr_mergeable(2, MergeableState::Mergeable);
     forge.add_review_thread(2, "t1", "src/lib.rs", "reviewer", "please fix");
 

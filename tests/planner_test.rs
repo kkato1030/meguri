@@ -3,12 +3,12 @@
 //! `meguri:spec-reviewing`. A scripted "agent" plays the pane side (same
 //! protocol as worker_test).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, ProjectConfig, WorkspaceConfig};
 use meguri::engine::planner::{
     self, DECOMPOSED_MARKER, PlannerLoop, decompose_child_footer, run_planner, spec_rel_path,
 };
@@ -16,8 +16,8 @@ use meguri::engine::worker;
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_SPEC_REVIEWING,
-    LABEL_SPECCING, LABEL_WORKING,
+    Forge, ForgeFactory, Issue, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY,
+    LABEL_SPEC_REVIEWING, LABEL_SPECCING, LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -70,6 +70,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    // These planner tests don't exercise the self-review phase (ADR 0008); the
+    // dedicated self-review test enables it explicitly.
+    config.review.enabled = false;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -82,7 +85,10 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let deps = Deps::with_label_source(
@@ -284,7 +290,10 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
         "branch must follow the worker naming convention: {}",
         prs[0].head
     );
-    assert!(prs[0].body.contains("Closes #5"));
+    // Separate delivery (the default, ADR 0008): the spec PR uses a
+    // non-closing reference so merging it does not close the issue.
+    assert!(prs[0].body.contains("Refs #5"));
+    assert!(!prs[0].body.contains("Closes #5"));
     assert!(prs[0].draft, "pr.draft defaults to true");
     assert!(
         prs[0].labels.contains(&LABEL_SPEC_REVIEWING.to_string()),
@@ -316,6 +325,8 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     assert!(execute_prompt.contains(&spec_rel_path(5)));
     assert!(execute_prompt.contains("do NOT implement"));
     assert!(execute_prompt.contains("# Pull request description"));
+    // The adaptive spec-depth section rides along (issue #133).
+    assert!(execute_prompt.contains("# Spec depth"));
 
     // The spec branch actually landed on origin (the worker resumes there).
     let clone = &env.deps.project.repo_path;
@@ -325,6 +336,69 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     assert!(
         branches.contains("meguri/5-add-caching-layer-"),
         "{branches}"
+    );
+}
+
+/// The planner self-reviews its spec/ADR before opening the spec PR (ADR 0008,
+/// acceptance criterion 1): a review turn runs (in the self-review lane), and
+/// the folded `<details>` inspection history rides the spec PR body.
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_self_reviews_the_spec_before_opening_the_pr() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = std::fs::read_to_string(wt.join(format!(".meguri/prompt-{turn_id}.md")))
+                .unwrap_or_default();
+            if prompt.contains("self-review round") {
+                // A clean spec review: write the verdict file, touch nothing.
+                let body = serde_json::json!({
+                    "verdict": "clean", "review": "spec looks sound", "findings": [],
+                });
+                std::fs::write(
+                    wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+                    body.to_string(),
+                )
+                .unwrap();
+            } else {
+                commit_spec(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id))
+        .await
+        .expect("planner timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    // A self-review actually ran (the plan side is symmetric now, ADR 0008).
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.reviewed".to_string()),
+        "planner must self-review the spec: {kinds:?}"
+    );
+
+    // The spec PR body folds the self-review inspection history.
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(
+        prs[0].body.contains("<details>") && prs[0].body.contains("self-review"),
+        "spec PR body must fold a self-review summary: {}",
+        prs[0].body
     );
 }
 
@@ -476,6 +550,227 @@ async fn planner_decompose_files_children_with_deps_labels_and_parent_comment() 
         .expect("execute prompt exists");
     assert!(execute_prompt.contains("# Too big for one spec?"));
     assert!(execute_prompt.contains(r#""status": "decompose""#));
+}
+
+/// A [`ForgeFactory`] backed by a slug→FakeForge map: the cross-repo
+/// decomposition path resolves a workspace sibling's forge through it (#154).
+struct MapForgeFactory {
+    map: HashMap<String, Arc<FakeForge>>,
+}
+
+impl ForgeFactory for MapForgeFactory {
+    fn for_slug(&self, slug: &str) -> Arc<dyn Forge> {
+        self.map
+            .get(slug)
+            .cloned()
+            .map(|f| f as Arc<dyn Forge>)
+            .unwrap_or_else(|| panic!("no fake forge registered for slug {slug}"))
+    }
+}
+
+/// A planner env whose project `proj` (repo `me/proj`) is in a workspace with
+/// a sibling `sib` (repo `me/sib`), each backed by its own FakeForge so the
+/// cross-repo issue-filing path is exercised end-to-end (#154).
+async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
+    let root = tempfile::tempdir().unwrap();
+    let (_origin, clone) = init_origin_and_clone(root.path()).await;
+    let worktree_root = root.path().join("worktrees");
+
+    let parent = Arc::new(FakeForge::with_slug("me/proj"));
+    parent.issues.lock().unwrap().push(Issue {
+        number: 5,
+        title: "Split shop into api and web".into(),
+        body: "Big cross-repo change.".into(),
+        labels: vec![LABEL_PLAN.into()],
+    });
+    let sibling = Arc::new(FakeForge::with_slug("me/sib"));
+
+    let mut config = Config::default();
+    config.limits.idle_grace_secs = 3600;
+    config.limits.result_grace_secs = 1;
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(worktree_root.clone()),
+        pr: None,
+        clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+    };
+    let sibling_project = ProjectConfig {
+        id: "sib".into(),
+        repo_path: root.path().join("sib-unused"),
+        repo_slug: Some("me/sib".into()),
+        ..project.clone()
+    };
+    config.projects = vec![project.clone(), sibling_project];
+    config.workspaces = vec![WorkspaceConfig {
+        id: "shop".into(),
+        projects: vec!["proj".into(), "sib".into()],
+    }];
+
+    let factory = Arc::new(MapForgeFactory {
+        map: HashMap::from([
+            ("me/proj".to_string(), parent.clone()),
+            ("me/sib".to_string(), sibling.clone()),
+        ]),
+    });
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        parent.clone(),
+        config,
+        project,
+    )
+    .with_forge_factory(factory);
+    (
+        TestEnv {
+            deps,
+            forge: parent,
+            root,
+            worktree_root,
+        },
+        sibling,
+    )
+}
+
+/// Decompose with a sibling-repo child and a human node: child 0 in the parent
+/// repo, child 1 in sibling `sib`, child 2 a `human` node — all chained.
+fn write_cross_repo_decompose_result(worktree: &Path, turn_id: &str) {
+    let result = serde_json::json!({
+        "turn_id": turn_id, "status": "decompose",
+        "summary": "api and web move together; the shared repo is a human step",
+        "children": [
+            {"title": "API side change", "body": "Change the API.", "kind": "ready"},
+            {"title": "Web side change", "body": "Follow the API.", "kind": "ready",
+             "blocked_by": [0], "project": "sib"},
+            {"title": "Create shared infra repo", "body": "meguri can't do this.",
+             "kind": "human", "blocked_by": [0, 1]},
+        ],
+    });
+    std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_decompose_files_cross_repo_child_and_human_node() {
+    let (env, sibling) = setup_cross_repo().await;
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_cross_repo_decompose_result(wt, turn_id);
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id))
+        .await
+        .expect("planner timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Decomposed(_)));
+
+    // Parent repo holds the parent + the two same-repo children (api + human);
+    // the sibling child was filed in the sibling repo's forge.
+    let parent_issues = env.forge.all_issues();
+    assert_eq!(
+        parent_issues.len(),
+        3,
+        "parent + api + human: {parent_issues:?}"
+    );
+    let api = &parent_issues[1];
+    let human = &parent_issues[2];
+    assert_eq!(api.title, "API side change");
+    assert!(api.labels.contains(&LABEL_READY.to_string()));
+    // The human node is filed with NO trigger label so discovery never drives
+    // it — a person closes it, unblocking dependents (#154).
+    assert_eq!(human.title, "Create shared infra repo");
+    assert!(
+        human.labels.is_empty(),
+        "human node labels: {:?}",
+        human.labels
+    );
+
+    let sib_issues = sibling.all_issues();
+    assert_eq!(
+        sib_issues.len(),
+        1,
+        "web child in the sibling repo: {sib_issues:?}"
+    );
+    let web = &sib_issues[0];
+    assert_eq!(web.title, "Web side change");
+    assert!(web.labels.contains(&LABEL_READY.to_string()));
+    // A cross-repo child references the parent as `owner/repo#N` so the link
+    // resolves back to the parent's repo, not a same-numbered sibling issue.
+    assert!(web.body.contains("me/proj#5"), "web body: {}", web.body);
+    assert!(web.body.contains(DECOMPOSED_MARKER));
+
+    // Dependency wiring spans repos: the web child (in sib) waits on the api
+    // child (in proj); the parent waits on all three children.
+    assert_eq!(sibling.blockers_of(web.number), vec![api.number]);
+    let parent_blockers = env.forge.blockers_of(5);
+    assert!(parent_blockers.contains(&api.number));
+    assert!(parent_blockers.contains(&web.number));
+    assert!(parent_blockers.contains(&human.number));
+
+    // The rationale comment on the parent names the cross-repo child qualified.
+    let comments = env.forge.comments_of(5);
+    assert_eq!(comments.len(), 1);
+    assert!(
+        comments[0].contains(&format!("me/sib#{}", web.number)),
+        "{}",
+        comments[0]
+    );
+
+    // The decompose prompt advertised the workspace scope + human kind.
+    let wt = find_worktree(&env.worktree_root).unwrap();
+    let execute_prompt = prompts_in(&wt)
+        .into_iter()
+        .find(|p| p.contains("# Issue:"))
+        .expect("execute prompt exists");
+    assert!(execute_prompt.contains("Cross-repo scope"));
+    assert!(execute_prompt.contains("workspace `shop`"));
+    assert!(execute_prompt.contains("`sib`"));
+    assert!(execute_prompt.contains(r#""human""#));
+}
+
+/// A child targeting a repo outside the parent's workspace is rejected and the
+/// whole decomposition escalates to a human — scope stays pinned to config.
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_decompose_rejects_out_of_scope_project() {
+    let (env, sibling) = setup_cross_repo().await;
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let result = serde_json::json!({
+            "turn_id": turn_id, "status": "decompose",
+            "summary": "tries to reach a repo it must not",
+            "children": [
+                {"title": "Sneaky", "body": "x", "kind": "ready", "project": "stranger"},
+            ],
+        });
+        std::fs::write(wt.join(".meguri/result.json"), result.to_string()).unwrap();
+    });
+    let result =
+        tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id)).await;
+    agent.abort();
+    assert!(
+        result.expect("planner timed out").is_err(),
+        "out-of-scope decompose must fail"
+    );
+
+    // No child was filed anywhere; the parent is escalated to a human.
+    assert_eq!(env.forge.all_issues().len(), 1);
+    assert!(sibling.all_issues().is_empty());
+    assert!(
+        env.forge
+            .labels_of(5)
+            .contains(&LABEL_NEEDS_HUMAN.to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,9 +1,12 @@
 # ADR 0003: エージェントの振り分けは役割ベース — 明示は auto に勝ち、失敗は起動時に大きな音を立てる
 
-- Status: accepted
+- Status: accepted(role の粒度は ADR 0011 で改訂 — 本 ADR の「役割ベースで振り分ける」
+  「明示は auto に勝つ」「推奨表は日付付きで焼き込む」という決定自体は現行のまま)
 - Date: 2026-07-12
 - Issue: #64
-- 関連: docs/specs/issue-64.md(routing 1/3。後段: 2/3 成果ベース検査、3/3 エスカレーション)
+- 関連: docs/specs/issue-64.md(routing 1/3。後段: 2/3 成果ベース検査、3/3 エスカレーション)、
+  docs/adr/0011-routing-role-6-kinds-of-work-independent-of-loop-kind.md
+  (role のキーを内部 loop kind から分離し6分類に改訂、issue #167)
 
 ## 文脈
 

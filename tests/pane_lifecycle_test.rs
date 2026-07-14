@@ -80,9 +80,12 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
