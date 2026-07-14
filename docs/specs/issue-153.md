@@ -75,7 +75,7 @@ findings park を「まず自動で直す」ループの欠落は #188 として
 3. 重複抑止は best-effort: 同一プロセス・throttle 窓内の再 park では再配送されない(既存 per-`run_id` throttle)。settle 再実行・デーモン再起動をまたぐ head 単位の厳密1回は**保証しない**(主要な決定 7)。
 4. `review.awaiting_human` イベントが emit される(verdict/head/pr を含む)。
 5. `meguri top` に該当 run が `▶` 強調行で出る(`Succeeded` でも、pane が無くても)。逆に `AwaitingHuman` が残っているだけの run は出ない: turn 側で人間待ちになったまま stop/cancel/failed/skipped で終わった run も、pr-reviewer 自身の turn linger(Impl / combined-Plan が runtime/quiet で awaiting_human → 同 run が Succeeded)も、`review.awaiting_human` イベントを持たないので拾わない。
-6. 次 head を push → 新 review 着手で、古い parked run の `interaction_state` がクリアされ、dashboard に残留しない。
+6. parked `interaction_state` は2つの契機でクリアされ、`meguri top` に残らない: **(a) 次 head 着手時** — 次 head を push → 新 review の `prepare_work`(claim)で、古い parked run の状態が落ちる。**(b) issue close 時** — `reaper::sweep` の pane 回収と同じ経路で状態が落ちる。(b) は clean park で次 head が来ないまま spec PR がマージされ issue が閉じる経路で効く。`list_parked_reviews()` は `review.awaiting_human` イベントを見続けるので、close 時に状態を落とさなければ、閉じた issue の parked run が dashboard に残ってしまう。
 7. **回帰なし:** clean 判定のラベル遷移(`spec-reviewing → spec-ready`)と findings 判定の `spec-reviewing` 維持は従来どおり。combined では clean で park シグナルが出ず、`spec_worker` の自動継続を妨げない。pr_reviewer(Impl) では park ヘルパは呼ばれない。
 8. notify 無効時 / webhook 未設定時も落ちない(best-effort、既存挙動どおり)。
 
@@ -86,7 +86,8 @@ findings park を「まず自動で直す」ループの欠落は #188 として
 - **unit(store):** `list_parked_reviews()` が「Succeeded + AwaitingHuman + `review.awaiting_human` イベント有り」の run を返し、active run・interaction 無しの run を返さないこと。除外ケースを必ず入れる: (a) **cancelled/failed/skipped + AwaitingHuman**(turn 側の人間待ちを stop、または異常終了)、(b) **Succeeded + AwaitingHuman だが `review.awaiting_human` イベント無し**(= park ヘルパ未実行の turn linger。pr-reviewer の run でも起きる)。どちらも返さないこと。クリア(`update_interaction_state(id, None)`)で消えること。
 - **integration(`pr_reviewer` settle findings):** `FakeForge` + `FakeMux` で plan PR の review=`findings` を通し、run が `Succeeded` + `interaction_state=AwaitingHuman`、notifier delivered==1、`review.awaiting_human` emit を確認(既存の `tests/pr_reviewer_test.rs` の道具立てをそのまま使える)。
 - **integration(`pr_reviewer` settle clean):** `plan_delivery=separate` では clean でも park シグナル(interaction_state + notify)が出ること。`combined` では出ず、`spec-ready` 遷移だけが起きること。
-- **clearing:** 同一 issue の2回目 head の `prepare_work`(claim)で prior parked run の `interaction_state` が None に落ちること。
+- **clearing(次 head):** 同一 issue の2回目 head の `prepare_work`(claim)で prior parked run の `interaction_state` が None に落ち、`list_parked_reviews()` から消えること。
+- **clearing(issue close):** parked run のある issue が close → `reaper::sweep` で `interaction_state` が None に落ち、`list_parked_reviews()` から消えること(次 head が来ない clean park → マージ → close の経路を担保)。
 - **回帰(impl):** `Kind::Impl` の findings では park ヘルパが呼ばれないこと。
 
 ## Done の目安
