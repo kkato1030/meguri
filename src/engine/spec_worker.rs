@@ -78,6 +78,11 @@ impl super::Loop for SpecWorkerLoop {
             {
                 continue;
             }
+            // A reviewed decomposition proposal is not implemented here — the
+            // materializer sweep files its children instead (issue #134).
+            if super::planner::is_decompose_proposal(&pr.body) {
+                continue;
+            }
             let Some(issue) = gitops::issue_from_branch(&pr.head_branch) else {
                 continue; // human-made head: not meguri's to take over
             };
@@ -591,5 +596,54 @@ mod tests {
             crate::config::Config::default(),
             project,
         )
+    }
+
+    #[tokio::test]
+    async fn discover_excludes_decompose_proposal_prs() {
+        use crate::engine::Loop;
+        use std::sync::Arc;
+        let forge = Arc::new(crate::forge::fake::FakeForge::default());
+        // A proposal PR (marked) and an ordinary spec PR, both spec-ready on
+        // meguri branches with their issues seeded.
+        for (issue, num, marked) in [(5i64, 50i64, true), (6, 60, false)] {
+            forge.issues.lock().unwrap().push(crate::forge::Issue {
+                number: issue,
+                title: "t".into(),
+                body: String::new(),
+                labels: vec![],
+            });
+            let body = if marked {
+                super::super::planner::DECOMPOSE_PROPOSAL_MARKER.to_string()
+            } else {
+                "plain spec".into()
+            };
+            forge.add_pr(
+                num,
+                "t",
+                &body,
+                &[forge::LABEL_SPEC_READY],
+                &format!("meguri/{issue}-x-abc"),
+                "sha",
+            );
+        }
+        let mut project = fake_deps().project.clone();
+        project.plan_delivery = crate::config::PlanDelivery::Combined;
+        let deps = Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+        let targets = SpecWorkerLoop.discover(&deps).await.unwrap();
+        let issues: Vec<i64> = targets
+            .iter()
+            .filter_map(|t| match t.key {
+                crate::tasks::TaskKey::Issue(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(issues.contains(&6), "ordinary spec PR is picked up");
+        assert!(!issues.contains(&5), "decompose proposal PR is excluded");
     }
 }

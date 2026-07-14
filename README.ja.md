@@ -204,6 +204,8 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 いずれの場合も spec 自体はレビュー用の使い捨ての足場で、実装時に削除されます — `docs/specs/` がデフォルトブランチに溜まっていくことはありません。残す価値のあるもの（設計判断・ドメイン規則）は ADR（`docs/adr/`）や永続的なドメイン文書へ振り分けられます。
 
+**分解提案**（[ADR 0012](docs/adr/0012-decompose-through-spec-review-gate-then-materialize.md)）— 1 つの spec に収まらない大きな issue（独立した PR としてレビュー・ロールバックしたい複数の成果物）だと planner が判断したときは、実装 spec の代わりに **分解提案 spec** を書きます: 親のゴール・要求カバレッジ表・子 issue の一覧と依存グラフ・rollout 順に加えて、機械可読な ` ```json meguri-children ` ブロックを 1 つ載せます。これは通常の spec と **同じ spec-review ゲート** を通ります（切り方と「どの子がどの親要求を満たすか」が、何かを起票する前にレビューされます）。提案 PR が承認されると（guard が実際にレビューした head の `spec-ready`）、軽量な **materializer** sweep が子 issue を起こし、GitHub ネイティブの `blocked_by` 依存を張り、各子に指定のフェーズラベル（`meguri:ready` / `meguri:plan`、`human` ステップは無ラベル）を付け、親を無ラベルの **tracking** issue にして、使い捨ての提案 PR を未マージで閉じます（子 issue 群 + 依存が永続状態で、あとは discovery の既存の依存ゲートが rollout を順序づけます）。materialization は冪等で、途中まで進んだ実行は親の依存グラフから再開され、重複 issue は決して作りません。承認済みの提案を人間の判断まで保留したいときは `decompose.materialize_enabled = false`。分解は 1 レベルのみです（子はさらに分解できません）。
+
 ### レビュー: 内部 self-review（必須）+ GitHub guard（任意）
 
 spec と impl は対称です（ADR 0008）: どちらも PR を開く前に **必須の内部 self-review** を回し、開いた PR に対して **任意の外部 guard** を有効化できます。

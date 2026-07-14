@@ -299,6 +299,17 @@ pub struct Blocker {
     pub state: String,
     /// Why it closed ("completed", "not_planned", "duplicate"), if closed.
     pub state_reason: Option<String>,
+    /// The blocker issue's body, as GitHub's dependency endpoint returns it
+    /// (the whole issue object). The decompose materializer matches its
+    /// per-child marker here to recognize an already-created child as the
+    /// strongly-consistent authority (issue #134); empty when the forge did
+    /// not supply one. The dependency gate ignores it.
+    pub body: String,
+    /// The blocker issue's home repo slug (`owner/repo`) — a cross-repo
+    /// decomposition child lives in a workspace sibling, so identifying it
+    /// needs the repo, not just the number (issue #134 / #154). Empty when the
+    /// forge did not supply one.
+    pub repo: String,
 }
 
 impl Blocker {
@@ -403,15 +414,27 @@ pub trait Forge: Send + Sync {
     /// File a new issue; returns its number (planner decomposition,
     /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
+    /// The number of an issue whose body contains `marker`, searching **all
+    /// states** (open and closed) — the decompose materializer's backstop for
+    /// recognizing an already-created child after a crash between creating it
+    /// and linking it into the parent's dependency graph (issue #134). `None`
+    /// when no such issue exists. The parent dependency graph is the primary
+    /// authority; this covers the brief create→link window and tolerates
+    /// GitHub's search-index lag.
+    async fn find_issue_by_marker(&self, marker: &str) -> Result<Option<i64>>;
     /// Record `issue` (in this forge's repo) as blocked by `blocker` in the
     /// forge-native dependency graph (the same graph [`Forge::blocked_by`]
-    /// reads).
+    /// reads). Idempotent: re-adding an edge that already exists is a no-op
+    /// success — the decompose materializer re-wires every sweep until the
+    /// proposal PR closes, so a duplicate add must not fail (issue #134).
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
     /// Like [`Forge::add_blocked_by`] but the blocker lives in `blocker_repo`
     /// (`owner/repo`), which may differ from this forge's own repo — the
     /// cross-repo decomposition case (issue #154). The dependent `issue` is
     /// still in this forge's repo; only the blocker's home repo changes. When
     /// `blocker_repo` equals this forge's repo the two are equivalent.
+    /// Idempotent like [`Forge::add_blocked_by`]: an existing edge re-adds as a
+    /// no-op success.
     async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()>;
     /// Overwrite an issue's body wholesale (snapshot-style report updates).
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
@@ -501,6 +524,12 @@ pub trait Forge: Send + Sync {
     async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
+    /// Close a pull request **without merging** (`gh pr close`). The decompose
+    /// materializer's single commit point: once the children are filed it
+    /// closes the disposable proposal PR so `docs/specs/` never lands on the
+    /// default branch (issue #134). Idempotent from the caller's view — an
+    /// already-closed PR closes again cleanly.
+    async fn close_pr(&self, pr: i64) -> Result<()>;
 
     /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
     /// — meguri's inspection history for a review (ADR 0008). `context` is the
@@ -555,6 +584,8 @@ mod tests {
             number: 1,
             state: state.into(),
             state_reason: state_reason.map(str::to_string),
+            body: String::new(),
+            repo: String::new(),
         }
     }
 

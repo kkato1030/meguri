@@ -112,6 +112,8 @@ pub struct Config {
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
+    pub decompose: DecomposeConfig,
+    #[serde(default)]
     pub reconcile: ReconcileConfig,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
@@ -200,6 +202,27 @@ impl Default for GuardConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// `[decompose]` — the reviewed-decomposition materializer (issue #134). The
+/// planner writes a decomposition proposal spec; once its PR is approved a
+/// lightweight sweep files the child issues + dependencies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DecomposeConfig {
+    /// Kill switch (default on): false makes the materialization sweep inert,
+    /// so an approved proposal is not materialized — it stays `spec-ready`
+    /// awaiting a human. The operational lever for rolling back the
+    /// irreversible child-creation step (ADR 0012).
+    #[serde(default = "default_true")]
+    pub materialize_enabled: bool,
+}
+
+impl Default for DecomposeConfig {
+    fn default() -> Self {
+        Self {
+            materialize_enabled: default_true(),
+        }
+    }
 }
 
 /// Settings for the reconcile loop (issue #142): detecting that a once-shipped
