@@ -15,6 +15,7 @@ use meguri::config::{AgentProfile, Config, LaunchMode, ProjectConfig};
 use meguri::engine::pr_reviewer::{
     self, DIFF_FILE, PR_REVIEW_STATUS, PrReviewerLoop, REVIEW_FILE, run_pr_reviewer,
 };
+use meguri::engine::spec_fixer::SpecFixerLoop;
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
@@ -319,12 +320,15 @@ async fn plan_review_clean_flips_to_spec_ready_via_status_and_body() {
     assert!(wt.join(DIFF_FILE).exists());
 }
 
-/// pr-reviewer(Plan) findings escalate (issue #176, ADR 0012): a failure
-/// status, the summary in the body, spec-reviewing kept, and — new —
-/// needs-human so a person resolves the findings. The parked PR is skipped by
-/// discovery until a human clears the label, even on a new head.
+/// pr-reviewer(Plan) findings do NOT escalate (issue #192, ADR 0013): a
+/// failure status, the summary in the body, spec-reviewing kept, working
+/// released, and no needs-human — `spec_fixer` owns the plan-side fix loop
+/// and its discover must be able to pick the PR up on the very next poll.
+/// Escalating here would starve spec_fixer's discover (which skips
+/// needs-human PRs) before it ever ran (the #176/#188 integration bug this
+/// issue fixes).
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_review_findings_escalate_and_park_on_needs_human() {
+async fn plan_review_findings_defer_to_spec_fixer_without_escalating() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     let run = create_pr_reviewer_run(&env);
 
@@ -347,13 +351,15 @@ async fn plan_review_findings_escalate_and_park_on_needs_human() {
         "{labels:?}"
     );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
-    // The pr-reviewer is the human gate: findings park the PR on needs-human.
     assert!(
-        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
-        "{labels:?}"
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "plan findings must not escalate — spec_fixer owns the fix loop: {labels:?}"
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
-    assert_eq!(env.forge.comments_of(PR).len(), 1, "one escalation comment");
+    assert!(
+        env.forge.comments_of(PR).is_empty(),
+        "no escalation comment for plan findings"
+    );
     assert_eq!(
         env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
         Some(CommitStatusState::Failure)
@@ -366,22 +372,19 @@ async fn plan_review_findings_escalate_and_park_on_needs_human() {
         .unwrap();
     assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
 
-    // A needs-human PR is parked: even a new head is not re-reviewed until a
-    // human clears the label.
-    env.forge.set_pr_head(PR, "feedfacefeedface");
+    // pr_reviewer itself does not re-review a head it already settled...
     assert!(
         PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "a needs-human PR must not be re-reviewed until a human clears it"
+        "an already-reviewed head is not re-reviewed"
     );
-    // Once the label is cleared, the new head is reviewable again.
-    env.forge
-        .remove_pr_label(PR, LABEL_NEEDS_HUMAN)
-        .await
-        .unwrap();
-    let targets = PrReviewerLoop.discover(&env.deps).await.unwrap();
+    // ...but spec_fixer's discover fires on the very next poll (issue #192,
+    // acceptance criterion 1): no needs-human means it is free to pick up
+    // the PR whose head pr-review status it just saw settle to Failure.
+    let targets = SpecFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![ISSUE]
+        vec![ISSUE],
+        "spec_fixer must discover the findings PR now that it is not escalated"
     );
 }
 
