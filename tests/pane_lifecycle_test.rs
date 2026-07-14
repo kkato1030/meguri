@@ -18,7 +18,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneId;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_AUTHOR, Store};
+use meguri::store::{LANE_AUTHOR, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -73,24 +73,31 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        mode: Default::default(),
+        deliver: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: mux.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
         forge,
         config,
         project,
-        notifier: meguri::notify::fake::recording_notifier().0,
-    };
+    );
     TestEnv {
         deps,
         mux,
@@ -121,7 +128,8 @@ impl Flavor for FixedBranchFlavor {
         let root = deps.project.worktree_root.clone().unwrap();
         let wt = gitops::worktree_path(&root, &deps.project.id, &self.branch);
         if !wt.exists() {
-            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main").await?;
+            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main", &[])
+                .await?;
         }
         deps.store
             .update_run_worktree(&run.id, &self.branch, &wt.to_string_lossy())?;
@@ -288,7 +296,7 @@ async fn second_run_on_same_issue_reuses_live_pane() {
     let pane = env
         .deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     let pane_id = PaneId(pane.mux_pane_id.clone().unwrap());
@@ -332,7 +340,7 @@ async fn keep_pane_never_releases_pane_after_success() {
     let pane = env
         .deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     assert_eq!(pane.mux_pane_id, None, "pane released at run end");
@@ -361,7 +369,7 @@ async fn moved_worktree_retires_old_pane_and_respawns() {
     let first_pane = PaneId(
         env.deps
             .store
-            .get_pane("proj", 7, ROLE_AUTHOR)
+            .get_pane("proj", 7, LANE_AUTHOR)
             .unwrap()
             .unwrap()
             .mux_pane_id
@@ -383,7 +391,7 @@ async fn moved_worktree_retires_old_pane_and_respawns() {
     let pane = env
         .deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     let new_id = pane.mux_pane_id.expect("new pane registered");
@@ -415,7 +423,7 @@ async fn fixer_family_run_adopts_the_workers_author_pane() {
     let pane = env
         .deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     let pane_id = pane.mux_pane_id.expect("worker pane registered");

@@ -16,7 +16,7 @@ use crate::agent_session;
 use crate::forge::IssueState;
 use crate::gitops;
 use crate::mux::{Multiplexer, PaneId};
-use crate::store::{PaneRecord, ROLE_AUTHOR, ROLE_REVIEW};
+use crate::store::{LANE_AUTHOR, LANE_PR_REVIEW, LANE_SELF_REVIEW, PaneRecord};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
@@ -91,7 +91,7 @@ impl IssueStates {
         if let Some(state) = self.0.get(&issue) {
             return *state;
         }
-        let state = match deps.forge.issue_state(issue).await {
+        let state = match deps.forge().issue_state(issue).await {
             Ok(state) => Some(state),
             Err(e) => {
                 tracing::warn!("cannot resolve state of issue #{issue}: {e:#}");
@@ -172,13 +172,21 @@ async fn classify(
         verdict,
     };
 
-    let Some(issue_number) = issue else {
-        return Ok(candidate(Verdict::Orphan));
-    };
     // An active run owns its worktree; don't even ask the forge.
     if runs.iter().any(|r| r.status.is_active()) {
         return Ok(candidate(Verdict::ActiveRun));
     }
+    // Local mode (no forge): there is no issue lifecycle to consult, and a
+    // `deliver = "branch"` deliverable *is* the branch + worktree — so the
+    // Phase 1 reaper never auto-reclaims it. It parks as StateUnknown until
+    // `meguri accept` (issue #54 Phase 2) designs the reclaim conditions.
+    if deps.forge.is_none() {
+        return Ok(candidate(Verdict::StateUnknown));
+    }
+
+    let Some(issue_number) = issue else {
+        return Ok(candidate(Verdict::Orphan));
+    };
     match states.get(deps, issue_number).await {
         Some(IssueState::Open) => return Ok(candidate(Verdict::Open)),
         Some(IssueState::Closed) => {}
@@ -189,8 +197,8 @@ async fn classify(
     // runs first, so this only trips when the kill failed (or was skipped);
     // the worktree then waits for the next sweep. Both lanes of the issue
     // are checked — either one alive keeps the worktree.
-    for role in [ROLE_AUTHOR, ROLE_REVIEW] {
-        if let Some(pane) = deps.store.get_pane(&deps.project.id, issue_number, role)?
+    for lane in [LANE_AUTHOR, LANE_PR_REVIEW, LANE_SELF_REVIEW] {
+        if let Some(pane) = deps.store.get_pane(&deps.project.id, issue_number, lane)?
             && record_pane_alive(deps, &pane).await
         {
             return Ok(candidate(Verdict::PaneAlive));
@@ -304,7 +312,13 @@ async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool
         }
         Err(e) => e,
     };
-    match deps.forge.pr_for_branch(branch).await {
+    // No forge (local mode): the offline ancestor check is all we have, and it
+    // said unmerged — keep the branch (its verified commits are the deliverable).
+    let Some(forge) = deps.forge.as_ref() else {
+        tracing::warn!("keeping branch {branch}: no forge to check PR merge state (local mode)");
+        return false;
+    };
+    match forge.pr_for_branch(branch).await {
         Ok(Some(pr)) if pr.state == "merged" => {
             match gitops::delete_branch(
                 &deps.project.repo_path,
@@ -344,7 +358,7 @@ async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool
 #[derive(Debug, Clone)]
 pub struct PaneCandidate {
     pub issue: i64,
-    pub role: String,
+    pub lane: String,
     pub pane: PaneId,
     pub worktree_path: Option<String>,
     pub verdict: Verdict,
@@ -357,7 +371,7 @@ pub struct PaneCandidate {
 #[derive(Debug, Clone)]
 pub struct ReclaimedPane {
     pub issue: i64,
-    pub role: String,
+    pub lane: String,
     pub pane: PaneId,
     /// Agent session saved before the kill; `claude --resume <id>` restores
     /// the context.
@@ -375,7 +389,7 @@ pub async fn plan_panes(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Pan
         };
         let candidate = |verdict, reason| PaneCandidate {
             issue: record.issue_number,
-            role: record.role.clone(),
+            lane: record.lane.clone(),
             pane: PaneId(id.clone()),
             worktree_path: record.worktree_path.clone(),
             verdict,
@@ -411,7 +425,7 @@ pub async fn reclaim_panes(
 ) -> Result<Vec<ReclaimedPane>> {
     let mut reclaimed = Vec::new();
     for c in candidates.iter().filter(|c| c.verdict == Verdict::Reclaim) {
-        reclaimed.push(release_pane_record(deps, c.issue, &c.role, c.reason).await?);
+        reclaimed.push(release_pane_record(deps, c.issue, &c.lane, c.reason).await?);
     }
     Ok(reclaimed)
 }
@@ -422,22 +436,22 @@ pub async fn reclaim_panes(
 pub async fn release_pane(
     deps: &Deps,
     issue: i64,
-    role: &str,
+    lane: &str,
     reason: &str,
 ) -> Option<ReclaimedPane> {
-    match deps.store.get_pane(&deps.project.id, issue, role) {
+    match deps.store.get_pane(&deps.project.id, issue, lane) {
         Ok(Some(record)) if record.mux_pane_id.is_some() => {
-            match release_pane_record(deps, issue, role, reason).await {
+            match release_pane_record(deps, issue, lane, reason).await {
                 Ok(reclaimed) => Some(reclaimed),
                 Err(e) => {
-                    tracing::warn!("cannot release {role} pane of issue #{issue}: {e:#}");
+                    tracing::warn!("cannot release {lane} pane of issue #{issue}: {e:#}");
                     None
                 }
             }
         }
         Ok(_) => None,
         Err(e) => {
-            tracing::warn!("cannot look up {role} pane of issue #{issue}: {e:#}");
+            tracing::warn!("cannot look up {lane} pane of issue #{issue}: {e:#}");
             None
         }
     }
@@ -446,17 +460,17 @@ pub async fn release_pane(
 async fn release_pane_record(
     deps: &Deps,
     issue: i64,
-    role: &str,
+    lane: &str,
     reason: &str,
 ) -> Result<ReclaimedPane> {
     let record = deps
         .store
-        .get_pane(&deps.project.id, issue, role)?
-        .with_context(|| format!("issue #{issue} has no {role} pane record"))?;
+        .get_pane(&deps.project.id, issue, lane)?
+        .with_context(|| format!("issue #{issue} has no {lane} pane record"))?;
     let id = record
         .mux_pane_id
         .clone()
-        .with_context(|| format!("issue #{issue} has no live {role} pane"))?;
+        .with_context(|| format!("issue #{issue} has no live {lane} pane"))?;
     let pane = PaneId(id);
 
     // Reversibility first: persist the agent's native session id before the
@@ -470,7 +484,7 @@ async fn release_pane_record(
         .and_then(|wt| agent_session::latest_session_id(&session_root, Path::new(wt)));
     if let Some(session) = &agent_session_id {
         deps.store
-            .save_pane_session(&deps.project.id, issue, role, Some(session))?;
+            .save_pane_session(&deps.project.id, issue, lane, Some(session))?;
     }
 
     if let Some(kind) = &record.mux_kind
@@ -482,13 +496,13 @@ async fn release_pane_record(
         anyhow::bail!("kill_pane failed for issue #{issue}: {e}");
     }
     deps.store
-        .mark_pane_reclaimed(&deps.project.id, issue, role)?;
+        .mark_pane_reclaimed(&deps.project.id, issue, lane)?;
     deps.store.emit(
         None,
         "pane.reclaimed",
         json!({
             "issue": issue,
-            "role": role,
+            "lane": lane,
             "pane": pane.0,
             "reason": reason,
             "agent_session_id": agent_session_id,
@@ -496,7 +510,7 @@ async fn release_pane_record(
     )?;
     Ok(ReclaimedPane {
         issue,
-        role: role.to_string(),
+        lane: lane.to_string(),
         pane,
         agent_session_id,
     })
@@ -510,7 +524,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     for p in reclaim_panes(deps, &plan_panes(deps, &mut states).await?).await? {
         tracing::info!(
             "reclaimed {} pane {} (issue #{}{})",
-            p.role,
+            p.lane,
             p.pane,
             p.issue,
             match &p.agent_session_id {

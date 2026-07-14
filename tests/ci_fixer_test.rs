@@ -88,23 +88,30 @@ async fn setup() -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        mode: Default::default(),
+        deliver: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -344,7 +351,7 @@ async fn ci_fixer_discovery_wants_red_unclaimed_meguri_prs_only() {
 
     let targets = CiFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![9],
         "only the open, unclaimed, unescalated meguri PR whose CI settled red is actionable \
          — keyed by its canonical issue"
@@ -366,6 +373,9 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
     }
+    // A new tick: the scheduler would clear the shared open-PR cache here
+    // (issue #170) before calling discover again.
+    env.deps.open_prs.clear().await;
     assert!(
         CiFixerLoop.discover(&env.deps).await.unwrap().is_empty(),
         "a PR whose CI keeps coming back red must stop being rediscovered"
@@ -381,6 +391,7 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
 
     // The next sweep hits the needs-human guard: no second comment, no
     // extra rollup poll needed.
+    env.deps.open_prs.clear().await;
     assert!(CiFixerLoop.discover(&env.deps).await.unwrap().is_empty());
     assert_eq!(env.forge.comments_of(1).len(), 1, "escalate exactly once");
 }
