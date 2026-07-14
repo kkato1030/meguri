@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use meguri::app::{
-    AddParams, add_core, check_add_flags, compose_refined_body, infer_project, initial_title,
-    issue_url,
+    AddParams, add_core, check_add_flags, compose_refined_body, github_memo, infer_project,
+    initial_title, issue_url,
 };
 use meguri::config::Config;
 use meguri::forge::fake::FakeForge;
@@ -211,6 +211,34 @@ async fn write_back_title_failure_keeps_a_coherent_issue() {
     assert_eq!(issue.title, memo); // raw title stands
     assert!(issue.body.contains("## 症状")); // refined body applied
     assert!(issue.body.contains(memo)); // original memo still present
+}
+
+#[test]
+fn github_memo_validates_trimmed_but_returns_verbatim() {
+    // The cmd_add entry point must judge emptiness on a trimmed view only:
+    // the memo it hands to add_github is the original text, byte-for-byte,
+    // or the verbatim guarantee (ADR 0006 原則2) breaks before add_core.
+    assert_eq!(github_memo(Some("  raw memo\n")).unwrap(), "  raw memo\n");
+    assert_eq!(github_memo(Some("memo")).unwrap(), "memo");
+    // No memo, or only whitespace, is still rejected.
+    assert!(github_memo(None).is_err());
+    assert!(github_memo(Some("")).is_err());
+    assert!(github_memo(Some("  \n\t ")).is_err());
+}
+
+#[tokio::test]
+async fn cmd_add_path_keeps_whitespace_and_trailing_newline_verbatim() {
+    // The full github-mode path a `meguri add $'  raw memo\n'` takes:
+    // github_memo (cmd_add's validation) → add_core. Leading whitespace and
+    // the trailing newline must survive into the body and the 原文メモ footer.
+    let memo = github_memo(Some("  raw memo\n")).unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let r = FixedRefiner(refined("整った題", "整った本文"));
+    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+        .await
+        .unwrap();
+    let issue = forge.get_issue(n).await.unwrap();
+    assert!(issue.body.ends_with("## 原文メモ\n  raw memo\n"));
 }
 
 #[test]

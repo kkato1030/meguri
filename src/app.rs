@@ -126,14 +126,21 @@ pub async fn cmd_add(
     )?;
     match project.mode {
         ProjectMode::Github => {
-            let text = text
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .context("give `meguri add` a one-line memo to capture")?;
+            let text = github_memo(text)?;
             add_github(&cfg, project, text, plan, ready, raw).await
         }
         ProjectMode::Local => add_local(project, text, file, not_before),
     }
+}
+
+/// The github-mode memo check, factored out of [`cmd_add`] so it is testable
+/// without a config file. Emptiness is judged on a trimmed view only; the
+/// memo itself is returned untouched, because `add_core` stores it verbatim
+/// (ADR 0006 原則2) — trimming here would silently strip the quoted
+/// whitespace/newlines from the issue body and the 原文メモ footer.
+pub fn github_memo(text: Option<&str>) -> Result<&str> {
+    text.filter(|t| !t.trim().is_empty())
+        .context("give `meguri add` a one-line memo to capture")
 }
 
 /// Flag ↔ mode compatibility for `meguri add`, factored out of [`cmd_add`] so
