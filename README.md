@@ -376,6 +376,8 @@ required = false                           # true escalates a failing command to
 timeout_secs = 300                         # per-command; commands may fetch over the network
 ```
 
+See [docs/ops/apm-worktree-setup.md](docs/ops/apm-worktree-setup.md) for the wired-up, dogfooded example (#139). Note that `apm install --frozen` rewrites `apm.lock.yaml` (a tracked file) on every run, so `commands` needs a trailing `git checkout -- apm.lock.yaml` — otherwise the clean-tree check fails on a diff the agent never touched (`exclude` only suppresses untracked paths, it can't help here).
+
 Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `guard`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
 
 ### Scheduled enqueue (`[[projects.schedules]]`, optional)
@@ -469,7 +471,7 @@ apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Cod
 
 Order matters: `apm compile` skips `CLAUDE.md` only because the preceding `apm install` already populated `.claude/rules/` (Claude Code reads that directly, so `apm` dedupes `CLAUDE.md` out). Compile first, or compile against an empty tree (e.g. `--root <scratch-dir>` for isolated verification), and it generates `CLAUDE.md`/`src/CLAUDE.md` too, since there's nothing to dedupe against yet. `apm install --dry-run` doesn't preview this step either — dry-run only reports on `apm`/`mcp` package dependencies (this repo has none), not the local `.apm/instructions/` integration; a real (non-dry-run) `apm install` is what actually deploys `.claude/rules/`.
 
-Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation; wiring it up for meguri's own loops is tracked separately (#139).
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation, and it's wired up for meguri's own loops too (#139; see [docs/ops/apm-worktree-setup.md](docs/ops/apm-worktree-setup.md) for the setup and the results of dogfooding it).
 
 ## Status / roadmap
 
