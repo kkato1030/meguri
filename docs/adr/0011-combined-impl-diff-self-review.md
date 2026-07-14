@@ -44,8 +44,9 @@ ready(worker)・separate(worker)・combined(spec-worker)の 3 経路が対称に
 
 ### レビュー対象は「combined 差分」= ADR + 実装コード
 
-self-review は flavor の `verify_base` ではなく常に **default branch** との差分
-(`git diff main...HEAD`)を読む(`impl_reviewer.rs`)。combined branch では planner が
+self-review は flavor の `verify_base` ではなく常にプロジェクトの **default branch**
+(`deps.project.default_branch` — `main` とは限らない)との差分を読む
+(`impl_reviewer.rs`)。combined branch では planner が
 spec を追加し、spec-worker が実装完了時にそれを削除する。self-review が走る時点
 (execute → validate の後)では spec は既に削除済みなので、レビュー対象は
 **ADR + 実装コード**という、まさに公開される中身そのものになる。二重の base 指定や
