@@ -213,18 +213,19 @@ async fn add_github(
         labels.push(crate::forge::LABEL_READY);
     }
 
-    // Build the refiner unless --raw. A profile with no headless mode is not an
-    // error: capture still runs, and add_core prints the skip note after the
-    // issue number so the capture report always comes first.
-    let (refiner, skip_note): (Option<HeadlessRefiner>, Option<String>) = if raw {
-        (None, None)
+    // `--raw` is "no refine at all". Otherwise the refiner is *not* built here:
+    // `build_refiner` runs `routing::resolve`, which under `mode = "auto"` may
+    // probe agent CLIs (`command --version`) — slow or hung detection must
+    // never delay the capture. add_core invokes this source only after
+    // `create_issue` succeeded and the number + URL are printed (capture-first,
+    // ADR 0006); a resolution failure is a skip note, the issue stays raw.
+    let refiner_source: Option<RefinerSource> = if raw {
+        None
     } else {
-        match build_refiner(cfg) {
-            Ok(r) => (Some(r), None),
-            Err(reason) => (None, Some(reason)),
-        }
+        Some(Box::new(|| {
+            build_refiner(cfg).map(|r| Box::new(r) as Box<dyn Refiner>)
+        }))
     };
-    let refiner_dyn = refiner.as_ref().map(|r| r as &dyn Refiner);
 
     let params = AddParams {
         text,
@@ -233,7 +234,7 @@ async fn add_github(
         repo_path: &project.repo_path,
         language: cfg.language_for(project),
     };
-    add_core(&forge, params, refiner_dyn, skip_note.as_deref()).await?;
+    add_core(&forge, params, refiner_source).await?;
     Ok(())
 }
 
@@ -247,15 +248,23 @@ pub struct AddParams<'a> {
     pub language: Option<&'a str>,
 }
 
+/// Lazily resolves the refiner. `add_core` invokes it only *after*
+/// `create_issue` succeeded, so a slow or hung resolution (e.g. routing's
+/// agent-CLI detection) can never delay the capture report. `Err` is a
+/// human-readable skip note printed after the issue number; the issue stays
+/// raw. `None` at the call site means `--raw`: no refine step at all.
+pub type RefinerSource<'a> =
+    Box<dyn FnOnce() -> std::result::Result<Box<dyn Refiner>, String> + Send + 'a>;
+
 /// The capture→refine→write-back core, split out from [`cmd_add`] so tests can
 /// drive it with a fake forge and a fake refiner. Returns the created issue
 /// number. `create_issue` failing is a real error (no issue exists); every
-/// later failure leaves the raw issue in place and reports capture success.
+/// later failure — including refiner resolution itself, which only runs after
+/// capture — leaves the raw issue in place and reports capture success.
 pub async fn add_core(
     forge: &dyn Forge,
     params: AddParams<'_>,
-    refiner: Option<&dyn Refiner>,
-    skip_note: Option<&str>,
+    refiner_source: Option<RefinerSource<'_>>,
 ) -> Result<i64> {
     // The memo is stored verbatim (ADR 0006 原則2): the raw `params.text`
     // becomes the body and the refined footer, so quoted leading/trailing
@@ -276,11 +285,18 @@ pub async fn add_core(
         issue_url(params.repo_slug, number)
     );
 
-    let Some(refiner) = refiner else {
-        if let Some(note) = skip_note {
-            println!("{note}");
-        }
+    // Only now — with the issue standing and reported — resolve the refiner
+    // (capture-first, ADR 0006). Resolution failure is best-effort like every
+    // other post-capture step: print the note, leave the issue raw.
+    let Some(source) = refiner_source else {
         return Ok(number);
+    };
+    let refiner = match source() {
+        Ok(r) => r,
+        Err(note) => {
+            println!("{note}");
+            return Ok(number);
+        }
     };
 
     print!("refining… ");

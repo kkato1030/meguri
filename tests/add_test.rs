@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use meguri::app::{
-    AddParams, add_core, check_add_flags, compose_refined_body, github_memo, infer_project,
-    initial_title, issue_url,
+    AddParams, RefinerSource, add_core, check_add_flags, compose_refined_body, github_memo,
+    infer_project, initial_title, issue_url,
 };
 use meguri::config::Config;
 use meguri::forge::fake::FakeForge;
@@ -53,6 +53,12 @@ impl Refiner for EditingRefiner {
     }
 }
 
+/// A refiner source that resolves immediately to `r` — the tests' stand-in for
+/// a successful post-capture `build_refiner`.
+fn ready<R: Refiner + 'static>(r: R) -> Option<RefinerSource<'static>> {
+    Some(Box::new(move || Ok(Box::new(r) as Box<dyn Refiner>)))
+}
+
 fn params<'a>(text: &'a str, labels: &'a [&'a str]) -> AddParams<'a> {
     AddParams {
         text,
@@ -78,7 +84,7 @@ async fn capture_is_unlabeled_and_refine_restructures_with_verbatim_memo() {
         "ログイン後のリダイレクト先が意図しないページになる",
         "## 症状\nリダイレクトがおかしい\n## 期待動作\n正しい遷移",
     ));
-    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(r))
         .await
         .unwrap();
 
@@ -102,9 +108,7 @@ async fn raw_capture_never_refines() {
     // --raw is modeled as "no refiner"; the issue stays exactly as captured.
     let forge = Arc::new(FakeForge::default());
     let memo = "cleaner のレポートに stale ブランチが出ない";
-    let n = add_core(&*forge, params(memo, &[]), None, None)
-        .await
-        .unwrap();
+    let n = add_core(&*forge, params(memo, &[]), None).await.unwrap();
     let issue = forge.get_issue(n).await.unwrap();
     assert_eq!(issue.title, memo);
     assert_eq!(issue.body, memo);
@@ -115,7 +119,7 @@ async fn refine_failure_leaves_issue_raw_and_reports_success() {
     let forge = Arc::new(FakeForge::default());
     let memo = "add コマンドが欲しい";
     // add_core returns Ok (capture succeeded) even though refine failed (基準 3).
-    let n = add_core(&*forge, params(memo, &[]), Some(&FailingRefiner), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(FailingRefiner))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -124,9 +128,47 @@ async fn refine_failure_leaves_issue_raw_and_reports_success() {
 }
 
 #[tokio::test]
+async fn refiner_resolution_failure_leaves_issue_raw_and_reports_success() {
+    // `build_refiner` failing (no profile / no headless mode / CLI detection
+    // error) is a post-capture skip, not an error: the issue is already
+    // created and stays raw, and add_core still returns Ok.
+    let forge = Arc::new(FakeForge::default());
+    let memo = "refiner が解決できなくても capture は成功する";
+    let source: RefinerSource =
+        Box::new(|| Err("refine skipped: agent CLI not found — issue left raw".into()));
+    let n = add_core(&*forge, params(memo, &[]), Some(source))
+        .await
+        .unwrap();
+    let issue = forge.get_issue(n).await.unwrap();
+    assert_eq!(issue.title, memo);
+    assert_eq!(issue.body, memo);
+}
+
+#[tokio::test]
+async fn refiner_is_resolved_only_after_capture() {
+    // Capture-first (ADR 0006): the refiner source — where the real path runs
+    // routing's potentially slow agent-CLI detection — must not be invoked
+    // until the issue exists, so a hung detection can never delay the capture.
+    let forge = Arc::new(FakeForge::default());
+    let issues_at_resolve = Arc::new(std::sync::Mutex::new(None::<usize>));
+    let (f, seen) = (forge.clone(), issues_at_resolve.clone());
+    let source: RefinerSource = Box::new(move || {
+        *seen.lock().unwrap() = Some(f.all_issues().len());
+        Ok(Box::new(FixedRefiner(refined("整った題", "整った本文"))) as Box<dyn Refiner>)
+    });
+    let n = add_core(&*forge, params("timing memo", &[]), Some(source))
+        .await
+        .unwrap();
+    // When the source ran, the captured issue was already on the forge.
+    assert_eq!(*issues_at_resolve.lock().unwrap(), Some(1));
+    // ...and the refine still applied afterwards.
+    assert_eq!(forge.get_issue(n).await.unwrap().title, "整った題");
+}
+
+#[tokio::test]
 async fn flags_apply_labels_at_capture() {
     let forge = Arc::new(FakeForge::default());
-    let n = add_core(&*forge, params("plan me", &[LABEL_PLAN]), None, None)
+    let n = add_core(&*forge, params("plan me", &[LABEL_PLAN]), None)
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -142,7 +184,7 @@ async fn refine_guard_keeps_human_edit() {
         number: 1,
         refined: refined("AI title", "AI body"),
     };
-    let n = add_core(&*forge, params(memo, &[]), Some(&editor), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(editor))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -157,9 +199,7 @@ async fn raw_capture_body_is_byte_for_byte() {
     // The whole memo — leading/trailing whitespace and newlines — is the body.
     let forge = Arc::new(FakeForge::default());
     let memo = "  spaced\nmemo  ";
-    let n = add_core(&*forge, params(memo, &[]), None, None)
-        .await
-        .unwrap();
+    let n = add_core(&*forge, params(memo, &[]), None).await.unwrap();
     assert_eq!(forge.get_issue(n).await.unwrap().body, memo);
 }
 
@@ -168,7 +208,7 @@ async fn refine_footer_preserves_memo_whitespace() {
     let forge = Arc::new(FakeForge::default());
     let memo = "  行頭スペースと\n改行を保つ  ";
     let r = FixedRefiner(refined("整った題", "整った本文"));
-    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(r))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -187,7 +227,7 @@ async fn write_back_body_failure_leaves_issue_raw() {
     let memo = "capture me";
     forge.update_body_errors.lock().unwrap().insert(1);
     let r = FixedRefiner(refined("AI title", "AI body"));
-    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(r))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -204,7 +244,7 @@ async fn write_back_title_failure_keeps_a_coherent_issue() {
     let memo = "capture me";
     forge.update_title_errors.lock().unwrap().insert(1);
     let r = FixedRefiner(refined("AI title", "## 症状\nx"));
-    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(r))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
@@ -234,7 +274,7 @@ async fn cmd_add_path_keeps_whitespace_and_trailing_newline_verbatim() {
     let memo = github_memo(Some("  raw memo\n")).unwrap();
     let forge = Arc::new(FakeForge::default());
     let r = FixedRefiner(refined("整った題", "整った本文"));
-    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+    let n = add_core(&*forge, params(memo, &[]), ready(r))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
