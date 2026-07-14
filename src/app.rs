@@ -113,36 +113,73 @@ pub async fn cmd_add(
     file: Option<&str>,
     not_before: Option<&str>,
 ) -> Result<()> {
-    if plan && ready {
-        bail!("--plan and --ready are mutually exclusive — pick one");
-    }
     let cfg = Config::load()?;
     let cwd = std::env::current_dir().context("resolving the current directory")?;
     let project = infer_project(&cfg, project, &cwd)?;
+    check_add_flags(
+        project,
+        plan,
+        ready,
+        raw,
+        file.is_some(),
+        not_before.is_some(),
+    )?;
     match project.mode {
         ProjectMode::Github => {
-            if file.is_some() || not_before.is_some() {
-                bail!(
-                    "--file / --not-before are local-mode options; a github-mode \
-                     `meguri add` captures a one-line memo as an issue"
-                );
-            }
             let text = text
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .context("give `meguri add` a one-line memo to capture")?;
             add_github(&cfg, project, text, plan, ready, raw).await
         }
+        ProjectMode::Local => add_local(project, text, file, not_before),
+    }
+}
+
+/// Flag ↔ mode compatibility for `meguri add`, factored out of [`cmd_add`] so
+/// it is testable without a config file on disk. Notably, `--plan` needs a
+/// github-mode project: local mode has no planner yet (issue #54 Phase 3) —
+/// `PlannerLoop::discover` returns nothing without a forge — so a local plan
+/// task would sit queued forever. Reject it up front, mirroring the
+/// config-side check that refuses a local-mode `plan` schedule.
+pub fn check_add_flags(
+    project: &ProjectConfig,
+    plan: bool,
+    ready: bool,
+    raw: bool,
+    has_file: bool,
+    has_not_before: bool,
+) -> Result<()> {
+    if plan && ready {
+        bail!("--plan and --ready are mutually exclusive — pick one");
+    }
+    match project.mode {
+        ProjectMode::Github => {
+            if has_file || has_not_before {
+                bail!(
+                    "--file / --not-before are local-mode options; a github-mode \
+                     `meguri add` captures a one-line memo as an issue"
+                );
+            }
+        }
         ProjectMode::Local => {
             if ready || raw {
                 bail!(
                     "--ready / --raw are github-mode options; a local-mode `meguri add` \
-                     queues a task (default kind is work; use --plan for the planner)"
+                     queues a work task"
                 );
             }
-            add_local(project, plan, text, file, not_before)
+            if plan {
+                bail!(
+                    "project {:?} is mode = \"local\" but --plan queues planner work \
+                     (local mode has no planner yet — issue #54 — so the task would \
+                     never be consumed); use a github-mode project for --plan",
+                    project.id
+                );
+            }
         }
     }
+    Ok(())
 }
 
 /// github-mode capture: an issue is created immediately and, unless `--raw`,
@@ -785,10 +822,10 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
 
 /// local-mode capture: queue a task in the sqlite `tasks` table for the watch
 /// to pick up (issue #148 / ADR 0003). The project is already resolved and
-/// mode-checked by [`cmd_add`].
+/// mode-checked by [`cmd_add`]. Always `TaskKind::Work` — `--plan` is rejected
+/// by [`check_add_flags`] until local mode grows a planner (issue #54).
 fn add_local(
     project: &ProjectConfig,
-    plan: bool,
     title: Option<&str>,
     file: Option<&str>,
     not_before: Option<&str>,
@@ -808,7 +845,7 @@ fn add_local(
         None => None,
     };
     let (title, body) = resolve_task_input(title, file)?;
-    let kind = if plan { TaskKind::Plan } else { TaskKind::Work };
+    let kind = TaskKind::Work;
     let store = open_store()?;
     let task = store.create_task_with_not_before(
         &project.id,

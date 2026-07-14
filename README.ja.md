@@ -156,6 +156,9 @@ meguri prune              # reclaim panes + worktrees of closed issues (--dry-ru
 
 **local モード** — issue の代わりに sqlite にタスクを投入します（下記）。
 `--file` は markdown のタスクを読み、`--not-before` は指定時刻まで保留します。
+`--plan` は拒否されます: local モードにはまだ planner が無く（issue #54）、
+plan タスクは誰にも拾われないためです。planner 仕事は github モードの
+プロジェクトで使ってください。
 
 `--project` は cwd（その `repo_path` 配下）から推定します。曖昧なら明示して
 ください。
@@ -179,10 +182,11 @@ check_command = "cargo test"
 ```bash
 meguri add "export コマンドに --json フラグを足す"   # タスクを投入
 meguri add --file task.md                            # 1 行目の見出し → title、本文 → body
-meguri add --plan "export フォーマットを設計する"    # worker ではなく planner に投入
 meguri tasks                                         # 未完了タスク一覧（needs_human は強調）
 meguri watch                                         # poll 間隔以内に拾って走らせる
 ```
+
+（`meguri add --plan` は github モード専用です。local モードにはまだ planner がありません — issue #54。）
 
 ローカル run は `meguri/t<task-id>-<slug>-<hash>` ブランチで作業し、成功すると検証済みコミットをそこに残して task を `done` にします（push はしません）。失敗した run は task を reason 付きの `needs_human` にし（`meguri tasks` / `meguri ps` で見えます）、次の run が再 claim して解除します。ブランチは自分で確認してマージしてください（`meguri review` / `accept` は後のフェーズで入ります）。
 

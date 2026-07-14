@@ -170,6 +170,8 @@ profile's `headless_args` too or refine is skipped (raw capture only) —
 
 **local mode** — it queues a task in meguri's sqlite instead (see below);
 `--file` reads a markdown task and `--not-before` holds it until a time.
+`--plan` is rejected: local mode has no planner yet (issue #54), so a plan
+task would never be picked up — use a github-mode project for planner work.
 
 `--project` is inferred from the cwd (the project whose `repo_path` contains
 it); pass it explicitly when ambiguous.
@@ -193,10 +195,11 @@ Queue and track work with the local task commands instead of labels:
 ```bash
 meguri add "Add a --json flag to the export command"   # queue a task
 meguri add --file task.md                              # first heading → title, rest → body
-meguri add --plan "Design the export format"           # queue for the planner instead of the worker
 meguri tasks                                           # list open tasks (needs_human highlighted)
 meguri watch                                           # picks tasks up within one poll interval
 ```
+
+(`meguri add --plan` is github-only: local mode has no planner yet — issue #54.)
 
 A local run works on a `meguri/t<task-id>-<slug>-<hash>` branch; on success it leaves the verified commits there and flips the task to `done` — nothing is pushed. A failed run marks the task `needs_human` with a reason (shown by `meguri tasks` / `meguri ps`), and the next run re-claims it and clears the flag. Review the branch yourself and merge when happy (`meguri review` / `accept` land in a later phase).
 

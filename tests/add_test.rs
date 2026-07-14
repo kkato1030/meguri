@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use meguri::app::{
-    AddParams, add_core, compose_refined_body, infer_project, initial_title, issue_url,
+    AddParams, add_core, check_add_flags, compose_refined_body, infer_project, initial_title,
+    issue_url,
 };
 use meguri::config::Config;
 use meguri::forge::fake::FakeForge;
@@ -272,4 +273,55 @@ repo_slug = "me/b"
     assert_eq!(infer_project(&cfg, Some("b"), &nested).unwrap().id, "b");
     // cwd under none, multiple projects → ambiguous error.
     assert!(infer_project(&cfg, None, tmp.path()).is_err());
+}
+
+/// One github-mode and one local-mode project for the flag↔mode checks.
+fn two_mode_config() -> Config {
+    toml::from_str(
+        r#"
+[[projects]]
+id = "gh"
+repo_path = "/tmp/gh"
+repo_slug = "me/gh"
+
+[[projects]]
+id = "loc"
+repo_path = "/tmp/loc"
+mode = "local"
+"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn local_mode_plan_flag_is_rejected() {
+    // Local mode has no planner (issue #54): PlannerLoop::discover returns
+    // nothing without a forge, so a plan task would stay queued forever.
+    // `meguri add --plan` on a local project must fail up front, like the
+    // config-side rejection of a local-mode plan schedule.
+    let cfg = two_mode_config();
+    let local = &cfg.projects[1];
+    let err = check_add_flags(local, true, false, false, false, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no planner"), "{err}");
+    assert!(err.contains("#54"), "{err}");
+    // Without --plan the same local capture is fine (work task).
+    check_add_flags(local, false, false, false, true, true).unwrap();
+}
+
+#[test]
+fn add_flags_are_checked_against_the_mode() {
+    let cfg = two_mode_config();
+    let (gh, local) = (&cfg.projects[0], &cfg.projects[1]);
+    // github mode: --plan is exactly what the planner intake wants...
+    check_add_flags(gh, true, false, false, false, false).unwrap();
+    // ...but --plan + --ready contradict each other,
+    assert!(check_add_flags(gh, true, true, false, false, false).is_err());
+    // and --file / --not-before are local-mode options.
+    assert!(check_add_flags(gh, false, false, false, true, false).is_err());
+    assert!(check_add_flags(gh, false, false, false, false, true).is_err());
+    // local mode: --ready / --raw are github-mode options.
+    assert!(check_add_flags(local, false, true, false, false, false).is_err());
+    assert!(check_add_flags(local, false, false, true, false, false).is_err());
 }
