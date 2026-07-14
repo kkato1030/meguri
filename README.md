@@ -85,6 +85,30 @@ repo_slug = "owner/repo"
 
 Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
+### Let coding agents propose meguri
+
+meguri ships a Claude Code **skill** so a coding agent can notice when a repo would benefit from
+meguri and offer to set it up — honestly, disclosing the unattended-shell trade-off up front (see
+[ADR 0009](docs/adr/0009-agent-skill-distribution-symptom-trigger-honest-pitch.md) and
+[ADR 0012](docs/adr/0012-acquisition-skill-as-apm-subpath-github-ref.md)). Two channels, by whether
+meguri already runs in the repo:
+
+- **Not using meguri yet** — install the skill at the **user level** with
+  [apm](https://github.com/microsoft/apm), so an agent can suggest meguri in any repo, even one that
+  has never seen it:
+
+  ```bash
+  # replace vX.Y.Z with the latest release tag: https://github.com/kkato1030/meguri/releases/latest
+  apm install -g --target claude kkato1030/meguri/skills/meguri#vX.Y.Z
+  ```
+
+  `--target claude` is not optional: without it apm deploys only to `~/.agents/skills/`, which Claude
+  Code doesn't read, so the skill never fires. Pin the ref to a release tag (`#vX.Y.Z`) — an unpinned
+  ref tracks `main` and drifts.
+
+- **Already running meguri here** — the retention counterpart, `meguri agent-skills install`, folds
+  meguri's repo-level rule fragment into this repo's `AGENTS.md` / `CLAUDE.md` (coming with #150).
+
 ## Use
 
 ```bash
