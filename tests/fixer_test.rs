@@ -85,23 +85,34 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
         clean: None,
+        // These tests assert the combined-delivery invariant that a
+        // spec-ready PR belongs to the spec worker, so the fixer keeps off
+        // it (ADR 0008). Separate-mode fixing of spec-ready PRs is covered
+        // by the fixer unit test.
+        plan_delivery: meguri::config::PlanDelivery::Combined,
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -300,7 +311,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     // Round 1: the reviewer's comment gets fixed and pushed.
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![9]
     );
     let run1 = create_fixer_run(&env);
@@ -352,7 +363,7 @@ async fn fixer_reviewer_ping_pong_converges() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fixer_discovery_skips_spec_ready_merged_held_and_foreign_prs() {
+async fn fixer_discovery_skips_spec_ready_merged_held_needs_human_and_foreign_prs() {
     let env = setup(None).await;
 
     // PR #2: spec approved — the worker owns the branch now.
@@ -384,12 +395,22 @@ async fn fixer_discovery_skips_spec_ready_merged_held_and_foreign_prs() {
         .push_pr("meguri/15-busy-bbb222", "Busy (#15)", &[LABEL_WORKING]);
     env.forge
         .add_review_thread(pr, "t-busy", "z.txt", "reviewer", "fix");
+    // PR #7: escalated — waits for a human to clear the label (issue #170:
+    // the fixer used to carry no needs-human gate at all, unlike ci-fixer
+    // and the conflict resolver).
+    let pr = env.forge.push_pr(
+        "meguri/16-stuck-ccc333",
+        "Stuck (#16)",
+        &[LABEL_NEEDS_HUMAN],
+    );
+    env.forge
+        .add_review_thread(pr, "t-stuck", "w.txt", "reviewer", "fix");
 
     let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![9],
-        "only the open, unclaimed meguri PR with an awaiting thread is actionable"
+        "only the open, unclaimed, unescalated meguri PR with an awaiting thread is actionable"
     );
 }
 
@@ -421,7 +442,7 @@ async fn fixer_skips_quietly_when_pr_flips_spec_ready_after_discovery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fixer_needs_human_escalates_on_the_pr() {
+async fn fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     let env = setup(None).await;
     let run = create_fixer_run(&env);
 
@@ -454,4 +475,13 @@ async fn fixer_needs_human_escalates_on_the_pr() {
     // the needs-human state the comment is still actionable.
     let threads = env.forge.threads_of(1);
     assert_eq!(threads[0].comments.len(), 1);
+
+    // The unresolved, unparked thread would otherwise re-trigger the fixer
+    // forever (issue #170: the fixer used to have no needs-human gate at
+    // all, unlike ci-fixer and the conflict resolver); the escalation must
+    // still park discovery.
+    assert!(
+        FixerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "an escalated PR must wait for a human, not re-trigger"
+    );
 }

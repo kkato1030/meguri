@@ -1,0 +1,37 @@
+name: cargo-deny (schedule)
+
+# issue #119(OSS 公開 7/7): cargo-deny は push / pull_request トリガのみだと、
+# コミットが止まっている期間に公表された RustSec advisory に気づけない。
+# 週次でコミット無しでも実行し、advisory 検知を継続する。
+#
+# 失敗時の通知: GitHub 標準のスケジュール実行失敗メール通知(cron を最後に編集した
+# コミッターへ届く)に委ねる。single-maintainer な best-effort 運用(SECURITY.md 参照)
+# のため、issue 自動起票などの追加導線は現時点では過剰と判断した。
+on:
+  schedule:
+    - cron: "0 3 * * 1" # 毎週月曜 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check

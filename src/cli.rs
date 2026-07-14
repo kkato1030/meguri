@@ -16,25 +16,41 @@ pub enum Command {
     /// Create ~/.meguri (config.toml + sqlite db)
     Init,
     /// Check environment: gh auth, mux availability, git
-    Doctor,
-    /// Capture an issue from a one-line memo: create it immediately (never
-    /// via the LLM), then let an agent refine title/body best-effort
+    Doctor {
+        /// Also fire a one-shot live probe per agent profile to verify each
+        /// model alias still resolves (spends a few hundred tokens of quota)
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Capture work with one line: a GitHub issue (github mode — created
+    /// immediately, then refined by an agent best-effort) or a local task
+    /// (local mode — queued for the watch)
     Add {
-        /// The raw one-line memo (the only positional argument)
-        text: String,
+        /// The one-line memo / task title (in local mode, omit only when
+        /// --file supplies a heading)
+        text: Option<String>,
         /// Project id from config.toml (default: inferred from the cwd, or the
         /// sole configured project)
         #[arg(long)]
         project: Option<String>,
-        /// Also queue it for the planner loop (`meguri:plan`)
+        /// Queue it for the planner (`meguri:plan` / a plan task) instead of
+        /// the worker
         #[arg(long)]
         plan: bool,
-        /// Also queue it for the worker loop (`meguri:ready`)
+        /// github mode: also queue it for the worker loop (`meguri:ready`)
         #[arg(long)]
         ready: bool,
-        /// Skip refine entirely: capture the raw memo and stop (no LLM call)
+        /// github mode: skip refine entirely, capture the raw memo (no LLM call)
         #[arg(long)]
         raw: bool,
+        /// local mode: read the task from a markdown file (first heading →
+        /// title, body → body)
+        #[arg(long)]
+        file: Option<String>,
+        /// local mode: hold the task until this instant (YYYY-MM-DD or RFC3339
+        /// UTC); discovered only once the time passes (issue #148)
+        #[arg(long)]
+        not_before: Option<String>,
     },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
@@ -55,11 +71,31 @@ pub enum Command {
         #[arg(long)]
         mux: Option<String>,
     },
+    /// List local tasks (needs_human is highlighted)
+    Tasks {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Include done/cancelled tasks
+        #[arg(long)]
+        all: bool,
+    },
+    /// List cron schedules (definition, last fire, next fire)
+    Schedules {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List runs and their interaction state
     Ps {
         /// Include finished runs
         #[arg(long)]
         all: bool,
+    },
+    /// Show aggregate stats read straight from sqlite (works with watch stopped)
+    Stats {
+        #[command(subcommand)]
+        command: StatsCommand,
     },
     /// Build a dedicated dashboard workspace of tiled live agent panes and
     /// attach to it — a terminal dashboard
@@ -119,6 +155,62 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Distribute the embedded meguri skill/rule fragment to agent CLIs, so
+    /// an agent working nearby can learn about and propose meguri on its own
+    AgentSkills {
+        #[command(subcommand)]
+        command: AgentSkillsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentSkillsCommand {
+    /// Install the user-level skill (default), or the project-level rule
+    /// fragment with `--project`
+    Install {
+        /// Agent CLI to target (currently only "claude")
+        #[arg(long, default_value = "claude")]
+        target: String,
+        /// Install the repo-level rule fragment (`.claude/rules/meguri.md`
+        /// for the claude target) instead of the user-level skill
+        /// (`~/.claude/skills/meguri/`)
+        #[arg(long)]
+        project: bool,
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Overwrite files that differ from the embedded source (without
+        /// this, a diff is shown and differing files are left untouched)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show whether the skill/rule fragment is installed and matches this
+    /// binary's embedded version
+    Status {
+        /// Agent CLI to target (currently only "claude")
+        #[arg(long, default_value = "claude")]
+        target: String,
+        /// Check the project-level rule fragment instead of the user-level
+        /// skill
+        #[arg(long)]
+        project: bool,
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StatsCommand {
+    /// Success rate / mean turns / mean duration per (role, profile), plus any
+    /// active routing drift
+    Routing {
+        /// Restrict to one project id (default: all projects, project column)
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,5 +269,74 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("prune"));
         assert!(!help.contains("clean"));
+    }
+
+    #[test]
+    fn agent_skills_install_defaults_to_user_level_claude_target() {
+        let cli = Cli::try_parse_from(["meguri", "agent-skills", "install"]).unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Install {
+                        target,
+                        project,
+                        repo,
+                        force,
+                    },
+            } => {
+                assert_eq!(target, "claude");
+                assert!(!project);
+                assert_eq!(repo, None);
+                assert!(!force);
+            }
+            other => panic!("expected AgentSkills(Install), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_skills_install_parses_project_flags() {
+        let cli = Cli::try_parse_from([
+            "meguri",
+            "agent-skills",
+            "install",
+            "--project",
+            "--repo",
+            "/tmp/some-repo",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Install {
+                        project,
+                        repo,
+                        force,
+                        ..
+                    },
+            } => {
+                assert!(project);
+                assert_eq!(repo.as_deref(), Some("/tmp/some-repo"));
+                assert!(force);
+            }
+            other => panic!("expected AgentSkills(Install), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_skills_status_parses() {
+        let cli = Cli::try_parse_from(["meguri", "agent-skills", "status", "--project"]).unwrap();
+        match cli.command {
+            Command::AgentSkills {
+                command:
+                    AgentSkillsCommand::Status {
+                        target, project, ..
+                    },
+            } => {
+                assert_eq!(target, "claude");
+                assert!(project);
+            }
+            other => panic!("expected AgentSkills(Status), got {other:?}"),
+        }
     }
 }

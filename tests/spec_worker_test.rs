@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, LaunchMode, ProjectConfig};
 use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
@@ -107,28 +107,49 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     );
 
     let mut config = Config::default();
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so a self-review turn (if a test enables
+    // review.enabled) doesn't fall through to its recommended `direct` mode,
+    // which would spawn a *real* `claude` subprocess instead of going
+    // through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    // These takeover tests don't script the self-review turn; the dedicated
+    // self-review test (ADR 0011) enables it explicitly.
+    config.review.enabled = false;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        // The spec worker (branch-takeover morph) is the combined delivery
+        // (ADR 0008); in separate delivery it is inert.
+        plan_delivery: meguri::config::PlanDelivery::Combined,
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -188,10 +209,37 @@ fn pending_turn(worktree: &Path) -> Option<String> {
 }
 
 fn write_result(worktree: &Path, turn_id: &str, status: &str) {
-    let result = serde_json::json!({
+    write_result_with_subject(worktree, turn_id, status, None);
+}
+
+fn write_result_with_subject(worktree: &Path, turn_id: &str, status: &str, subject: Option<&str>) {
+    let mut result = serde_json::json!({
         "turn_id": turn_id, "status": status, "summary": "scripted implementation",
     });
+    if let Some(subject) = subject {
+        result["subject"] = serde_json::Value::String(subject.to_string());
+    }
     std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
+}
+
+/// The prompt delivered for one turn, so a scripted agent can tell the
+/// execute turn from the self-review turn (ADR 0011).
+fn prompt_of(worktree: &Path, turn_id: &str) -> String {
+    std::fs::read_to_string(worktree.join(format!(".meguri/prompt-{turn_id}.md")))
+        .unwrap_or_default()
+}
+
+/// Write the review turn's verdict file (the self-review lane reads this,
+/// not `result.json`).
+fn write_review(worktree: &Path, verdict: &str) {
+    let body = serde_json::json!({
+        "verdict": verdict, "review": "self-review note", "findings": [],
+    });
+    std::fs::write(
+        worktree.join(meguri::engine::self_review::REVIEW_FILE),
+        body.to_string(),
+    )
+    .unwrap();
 }
 
 /// Contents of the prompt files delivered to the (scripted) agent.
@@ -260,7 +308,7 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     // Discovery keys the run to the issue the branch encodes, not the PR.
     let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![5]
     );
 
@@ -396,6 +444,114 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     assert!(SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty());
 }
 
+/// ADR 0011: the combined-delivery takeover runs the internal self-review
+/// over its implementation diff before the spec PR becomes the impl PR —
+/// symmetric with the worker and planner. Enabled here explicitly (the other
+/// takeover tests skip it); the scripted agent answers the review turn with a
+/// clean verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_worker_self_reviews_the_combined_impl_diff() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+
+    let run = create_spec_worker_run(&env);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            // The review turn reads a verdict file; the execute turn commits.
+            if prompt_of(&wt, &turn_id).contains("self-review round") {
+                write_review(&wt, "clean");
+            } else {
+                commit_implementation(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_spec_worker(&env.deps, &run.id))
+            .await
+            .expect("spec worker timed out")
+            .unwrap();
+    agent.abort();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "got {outcome:?}"
+    );
+
+    // A self-review actually ran over the takeover's diff and resolved clean.
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.reviewed".to_string()),
+        "the combined takeover must run self-review: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"self_review.clean".to_string()),
+        "{kinds:?}"
+    );
+
+    // The internal loop never touched the forge, and the folded <details>
+    // records the inspection history on the PR body (ADR 0008).
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "still no second PR");
+    assert!(
+        env.forge.threads_of(1).is_empty() && env.forge.pr_comments_of(1).is_empty(),
+        "self-review must post nothing on the forge"
+    );
+    assert!(
+        prs[0].body.contains("<details>") && prs[0].body.contains("self-review"),
+        "the PR body folds the self-review summary: {}",
+        prs[0].body
+    );
+}
+
+/// Acceptance (issue #136): the takeover's own execute turn authors a
+/// `subject` describing the implementation, and that — not the planner's
+/// spec-time title — becomes the PR title, moving the PR from the spec's
+/// framing to the implementation's.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_worker_retitle_uses_the_implementation_turns_own_subject() {
+    let env = setup(Some("test -f cache.txt && test ! -f docs/specs/issue-5.md")).await;
+    let run = create_spec_worker_run(&env);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_implementation(&wt).await;
+            write_result_with_subject(
+                &wt,
+                &turn_id,
+                "success",
+                Some("Cache read-through responses in memory"),
+            );
+        });
+    });
+
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_spec_worker(&env.deps, &run.id))
+            .await
+            .expect("spec worker timed out")
+            .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(
+        prs[0].title, "Cache read-through responses in memory (#5)",
+        "the implementation turn's own subject replaces the planner's spec title"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_worker_needs_human_escalates_like_the_worker() {
     let env = setup(None).await;
@@ -504,7 +660,7 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
 
     let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![5]
     );
 

@@ -11,7 +11,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneSpec;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_AUTHOR, RunStatus, Store};
+use meguri::store::{LANE_AUTHOR, RunStatus, Store};
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -39,24 +39,32 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 
 async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
-    Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(root.join("worktrees")),
+        pr: None,
+        clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
+    };
+    Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
         forge,
-        config: Config::default(),
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: clone,
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(root.join("worktrees")),
-            pr: None,
-            clean: None,
-        },
-    }
+        Config::default(),
+        project,
+    )
 }
 
 /// Create a meguri worktree for `issue` with one committed file; returns
@@ -65,7 +73,7 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
     let branch = gitops::branch_name(issue, title, &format!("run-{issue}"));
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main")
+    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main", &[])
         .await
         .unwrap();
     std::fs::write(wt.join("work.txt"), format!("issue {issue}\n")).unwrap();
@@ -93,14 +101,14 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
 async fn add_review_worktree(deps: &Deps, pr: i64) -> PathBuf {
     let run = deps
         .store
-        .create_run_for_loop("proj", "reviewer", pr, &format!("Review PR #{pr}"))
+        .create_run_for_loop("proj", "spec-reviewer", pr, &format!("Review PR #{pr}"))
         .unwrap();
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &format!("review-{pr}-{}", run.id));
     let head = run_git(&deps.project.repo_path, &["rev-parse", "HEAD"])
         .await
         .unwrap();
-    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim())
+    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim(), &[])
         .await
         .unwrap();
     // A detached checkout reports no branch, so the run lookup goes by path;
@@ -416,7 +424,7 @@ async fn register_pane(deps: &Deps, issue: i64, wt: &Path) -> meguri::mux::PaneI
         .upsert_pane(
             "proj",
             issue,
-            ROLE_AUTHOR,
+            LANE_AUTHOR,
             deps.mux.kind().as_str(),
             "meguri",
             &pane.0,
@@ -462,7 +470,7 @@ async fn sweep_reclaims_pane_then_worktree_of_closed_issue() {
     assert!(!deps.mux.pane_alive(&pane).await.unwrap());
     let record = deps
         .store
-        .get_pane("proj", 11, ROLE_AUTHOR)
+        .get_pane("proj", 11, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     assert_eq!(record.mux_pane_id, None);
@@ -538,7 +546,7 @@ async fn sweep_clears_stale_mapping_of_dead_pane() {
     reaper::sweep(&deps).await.unwrap();
     let record = deps
         .store
-        .get_pane("proj", 14, ROLE_AUTHOR)
+        .get_pane("proj", 14, LANE_AUTHOR)
         .unwrap()
         .unwrap();
     assert_eq!(record.mux_pane_id, None, "stale mapping cleared");

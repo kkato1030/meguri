@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{CleanConfig, Config, ProjectConfig};
+use meguri::config::{CleanConfig, Config, LaunchMode, ProjectConfig};
 use meguri::engine::cleaner::{
     self, CleanerLoop, MARKER_HEAD_NONE, REPORT_FILE, clean_marker, parse_clean_marker, run_cleaner,
 };
@@ -104,26 +104,41 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     config.clean = clean;
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin cleaner to pane so it doesn't fall through to its recommended
+    // `direct` mode, which would spawn a *real* `claude` subprocess instead
+    // of going through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("cleaner".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone.clone(),
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        mode: Default::default(),
+        deliver: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-        notifier: meguri::notify::fake::recording_notifier().0,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -251,7 +266,7 @@ async fn first_sweep_creates_report_issue_and_touches_nothing_else() {
     // Discovery: no report issue yet → the synthetic target 0.
     let targets = CleanerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![0]
     );
 
@@ -345,7 +360,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .unwrap();
     let targets = CleanerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![report]
     );
 

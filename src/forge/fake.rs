@@ -7,9 +7,24 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergeableState, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
+    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
+
+/// The FakeForge's default merge policy: everything allowed and the base
+/// protected, so auto-merge tests read straight without per-test setup.
+fn permissive_policy() -> MergePolicy {
+    MergePolicy {
+        auto_merge_allowed: true,
+        allowed_strategies: vec![
+            MergeStrategy::Squash,
+            MergeStrategy::Merge,
+            MergeStrategy::Rebase,
+        ],
+        protected_with_required_checks: true,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecordedPr {
@@ -27,6 +42,10 @@ pub struct RecordedPr {
 
 #[derive(Default)]
 pub struct FakeForge {
+    /// This fake's own repo slug, if it stands in for a specific repo (issue
+    /// #154 cross-repo tests). `None` = the single-repo default: every
+    /// `add_blocked_by_in` is treated as same-repo.
+    pub slug: Option<String>,
     pub issues: Mutex<Vec<Issue>>,
     /// Closed issues: number → state_reason ("completed", "not_planned", ...).
     pub closed: Mutex<HashMap<i64, String>>,
@@ -38,11 +57,36 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
-    pub pr_comments: Mutex<Vec<(i64, String)>>,
+    /// PR conversation comments: (pr, body, createdAt). `comment_pr` stamps
+    /// `store::now()`; [`FakeForge::add_pr_comment_at`] seeds an explicit
+    /// (e.g. stale) timestamp for merge-watch arm-since tests.
+    pub pr_comments: Mutex<Vec<(i64, String, String)>>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
+    /// `mergeStateStatus` per PR (merge-watch); unset reports `Unknown`.
+    pub merge_status: Mutex<HashMap<i64, MergeStateStatus>>,
+    /// Explicit auto-merge-armed override per PR (merge-watch HumanDisabled
+    /// tests). Unset falls back to whether `armed` holds the PR.
+    pub auto_merge_enabled: Mutex<HashMap<i64, bool>>,
+    /// PRs whose `pr_merge_state` fails — the 429/5xx TransientError scenario.
+    pub merge_state_errors: Mutex<HashSet<i64>>,
     /// Mergeability per PR number; unset PRs report `Unknown` (like GitHub
     /// before it finished computing).
     pub mergeable: Mutex<HashMap<i64, MergeableState>>,
+    /// Armed auto-merge: PR → (strategy, head_sha). Re-arm overwrites.
+    pub armed: Mutex<HashMap<i64, (MergeStrategy, String)>>,
+    /// PRs GitHub already judges mergeable — `enable_auto_merge` returns
+    /// `AlreadyClean` for these (see [`FakeForge::set_clean`]).
+    pub clean_prs: Mutex<HashSet<i64>>,
+    /// Finalized merges: PR → head_sha it merged at.
+    pub merged: Mutex<HashMap<i64, String>>,
+    /// Repository merge policy; `None` means the permissive default.
+    pub policy: Mutex<Option<MergePolicy>>,
+    /// When true, the branch-protection probe is "forbidden" — it mirrors a
+    /// non-admin token's HTTP 403 (see [`FakeForge::forbid_protection_probe`]).
+    /// `merge_policy` only consults the probe when `require_branch_protection`
+    /// is true, so this errors then and is silently skipped otherwise — the
+    /// exact escape hatch the real GhForge implements.
+    pub protection_probe_forbidden: Mutex<bool>,
     /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
     pub pr_for_branch_errors: Mutex<HashSet<String>>,
     /// CI checks per PR number (ci-fixer tests); unset PRs report an empty
@@ -54,25 +98,45 @@ pub struct FakeForge {
     /// (the inline comments land in `threads`).
     pub pr_reviews: Mutex<Vec<(i64, String)>>,
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
-    /// scenarios; the impl-reviewer falls back to a summary comment).
+    /// scenarios; exercised even though no current loop calls it).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
     /// Issues whose update_issue_body fails (`meguri add` refine-writeback
     /// forge-hiccup scenarios).
     pub update_body_errors: Mutex<HashSet<i64>>,
     /// Issues whose update_issue_title fails (same, title side).
     pub update_title_errors: Mutex<HashSet<i64>>,
+    /// Commit statuses meguri wrote: (head_sha, context) → latest state
+    /// (ADR 0008 inspection history). Re-posting a context overwrites it.
+    pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
 }
 
 impl FakeForge {
     pub fn with_issue(number: i64, title: &str, body: &str, labels: &[&str]) -> Self {
         let forge = Self::default();
-        forge.issues.lock().unwrap().push(Issue {
+        forge.add_issue(number, title, body, labels);
+        forge
+    }
+
+    /// Seed an additional issue on the fake forge (multi-issue discovery /
+    /// cadence tests).
+    pub fn add_issue(&self, number: i64, title: &str, body: &str, labels: &[&str]) {
+        self.issues.lock().unwrap().push(Issue {
             number,
             title: title.into(),
             body: body.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
-        forge
+    }
+
+    /// A fake standing in for a specific repo slug (issue #154 cross-repo
+    /// decomposition tests): `add_blocked_by_in` then distinguishes
+    /// same-repo blockers (existence-checked) from cross-repo ones (recorded
+    /// as-is, since the blocker lives in another fake's store).
+    pub fn with_slug(slug: &str) -> Self {
+        Self {
+            slug: Some(slug.to_string()),
+            ..Self::default()
+        }
     }
 
     pub fn close_issue(&self, number: i64) {
@@ -199,6 +263,14 @@ impl FakeForge {
         }
     }
 
+    /// Toggle a seeded PR's draft flag (auto-merge draft-readying tests).
+    pub fn set_pr_draft(&self, number: i64, draft: bool) {
+        let mut prs = self.prs.lock().unwrap();
+        if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
+            pr.draft = draft;
+        }
+    }
+
     /// Numbers of the issues recorded as blocking `number`.
     pub fn blockers_of(&self, number: i64) -> Vec<i64> {
         self.blocked_by
@@ -253,9 +325,37 @@ impl FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _)| *n == number)
-            .map(|(_, c)| c.clone())
+            .filter(|(n, _, _)| *n == number)
+            .map(|(_, body, _)| body.clone())
             .collect()
+    }
+
+    /// Seed a PR comment with an explicit `createdAt` (merge-watch tests seed a
+    /// stale arm marker to drive arm-since past `STALE_AFTER`).
+    pub fn add_pr_comment_at(&self, pr: i64, body: &str, created_at: &str) {
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .push((pr, body.into(), created_at.into()));
+    }
+
+    /// Simulate GitHub's `mergeStateStatus` for a PR (merge-watch tests).
+    pub fn set_merge_state_status(&self, number: i64, status: MergeStateStatus) {
+        self.merge_status.lock().unwrap().insert(number, status);
+    }
+
+    /// Force whether auto-merge reads as armed on a PR, independent of the
+    /// `armed` map (merge-watch HumanDisabled: arm marker present, this false).
+    pub fn set_auto_merge_enabled(&self, number: i64, enabled: bool) {
+        self.auto_merge_enabled
+            .lock()
+            .unwrap()
+            .insert(number, enabled);
+    }
+
+    /// Make `pr_merge_state` fail for a PR (the 429/5xx TransientError path).
+    pub fn fail_merge_state(&self, number: i64) {
+        self.merge_state_errors.lock().unwrap().insert(number);
     }
 
     /// Seed an already-open PR (as if a worker run shipped it earlier);
@@ -340,6 +440,70 @@ impl FakeForge {
             .collect()
     }
 
+    /// GitHub already judges this PR mergeable: `enable_auto_merge` returns
+    /// `AlreadyClean` for it, exercising the clean-status finalize path.
+    pub fn set_clean(&self, pr: i64) {
+        self.clean_prs.lock().unwrap().insert(pr);
+    }
+
+    /// The latest commit-status state meguri wrote for (sha, context), if any.
+    pub fn commit_status_of(&self, head_sha: &str, context: &str) -> Option<CommitStatusState> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .get(&(head_sha.to_string(), context.to_string()))
+            .copied()
+    }
+
+    /// Seed a commit status directly (e.g. a guard verdict a prior run left on
+    /// the PR head), so the auto-merger's guard gate can be exercised.
+    pub fn set_commit_status_direct(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+    ) {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
+    }
+
+    /// Override the repository's merge policy (default: everything allowed +
+    /// base protected).
+    pub fn set_merge_policy(&self, policy: MergePolicy) {
+        *self.policy.lock().unwrap() = Some(policy);
+    }
+
+    /// Make the branch-protection probe fail like a non-admin token's HTTP 403.
+    /// `merge_policy` only errors when `require_branch_protection` is true;
+    /// with it false the probe is skipped and never surfaces the 403 — the
+    /// escape hatch under test (issue #41 review).
+    pub fn forbid_protection_probe(&self) {
+        *self.protection_probe_forbidden.lock().unwrap() = true;
+    }
+
+    /// The armed (strategy, head_sha) for a PR, if any.
+    pub fn armed_of(&self, pr: i64) -> Option<(MergeStrategy, String)> {
+        self.armed.lock().unwrap().get(&pr).cloned()
+    }
+
+    /// The head_sha a PR was finalized (merged) at, if any.
+    pub fn merged_head(&self, pr: i64) -> Option<String> {
+        self.merged.lock().unwrap().get(&pr).cloned()
+    }
+
+    /// Whether a PR is currently a draft.
+    pub fn is_draft(&self, pr: i64) -> bool {
+        self.prs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.number == pr)
+            .map(|p| p.draft)
+            .unwrap_or(false)
+    }
+
     fn pr_to_public(pr: &RecordedPr) -> PullRequest {
         PullRequest {
             number: pr.number,
@@ -349,6 +513,7 @@ impl FakeForge {
             head_branch: pr.head.clone(),
             head_sha: pr.head_sha.clone(),
             state: pr.state.clone(),
+            is_draft: pr.draft,
             labels: pr.labels.clone(),
         }
     }
@@ -456,6 +621,25 @@ impl Forge for FakeForge {
                 if !issues.iter().any(|i| i.number == number) {
                     bail!("issue #{number} not found");
                 }
+            }
+        }
+        self.block_issue(issue, blocker);
+        Ok(())
+    }
+
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()> {
+        // Same-repo (this fake owns blocker_repo, or is the single-repo
+        // default): existence-checked exactly like add_blocked_by. Cross-repo:
+        // the blocker lives in another fake's store, so only the dependent
+        // issue is checked and the edge is recorded as-is.
+        let same_repo = self.slug.as_deref().is_none_or(|s| s == blocker_repo);
+        if same_repo {
+            return self.add_blocked_by(issue, blocker).await;
+        }
+        {
+            let issues = self.issues.lock().unwrap();
+            if !issues.iter().any(|i| i.number == issue) {
+                bail!("issue #{issue} not found");
             }
         }
         self.block_issue(issue, blocker);
@@ -578,6 +762,38 @@ impl Forge for FakeForge {
             .unwrap_or(MergeableState::Unknown))
     }
 
+    async fn pr_merge_state(&self, number: i64) -> Result<MergeState> {
+        if self.merge_state_errors.lock().unwrap().contains(&number) {
+            bail!("merge state of PR #{number} is unavailable (simulated 429)");
+        }
+        let mergeable = self
+            .mergeable
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or(MergeableState::Unknown);
+        let status = self
+            .merge_status
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or(MergeStateStatus::Unknown);
+        let auto_merge_enabled = self
+            .auto_merge_enabled
+            .lock()
+            .unwrap()
+            .get(&number)
+            .copied()
+            .unwrap_or_else(|| self.armed.lock().unwrap().contains_key(&number));
+        Ok(MergeState {
+            mergeable,
+            status,
+            auto_merge_enabled,
+        })
+    }
+
     async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup> {
         Ok(CheckRollup {
             checks: self
@@ -625,8 +841,25 @@ impl Forge for FakeForge {
         Ok(self.pr_comments_of(number))
     }
 
+    async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>> {
+        Ok(self
+            .pr_comments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| *n == number)
+            .map(|(_, body, created_at)| PrComment {
+                body: body.clone(),
+                created_at: created_at.clone(),
+            })
+            .collect())
+    }
+
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
-        self.pr_comments.lock().unwrap().push((pr, body.into()));
+        self.pr_comments
+            .lock()
+            .unwrap()
+            .push((pr, body.into(), crate::store::now()));
         Ok(())
     }
 
@@ -695,6 +928,102 @@ impl Forge for FakeForge {
             body: body.into(),
         });
         Ok(())
+    }
+
+    async fn enable_auto_merge(
+        &self,
+        pr: i64,
+        strategy: MergeStrategy,
+        head_sha: &str,
+    ) -> Result<ArmOutcome> {
+        if self.clean_prs.lock().unwrap().contains(&pr) {
+            return Ok(ArmOutcome::AlreadyClean);
+        }
+        // Re-arm overwrites: the same head arming twice is idempotent success.
+        self.armed
+            .lock()
+            .unwrap()
+            .insert(pr, (strategy, head_sha.to_string()));
+        Ok(ArmOutcome::Armed)
+    }
+
+    async fn merge_pr(&self, pr: i64, _strategy: MergeStrategy, head_sha: &str) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        // --match-head-commit: GitHub rejects a merge whose head moved. A
+        // stale head_sha here mirrors that rejection (TOCTOU protection).
+        if rec.head_sha != head_sha {
+            bail!(
+                "PR #{pr} head moved ({} != {head_sha}); refusing to merge",
+                rec.head_sha
+            );
+        }
+        rec.state = "merged".into();
+        self.merged.lock().unwrap().insert(pr, head_sha.to_string());
+        Ok(())
+    }
+
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        _description: &str,
+    ) -> Result<()> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
+        Ok(())
+    }
+
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>> {
+        Ok(self.commit_status_of(head_sha, context))
+    }
+
+    async fn mark_pr_ready(&self, pr: i64) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.draft = false;
+        Ok(())
+    }
+
+    async fn merge_policy(
+        &self,
+        _base_branch: &str,
+        require_branch_protection: bool,
+    ) -> Result<MergePolicy> {
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(permissive_policy);
+        // Mirror GhForge: the probe only runs when protection is required.
+        if !require_branch_protection {
+            // Skipped — its result is reported false rather than read, and a
+            // forbidden (403) probe can never surface. This is the escape hatch.
+            policy.protected_with_required_checks = false;
+            return Ok(policy);
+        }
+        // Required: the probe runs. A forbidden probe mirrors a non-admin
+        // token's HTTP 403 (GhForge's `protection_from_stderr` bail).
+        if *self.protection_probe_forbidden.lock().unwrap() {
+            bail!(
+                "cannot read branch protection: the token lacks admin rights \
+                 (HTTP 403). Use an admin-scoped token, or set \
+                 `require_branch_protection = false` if you are not an admin"
+            );
+        }
+        Ok(policy)
     }
 
     async fn create_pr_review(

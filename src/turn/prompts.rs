@@ -33,12 +33,21 @@ pub struct ChildIssue {
     #[serde(default)]
     pub body: String,
     /// How the child enters the loops: "ready" (small enough to implement
-    /// directly) or "plan" (needs its own design pass first).
+    /// directly), "plan" (needs its own design pass first), or "human" (a task
+    /// meguri cannot run — filed with no trigger label so discovery never
+    /// picks it up and a human closes it; issue #154).
     pub kind: String,
     /// Zero-based indices of *earlier* `children` entries this one depends
     /// on; meguri wires them as GitHub-native `blocked_by`.
     #[serde(default)]
     pub blocked_by: Vec<usize>,
+    /// Which project (repository) to file this child in. `None` (the default)
+    /// files it in the parent issue's own repo — the existing behavior. A
+    /// value must name a workspace sibling of the parent's project; the
+    /// planner rejects anything else, keeping issue-filing scope pinned to the
+    /// host operator's config (issue #154 / ADR 0009).
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +56,12 @@ pub struct TurnResultFile {
     pub status: TurnStatus,
     #[serde(default)]
     pub summary: String,
+    /// Agent-authored PR/commit subject (issue #136): a short, imperative
+    /// line describing the actual change, used as the PR title instead of
+    /// the issue title when present. `summary`/`pr_body` follow the same
+    /// optional-field shape.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Agent-authored pull-request description (Markdown), used as the PR
     /// body when present; `summary` is the fallback.
     #[serde(default)]
@@ -88,11 +103,19 @@ fn completion_contract(turn_id: &str) -> String {
 When you have FULLY completed the task above, write a JSON file at
 `{MEGURI_DIR}/{RESULT_FILE}` (relative to the repository root) containing exactly:
 
-    {{"turn_id": "{turn_id}", "status": "success", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
+    {{"turn_id": "{turn_id}", "status": "success", "subject": "<imperative one-line description of the actual change>", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
 
 - `status` must be one of: "success" (task done), "failure" (you tried and
   cannot complete it), "needs_human" (a human decision or missing information
   blocks you — explain what you need in the summary).
+- `subject` (optional): a short, imperative-mood line (roughly 50-72
+  characters) naming what this PR actually changes — not a restatement of
+  the issue's goal. It becomes the commit subject / PR title as "<subject>
+  (#N)"; do not add the "(#N)" yourself, the engine appends it. If you only
+  wrote a spec, say so honestly (e.g. "Add a spec for ..."); if the real
+  change diverged from the issue's ask, describe what landed. Match the
+  repository's existing language convention. Omit this field to fall back
+  to the issue title (previous behavior).
 - `pr_body` (on success): a Markdown pull-request description of what you
   actually changed. If the prompt includes a PR template, fill in each of its
   sections; escape newlines as \n inside the JSON string.
@@ -107,12 +130,28 @@ When you have FULLY completed the task above, write a JSON file at
 }
 
 /// Write the full prompt file for a turn; returns its path.
-pub fn write_prompt_file(worktree: &Path, turn_id: &str, body: &str) -> Result<PathBuf> {
+///
+/// `preamble` is the project's standing-discipline block (issue #149): when
+/// non-empty it is placed right after the header and before `{body}`, so it
+/// reads as a preface while the completion contract stays last and
+/// authoritative. An empty `preamble` yields byte-for-byte the historical
+/// output.
+pub fn write_prompt_file(
+    worktree: &Path,
+    turn_id: &str,
+    body: &str,
+    preamble: &str,
+) -> Result<PathBuf> {
     let dir = meguri_dir(worktree);
     std::fs::create_dir_all(&dir)?;
     let path = prompt_path(worktree, turn_id);
+    let preamble_block = if preamble.is_empty() {
+        String::new()
+    } else {
+        format!("{preamble}\n\n")
+    };
     let content = format!(
-        "<!-- meguri prompt -->\nturn_id: {turn_id}\n\n{body}\n\n{contract}\n",
+        "<!-- meguri prompt -->\nturn_id: {turn_id}\n\n{preamble_block}{body}\n\n{contract}\n",
         contract = completion_contract(turn_id)
     );
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
@@ -155,14 +194,51 @@ mod tests {
     #[test]
     fn prompt_file_contains_contract_and_turn_id() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_prompt_file(dir.path(), "abc-123", "Implement the thing.").unwrap();
+        let path = write_prompt_file(dir.path(), "abc-123", "Implement the thing.", "").unwrap();
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("turn_id: abc-123"));
         assert!(content.contains("Implement the thing."));
         assert!(content.contains(r#""turn_id": "abc-123""#));
         assert!(content.contains("needs_human"));
         assert!(content.contains("pr_body"));
+        assert!(content.contains("subject"));
         assert!(content.contains("agent_session_id"));
+    }
+
+    #[test]
+    fn empty_preamble_leaves_output_unchanged() {
+        // The whole point of the empty-preamble path: a project with no
+        // `[prompts]` config gets byte-for-byte the historical prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let with = write_prompt_file(dir.path(), "t", "Body here.", "").unwrap();
+        let content = std::fs::read_to_string(with).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "<!-- meguri prompt -->\nturn_id: t\n\nBody here.\n\n{}\n",
+                completion_contract("t")
+            )
+        );
+    }
+
+    #[test]
+    fn preamble_sits_before_body_and_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_file(
+            dir.path(),
+            "t",
+            "ISSUE BODY",
+            "## 恒常規律\nRead the guardrails.",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        let preamble_at = content.find("恒常規律").unwrap();
+        let body_at = content.find("ISSUE BODY").unwrap();
+        let contract_at = content.find("Completion contract").unwrap();
+        // preamble before the issue body, and the completion contract stays
+        // last so it keeps final authority (ADR 0012).
+        assert!(preamble_at < body_at, "preamble must precede the body");
+        assert!(body_at < contract_at, "contract must stay last");
     }
 
     #[test]
@@ -249,6 +325,28 @@ mod tests {
         assert_eq!(
             read_result(dir.path(), "t1").unwrap().pr_body.as_deref(),
             Some("## Summary\nDid it.")
+        );
+    }
+
+    #[test]
+    fn result_subject_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_result(dir.path(), "t1").unwrap().subject, None);
+
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"t1","status":"success","summary":"done","subject":"Cache API responses"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_result(dir.path(), "t1").unwrap().subject.as_deref(),
+            Some("Cache API responses")
         );
     }
 

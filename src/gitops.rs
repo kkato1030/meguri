@@ -46,6 +46,16 @@ pub fn run_git_sync(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Resolve the toplevel of the Git work tree containing `dir` (blocking, via
+/// `git rev-parse --show-toplevel`). Errors when `dir` is not inside a Git
+/// work tree — callers that want a fallback must handle it explicitly rather
+/// than silently getting `dir` back.
+pub fn repo_toplevel_sync(dir: &Path) -> Result<PathBuf> {
+    let top = run_git_sync(dir, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a Git repository", dir.display()))?;
+    Ok(PathBuf::from(top))
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -75,6 +85,28 @@ pub fn branch_name(issue: i64, title: &str, run_id: &str) -> String {
     format!("meguri/{issue}-{slug}-{hash}", slug = slugify(title))
 }
 
+/// `meguri/t<task_id>-<slug>-<runhash>`: the local-task counterpart of
+/// [`branch_name`]. The `t` prefix keeps local branches out of
+/// [`issue_from_branch`]'s number space, and Phase 4 detects a re-claim by
+/// matching the `meguri/t<id>-` prefix on the remote.
+pub fn task_branch_name(task_id: i64, title: &str, run_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(&Sha256::digest(run_id.as_bytes())[..3]);
+    format!("meguri/t{task_id}-{slug}-{hash}", slug = slugify(title))
+}
+
+/// The task id a [`task_branch_name`]-style branch encodes
+/// (`meguri/t<id>-<slug>-<runhash>`); `None` for anything else, including
+/// issue branches (`meguri/<issue>-…`).
+pub fn task_from_branch(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix("meguri/t")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -100,15 +132,21 @@ pub fn worktree_path(worktrees_root: &Path, project_id: &str, branch: &str) -> P
 }
 
 /// Create (or reuse) a worktree for `branch` off the project's default
-/// branch. Prefers `origin/<default>` when a remote exists.
+/// branch. Prefers `origin/<default>` when a remote exists. `extra_excludes`
+/// (a project's `worktree_setup.exclude`) is appended to `info/exclude`
+/// alongside the always-on `.meguri/`.
 pub async fn create_worktree(
     repo_path: &Path,
     worktree: &Path,
     branch: &str,
     default_branch: &str,
+    extra_excludes: &[String],
 ) -> Result<()> {
     if worktree.join(".git").exists() {
-        return Ok(()); // resuming an interrupted run
+        // Resuming an interrupted run. `worktree_setup.exclude` may have
+        // changed since this worktree was first created, so re-apply it
+        // rather than assuming the original creation covered it.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -144,13 +182,19 @@ pub async fn create_worktree(
     .await
     .context("git worktree add")?;
 
-    exclude_meguri(worktree).await
+    exclude_paths(worktree, extra_excludes).await
 }
 
 /// Attach a worktree to an *existing* branch (a PR's head): detach the
 /// branch from whichever worktree still holds it (git refuses two checkouts
 /// of one branch), reset it to the pushed tip, and check it out here.
-pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) -> Result<()> {
+/// `extra_excludes` — see [`create_worktree`].
+pub async fn attach_worktree(
+    repo_path: &Path,
+    worktree: &Path,
+    branch: &str,
+    extra_excludes: &[String],
+) -> Result<()> {
     if worktree.join(".git").exists() {
         // Resuming, or reusing the worktree that already owns the branch
         // (attach and create share the same path scheme). Best-effort sync
@@ -161,7 +205,9 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
             &["merge", "--ff-only", &format!("origin/{branch}")],
         )
         .await;
-        return Ok(());
+        // `worktree_setup.exclude` may have changed since this worktree was
+        // first attached, so re-apply it rather than assuming it's covered.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -193,7 +239,7 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
         .await
         .context("git worktree add (attach)")?;
 
-    exclude_meguri(worktree).await
+    exclude_paths(worktree, extra_excludes).await
 }
 
 /// Create (or re-point) a review worktree detached at `head_sha` (a PR
@@ -202,12 +248,14 @@ pub async fn attach_worktree(repo_path: &Path, worktree: &Path, branch: &str) ->
 /// worktree is issue-scoped and survives review rounds (issue #92): when it
 /// already exists — resuming an interrupted run, or reviewing the next push
 /// — it is reset hard onto the new head instead of being recreated, so the
-/// pane standing in it stays valid.
+/// pane standing in it stays valid. `extra_excludes` — see
+/// [`create_worktree`].
 pub async fn create_review_worktree(
     repo_path: &Path,
     worktree: &Path,
     head_branch: &str,
     head_sha: &str,
+    extra_excludes: &[String],
 ) -> Result<()> {
     // Best-effort: the head may already be local (pushed from this host).
     let _ = run_git(repo_path, &["fetch", "origin", head_branch]).await;
@@ -221,7 +269,9 @@ pub async fn create_review_worktree(
         run_git(worktree, &["clean", "-fd"])
             .await
             .context("git clean (review re-point)")?;
-        return Ok(());
+        // `worktree_setup.exclude` may have changed since this worktree was
+        // first created, so re-apply it rather than assuming it's covered.
+        return exclude_paths(worktree, extra_excludes).await;
     }
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
@@ -235,7 +285,7 @@ pub async fn create_review_worktree(
     .await
     .context("git worktree add (review)")?;
 
-    exclude_meguri(worktree).await
+    exclude_paths(worktree, extra_excludes).await
 }
 
 /// Detach `branch` from every worktree that has it checked out so another
@@ -259,8 +309,10 @@ pub async fn detach_branch(repo_path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Keep .meguri/ (prompts, result contract) out of the agent's diffs.
-async fn exclude_meguri(worktree: &Path) -> Result<()> {
+/// Keep `.meguri/` (prompts, result contract) — and any project-configured
+/// `worktree_setup.exclude` entries — out of the agent's diffs and out of
+/// the clean-tree verification.
+async fn exclude_paths(worktree: &Path, extra: &[String]) -> Result<()> {
     let exclude = run_git(worktree, &["rev-parse", "--git-path", "info/exclude"]).await?;
     let exclude_path = if Path::new(&exclude).is_absolute() {
         PathBuf::from(exclude)
@@ -270,10 +322,16 @@ async fn exclude_meguri(worktree: &Path) -> Result<()> {
     if let Some(dir) = exclude_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut current = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if !current.contains(".meguri/") {
-        current.push_str("\n.meguri/\n");
-        std::fs::write(&exclude_path, current)?;
+    let current = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut to_append = String::new();
+    for entry in std::iter::once(".meguri/").chain(extra.iter().map(String::as_str)) {
+        if !current.lines().any(|line| line == entry) {
+            to_append.push_str(entry);
+            to_append.push('\n');
+        }
+    }
+    if !to_append.is_empty() {
+        std::fs::write(&exclude_path, current + &to_append)?;
     }
     Ok(())
 }
@@ -427,6 +485,26 @@ pub async fn commits_ahead(worktree: &Path, default_branch: &str) -> Result<u64>
     Ok(count.parse().unwrap_or(0))
 }
 
+/// The unified diff of HEAD against the base ref — three-dot, i.e. the
+/// changes introduced on HEAD since it diverged from base (the same shape a
+/// PR shows). Mirrors [`commits_ahead`]'s `origin/<base>` vs `<base>`
+/// resolution so the self-review reads exactly the PR's own diff, locally,
+/// without any forge call (ADR 0006).
+pub async fn diff_against_base(worktree: &Path, default_branch: &str) -> Result<String> {
+    let base = if run_git(
+        worktree,
+        &["rev-parse", "--verify", &format!("origin/{default_branch}")],
+    )
+    .await
+    .is_ok()
+    {
+        format!("origin/{default_branch}")
+    } else {
+        default_branch.to_string()
+    };
+    run_git(worktree, &["diff", &format!("{base}...HEAD")]).await
+}
+
 pub async fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
     run_git(worktree, &["push", "-u", "origin", branch]).await?;
     Ok(())
@@ -543,6 +621,17 @@ mod tests {
     }
 
     #[test]
+    fn task_branches_carry_the_t_prefix_and_stay_out_of_issue_space() {
+        let b = task_branch_name(5, "Local task", "run-1");
+        assert!(b.starts_with("meguri/t5-local-task-"));
+        assert_eq!(task_from_branch(&b), Some(5));
+        // Task branches never parse as issue branches, and vice versa.
+        assert_eq!(issue_from_branch(&b), None);
+        assert_eq!(task_from_branch("meguri/7-fix-bug-abc"), None);
+        assert_eq!(task_from_branch("main"), None);
+    }
+
+    #[test]
     fn branch_name_is_stable_and_scoped() {
         let a = branch_name(7, "Fix bug", "run-1");
         let b = branch_name(7, "Fix bug", "run-2");
@@ -562,6 +651,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repo_toplevel_sync_walks_up_from_subdir_and_rejects_non_repos() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("docs").join("adr");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Canonicalize both sides: on macOS the tempdir sits behind the
+        // /var -> /private/var symlink and git reports the resolved path.
+        assert_eq!(
+            repo_toplevel_sync(&sub).unwrap().canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+
+        // Outside any work tree: a hard error, never a silent fallback.
+        let plain = tempfile::tempdir().unwrap();
+        let err = repo_toplevel_sync(plain.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not inside a Git repository"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn worktree_lifecycle_and_verification() {
         let repo = tempfile::tempdir().unwrap();
@@ -571,12 +682,12 @@ mod tests {
         let branch = branch_name(1, "Test issue", "run-x");
         let wt = worktree_path(wt_root.path(), "proj", &branch);
 
-        create_worktree(repo.path(), &wt, &branch, "main")
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
             .await
             .unwrap();
         assert!(wt.join(".git").exists());
         // Idempotent for resume.
-        create_worktree(repo.path(), &wt, &branch, "main")
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
             .await
             .unwrap();
 
@@ -601,6 +712,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extra_excludes_are_appended_alongside_meguri() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = branch_name(2, "Excludes", "run-e");
+        let wt = worktree_path(wt_root.path(), "proj", &branch);
+        let extra = vec!["generated/".to_string(), "AGENTS.md".to_string()];
+
+        create_worktree(repo.path(), &wt, &branch, "main", &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let exclude_path = wt.join(exclude);
+        let contents = std::fs::read_to_string(&exclude_path).unwrap();
+        assert!(contents.contains(".meguri/"));
+        assert!(contents.contains("generated/"));
+        assert!(contents.contains("AGENTS.md"));
+
+        // Re-running does not duplicate entries.
+        create_worktree(repo.path(), &wt, &branch, "main", &extra)
+            .await
+            .unwrap();
+        let contents_again = std::fs::read_to_string(&exclude_path).unwrap();
+        assert_eq!(contents_again.matches("generated/").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn extra_excludes_apply_on_the_resume_fast_path_too() {
+        // `create_worktree` short-circuits when the worktree already exists
+        // (resuming); excludes configured *after* that first creation must
+        // still land on a later call, not just on the initial `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = branch_name(6, "Resume excludes", "run-r");
+        let wt = worktree_path(wt_root.path(), "proj", &branch);
+
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
+            .await
+            .unwrap();
+        assert!(wt.join(".git").exists());
+
+        let extra = vec!["late-generated/".to_string()];
+        create_worktree(repo.path(), &wt, &branch, "main", &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "resume path must still apply new excludes: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_worktrees_reports_paths_and_branches() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;
@@ -608,7 +782,7 @@ mod tests {
         let wt_root = tempfile::tempdir().unwrap();
         let branch = branch_name(3, "List me", "run-l");
         let wt = worktree_path(wt_root.path(), "proj", &branch);
-        create_worktree(repo.path(), &wt, &branch, "main")
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
             .await
             .unwrap();
 
@@ -634,7 +808,7 @@ mod tests {
         let wt_root = tempfile::tempdir().unwrap();
         let branch = "meguri/1-feature-abc";
         let old_wt = worktree_path(wt_root.path(), "proj", branch);
-        create_worktree(repo.path(), &old_wt, branch, "main")
+        create_worktree(repo.path(), &old_wt, branch, "main", &[])
             .await
             .unwrap();
         std::fs::write(old_wt.join("f.txt"), "v1").unwrap();
@@ -648,7 +822,9 @@ mod tests {
         // worktree gets detached, the new one sits on the branch tip.
         let new_root = tempfile::tempdir().unwrap();
         let new_wt = worktree_path(new_root.path(), "proj", branch);
-        attach_worktree(repo.path(), &new_wt, branch).await.unwrap();
+        attach_worktree(repo.path(), &new_wt, branch, &[])
+            .await
+            .unwrap();
 
         assert_eq!(run_git(&new_wt, &["rev-parse", "HEAD"]).await.unwrap(), tip);
         assert_eq!(
@@ -672,14 +848,47 @@ mod tests {
         assert_eq!(commits_ahead(&new_wt, "main").await.unwrap(), 1);
 
         // Attaching again (resume) is idempotent.
-        attach_worktree(repo.path(), &new_wt, branch).await.unwrap();
+        attach_worktree(repo.path(), &new_wt, branch, &[])
+            .await
+            .unwrap();
 
         // A branch that exists nowhere fails loudly.
         let missing = worktree_path(new_root.path(), "proj", "meguri/none");
         assert!(
-            attach_worktree(repo.path(), &missing, "meguri/none")
+            attach_worktree(repo.path(), &missing, "meguri/none", &[])
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_applies_new_excludes_on_the_reuse_path() {
+        // `attach_worktree`'s reuse branch (fetch + ff-only merge) must still
+        // re-apply `extra_excludes`, not just the first `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+
+        let branch = "meguri/9-reuse";
+        run_git(repo.path(), &["branch", branch]).await.unwrap();
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = worktree_path(wt_root.path(), "proj", branch);
+        attach_worktree(repo.path(), &wt, branch, &[])
+            .await
+            .unwrap();
+
+        let extra = vec!["late-generated/".to_string()];
+        attach_worktree(repo.path(), &wt, branch, &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "reuse path must still apply new excludes: {contents:?}"
         );
     }
 
@@ -691,7 +900,7 @@ mod tests {
         let wt_root = tempfile::tempdir().unwrap();
         let branch = branch_name(4, "Unmerged", "run-u");
         let wt = worktree_path(wt_root.path(), "proj", &branch);
-        create_worktree(repo.path(), &wt, &branch, "main")
+        create_worktree(repo.path(), &wt, &branch, "main", &[])
             .await
             .unwrap();
         run_git(&wt, &["commit", "--allow-empty", "-m", "unmerged work"])
@@ -823,7 +1032,7 @@ mod tests {
 
         let wt_root = tempfile::tempdir().unwrap();
         let wt = worktree_path(wt_root.path(), "proj", "review-1-run-x");
-        create_review_worktree(repo.path(), &wt, "pr-branch", &sha)
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha, &[])
             .await
             .unwrap();
         assert!(wt.join("spec.md").exists());
@@ -834,8 +1043,47 @@ mod tests {
             "review worktree must be detached"
         );
         // Idempotent for resume.
-        create_review_worktree(repo.path(), &wt, "pr-branch", &sha)
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha, &[])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_worktree_applies_new_excludes_on_the_repoint_path() {
+        // The re-point branch (`reset --hard` + `clean -fd`) must still
+        // re-apply `extra_excludes`, not just the first `worktree add`.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        run_git(repo.path(), &["checkout", "-b", "pr-branch"])
+            .await
+            .unwrap();
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "r1"])
+            .await
+            .unwrap();
+        let sha1 = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = worktree_path(wt_root.path(), "proj", "review-2-run-x");
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha1, &[])
+            .await
+            .unwrap();
+
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "r2"])
+            .await
+            .unwrap();
+        let sha2 = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let extra = vec!["late-generated/".to_string()];
+        create_review_worktree(repo.path(), &wt, "pr-branch", &sha2, &extra)
+            .await
+            .unwrap();
+
+        let exclude = run_git(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(wt.join(exclude)).unwrap();
+        assert!(
+            contents.contains("late-generated/"),
+            "re-point path must still apply new excludes: {contents:?}"
+        );
     }
 }

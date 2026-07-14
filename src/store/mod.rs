@@ -5,9 +5,17 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
+mod reconcile;
 mod runs;
+mod schedules;
+mod stats;
+mod tasks;
 pub use panes::*;
 pub use runs::*;
+pub use schedules::*;
+pub use stats::*;
+pub use tasks::*;
+// `reconcile` only adds inherent `impl Store` methods (no exported types).
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
@@ -27,6 +35,53 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0006_pane_role",
         include_str!("migrations/0006_pane_role.sql"),
+    ),
+    // Renumbered from 0004 after the merge with main (which claimed 0004–0006):
+    // this migration recreates the `runs` table, so it must run *after* every
+    // other runs-touching migration (0005 adds `agent_profile`) to carry those
+    // columns forward.
+    ("0007_tasks", include_str!("migrations/0007_tasks.sql")),
+    // routing 2/3 (#65): cli_versions + routing_drift. Independent new tables,
+    // renumbered to 0008 after main claimed 0007; runs last so it sees the
+    // recreated `runs` table from 0007_tasks.
+    (
+        "0008_routing_freshness",
+        include_str!("migrations/0008_routing_freshness.sql"),
+    ),
+    // issue #142: reconcile — runs.body_digest + issue_reconcile. Renumbered to
+    // 0009 after main claimed 0008 for routing freshness; independent tables.
+    (
+        "0009_reconcile",
+        include_str!("migrations/0009_reconcile.sql"),
+    ),
+    // issue #146: schedule_state — cron schedule bookkeeping. Renumbered to
+    // 0010 after main claimed 0008/0009; an independent new table.
+    (
+        "0010_schedules",
+        include_str!("migrations/0010_schedules.sql"),
+    ),
+    // issue #148: cadence — runs.cadence_label + tasks.not_before + an index
+    // for the window COUNT. Simple ALTERs; runs was already recreated by 0007.
+    ("0011_cadence", include_str!("migrations/0011_cadence.sql")),
+    // issue #168: panes.role -> panes.lane (+ value remap review/impl-review
+    // -> pr-review/self-review). Same rebuild-the-table shape as 0006.
+    // Renumbered from 0011 after main claimed it for cadence (#148).
+    (
+        "0012_panes_lane",
+        include_str!("migrations/0012_panes_lane.sql"),
+    ),
+    // issue #168: runs.loop_kind 'guard' -> 'pr-reviewer'. Pure data UPDATE.
+    (
+        "0013_loop_kind_pr_reviewer",
+        include_str!("migrations/0013_loop_kind_pr_reviewer.sql"),
+    ),
+    // routing 3/3 (#66): runs.routing_arm — mainline / explore / escalated.
+    // A single ADD COLUMN on the runs table recreated by 0007_tasks. Renumbered
+    // to 0014 after main claimed 0012/0013 for the pane/role rename (#168); an
+    // independent ALTER, so its order relative to those doesn't matter.
+    (
+        "0014_routing_arm",
+        include_str!("migrations/0014_routing_arm.sql"),
     ),
 ];
 
@@ -147,10 +202,17 @@ pub fn parse_ts(ts: &str) -> Option<u64> {
 
 /// RFC3339 UTC timestamp without external chrono dependency.
 pub fn now() -> String {
-    let d = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    let secs = d.as_secs();
+        .unwrap()
+        .as_secs();
+    format_epoch(secs)
+}
+
+/// Format epoch seconds as our RFC3339 UTC shape (`YYYY-MM-DDThh:mm:ssZ`).
+/// Split out from [`now`] so callers with an injected clock (e.g. the schedule
+/// sweep, whose `now` is a test-supplied epoch) format the same way.
+pub fn format_epoch(secs: u64) -> String {
     // Days-to-civil algorithm (Howard Hinnant), valid for the years we care about.
     let days = secs / 86_400;
     let rem = secs % 86_400;
@@ -184,6 +246,146 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Apply the first `up_to` migrations onto a raw connection, in order.
+    fn apply_migrations(conn: &Connection, up_to: usize) {
+        for (_, sql) in &MIGRATIONS[..up_to] {
+            conn.execute_batch(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_tasks_preserves_runs_and_splits_the_active_index() {
+        // Acceptance criterion 7: a DB already at the prior migration with runs
+        // data survives the tasks migration with its data and active-run
+        // exclusion intact. (0007 after the merge with main, which took 0004–0006.)
+        let conn = Connection::open_in_memory().unwrap();
+        let idx_tasks = MIGRATIONS
+            .iter()
+            .position(|(n, _)| *n == "0007_tasks")
+            .unwrap();
+        apply_migrations(&conn, idx_tasks); // everything before the tasks migration
+
+        // A pre-existing github run.
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                               status, created_at)
+             VALUES ('run-old', 'proj', 'worker', 7, 'old', 'running', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Apply the tasks migration (recreates runs, adds tasks + partial indexes).
+        conn.execute_batch(MIGRATIONS[idx_tasks].1).unwrap();
+
+        // Data survived, and issue_number maps through with task_id NULL.
+        let (issue, task): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT issue_number, task_id FROM runs WHERE id = 'run-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(issue, 7);
+        assert_eq!(task, None);
+
+        // runs_active_issue: a second active run for the same (project, loop,
+        // issue) is rejected.
+        let dup = conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, status, created_at)
+             VALUES ('run-dup', 'proj', 'worker', 7, 'queued', '2026-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate active issue run must be rejected");
+
+        // A local run (task_id set, issue_number NULL) lives under the other
+        // partial index and does not collide with issue runs.
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, task_id, status, created_at)
+             VALUES ('run-loc', 'proj', 'worker', 3, 'queued', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let dup_task = conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, task_id, status, created_at)
+             VALUES ('run-loc2', 'proj', 'worker', 3, 'queued', '2026-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(
+            dup_task.is_err(),
+            "duplicate active task run must be rejected"
+        );
+
+        // Two active issue-NULL runs for different tasks coexist (the partial
+        // index keys on task_id, not the NULL issue_number).
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, task_id, status, created_at)
+             VALUES ('run-loc3', 'proj', 'worker', 4, 'queued', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_loop_kind_pr_reviewer_renames_guard_runs_in_place() {
+        // Issue #168: a pre-existing 'guard' run must resume, count toward
+        // budget, and be reaped under its new 'pr-reviewer' loop_kind after
+        // the migration — a pure data UPDATE, no schema change.
+        let conn = Connection::open_in_memory().unwrap();
+        let idx = MIGRATIONS
+            .iter()
+            .position(|(n, _)| *n == "0013_loop_kind_pr_reviewer")
+            .unwrap();
+        apply_migrations(&conn, idx); // everything before this migration
+
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                               status, created_at)
+             VALUES ('run-guard', 'proj', 'guard', 5, 'old', 'running', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                               status, created_at)
+             VALUES ('run-worker', 'proj', 'worker', 6, 'old', 'running', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[idx].1).unwrap();
+
+        let loop_kind: String = conn
+            .query_row(
+                "SELECT loop_kind FROM runs WHERE id = 'run-guard'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loop_kind, "pr-reviewer");
+        // Unrelated loop kinds are untouched.
+        let other: String = conn
+            .query_row(
+                "SELECT loop_kind FROM runs WHERE id = 'run-worker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, "worker");
+
+        // The renamed run is still findable (resume) and still counts as
+        // active under its new loop_kind (budget/reaper continuity).
+        let active: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id = 'proj'
+                   AND loop_kind = 'pr-reviewer' AND issue_number = 5
+                   AND status IN ('queued','running','interrupted'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(active, "the migrated run must still count as active");
     }
 
     #[test]
