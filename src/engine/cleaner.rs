@@ -266,6 +266,7 @@ impl super::Loop for CleanerLoop {
         Ok(vec![Target {
             key: TaskKey::Issue(report.map(|i| i.number).unwrap_or(0)),
             title: REPORT_TITLE.to_string(),
+            cadence_label: None,
         }])
     }
 

@@ -60,6 +60,9 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_schedules",
         include_str!("migrations/0010_schedules.sql"),
     ),
+    // issue #148: cadence — runs.cadence_label + tasks.not_before + an index
+    // for the window COUNT. Simple ALTERs; runs was already recreated by 0007.
+    ("0011_cadence", include_str!("migrations/0011_cadence.sql")),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

@@ -27,6 +27,7 @@ fn deps_with(forge: Arc<FakeForge>, delivery: PlanDelivery) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     Deps::with_label_source(

@@ -910,6 +910,26 @@ pub struct ScheduleConfig {
     pub allow_overlap: bool,
 }
 
+/// One `[[projects.cadence]]` entry (issue #148): a per-label消化レート上限。
+/// `label`(例: `sns`)を持つ issue を、窓あたり上限件数までしか消化しない。
+/// 期間モードは `max_per_day`(UTC 暦日あたり)**または** `per_hours` + `max`
+/// (ローリング窓)のちょうど一方(`[`Config::validate`] が保証)。消化実績は
+/// forge ではなくローカル run 履歴(`runs.cadence_label`)で数える(ADR 0011)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CadenceRule {
+    /// 対象 issue ラベル(github mode 専用。local タスクにラベル軸は無い)。
+    pub label: String,
+    /// UTC 暦日あたりの上限。`per_hours`/`max` と排他。
+    #[serde(default)]
+    pub max_per_day: Option<u32>,
+    /// ローリング窓の長さ(時間)。`max` と対で使い、`max_per_day` と排他。
+    #[serde(default)]
+    pub per_hours: Option<u32>,
+    /// ローリング窓あたりの上限。`per_hours` と対で使う。
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -957,6 +977,9 @@ pub struct ProjectConfig {
     /// Cron schedules that periodically enqueue issues/tasks (issue #146).
     #[serde(default)]
     pub schedules: Vec<ScheduleConfig>,
+    /// Per-label消化レート上限(issue #148)。github mode 専用。
+    #[serde(default)]
+    pub cadence: Vec<CadenceRule>,
     /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
     /// Same shape as the top-level `[prompts]`; a per-project entry overrides
     /// the top-level one for the same canonical role key. See
@@ -1126,6 +1149,56 @@ impl Config {
                 );
             }
             self.validate_schedules(p)?;
+            self.validate_cadence(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject cadence rules that would never enforce cleanly: an empty or
+    /// duplicate `label`, or a period mode that is neither exactly `max_per_day`
+    /// nor exactly (`per_hours` + `max`), or a non-positive limit. github-only
+    /// is not rejected here (a local project simply carries unused rules — the
+    /// local task source has no labels to match), matching how the local
+    /// planner is left dormant rather than errored.
+    fn validate_cadence(&self, p: &ProjectConfig) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for c in &p.cadence {
+            if c.label.trim().is_empty() {
+                anyhow::bail!("project {:?} has a cadence rule with an empty label", p.id);
+            }
+            if !seen.insert(c.label.as_str()) {
+                anyhow::bail!(
+                    "project {:?} has duplicate cadence label {:?}",
+                    p.id,
+                    c.label
+                );
+            }
+            match (c.max_per_day, c.per_hours, c.max) {
+                (Some(n), None, None) => {
+                    if n == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has max_per_day = 0 (must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                (None, Some(h), Some(m)) => {
+                    if h == 0 || m == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has per_hours/max = 0 (both must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                _ => anyhow::bail!(
+                    "project {:?} cadence label {:?} must set exactly one of `max_per_day` \
+                     or (`per_hours` + `max`)",
+                    p.id,
+                    c.label
+                ),
+            }
         }
         self.validate_prompts()?;
         Ok(())
@@ -2375,6 +2448,67 @@ allow_overlap = true
                    [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
         let cfg = Config::parse(raw, Path::new("cfg")).unwrap();
         assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
+    }
+
+    #[test]
+    fn cadence_rules_parse_both_period_modes() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"nl\"\nper_hours = 168\nmax = 2\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let cadence = &cfg.project("d").unwrap().cadence;
+        assert_eq!(cadence.len(), 2);
+        assert_eq!(cadence[0].label, "sns");
+        assert_eq!(cadence[0].max_per_day, Some(1));
+        assert_eq!(cadence[1].per_hours, Some(168));
+        assert_eq!(cadence[1].max, Some(2));
+    }
+
+    #[test]
+    fn cadence_rejects_empty_or_duplicate_label() {
+        let empty = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                     [[projects.cadence]]\nlabel = \"\"\nmax_per_day = 1\n";
+        let err = toml::from_str::<Config>(empty)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty label"), "{err}");
+
+        let dup = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 2\n";
+        let err = toml::from_str::<Config>(dup)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate cadence label"), "{err}");
+    }
+
+    #[test]
+    fn cadence_rejects_ambiguous_or_zero_period() {
+        // Both modes set.
+        let both = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\nper_hours = 24\nmax = 1\n";
+        // Rolling mode missing its `max`.
+        let missing = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                       [[projects.cadence]]\nlabel = \"sns\"\nper_hours = 24\n";
+        // Neither mode.
+        let none = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\n";
+        // Zero value.
+        let zero = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 0\n";
+        for raw in [both, missing, none, zero] {
+            let err = toml::from_str::<Config>(raw)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cadence label"), "{err}");
+        }
     }
 
     /// Minimal valid config carrying the given projects plus the extra lines.
