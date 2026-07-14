@@ -206,7 +206,7 @@ pub enum CheckState {
 }
 
 /// The subset of GitHub's commit-status states meguri writes for its inspection
-/// history (`meguri/self-review`, `meguri/guard-review`, ADR 0008). Advisory by
+/// history (`meguri/self-review`, `meguri/pr-review`, ADR 0008). Advisory by
 /// default: a `Failure` status is a red check that does not block a human merge
 /// (GitHub reports the PR `UNSTABLE`) unless the user makes the context a
 /// required check; the auto-merger reads it as its arm gate.
@@ -504,7 +504,7 @@ pub trait Forge: Send + Sync {
 
     /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
     /// — meguri's inspection history for a review (ADR 0008). `context` is the
-    /// status name (`meguri/self-review` / `meguri/guard-review`), `description`
+    /// status name (`meguri/self-review` / `meguri/pr-review`), `description`
     /// the one-line verdict. Idempotent from the caller's view: re-posting the
     /// same context replaces the visible status.
     async fn set_commit_status(

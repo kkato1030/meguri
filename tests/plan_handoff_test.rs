@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use meguri::config::{Config, PlanDelivery, ProjectConfig};
-use meguri::engine::handoff;
+use meguri::engine::plan_handoff;
 use meguri::engine::{Deps, planner};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Issue, LABEL_READY, LABEL_SPECCING};
@@ -28,6 +28,7 @@ fn deps_with(forge: Arc<FakeForge>, delivery: PlanDelivery) -> Deps {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     Deps::with_label_source(
@@ -67,7 +68,7 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     let deps = deps_with(forge.clone(), PlanDelivery::Separate);
     let pr = seed(&forge, &deps, 5, "meguri/5-thing-abc", "merged");
 
-    handoff::sweep(&deps).await.unwrap();
+    plan_handoff::sweep(&deps).await.unwrap();
 
     let labels = forge.labels_of(5);
     assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
@@ -81,7 +82,7 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     );
 
     // Idempotent: a second sweep (issue no longer speccing) is a no-op.
-    handoff::sweep(&deps).await.unwrap();
+    plan_handoff::sweep(&deps).await.unwrap();
     assert_eq!(forge.comments_of(5).len(), 1);
 }
 
@@ -91,13 +92,13 @@ async fn an_open_or_unmerged_spec_pr_does_not_hand_off() {
     let deps = deps_with(forge.clone(), PlanDelivery::Separate);
     // Still open (under review / awaiting merge): no handoff.
     seed(&forge, &deps, 5, "meguri/5-thing-abc", "open");
-    handoff::sweep(&deps).await.unwrap();
+    plan_handoff::sweep(&deps).await.unwrap();
     assert!(forge.labels_of(5).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(5).contains(&LABEL_READY.to_string()));
 
     // Closed unmerged (abandoned spec): also no handoff — a human re-triages.
     seed(&forge, &deps, 6, "meguri/6-thing-def", "closed");
-    handoff::sweep(&deps).await.unwrap();
+    plan_handoff::sweep(&deps).await.unwrap();
     assert!(forge.labels_of(6).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(6).contains(&LABEL_READY.to_string()));
 }
@@ -108,7 +109,7 @@ async fn combined_delivery_never_hands_off() {
     let deps = deps_with(forge.clone(), PlanDelivery::Combined);
     seed(&forge, &deps, 5, "meguri/5-thing-abc", "merged");
 
-    handoff::sweep(&deps).await.unwrap();
+    plan_handoff::sweep(&deps).await.unwrap();
     // Combined delivery hands off via the spec worker, not this sweep.
     assert!(forge.labels_of(5).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(5).contains(&LABEL_READY.to_string()));

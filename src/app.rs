@@ -16,7 +16,9 @@ use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
-use crate::store::{DesiredState, DriftRow, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
+use crate::store::{
+    DesiredState, DriftRow, LANE_AUTHOR, LANE_PR_REVIEW, RunRecord, RunStatus, Store,
+};
 use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
@@ -46,6 +48,7 @@ fn build_coordination(
                 store.clone(),
                 project.id.clone(),
                 cfg.reconcile,
+                project.cadence.clone(),
             ));
             Ok((Some(forge), ts))
         }
@@ -107,7 +110,26 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
     let deps = build_deps(&cfg, project, mux_override)?;
 
     let gh_issue = deps.forge().get_issue(issue).await?;
-    let run = match deps.store.create_run(&project.id, issue, &gh_issue.title) {
+    // Manual run bypasses the cadence gate (it is a human's explicit override —
+    // always run it), but if the issue falls under a cadence rule the run must
+    // still count toward the window, or a same-day `watch` would consume the
+    // bucket a second time. Conflicting rules are the one case we refuse: a
+    // single `cadence_label` cannot count two buckets, so a human must pick.
+    let cadence_label = match crate::cadence::cadence_bucket(&gh_issue.labels, &project.cadence) {
+        Ok(bucket) => bucket,
+        Err(labels) => bail!(
+            "issue #{issue} matches multiple cadence rules ({}); a run can only count \
+             toward one — remove all but one of these labels",
+            labels.join(", ")
+        ),
+    };
+    let run = match deps.store.create_run_for_loop_cadence(
+        &project.id,
+        "worker",
+        issue,
+        &gh_issue.title,
+        cadence_label.as_deref(),
+    ) {
         Ok(run) => run,
         Err(_) => {
             // An active run exists (possibly interrupted): resume it.
@@ -414,10 +436,10 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
             None => println!("no routing stats yet"),
         }
     } else {
-        println!("routing stats — last {window} scored run(s) per (role, profile)\n");
+        println!("routing stats — last {window} scored run(s) per (role, profile, arm)\n");
         println!(
-            "{:<8} {:<18} {:<16} {:>5} {:>8} {:>9} {:>9}",
-            "PROJECT", "ROLE", "PROFILE", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
+            "{:<8} {:<18} {:<16} {:<10} {:>5} {:>8} {:>9} {:>9}",
+            "PROJECT", "ROLE", "PROFILE", "ARM", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
         );
         for r in &rows {
             let profile = if r.agent_profile.is_empty() {
@@ -430,8 +452,15 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
                 .map(|s| format!("{s:.0}s"))
                 .unwrap_or_else(|| "-".into());
             println!(
-                "{:<8} {:<18} {:<16} {:>5} {:>7.0}% {:>9.1} {:>9}",
-                r.project_id, r.loop_kind, profile, r.runs, r.success_rate, r.avg_turns, dur,
+                "{:<8} {:<18} {:<16} {:<10} {:>5} {:>7.0}% {:>9.1} {:>9}",
+                r.project_id,
+                r.loop_kind,
+                profile,
+                r.routing_arm,
+                r.runs,
+                r.success_rate,
+                r.avg_turns,
+                dur,
             );
         }
     }
@@ -454,6 +483,7 @@ pub fn cmd_add(
     plan: bool,
     file: Option<&str>,
     title: Option<&str>,
+    not_before: Option<&str>,
 ) -> Result<()> {
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
@@ -465,17 +495,42 @@ pub fn cmd_add(
             project.mode.as_str()
         );
     }
+    // Normalize --not-before to our RFC3339 UTC shape up front, so a typo is
+    // caught here rather than silently keeping the task queued forever.
+    let not_before = match not_before {
+        Some(raw) => {
+            let ts = crate::cadence::parse_not_before_value(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid --not-before {:?}: expected YYYY-MM-DD or an RFC3339 UTC instant",
+                    e.raw
+                )
+            })?;
+            Some(crate::store::format_epoch(ts))
+        }
+        None => None,
+    };
     let (title, body) = resolve_task_input(title, file)?;
     let kind = if plan { TaskKind::Plan } else { TaskKind::Work };
     let store = open_store()?;
-    let task = store.create_task(&project.id, kind.as_str(), &title, &body, "local")?;
+    let task = store.create_task_with_not_before(
+        &project.id,
+        kind.as_str(),
+        &title,
+        &body,
+        "local",
+        not_before.as_deref(),
+    )?;
     println!(
         "queued task #{} [{}] {}",
         task.id,
         kind.as_str(),
         task.title
     );
-    println!("`meguri watch` will pick it up within one poll interval.");
+    if let Some(nb) = &task.not_before {
+        println!("not-before {nb} — held until then, then picked up automatically.");
+    } else {
+        println!("`meguri watch` will pick it up within one poll interval.");
+    }
     Ok(())
 }
 
@@ -510,17 +565,30 @@ fn first_heading(markdown: &str) -> Option<String> {
     Some(line.trim_start_matches('#').trim().to_string())
 }
 
-/// `meguri tasks`: list a project's local tasks, newest first. needs_human
-/// tasks are highlighted with their reason so a human can pick them up.
-pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
+/// `meguri tasks`: inspect a project's discovery queue and why each item is (or
+/// is not) running. In local mode it lists the local tasks; in github mode it
+/// fetches the `ready`/`plan` issues and shows each one's disposition — the same
+/// gate discovery applies (issue #148), so silently-skipped work (not-before /
+/// cadence) that leaves no trace on the forge is visible here.
+pub async fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
+    match project.mode {
+        ProjectMode::Local => cmd_tasks_local(project, all),
+        ProjectMode::Github => cmd_tasks_github(&cfg, project).await,
+    }
+}
+
+/// Local-mode listing: the sqlite `tasks`, with a not-before annotation on any
+/// still-queued task whose gate has not yet opened.
+fn cmd_tasks_local(project: &ProjectConfig, all: bool) -> Result<()> {
     let store = open_store()?;
     let tasks = store.list_tasks(&project.id, all)?;
     if tasks.is_empty() {
         println!("no {}tasks", if all { "" } else { "open " });
         return Ok(());
     }
+    let now = crate::engine::scheduler_fire::epoch_now();
     println!("{:>4}  {:<6} {:<12} TITLE", "ID", "KIND", "STATUS");
     for t in tasks {
         let flag = if t.status == "needs_human" {
@@ -535,8 +603,102 @@ pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
         if let Some(reason) = t.reason.filter(|_| t.status == "needs_human") {
             println!("        ↳ {reason}");
         }
+        if t.status == "queued"
+            && let Some(raw) = &t.not_before
+        {
+            match crate::cadence::parse_not_before_value(raw) {
+                Err(_) => println!("        ↳ ⏳ not-before 待ち(解析不能: {raw})"),
+                Ok(ts) if crate::cadence::not_before_wait(Some(ts), now).is_some() => {
+                    println!(
+                        "        ↳ ⏳ not-before 待ち(until {})",
+                        crate::store::format_epoch(ts)
+                    );
+                }
+                Ok(_) => {}
+            }
+        }
     }
     Ok(())
+}
+
+/// Github-mode listing: the discovery queue (`ready`/`plan` issues) with each
+/// issue's live disposition. Goes through `LabelTaskSource::dispositions`, the
+/// same gate pipeline (and per-pass cadence allowance) discovery uses — so what
+/// shows `ready` is exactly what discover would run: a second same-bucket issue
+/// this pass reads `cadence 待ち`, not `ready`, even when the store count alone
+/// is still under the limit.
+async fn cmd_tasks_github(cfg: &Config, project: &ProjectConfig) -> Result<()> {
+    let store = open_store()?;
+    let source = LabelTaskSource::new(
+        Arc::new(GhForge::new(project.repo_slug.as_deref().context(
+            "github-mode project has no repo_slug (config validation should have caught this)",
+        )?)),
+        store,
+        project.id.clone(),
+        cfg.reconcile,
+        project.cadence.clone(),
+    );
+
+    // ready (worker) and plan (planner) are separate discovery passes, each
+    // with its own cadence allowance — mirror that here (an issue rarely carries
+    // both trigger labels; dedup by number keeps it listed once if it does).
+    let mut rows: Vec<(crate::forge::Issue, crate::cadence::Disposition)> =
+        source.dispositions(TaskKind::Work).await?;
+    for row in source.dispositions(TaskKind::Plan).await? {
+        if !rows.iter().any(|(i, _)| i.number == row.0.number) {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        println!(
+            "no {}/{} issues",
+            crate::forge::LABEL_READY,
+            crate::forge::LABEL_PLAN
+        );
+        return Ok(());
+    }
+    rows.sort_by_key(|(i, _)| i.number);
+
+    println!("{:>6}  STATE", "ISSUE");
+    for (issue, disposition) in rows {
+        println!(
+            "{:>6}  {}",
+            format!("#{}", issue.number),
+            format_disposition(&disposition)
+        );
+        println!("        {}", issue.title);
+    }
+    Ok(())
+}
+
+/// One-line rendering of a [`crate::cadence::Disposition`] for `meguri tasks`.
+fn format_disposition(disposition: &crate::cadence::Disposition) -> String {
+    use crate::cadence::Disposition;
+    use crate::store::format_epoch;
+    match disposition {
+        Disposition::Ready => "✅ ready".to_string(),
+        Disposition::WaitingNotBefore { until } => {
+            format!("⏳ not-before 待ち(until {})", format_epoch(*until))
+        }
+        Disposition::UnparsableNotBefore { raw } => {
+            format!("⏳ not-before 待ち(解析不能: {raw})")
+        }
+        Disposition::Blocked => "⛔ blocked(未解決の依存)".to_string(),
+        Disposition::ConflictingCadenceLabels { labels } => {
+            format!("⚠️  cadence ラベル競合({})", labels.join(", "))
+        }
+        Disposition::WaitingCadence {
+            label,
+            consumed,
+            max,
+            resets_at,
+        } => {
+            let resets = resets_at
+                .map(|t| format!(", resets {}", format_epoch(t)))
+                .unwrap_or_default();
+            format!("⏳ cadence 待ち({label} {consumed}/{max}{resets})")
+        }
+    }
 }
 
 /// `meguri schedules`: list a project's cron schedules with their definition,
@@ -734,12 +896,12 @@ fn heartbeat_alive(ts: &str, poll_interval_secs: u64) -> bool {
 /// Resolve the pane an active run drives, following the same precedence as
 /// [`resolve_attach_pane`]: the issue's persistent lane pane (panes table) wins
 /// over the pane id a run once recorded, which can be a stale start-of-run
-/// snapshot. The lane comes from the run's loop kind (the reviewer keeps its
-/// own `review` lane). Returns `(mux_kind, pane_id)`, or `None` when the run
-/// has no pane yet.
+/// snapshot. The lane comes from the run's loop kind (the pr-reviewer keeps
+/// its own `pr-review` lane). Returns `(mux_kind, pane_id)`, or `None` when
+/// the run has no pane yet.
 fn run_pane(store: &Store, run: &RunRecord) -> Result<Option<(String, String)>> {
-    let role = engine::role_for_loop(&run.loop_kind);
-    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, role)?
+    let lane = engine::lane_for_loop(&run.loop_kind);
+    if let Some(p) = store.get_pane(&run.project_id, run.issue_number, lane)?
         && let (Some(kind), Some(id)) = (p.mux_kind, p.mux_pane_id)
     {
         return Ok(Some((kind, id)));
@@ -1064,17 +1226,18 @@ pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
 }
 
 /// Resolve what `meguri attach <needle> [--review]` should attach to. Panes
-/// belong to the issue's lanes (author + review, kept until the issue
+/// belong to the issue's lanes (author + pr-review, kept until the issue
 /// closes), so the issue's persistent lane pane wins over whatever pane id
 /// a run once recorded — and a bare issue number keeps working after its
 /// runs finished. A run id derives its lane from the run's loop kind;
-/// `--review` picks the review lane for issue numbers.
+/// `--review` picks the pr-review lane for issue numbers.
 fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
-    let wanted_role = if review { ROLE_REVIEW } else { ROLE_AUTHOR };
+    let wanted_lane = if review { LANE_PR_REVIEW } else { LANE_AUTHOR };
     if let Some(run) = store.find_run(needle)? {
-        // `run_pane` derives the run's lane from its loop kind, so a review-lane
-        // run resolves its review pane and everything else the author pane —
-        // `--review` only matters for the bare-issue-number path below.
+        // `run_pane` derives the run's lane from its loop kind, so a
+        // pr-review-lane run resolves its pr-review pane and everything else
+        // the author pane — `--review` only matters for the
+        // bare-issue-number path below.
         if let Some(pane) = run_pane(store, &run)? {
             return Ok(pane);
         }
@@ -1084,7 +1247,7 @@ fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(Str
         let panes: Vec<_> = store
             .panes_for_issue(issue)?
             .into_iter()
-            .filter(|p| p.role == wanted_role)
+            .filter(|p| p.lane == wanted_lane)
             .collect();
         match panes.as_slice() {
             [] => {
@@ -1100,7 +1263,7 @@ fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(Str
             many => {
                 let projects: Vec<&str> = many.iter().map(|p| p.project_id.as_str()).collect();
                 bail!(
-                    "issue #{issue} has {wanted_role} panes in multiple projects ({}) — \
+                    "issue #{issue} has {wanted_lane} panes in multiple projects ({}) — \
                      pass a run id instead",
                     projects.join(", ")
                 );
@@ -1175,7 +1338,7 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                 let released = reaper::release_pane(
                     &deps,
                     run.issue_number,
-                    engine::role_for_loop(&run.loop_kind),
+                    engine::lane_for_loop(&run.loop_kind),
                     "stopped by user",
                 )
                 .await;
@@ -1297,7 +1460,7 @@ mod tests {
             .upsert_pane(
                 "demo",
                 7,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "wD:pN",
@@ -1314,7 +1477,7 @@ mod tests {
             .upsert_pane(
                 "demo",
                 8,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "wD:pR",

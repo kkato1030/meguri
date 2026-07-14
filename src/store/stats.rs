@@ -2,9 +2,12 @@
 //!
 //! Everything here is pure sqlite direct-read/write so `meguri stats routing`
 //! and doctor work with the watch stopped (mirrors the retired serve read
-//! path, ADR 0002). Aggregation keys on `(project_id, runs.loop_kind = role,
-//! runs.agent_profile)`; the empty string stands in for an unrouted run
-//! (`agent_profile IS NULL`) so it can sit in a composite key.
+//! path, ADR 0002). `routing_stats` keys on `(project_id, runs.loop_kind =
+//! role, runs.agent_profile, runs.routing_arm)` — the arm (main / explore /
+//! escalated, routing 3/3 #66) keeps a canary or escalated run on its own row
+//! instead of collapsing into the mainline profile it shares. Drift keys on the
+//! narrower `(project, role, profile)`. The empty string stands in for an
+//! unrouted run (`agent_profile IS NULL`) so it can sit in a composite key.
 
 use anyhow::Result;
 use rusqlite::params;
@@ -20,11 +23,17 @@ const SCORED_STATUSES: &str = "('succeeded', 'failed', 'cancelled')";
 /// The empty-string sentinel for an unrouted run (NULL `agent_profile`).
 pub const UNROUTED: &str = "";
 
+/// The mainline-arm sentinel for a run with no `routing_arm` set (routing 3/3,
+/// issue #66) — the ordinary pick, as opposed to `explore` / `escalated`.
+pub const ARM_MAIN: &str = "main";
+
 /// One terminal, scored run reduced to just the columns aggregation needs.
 struct RunOutcome {
     project_id: String,
     loop_kind: String,
     agent_profile: String,
+    /// Routing arm: [`ARM_MAIN`], `"explore"`, or `"escalated"` (issue #66).
+    routing_arm: String,
     succeeded: bool,
     turn_no: i64,
     duration_secs: Option<i64>,
@@ -59,14 +68,16 @@ impl WindowAgg {
     }
 }
 
-/// One row of `meguri stats routing`: a `(role, profile)` group over the most
-/// recent N scored runs.
+/// One row of `meguri stats routing`: a `(role, profile, arm)` group over the
+/// most recent N scored runs.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutingStatRow {
     pub project_id: String,
     pub loop_kind: String,
     /// Profile name, or [`UNROUTED`] (empty) for runs with no pinned profile.
     pub agent_profile: String,
+    /// Routing arm: [`ARM_MAIN`], `"explore"`, or `"escalated"` (issue #66).
+    pub routing_arm: String,
     pub runs: usize,
     pub success_rate: f64,
     pub avg_turns: f64,
@@ -115,6 +126,7 @@ impl Store {
         self.with_conn(|c| {
             let sql = format!(
                 "SELECT project_id, loop_kind, COALESCE(agent_profile, '') AS profile,
+                        COALESCE(routing_arm, '{ARM_MAIN}') AS arm,
                         status, turn_no, started_at, finished_at
                  FROM runs
                  WHERE status IN {SCORED_STATUSES}
@@ -140,6 +152,7 @@ impl Store {
                         project_id: row.get("project_id")?,
                         loop_kind: row.get("loop_kind")?,
                         agent_profile: row.get("profile")?,
+                        routing_arm: row.get("arm")?,
                         succeeded: status == "succeeded",
                         turn_no: row.get("turn_no")?,
                         duration_secs,
@@ -150,25 +163,30 @@ impl Store {
         })
     }
 
-    /// `(role, profile)` metrics over the most recent `window` scored runs.
-    /// `project = None` spans every project (each row keeps its `project_id`);
-    /// `Some(id)` restricts to one. Groups are returned sorted for stable
-    /// display (project, role, profile).
+    /// `(role, profile, arm)` metrics over the most recent `window` scored
+    /// runs. `project = None` spans every project (each row keeps its
+    /// `project_id`); `Some(id)` restricts to one. Groups are returned sorted
+    /// for stable display (project, role, profile, arm).
     pub fn routing_stats(
         &self,
         project: Option<&str>,
         window: usize,
     ) -> Result<Vec<RoutingStatRow>> {
         let outcomes = self.scored_outcomes(project)?;
-        // Preserve newest-first order within each group as we bucket.
-        let mut order: Vec<(String, String, String)> = Vec::new();
-        let mut groups: std::collections::HashMap<(String, String, String), Vec<&RunOutcome>> =
+        // Preserve newest-first order within each group as we bucket. The arm
+        // (main / explore / escalated) joins the key so a canary or an
+        // escalated run shows as its own row rather than collapsing into the
+        // mainline profile it shares an `agent_profile` with (issue #66).
+        type Key = (String, String, String, String);
+        let mut order: Vec<Key> = Vec::new();
+        let mut groups: std::collections::HashMap<Key, Vec<&RunOutcome>> =
             std::collections::HashMap::new();
         for o in &outcomes {
             let key = (
                 o.project_id.clone(),
                 o.loop_kind.clone(),
                 o.agent_profile.clone(),
+                o.routing_arm.clone(),
             );
             let bucket = groups.entry(key.clone()).or_insert_with(|| {
                 order.push(key);
@@ -193,6 +211,7 @@ impl Store {
                 project_id: key.0,
                 loop_kind: key.1,
                 agent_profile: key.2,
+                routing_arm: key.3,
                 runs: agg.runs,
                 success_rate: agg.success_rate,
                 avg_turns: agg.avg_turns,
@@ -422,6 +441,47 @@ mod tests {
             .update_run_status(&run.id, RunStatus::Running, None)
             .unwrap();
         store.update_run_status(&run.id, status, None).unwrap();
+    }
+
+    #[test]
+    fn routing_stats_splits_by_arm() {
+        // Two runs share (worker, claude-opus) but differ by arm: one mainline,
+        // one escalated. They must land in separate rows so `stats routing` can
+        // tell "started on opus" from "climbed to opus" (issue #66).
+        let store = Store::open_in_memory().unwrap();
+        seed_run(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("claude-opus"),
+            3,
+            RunStatus::Succeeded,
+        );
+        let escalated = store.create_run_for_loop("demo", "worker", 2, "t").unwrap();
+        store
+            .update_run_agent_profile(&escalated.id, "claude-opus")
+            .unwrap();
+        store
+            .update_run_routing_arm(&escalated.id, Some("escalated"))
+            .unwrap();
+        store
+            .update_run_status(&escalated.id, RunStatus::Running, None)
+            .unwrap();
+        store
+            .update_run_status(&escalated.id, RunStatus::Succeeded, None)
+            .unwrap();
+
+        let rows = store.routing_stats(Some("demo"), 20).unwrap();
+        assert_eq!(rows.len(), 2, "mainline and escalated are separate rows");
+        assert!(
+            rows.iter()
+                .any(|r| r.agent_profile == "claude-opus" && r.routing_arm == ARM_MAIN)
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.agent_profile == "claude-opus" && r.routing_arm == "escalated")
+        );
     }
 
     #[test]

@@ -96,6 +96,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
 
@@ -866,7 +867,7 @@ fn write_review(wt: &Path, verdict: &str, findings: serde_json::Value) {
         "verdict": verdict, "review": "self-review note", "findings": findings,
     });
     std::fs::write(
-        wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        wt.join(meguri::engine::self_review::REVIEW_FILE),
         body.to_string(),
     )
     .unwrap();
@@ -1175,9 +1176,9 @@ async fn self_review_needs_human_escalates_immediately() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn self_review_turn_uses_the_impl_reviewer_profile() {
+async fn self_review_turn_uses_the_self_reviewer_profile() {
     // Model separation survives the internal loop: the review turn spawns
-    // under the `impl-reviewer` profile, the author's turns under `worker`.
+    // under the `self-reviewer` profile, the author's turns under `worker`.
     let mut env = setup(None).await;
     let mut config: Config = toml::from_str(
         r#"
@@ -1194,7 +1195,7 @@ mode = "manual"
 
 [routing.roles]
 worker = "p-worker"
-impl-reviewer = "p-review"
+self-reviewer = "p-review"
 
 [launch.roles]
 self-reviewer = "pane"
@@ -1237,7 +1238,7 @@ self-reviewer = "pane"
         commands
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("review-cli")),
-        "the review turn must spawn under the impl-reviewer profile: {commands:?}"
+        "the review turn must spawn under the self-reviewer profile: {commands:?}"
     );
     assert!(
         commands

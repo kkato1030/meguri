@@ -1,8 +1,8 @@
 //! The pane registry: the issue is the unit of lifetime (#13, #92). A pane
-//! belongs to `(project, issue, role)` and outlives individual runs — one
+//! belongs to `(project, issue, lane)` and outlives individual runs — one
 //! `author` pane shared by every branch-editing loop of the issue, plus one
-//! independent `review` pane for the reviewer — and the reaper reclaims them
-//! when the issue closes on the forge. `agent_session_id` (the agent's
+//! independent `pr-review` pane for the pr-reviewer — and the reaper reclaims
+//! them when the issue closes on the forge. `agent_session_id` (the agent's
 //! native session, `claude --resume <id>`) is kept per lane and survives
 //! reclamation, so closing a pane stays reversible.
 
@@ -14,21 +14,21 @@ use super::{Store, now};
 /// The lane every branch-editing loop shares (planner, worker, spec worker,
 /// fixer, ci-fixer, conflict resolver — and the cleaner's standalone report
 /// pane, which no other loop ever touches).
-pub const ROLE_AUTHOR: &str = "author";
-/// The (spec) reviewer's independent lane: separate pane, separate session,
-/// but keyed by the same issue so it stays discoverable and resumable.
-pub const ROLE_REVIEW: &str = "review";
+pub const LANE_AUTHOR: &str = "author";
+/// The pr-reviewer's independent lane: separate pane, separate session, but
+/// keyed by the same issue so it stays discoverable and resumable.
+pub const LANE_PR_REVIEW: &str = "pr-review";
 /// The worker's internal self-review lane (ADR 0006): the review turn of the
-/// pre-publish self-review runs here, under the `impl-reviewer` profile, so
+/// pre-publish self-review runs here, under the `self-reviewer` profile, so
 /// it stays a separate session/model from the author lane doing the fixes.
-pub const ROLE_IMPL_REVIEW: &str = "impl-review";
+pub const LANE_SELF_REVIEW: &str = "self-review";
 
 #[derive(Debug, Clone)]
 pub struct PaneRecord {
     pub project_id: String,
     pub issue_number: i64,
-    /// Lane within the issue: [`ROLE_AUTHOR`] or [`ROLE_REVIEW`].
-    pub role: String,
+    /// Lane within the issue: [`LANE_AUTHOR`] or [`LANE_PR_REVIEW`].
+    pub lane: String,
     pub mux_kind: Option<String>,
     pub mux_session: Option<String>,
     /// None once the pane was reclaimed (the row is kept for the saved
@@ -45,7 +45,7 @@ fn pane_from_row(row: &Row<'_>) -> rusqlite::Result<PaneRecord> {
     Ok(PaneRecord {
         project_id: row.get("project_id")?,
         issue_number: row.get("issue_number")?,
-        role: row.get("role")?,
+        lane: row.get("lane")?,
         mux_kind: row.get("mux_kind")?,
         mux_session: row.get("mux_session")?,
         mux_pane_id: row.get("mux_pane_id")?,
@@ -66,7 +66,7 @@ impl Store {
         &self,
         project_id: &str,
         issue_number: i64,
-        role: &str,
+        lane: &str,
         mux_kind: &str,
         mux_session: &str,
         mux_pane_id: &str,
@@ -74,16 +74,16 @@ impl Store {
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO panes (project_id, issue_number, role, mux_kind, mux_session,
+                "INSERT INTO panes (project_id, issue_number, lane, mux_kind, mux_session,
                                     mux_pane_id, worktree_path, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
-                 ON CONFLICT (project_id, issue_number, role) DO UPDATE SET
+                 ON CONFLICT (project_id, issue_number, lane) DO UPDATE SET
                    mux_kind = ?4, mux_session = ?5, mux_pane_id = ?6,
                    worktree_path = ?7, updated_at = ?8, reclaimed_at = NULL",
                 params![
                     project_id,
                     issue_number,
-                    role,
+                    lane,
                     mux_kind,
                     mux_session,
                     mux_pane_id,
@@ -105,21 +105,21 @@ impl Store {
         &self,
         project_id: &str,
         issue_number: i64,
-        role: &str,
+        lane: &str,
         worktree_path: &str,
         session_id: Option<&str>,
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO panes (project_id, issue_number, role, worktree_path,
+                "INSERT INTO panes (project_id, issue_number, lane, worktree_path,
                                     agent_session_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                 ON CONFLICT (project_id, issue_number, role) DO UPDATE SET
+                 ON CONFLICT (project_id, issue_number, lane) DO UPDATE SET
                    worktree_path = ?4, agent_session_id = ?5, updated_at = ?6",
                 params![
                     project_id,
                     issue_number,
-                    role,
+                    lane,
                     worktree_path,
                     session_id,
                     now()
@@ -133,14 +133,14 @@ impl Store {
         &self,
         project_id: &str,
         issue_number: i64,
-        role: &str,
+        lane: &str,
     ) -> Result<Option<PaneRecord>> {
         self.with_conn(|c| {
             let pane = c
                 .query_row(
                     "SELECT * FROM panes
-                     WHERE project_id = ?1 AND issue_number = ?2 AND role = ?3",
-                    params![project_id, issue_number, role],
+                     WHERE project_id = ?1 AND issue_number = ?2 AND lane = ?3",
+                    params![project_id, issue_number, lane],
                     pane_from_row,
                 )
                 .optional()?;
@@ -154,7 +154,7 @@ impl Store {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT * FROM panes WHERE project_id = ?1 AND mux_pane_id IS NOT NULL
-                 ORDER BY issue_number, role",
+                 ORDER BY issue_number, lane",
             )?;
             let panes = stmt
                 .query_map([project_id], pane_from_row)?
@@ -164,12 +164,12 @@ impl Store {
     }
 
     /// Live panes for an issue number across projects and lanes
-    /// (`meguri attach <N>` when no run matches anymore).
+    /// (`meguri attach <needle>` when no run matches anymore).
     pub fn panes_for_issue(&self, issue_number: i64) -> Result<Vec<PaneRecord>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT * FROM panes WHERE issue_number = ?1 AND mux_pane_id IS NOT NULL
-                 ORDER BY project_id, role",
+                 ORDER BY project_id, lane",
             )?;
             let panes = stmt
                 .query_map([issue_number], pane_from_row)?
@@ -186,14 +186,14 @@ impl Store {
         &self,
         project_id: &str,
         issue_number: i64,
-        role: &str,
+        lane: &str,
         session_id: Option<&str>,
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE panes SET agent_session_id = ?4, updated_at = ?5
-                 WHERE project_id = ?1 AND issue_number = ?2 AND role = ?3",
-                params![project_id, issue_number, role, session_id, now()],
+                 WHERE project_id = ?1 AND issue_number = ?2 AND lane = ?3",
+                params![project_id, issue_number, lane, session_id, now()],
             )?;
             Ok(())
         })
@@ -205,13 +205,13 @@ impl Store {
         &self,
         project_id: &str,
         issue_number: i64,
-        role: &str,
+        lane: &str,
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE panes SET mux_pane_id = NULL, reclaimed_at = ?4, updated_at = ?4
-                 WHERE project_id = ?1 AND issue_number = ?2 AND role = ?3",
-                params![project_id, issue_number, role, now()],
+                 WHERE project_id = ?1 AND issue_number = ?2 AND lane = ?3",
+                params![project_id, issue_number, lane, now()],
             )?;
             Ok(())
         })
@@ -240,27 +240,27 @@ mod tests {
     #[test]
     fn upsert_pane_session_creates_a_paneless_row_and_updates_it() {
         let store = Store::open_in_memory().unwrap();
-        assert!(store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().is_none());
+        assert!(store.get_pane("demo", 7, LANE_AUTHOR).unwrap().is_none());
 
         // A direct-mode lane's first completed turn: no pane was ever
         // spawned, so plain save_pane_session (an UPDATE) would no-op.
         store
-            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/demo/b1", Some("sess-1"))
+            .upsert_pane_session("demo", 7, LANE_AUTHOR, "/wt/demo/b1", Some("sess-1"))
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id, None);
         assert_eq!(pane.mux_kind, None);
         assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b1"));
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-1"));
 
-        // A later turn updates worktree + session without disturbing role.
+        // A later turn updates worktree + session without disturbing lane.
         store
-            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/demo/b2", Some("sess-2"))
+            .upsert_pane_session("demo", 7, LANE_AUTHOR, "/wt/demo/b2", Some("sess-2"))
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b2"));
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-2"));
-        assert_eq!(pane.role, ROLE_AUTHOR);
+        assert_eq!(pane.lane, LANE_AUTHOR);
     }
 
     #[test]
@@ -270,12 +270,12 @@ mod tests {
         // upsert touches the same row.
         let store = Store::open_in_memory().unwrap();
         store
-            .upsert_pane("demo", 7, ROLE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
+            .upsert_pane("demo", 7, LANE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
             .unwrap();
         store
-            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/a", Some("sess-1"))
+            .upsert_pane_session("demo", 7, LANE_AUTHOR, "/wt/a", Some("sess-1"))
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id.as_deref(), Some("%1"));
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-1"));
     }
@@ -283,30 +283,30 @@ mod tests {
     #[test]
     fn pane_upsert_reuse_and_reclaim() {
         let store = Store::open_in_memory().unwrap();
-        assert!(store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().is_none());
+        assert!(store.get_pane("demo", 7, LANE_AUTHOR).unwrap().is_none());
 
         store
             .upsert_pane(
                 "demo",
                 7,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "%3",
                 "/wt/demo/b1",
             )
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id.as_deref(), Some("%3"));
         assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b1"));
         assert!(pane.reclaimed_at.is_none());
 
         // Reclaim keeps the row (and later the session id) but drops the pane.
         store
-            .save_pane_session("demo", 7, ROLE_AUTHOR, Some("sess-abc"))
+            .save_pane_session("demo", 7, LANE_AUTHOR, Some("sess-abc"))
             .unwrap();
-        store.mark_pane_reclaimed("demo", 7, ROLE_AUTHOR).unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        store.mark_pane_reclaimed("demo", 7, LANE_AUTHOR).unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id, None);
         assert!(pane.reclaimed_at.is_some());
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-abc"));
@@ -317,14 +317,14 @@ mod tests {
             .upsert_pane(
                 "demo",
                 7,
-                ROLE_AUTHOR,
+                LANE_AUTHOR,
                 "tmux",
                 "meguri",
                 "%9",
                 "/wt/demo/b2",
             )
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id.as_deref(), Some("%9"));
         assert!(pane.reclaimed_at.is_none());
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-abc"));
@@ -332,9 +332,9 @@ mod tests {
 
         // Clearing the session id (a resume proved it dead) empties the slot.
         store
-            .save_pane_session("demo", 7, ROLE_AUTHOR, None)
+            .save_pane_session("demo", 7, LANE_AUTHOR, None)
             .unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.agent_session_id, None);
     }
 
@@ -342,37 +342,39 @@ mod tests {
     fn lanes_of_one_issue_are_independent() {
         let store = Store::open_in_memory().unwrap();
         store
-            .upsert_pane("demo", 7, ROLE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
+            .upsert_pane("demo", 7, LANE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
             .unwrap();
         store
-            .upsert_pane("demo", 7, ROLE_REVIEW, "tmux", "meguri", "%2", "/wt/r")
+            .upsert_pane("demo", 7, LANE_PR_REVIEW, "tmux", "meguri", "%2", "/wt/r")
             .unwrap();
         assert_eq!(store.list_panes("demo").unwrap().len(), 2);
 
         // Reclaiming one lane leaves the other standing.
         store
-            .save_pane_session("demo", 7, ROLE_REVIEW, Some("sess-rev"))
+            .save_pane_session("demo", 7, LANE_PR_REVIEW, Some("sess-rev"))
             .unwrap();
-        store.mark_pane_reclaimed("demo", 7, ROLE_REVIEW).unwrap();
-        let author = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        store
+            .mark_pane_reclaimed("demo", 7, LANE_PR_REVIEW)
+            .unwrap();
+        let author = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(author.mux_pane_id.as_deref(), Some("%1"));
         assert_eq!(author.agent_session_id, None);
-        let review = store.get_pane("demo", 7, ROLE_REVIEW).unwrap().unwrap();
+        let review = store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().unwrap();
         assert_eq!(review.mux_pane_id, None);
         assert_eq!(review.agent_session_id.as_deref(), Some("sess-rev"));
     }
 
     #[test]
-    fn panes_are_scoped_by_project_issue_and_role() {
+    fn panes_are_scoped_by_project_issue_and_lane() {
         let store = Store::open_in_memory().unwrap();
         store
-            .upsert_pane("a", 1, ROLE_AUTHOR, "tmux", "meguri", "%1", "/wt/a/1")
+            .upsert_pane("a", 1, LANE_AUTHOR, "tmux", "meguri", "%1", "/wt/a/1")
             .unwrap();
         store
-            .upsert_pane("b", 1, ROLE_AUTHOR, "tmux", "meguri", "%2", "/wt/b/1")
+            .upsert_pane("b", 1, LANE_AUTHOR, "tmux", "meguri", "%2", "/wt/b/1")
             .unwrap();
         store
-            .upsert_pane("a", 1, ROLE_REVIEW, "tmux", "meguri", "%3", "/wt/a/r1")
+            .upsert_pane("a", 1, LANE_PR_REVIEW, "tmux", "meguri", "%3", "/wt/a/r1")
             .unwrap();
         assert_eq!(store.list_panes("a").unwrap().len(), 2);
         assert_eq!(store.panes_for_issue(1).unwrap().len(), 3);
@@ -395,7 +397,7 @@ mod tests {
     fn migration_backfills_panes_from_latest_run() {
         // Simulate a pre-0004 database: apply only 0001, record a run with a
         // pane, then let Store::open run the 0004 backfill (and the 0005
-        // role rebuild on top).
+        // role rebuild, later renamed to lane by 0011, on top).
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("meguri.sqlite");
         {
@@ -429,10 +431,10 @@ mod tests {
         }
 
         let store = Store::open(&db).unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(pane.mux_pane_id.as_deref(), Some("%2"), "newest run wins");
         assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b"));
-        assert_eq!(pane.role, ROLE_AUTHOR);
+        assert_eq!(pane.lane, LANE_AUTHOR);
     }
 
     #[test]
@@ -480,10 +482,73 @@ mod tests {
         }
 
         let store = Store::open(&db).unwrap();
-        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
-        assert_eq!(pane.role, ROLE_AUTHOR);
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
+        assert_eq!(pane.lane, LANE_AUTHOR);
         assert_eq!(pane.mux_pane_id.as_deref(), Some("%5"));
         assert_eq!(pane.agent_session_id.as_deref(), Some("sess-old"));
-        assert!(store.get_pane("demo", 7, ROLE_REVIEW).unwrap().is_none());
+        assert!(store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_renames_role_to_lane_and_remaps_old_values() {
+        // Simulate a pre-0011 database with the old `role` column and old
+        // lane values ('review', 'impl-review'); 0011 must rebuild the table
+        // as `lane` with the values remapped to 'pr-review'/'self-review'.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("meguri.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            for (name, sql) in [
+                ("0001_init", include_str!("migrations/0001_init.sql")),
+                (
+                    "0002_heartbeats",
+                    include_str!("migrations/0002_heartbeats.sql"),
+                ),
+                (
+                    "0003_agent_session",
+                    include_str!("migrations/0003_agent_session.sql"),
+                ),
+                ("0004_panes", include_str!("migrations/0004_panes.sql")),
+                (
+                    "0005_agent_profile",
+                    include_str!("migrations/0005_agent_profile.sql"),
+                ),
+                (
+                    "0006_pane_role",
+                    include_str!("migrations/0006_pane_role.sql"),
+                ),
+            ] {
+                conn.execute_batch(sql).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
+                    params![name, now()],
+                )
+                .unwrap();
+            }
+            for (issue, role, pane) in [(7, "review", "%1"), (8, "impl-review", "%2")] {
+                conn.execute(
+                    "INSERT INTO panes (project_id, issue_number, role, mux_kind, mux_session,
+                                        mux_pane_id, worktree_path, created_at, updated_at)
+                     VALUES ('demo', ?1, ?2, 'tmux', 'meguri', ?3, '/wt/demo/b', ?4, ?4)",
+                    params![issue, role, pane, now()],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(&db).unwrap();
+        let review = store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().unwrap();
+        assert_eq!(review.mux_pane_id.as_deref(), Some("%1"));
+        let self_review = store
+            .get_pane("demo", 8, LANE_SELF_REVIEW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(self_review.mux_pane_id.as_deref(), Some("%2"));
     }
 }

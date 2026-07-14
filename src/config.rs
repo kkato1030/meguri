@@ -112,6 +112,12 @@ pub struct Config {
     /// regressions are still caught.
     #[serde(default)]
     pub drift: DriftConfig,
+    /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
+    /// #66). Top-level like `[drift]` so toggling it never materializes
+    /// `[routing]` and flips role routing on. Only fires when routing is
+    /// active (a common gate in the flow).
+    #[serde(default)]
+    pub escalation: EscalationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -202,7 +208,7 @@ fn default_review_lenses() -> Vec<String> {
 /// `[review.guard]` — the optional external GitHub guard review, toggled
 /// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
 /// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
-/// off (opt-in; external-bot compatible). Its output is a `meguri/guard-review`
+/// off (opt-in; external-bot compatible). Its output is a `meguri/pr-review`
 /// commit status + a folded PR-body `<details>` — never inline threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardConfig {
@@ -566,6 +572,52 @@ pub struct RoutingConfig {
     /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+    /// Fraction (0.0–1.0) of runs assigned to a comparison ("explore")
+    /// profile instead of the mainline pick (routing 3/3, issue #66). Default
+    /// `0.0` = off: no run is diverted, so behavior matches routing 1/3. The
+    /// selection is deterministic by target number, and lives inside
+    /// `[routing]` because explore is part of how routing assigns profiles —
+    /// you only set it when routing is already wanted.
+    #[serde(default)]
+    pub explore_ratio: f64,
+}
+
+/// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
+/// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
+/// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
+/// switches role routing on (see [`crate::routing`]), so a `[routing.escalation]`
+/// table would silently activate routing for a user who only wanted to turn
+/// escalation off — the same reason ADR 0007 gave `[drift]` a top-level home.
+/// Escalation still only fires when routing is active (a common gate in the
+/// flow), so `[escalation]` alone changes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Kill switch. Default `true`, but escalation only fires for roles that
+    /// have an escalation chain AND when routing is active, so the default is
+    /// inert until both hold.
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    /// Per-role chain overrides. Keys are the 6 routing roles (see
+    /// `crate::routing::KNOWN_ROLES`); values are ordered profile-name chains
+    /// (weakest → strongest), e.g. `worker = ["claude-sonnet", "claude-opus"]`.
+    /// An empty chain (`worker = []`) turns escalation off for that role
+    /// without touching the others. Flattened so `enabled` and the role chains
+    /// share the one `[escalation]` table.
+    #[serde(flatten, default)]
+    pub roles: HashMap<String, Vec<String>>,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            roles: HashMap::new(),
+        }
+    }
+}
+
+fn default_escalation_enabled() -> bool {
+    true
 }
 
 /// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
@@ -930,6 +982,26 @@ pub struct ScheduleConfig {
     pub allow_overlap: bool,
 }
 
+/// One `[[projects.cadence]]` entry (issue #148): a per-label消化レート上限。
+/// `label`(例: `sns`)を持つ issue を、窓あたり上限件数までしか消化しない。
+/// 期間モードは `max_per_day`(UTC 暦日あたり)**または** `per_hours` + `max`
+/// (ローリング窓)のちょうど一方(`[`Config::validate`] が保証)。消化実績は
+/// forge ではなくローカル run 履歴(`runs.cadence_label`)で数える(ADR 0011)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CadenceRule {
+    /// 対象 issue ラベル(github mode 専用。local タスクにラベル軸は無い)。
+    pub label: String,
+    /// UTC 暦日あたりの上限。`per_hours`/`max` と排他。
+    #[serde(default)]
+    pub max_per_day: Option<u32>,
+    /// ローリング窓の長さ(時間)。`max` と対で使い、`max_per_day` と排他。
+    #[serde(default)]
+    pub per_hours: Option<u32>,
+    /// ローリング窓あたりの上限。`per_hours` と対で使う。
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -981,6 +1053,9 @@ pub struct ProjectConfig {
     /// Cron schedules that periodically enqueue issues/tasks (issue #146).
     #[serde(default)]
     pub schedules: Vec<ScheduleConfig>,
+    /// Per-label消化レート上限(issue #148)。github mode 専用。
+    #[serde(default)]
+    pub cadence: Vec<CadenceRule>,
     /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
     /// Same shape as the top-level `[prompts]`; a per-project entry overrides
     /// the top-level one for the same canonical role key. See
@@ -1150,6 +1225,56 @@ impl Config {
                 );
             }
             self.validate_schedules(p)?;
+            self.validate_cadence(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject cadence rules that would never enforce cleanly: an empty or
+    /// duplicate `label`, or a period mode that is neither exactly `max_per_day`
+    /// nor exactly (`per_hours` + `max`), or a non-positive limit. github-only
+    /// is not rejected here (a local project simply carries unused rules — the
+    /// local task source has no labels to match), matching how the local
+    /// planner is left dormant rather than errored.
+    fn validate_cadence(&self, p: &ProjectConfig) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for c in &p.cadence {
+            if c.label.trim().is_empty() {
+                anyhow::bail!("project {:?} has a cadence rule with an empty label", p.id);
+            }
+            if !seen.insert(c.label.as_str()) {
+                anyhow::bail!(
+                    "project {:?} has duplicate cadence label {:?}",
+                    p.id,
+                    c.label
+                );
+            }
+            match (c.max_per_day, c.per_hours, c.max) {
+                (Some(n), None, None) => {
+                    if n == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has max_per_day = 0 (must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                (None, Some(h), Some(m)) => {
+                    if h == 0 || m == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has per_hours/max = 0 (both must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                _ => anyhow::bail!(
+                    "project {:?} cadence label {:?} must set exactly one of `max_per_day` \
+                     or (`per_hours` + `max`)",
+                    p.id,
+                    c.label
+                ),
+            }
         }
         self.validate_prompts()?;
         Ok(())
@@ -2195,6 +2320,47 @@ window = 50
     }
 
     #[test]
+    fn escalation_defaults_and_does_not_activate_routing() {
+        // No `[escalation]` section: enabled by default, no role chains, and it
+        // certainly doesn't imply `[routing]`.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.escalation.enabled);
+        assert!(cfg.escalation.roles.is_empty());
+        assert!(cfg.routing.is_none());
+
+        // A top-level `[escalation]` table parses `enabled` + per-role chains
+        // from the one flattened section, and must NOT materialize `[routing]`
+        // (the whole point of keeping it out of `[routing.escalation]`).
+        let cfg: Config = toml::from_str(
+            r#"
+[escalation]
+enabled = false
+worker = ["claude-sonnet", "claude-opus"]
+fixer = []
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.escalation.enabled);
+        assert_eq!(
+            cfg.escalation.roles["worker"],
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert_eq!(cfg.escalation.roles["fixer"], Vec::<String>::new());
+        assert!(
+            cfg.routing.is_none(),
+            "[escalation] must stay legacy for routing"
+        );
+    }
+
+    #[test]
+    fn explore_ratio_defaults_off_and_lives_under_routing() {
+        let cfg: Config = toml::from_str("[routing]\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.0);
+        let cfg: Config = toml::from_str("[routing]\nexplore_ratio = 0.1\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.1);
+    }
+
+    #[test]
     fn parses_profiles_and_routing() {
         let raw = r#"
 [agents.profiles.claude-opus]
@@ -2449,6 +2615,67 @@ allow_overlap = true
                    [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
         let cfg = Config::parse(raw, Path::new("cfg")).unwrap();
         assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
+    }
+
+    #[test]
+    fn cadence_rules_parse_both_period_modes() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"nl\"\nper_hours = 168\nmax = 2\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let cadence = &cfg.project("d").unwrap().cadence;
+        assert_eq!(cadence.len(), 2);
+        assert_eq!(cadence[0].label, "sns");
+        assert_eq!(cadence[0].max_per_day, Some(1));
+        assert_eq!(cadence[1].per_hours, Some(168));
+        assert_eq!(cadence[1].max, Some(2));
+    }
+
+    #[test]
+    fn cadence_rejects_empty_or_duplicate_label() {
+        let empty = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                     [[projects.cadence]]\nlabel = \"\"\nmax_per_day = 1\n";
+        let err = toml::from_str::<Config>(empty)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty label"), "{err}");
+
+        let dup = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 2\n";
+        let err = toml::from_str::<Config>(dup)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate cadence label"), "{err}");
+    }
+
+    #[test]
+    fn cadence_rejects_ambiguous_or_zero_period() {
+        // Both modes set.
+        let both = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\nper_hours = 24\nmax = 1\n";
+        // Rolling mode missing its `max`.
+        let missing = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                       [[projects.cadence]]\nlabel = \"sns\"\nper_hours = 24\n";
+        // Neither mode.
+        let none = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\n";
+        // Zero value.
+        let zero = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 0\n";
+        for raw in [both, missing, none, zero] {
+            let err = toml::from_str::<Config>(raw)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cadence label"), "{err}");
+        }
     }
 
     /// Minimal valid config carrying the given projects plus the extra lines.

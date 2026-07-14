@@ -98,6 +98,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
 
@@ -370,7 +371,7 @@ async fn planner_self_reviews_the_spec_before_opening_the_pr() {
                     "verdict": "clean", "review": "spec looks sound", "findings": [],
                 });
                 std::fs::write(
-                    wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+                    wt.join(meguri::engine::self_review::REVIEW_FILE),
                     body.to_string(),
                 )
                 .unwrap();
@@ -615,6 +616,7 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     let sibling_project = ProjectConfig {

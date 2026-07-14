@@ -5,16 +5,16 @@ pub mod conflict_resolver;
 pub mod escalation;
 pub mod fixer;
 pub mod flow;
-pub mod guard;
-pub mod handoff;
-pub mod impl_reviewer;
 pub mod merge_watch;
+pub mod plan_handoff;
 pub mod planner;
+pub mod pr_reviewer;
 pub mod reaper;
 pub mod reconcile;
 pub mod routing_drift;
 pub mod scheduler;
 pub mod scheduler_fire;
+pub mod self_review;
 pub mod spec_worker;
 pub mod worker;
 
@@ -29,7 +29,7 @@ use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
 use crate::notify::{Notification, Notifier};
-use crate::store::{DesiredState, InteractionState, ROLE_AUTHOR, ROLE_REVIEW, Store};
+use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, LANE_PR_REVIEW, Store};
 use crate::tasks::{TaskKey, TaskSource};
 use crate::turn::TurnControl;
 
@@ -39,8 +39,8 @@ pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
     /// The GitHub forge — issue reading, PR/label/review operations. `None`
-    /// in local mode; the forge-dependent loops (fixer, reviewer, spec-worker,
-    /// conflict-resolver, ci-fixer, impl-reviewer, cleaner) then discover
+    /// in local mode; the forge-dependent loops (fixer, pr-reviewer,
+    /// spec-worker, conflict-resolver, ci-fixer, cleaner) then discover
     /// nothing. Task coordination goes through [`Deps::task_source`], not here.
     pub forge: Option<Arc<dyn Forge>>,
     /// The task coordination layer (discover / claim / release / escalate /
@@ -83,6 +83,7 @@ impl Deps {
             store.clone(),
             project.id.clone(),
             config.reconcile,
+            project.cadence.clone(),
         ));
         let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {
@@ -248,6 +249,10 @@ pub struct Target {
     /// task row). Also the run-creation and dispatch-sort key.
     pub key: TaskKey,
     pub title: String,
+    /// The cadence bucket (issue #148) discovery matched, if any. The scheduler
+    /// stamps it onto the created run so consumption can be counted. `None`
+    /// outside any cadence rule and for all non-task-source loops.
+    pub cadence_label: Option<String>,
 }
 
 /// The GitHub issue a PR belongs to: the branch encoding first
@@ -314,17 +319,17 @@ pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullReq
     }
 }
 
-/// The pane lane a loop's runs live in: the guard keeps its independent
-/// `review` lane; every other loop shares the issue's `author` lane (the
+/// The pane lane a loop's runs live in: the pr-reviewer keeps its independent
+/// `pr-review` lane; every other loop shares the issue's `author` lane (the
 /// cleaner's report issue is only ever touched by the cleaner, so the default
 /// lane cannot collide). The internal self-review turn runs in its own
-/// `impl-review` lane, but that lane is entered explicitly by the flow, not
+/// `self-review` lane, but that lane is entered explicitly by the flow, not
 /// via a loop_kind, so it is not resolved here.
-pub fn role_for_loop(loop_kind: &str) -> &'static str {
-    if loop_kind == guard::KIND {
-        ROLE_REVIEW
+pub fn lane_for_loop(loop_kind: &str) -> &'static str {
+    if loop_kind == pr_reviewer::KIND {
+        LANE_PR_REVIEW
     } else {
-        ROLE_AUTHOR
+        LANE_AUTHOR
     }
 }
 
@@ -375,7 +380,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(guard::GuardLoop),
+        Arc::new(pr_reviewer::PrReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
@@ -474,8 +479,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_is_review_only_for_the_guard() {
-        assert_eq!(role_for_loop(guard::KIND), ROLE_REVIEW);
+    fn lane_is_pr_review_only_for_the_pr_reviewer() {
+        assert_eq!(lane_for_loop(pr_reviewer::KIND), LANE_PR_REVIEW);
         for kind in [
             "worker",
             "planner",
@@ -485,7 +490,7 @@ mod tests {
             "conflict-resolver",
             "cleaner",
         ] {
-            assert_eq!(role_for_loop(kind), ROLE_AUTHOR, "loop: {kind}");
+            assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
     }
 
@@ -577,6 +582,7 @@ mod tests {
             worktree_setup: Default::default(),
             schedules: Vec::new(),
             autonomy: None,
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         let deps = Deps::with_label_source(

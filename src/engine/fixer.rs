@@ -84,6 +84,7 @@ impl super::Loop for FixerLoop {
                     // carried as an Issue key through the coordination layer.
                     key: TaskKey::Issue(canonical_key(&pr)),
                     title: pr.title,
+                    cadence_label: None,
                 });
             }
         }
@@ -399,6 +400,7 @@ mod tests {
             worktree_setup: Default::default(),
             schedules: Vec::new(),
             autonomy: None,
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         Deps::with_label_source(

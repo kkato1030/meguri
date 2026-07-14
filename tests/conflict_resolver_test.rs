@@ -117,6 +117,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
 

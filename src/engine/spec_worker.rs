@@ -113,6 +113,7 @@ impl super::Loop for SpecWorkerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -584,6 +585,7 @@ mod tests {
             worktree_setup: Default::default(),
             schedules: Vec::new(),
             autonomy: None,
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         Deps::with_label_source(

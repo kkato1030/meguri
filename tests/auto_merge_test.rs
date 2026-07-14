@@ -7,7 +7,7 @@ use std::sync::Arc;
 use meguri::config::{AutoMergeMode, AutoMergeOptIn, Config, ProjectConfig};
 use meguri::engine::Deps;
 use meguri::engine::auto_merger::{ARMED_MARKER_PREFIX, armed_marker, sweep};
-use meguri::engine::guard::GUARD_STATUS;
+use meguri::engine::pr_reviewer::PR_REVIEW_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_REVIEWING,
@@ -37,6 +37,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     Deps::with_label_source(
@@ -86,37 +87,42 @@ async fn arms_when_all_conditions_met() {
     assert!(comments.iter().any(|c| c.contains("arm しました")));
 }
 
-/// Deps with the impl guard enabled (so the auto-merger applies the guard gate).
-fn deps_with_guard(forge: Arc<FakeForge>) -> Deps {
+/// Deps with the impl review enabled (so the auto-merger applies the
+/// pr-review gate).
+fn deps_with_pr_review(forge: Arc<FakeForge>) -> Deps {
     let mut deps = deps_with(forge);
     deps.config.review.guard.impl_enabled = true;
     deps
 }
 
 #[tokio::test]
-async fn guard_gate_arms_on_a_success_status() {
+async fn pr_review_gate_arms_on_a_success_status() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
-    let deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Success);
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
     assert_eq!(
         forge.armed_of(pr),
         Some((MergeStrategy::Squash, "sha-head".into())),
-        "a green guard status lets the arm proceed"
+        "a green pr-review status lets the arm proceed"
     );
 }
 
 #[tokio::test]
-async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
+async fn pr_review_gate_escalates_a_failure_status_and_does_not_arm() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
-    let deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Failure);
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
-    assert_eq!(forge.armed_of(pr), None, "a red guard status blocks arming");
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "a red pr-review status blocks arming"
+    );
     let labels = forge.pr_labels_of(pr);
     assert!(
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
@@ -126,19 +132,19 @@ async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
         forge
             .comments_of(pr)
             .iter()
-            .any(|c| c.contains("guard review"))
+            .any(|c| c.contains("PR review"))
     );
 }
 
 #[tokio::test]
-async fn guard_gate_waits_when_status_absent() {
+async fn pr_review_gate_waits_when_status_absent() {
     let forge = Arc::new(FakeForge::default());
-    let pr = seed_armable(&forge, 10, "sha-head"); // no guard status posted yet
-    let deps = deps_with_guard(forge.clone());
+    let pr = seed_armable(&forge, 10, "sha-head"); // no pr-review status posted yet
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
     assert_eq!(forge.armed_of(pr), None, "no status yet: wait, don't arm");
-    // Waiting is silent — no escalation while the guard has not run.
+    // Waiting is silent — no escalation while the pr-reviewer has not run.
     assert!(
         !forge
             .pr_labels_of(pr)
@@ -148,12 +154,12 @@ async fn guard_gate_waits_when_status_absent() {
 }
 
 #[tokio::test]
-async fn guard_gate_is_skipped_when_impl_guard_disabled() {
-    // The default (impl guard off): the auto-merger arms without any status,
+async fn pr_review_gate_is_skipped_when_impl_review_disabled() {
+    // The default (impl review off): the auto-merger arms without any status,
     // never demanding one that nothing produces (no ADR-0007 deadlock).
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    let deps = deps_with(forge.clone()); // impl guard stays off
+    let deps = deps_with(forge.clone()); // impl review stays off
 
     sweep(&deps).await.unwrap();
     assert_eq!(
@@ -163,14 +169,14 @@ async fn guard_gate_is_skipped_when_impl_guard_disabled() {
 }
 
 #[tokio::test]
-async fn attended_escalates_a_guard_failure_without_arming() {
+async fn attended_escalates_a_pr_review_failure_without_arming() {
     // ADR 0012 §5: escalation is mode-independent — autonomy changes only the
-    // final arm. Under the default `attended`, a guard-failed head still gets
+    // final arm. Under the default `attended`, a review-failed head still gets
     // its `needs-human` backstop, but nothing is ever armed.
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
-    let mut deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Failure);
+    let mut deps = deps_with_pr_review(forge.clone());
     deps.config.autonomy = meguri::config::Autonomy::Attended;
 
     sweep(&deps).await.unwrap();
@@ -178,29 +184,29 @@ async fn attended_escalates_a_guard_failure_without_arming() {
     assert_eq!(
         forge.armed_of(pr),
         None,
-        "attended never arms, guard failure or not"
+        "attended never arms, pr-review failure or not"
     );
     let labels = forge.pr_labels_of(pr);
     assert!(
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
-        "the guard-failed backstop escalates even under attended: {labels:?}"
+        "the review-failed backstop escalates even under attended: {labels:?}"
     );
     assert!(
         forge
             .comments_of(pr)
             .iter()
-            .any(|c| c.contains("guard review"))
+            .any(|c| c.contains("PR review"))
     );
 }
 
 #[tokio::test]
 async fn attended_leaves_a_green_pr_unarmed_and_unescalated() {
-    // Attended stops only the final arm: a green guard status means nothing to
-    // escalate, and the PR is left for a human to merge.
+    // Attended stops only the final arm: a green pr-review status means
+    // nothing to escalate, and the PR is left for a human to merge.
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
-    let mut deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Success);
+    let mut deps = deps_with_pr_review(forge.clone());
     deps.config.autonomy = meguri::config::Autonomy::Attended;
 
     sweep(&deps).await.unwrap();
