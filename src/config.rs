@@ -1232,6 +1232,14 @@ impl ConfigReloader {
             );
             return None;
         }
+        // `[launch.roles]` typos are a loud startup error (`crate::launch::
+        // validate`, issue #169) — a hot reload must reject the same way
+        // instead of silently applying an ignored override.
+        if let Err(e) = crate::launch::validate(&next) {
+            self.last_seen = Some(raw);
+            tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
+            return None;
+        }
 
         // Pin the process-bound settings so `current` always reflects what is
         // actually in effect.
@@ -1641,6 +1649,30 @@ language = "English"
         std::fs::write(&path, "language = \"B\"\n").unwrap();
         assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_none());
         assert!(!r.current().projects.is_empty());
+    }
+
+    #[test]
+    fn reloader_rejects_unknown_launch_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            "language = \"B\"\n[launch.roles]\nnonsense = \"direct\"\n",
+        )
+        .unwrap();
+        let mut applied = false;
+        assert!(
+            r.poll(|_, _| -> Result<()> {
+                applied = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!applied, "an unknown launch role must reject before apply");
+        assert_ne!(r.current().language.as_deref(), Some("B"));
     }
 
     #[test]
