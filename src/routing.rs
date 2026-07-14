@@ -283,6 +283,147 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
     }
 }
 
+/// The escalation chain for a role: the ordered profiles (weakest → strongest)
+/// a stuck run climbs (routing 3/3, issue #66). Distinct from
+/// [`recommended_chain`], which is a *detection fallback* ending in `default`
+/// (the weakening direction); escalation goes the strengthening direction.
+/// `worker` / `fixer` climb sonnet → opus by default; `planner` and the
+/// reviewer roles are already at the top, so they have no chain (never
+/// escalate). A `[escalation]` role entry overrides the default (an empty
+/// chain disables escalation for that role).
+pub fn escalation_chain(cfg: &Config, role: &str) -> Vec<String> {
+    let canonical = canonical_role(role);
+    if let Some(chain) = escalation_override(&cfg.escalation.roles, canonical) {
+        return chain.clone();
+    }
+    default_escalation_chain(canonical)
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The built-in escalation chain for a role (before any `[escalation]`
+/// override). Only the implementation-heavy roles lean cheap-then-strong.
+fn default_escalation_chain(role: &str) -> &'static [&'static str] {
+    match role {
+        "worker" | "fixer" => &["claude-sonnet", "claude-opus"],
+        _ => &[],
+    }
+}
+
+/// Look up a role's escalation-chain override, honoring the deprecated role
+/// aliases the same way [`role_override`] does for `[routing.roles]`.
+fn escalation_override<'a>(
+    roles: &'a HashMap<String, Vec<String>>,
+    role: &str,
+) -> Option<&'a Vec<String>> {
+    if let Some(chain) = roles.get(role) {
+        return Some(chain);
+    }
+    DEPRECATED_ROLE_ALIASES
+        .iter()
+        .filter(|(_, new)| *new == role)
+        .find_map(|(old, _)| roles.get(*old))
+}
+
+/// The next stronger profile to escalate a run to, or None when it should not
+/// escalate. The decision is anchored on where the run's *current* pinned
+/// profile sits in the role's escalation chain (issue #66):
+///
+/// - a profile not in the chain (e.g. `default` from a manual/fallback pin, or
+///   an explicit off-chain `[routing.roles]` pick) never escalates — routing
+///   1/3's contract is preserved;
+/// - from a chain entry that isn't the last, walk strictly upward to the first
+///   candidate that both exists and is detected, skipping unusable ones (the
+///   same skip flavor as [`resolve`], but only in the stronger direction);
+/// - the chain's last entry, or no usable stronger entry, yields None.
+pub fn next_escalation(
+    cfg: &Config,
+    role: &str,
+    current_profile: &str,
+    detect: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let chain = escalation_chain(cfg, role);
+    let pos = chain.iter().position(|p| p == current_profile)?;
+    for candidate in &chain[pos + 1..] {
+        let Ok(profile) = profile_by_name(cfg, candidate) else {
+            continue;
+        };
+        if detect(&profile.command) {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// The alternative ("explore") profile a canary run is diverted to instead of
+/// the mainline pick (issue #66): the next entry after the *auto* pick in the
+/// role's [`recommended_chain`] that exists, is detected, and differs from the
+/// mainline. None (no divert) when the mainline is already the chain's tail or
+/// nothing after it is usable — the run then stays on the mainline. `default`
+/// is a legitimate alternative here (it answers "is routing better than the
+/// bare `[agent]`?") and is returned without detection, mirroring [`resolve`].
+///
+/// Explore only ever canaries the *auto recommendation*. It is a no-op when the
+/// role's profile isn't the auto pick — legacy (no `[routing]`), manual mode, or
+/// an explicit `[routing.roles]` entry — because ADR 0003 promises an explicit
+/// pick is honored verbatim: a user who pinned `worker = "claude-sonnet"` gets
+/// exactly that, never a silently-diverted next-in-chain.
+pub fn explore_alternative(
+    cfg: &Config,
+    role: &str,
+    detect: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let routing = cfg.routing.as_ref()?;
+    // Manual mode has no auto recommendation to canary; an explicit override is
+    // the user's deliberate choice and must not be diverted.
+    if routing.mode == RoutingMode::Manual || role_override(&routing.roles, role).is_some() {
+        return None;
+    }
+    // With those ruled out, `resolve` returns the auto chain pick = the mainline.
+    let mainline = resolve(cfg, role, detect).ok()?;
+    let chain = recommended_chain(role);
+    let pos = chain.iter().position(|c| *c == mainline)?;
+    for candidate in &chain[pos + 1..] {
+        if *candidate == DEFAULT_PROFILE {
+            // `default` always resolves and, since the mainline sits earlier in
+            // the chain, necessarily differs from it.
+            return Some(DEFAULT_PROFILE.to_string());
+        }
+        let Ok(profile) = profile_by_name(cfg, candidate) else {
+            continue;
+        };
+        if detect(&profile.command) {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+}
+
+/// Whether a run targeting `number` (issue or task) falls in the explore
+/// fraction, decided deterministically so the same target always lands the same
+/// way and tests are reproducible (issue #66). Uses an explicit FNV-1a hash —
+/// NOT `std`'s `DefaultHasher`, whose output isn't stable across toolchains.
+pub fn is_explore(number: i64, ratio: f64) -> bool {
+    if ratio <= 0.0 {
+        return false;
+    }
+    if ratio >= 1.0 {
+        return true;
+    }
+    (fnv1a_u64(number as u64) % 10_000) < (ratio * 10_000.0) as u64
+}
+
+/// FNV-1a over the 8 little-endian bytes of `n`. Small, explicit, and stable.
+fn fnv1a_u64(n: u64) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in n.to_le_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Look up a profile by name, merging (user profiles win) builtin profiles and
 /// the reserved `default` (= `[agent]`). Err if the name is defined nowhere.
 pub fn profile_by_name(cfg: &Config, name: &str) -> Result<AgentProfile> {
@@ -365,6 +506,38 @@ pub fn validate(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Result<()> {
             "[agents.profiles.default] is reserved — the `default` profile is \
              the [agent] section; configure it there"
         );
+    }
+
+    // `[escalation]` chain overrides get the same loud, up-front surface: an
+    // unknown role name, an undefined profile, or a `default` entry (which has
+    // no defined "strength" and would muddy the in-chain position check) is a
+    // startup error, not a silent no-op (routing 3/3, issue #66). Checked
+    // independently of `[routing]` because `[escalation]` is a top-level
+    // section — a typo should be loud even in a legacy config (where escalation
+    // stays inert). Detection is NOT required: an escalation target that isn't
+    // installed is skipped at escalation time; only the chain's shape is checked.
+    for (role, chain) in &cfg.escalation.roles {
+        if !KNOWN_ROLES.contains(&canonical_role(role)) {
+            bail!(
+                "[escalation] has unknown role {role:?} — valid roles: {}",
+                KNOWN_ROLES.join(", "),
+            );
+        }
+        for profile_name in chain {
+            if profile_name == DEFAULT_PROFILE {
+                bail!(
+                    "[escalation] {role} chain lists {DEFAULT_PROFILE:?}, but the \
+                     default profile cannot be an escalation target (it has no \
+                     defined strength) — escalation climbs toward stronger models"
+                );
+            }
+            if !profile_exists(cfg, profile_name) {
+                bail!(
+                    "[escalation] {role} chain lists {profile_name:?}, but that \
+                     profile is not defined"
+                );
+            }
+        }
     }
 
     let Some(routing) = &cfg.routing else {
@@ -764,6 +937,226 @@ args = ["--foo"]
         // non-fatal Unavailable rather than a false ModelInvalid.
         let codex = builtin_profiles().remove("codex").unwrap();
         assert_eq!(probe_profile(&codex), ProbeOutcome::Unavailable);
+    }
+
+    // --- routing 3/3 (issue #66): escalation + explore --------------------
+
+    #[test]
+    fn escalation_chain_defaults_and_overrides() {
+        let cfg = Config::default();
+        // Implementation roles lean cheap→strong; the rest have no chain.
+        assert_eq!(
+            escalation_chain(&cfg, "worker"),
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert_eq!(
+            escalation_chain(&cfg, "fixer"),
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert!(escalation_chain(&cfg, "planner").is_empty());
+        assert!(escalation_chain(&cfg, "cleaner").is_empty());
+
+        // A `[escalation]` role entry replaces the default; an empty chain
+        // disables escalation for that role.
+        let cfg = cfg_from(
+            r#"
+[escalation]
+worker = ["claude-sonnet", "claude-opus", "codex"]
+fixer = []
+"#,
+        );
+        assert_eq!(
+            escalation_chain(&cfg, "worker"),
+            vec!["claude-sonnet", "claude-opus", "codex"]
+        );
+        assert!(escalation_chain(&cfg, "fixer").is_empty());
+        // A deprecated key still steers its renamed role.
+        let cfg = cfg_from("[escalation]\nspec-worker = [\"claude-opus\"]\n");
+        assert_eq!(escalation_chain(&cfg, "worker"), vec!["claude-opus"]);
+    }
+
+    #[test]
+    fn next_escalation_climbs_only_from_within_the_chain() {
+        let cfg = Config::default();
+        let detect = only(&["claude"]);
+        // From a mid-chain entry → the next stronger one.
+        assert_eq!(
+            next_escalation(&cfg, "worker", "claude-sonnet", &detect).as_deref(),
+            Some("claude-opus")
+        );
+        // From the chain tail → no escalation.
+        assert_eq!(
+            next_escalation(&cfg, "worker", "claude-opus", &detect),
+            None
+        );
+        // `default` (manual / detection-fallback pin) is off-chain → never
+        // escalates: routing 1/3's contract is preserved.
+        assert_eq!(
+            next_escalation(&cfg, "worker", DEFAULT_PROFILE, &detect),
+            None
+        );
+        // An explicit off-chain pick (e.g. `worker = "codex"`) → no escalation.
+        assert_eq!(next_escalation(&cfg, "worker", "codex", &detect), None);
+        // A role with no chain never escalates.
+        assert_eq!(
+            next_escalation(&cfg, "planner", "claude-opus", &detect),
+            None
+        );
+    }
+
+    #[test]
+    fn next_escalation_skips_undetected_candidates_upward() {
+        // A mid-chain entry that isn't installed is skipped toward the stronger
+        // end, same flavor as auto `resolve`, but only in the stronger direction.
+        let cfg = cfg_from(
+            r#"
+[escalation]
+worker = ["claude-sonnet", "codex", "claude-opus"]
+"#,
+        );
+        // codex CLI absent → skip it, land on claude-opus.
+        assert_eq!(
+            next_escalation(&cfg, "worker", "claude-sonnet", &only(&["claude"])).as_deref(),
+            Some("claude-opus")
+        );
+        // Nothing stronger is detected → no escalation.
+        assert_eq!(
+            next_escalation(&cfg, "worker", "claude-sonnet", &only(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_checks_escalation_chain_shape() {
+        // Unknown role name.
+        let err = validate(
+            &cfg_from("[escalation]\nnonsense = [\"claude-opus\"]\n"),
+            &only(&["claude"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown role"), "{err}");
+
+        // `default` is not a legal escalation target.
+        let err = validate(
+            &cfg_from("[escalation]\nworker = [\"claude-sonnet\", \"default\"]\n"),
+            &only(&["claude"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("default profile cannot be"), "{err}");
+
+        // Undefined profile.
+        let err = validate(
+            &cfg_from("[escalation]\nworker = [\"ghost\"]\n"),
+            &only(&["claude"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not defined"), "{err}");
+
+        // A well-formed chain passes — even with no `[routing]` (legacy), and
+        // without the CLI installed (detection isn't required for the shape check).
+        validate(
+            &cfg_from("[escalation]\nworker = [\"claude-sonnet\", \"claude-opus\"]\n"),
+            &only(&[]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn is_explore_is_deterministic_and_respects_the_bounds() {
+        // ratio 0 (the default) never explores; ratio ≥ 1 always does.
+        for n in 0..50 {
+            assert!(!is_explore(n, 0.0), "n={n}");
+            assert!(is_explore(n, 1.0), "n={n}");
+        }
+        // Same target, same verdict every call (reproducible).
+        for n in 0..50 {
+            assert_eq!(is_explore(n, 0.3), is_explore(n, 0.3), "n={n}");
+        }
+        // Roughly the requested fraction over a spread of targets (loose bound;
+        // this is a determinism test, not a statistics one).
+        let hits = (0..1000).filter(|&n| is_explore(n, 0.2)).count();
+        assert!((100..300).contains(&hits), "hits={hits}");
+    }
+
+    #[test]
+    fn explore_alternative_picks_the_next_chain_candidate() {
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        // Reviewer roles have a non-default alternative: mainline codex → the
+        // next chain entry claude-opus.
+        assert_eq!(
+            explore_alternative(&cfg, "pr-reviewer", &only(&["codex", "claude"])).as_deref(),
+            Some("claude-opus")
+        );
+        // Worker's mainline is claude-sonnet; the next candidate is `default`,
+        // a legitimate "routing vs bare [agent]" comparison.
+        assert_eq!(
+            explore_alternative(&cfg, "worker", &only(&["claude"])).as_deref(),
+            Some(DEFAULT_PROFILE)
+        );
+        // When the mainline is already the chain tail (`default`), there is no
+        // alternative → no divert.
+        assert_eq!(
+            explore_alternative(&cfg, "cleaner", &only(&["claude"])),
+            None
+        );
+    }
+
+    #[test]
+    fn explore_is_a_noop_for_explicit_and_manual_roles() {
+        // An explicit `[routing.roles]` pick is honored verbatim (ADR 0003) —
+        // even a chain member like claude-sonnet is never diverted.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "auto"
+
+[routing.roles]
+worker = "claude-sonnet"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "worker", &only(&["claude"])),
+            None
+        );
+        // A deprecated alias for the same role also counts as explicit.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "auto"
+
+[routing.roles]
+spec-worker = "claude-sonnet"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "worker", &only(&["claude"])),
+            None
+        );
+
+        // Manual mode has no auto recommendation to canary — even an explicit
+        // chain member stays put.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+pr-reviewer = "codex"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "pr-reviewer", &only(&["codex", "claude"])),
+            None
+        );
+
+        // Legacy (no `[routing]`) never explores.
+        assert_eq!(
+            explore_alternative(&Config::default(), "worker", &only(&["claude"])),
+            None
+        );
     }
 
     #[test]

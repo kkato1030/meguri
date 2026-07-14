@@ -75,6 +75,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0013_loop_kind_pr_reviewer",
         include_str!("migrations/0013_loop_kind_pr_reviewer.sql"),
     ),
+    // routing 3/3 (#66): runs.routing_arm — mainline / explore / escalated.
+    // A single ADD COLUMN on the runs table recreated by 0007_tasks. Renumbered
+    // to 0014 after main claimed 0012/0013 for the pane/role rename (#168); an
+    // independent ALTER, so its order relative to those doesn't matter.
+    (
+        "0014_routing_arm",
+        include_str!("migrations/0014_routing_arm.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

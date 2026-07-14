@@ -436,10 +436,10 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
             None => println!("no routing stats yet"),
         }
     } else {
-        println!("routing stats — last {window} scored run(s) per (role, profile)\n");
+        println!("routing stats — last {window} scored run(s) per (role, profile, arm)\n");
         println!(
-            "{:<8} {:<18} {:<16} {:>5} {:>8} {:>9} {:>9}",
-            "PROJECT", "ROLE", "PROFILE", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
+            "{:<8} {:<18} {:<16} {:<10} {:>5} {:>8} {:>9} {:>9}",
+            "PROJECT", "ROLE", "PROFILE", "ARM", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
         );
         for r in &rows {
             let profile = if r.agent_profile.is_empty() {
@@ -452,8 +452,15 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
                 .map(|s| format!("{s:.0}s"))
                 .unwrap_or_else(|| "-".into());
             println!(
-                "{:<8} {:<18} {:<16} {:>5} {:>7.0}% {:>9.1} {:>9}",
-                r.project_id, r.loop_kind, profile, r.runs, r.success_rate, r.avg_turns, dur,
+                "{:<8} {:<18} {:<16} {:<10} {:>5} {:>7.0}% {:>9.1} {:>9}",
+                r.project_id,
+                r.loop_kind,
+                profile,
+                r.routing_arm,
+                r.runs,
+                r.success_rate,
+                r.avg_turns,
+                dur,
             );
         }
     }

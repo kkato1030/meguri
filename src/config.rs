@@ -112,6 +112,12 @@ pub struct Config {
     /// regressions are still caught.
     #[serde(default)]
     pub drift: DriftConfig,
+    /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
+    /// #66). Top-level like `[drift]` so toggling it never materializes
+    /// `[routing]` and flips role routing on. Only fires when routing is
+    /// active (a common gate in the flow).
+    #[serde(default)]
+    pub escalation: EscalationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -546,6 +552,52 @@ pub struct RoutingConfig {
     /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+    /// Fraction (0.0–1.0) of runs assigned to a comparison ("explore")
+    /// profile instead of the mainline pick (routing 3/3, issue #66). Default
+    /// `0.0` = off: no run is diverted, so behavior matches routing 1/3. The
+    /// selection is deterministic by target number, and lives inside
+    /// `[routing]` because explore is part of how routing assigns profiles —
+    /// you only set it when routing is already wanted.
+    #[serde(default)]
+    pub explore_ratio: f64,
+}
+
+/// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
+/// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
+/// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
+/// switches role routing on (see [`crate::routing`]), so a `[routing.escalation]`
+/// table would silently activate routing for a user who only wanted to turn
+/// escalation off — the same reason ADR 0007 gave `[drift]` a top-level home.
+/// Escalation still only fires when routing is active (a common gate in the
+/// flow), so `[escalation]` alone changes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Kill switch. Default `true`, but escalation only fires for roles that
+    /// have an escalation chain AND when routing is active, so the default is
+    /// inert until both hold.
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    /// Per-role chain overrides. Keys are the 6 routing roles (see
+    /// `crate::routing::KNOWN_ROLES`); values are ordered profile-name chains
+    /// (weakest → strongest), e.g. `worker = ["claude-sonnet", "claude-opus"]`.
+    /// An empty chain (`worker = []`) turns escalation off for that role
+    /// without touching the others. Flattened so `enabled` and the role chains
+    /// share the one `[escalation]` table.
+    #[serde(flatten, default)]
+    pub roles: HashMap<String, Vec<String>>,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            roles: HashMap::new(),
+        }
+    }
+}
+
+fn default_escalation_enabled() -> bool {
+    true
 }
 
 /// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
@@ -2191,6 +2243,47 @@ window = 50
             cfg.routing.is_none(),
             "[drift] must stay legacy for routing"
         );
+    }
+
+    #[test]
+    fn escalation_defaults_and_does_not_activate_routing() {
+        // No `[escalation]` section: enabled by default, no role chains, and it
+        // certainly doesn't imply `[routing]`.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.escalation.enabled);
+        assert!(cfg.escalation.roles.is_empty());
+        assert!(cfg.routing.is_none());
+
+        // A top-level `[escalation]` table parses `enabled` + per-role chains
+        // from the one flattened section, and must NOT materialize `[routing]`
+        // (the whole point of keeping it out of `[routing.escalation]`).
+        let cfg: Config = toml::from_str(
+            r#"
+[escalation]
+enabled = false
+worker = ["claude-sonnet", "claude-opus"]
+fixer = []
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.escalation.enabled);
+        assert_eq!(
+            cfg.escalation.roles["worker"],
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert_eq!(cfg.escalation.roles["fixer"], Vec::<String>::new());
+        assert!(
+            cfg.routing.is_none(),
+            "[escalation] must stay legacy for routing"
+        );
+    }
+
+    #[test]
+    fn explore_ratio_defaults_off_and_lives_under_routing() {
+        let cfg: Config = toml::from_str("[routing]\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.0);
+        let cfg: Config = toml::from_str("[routing]\nexplore_ratio = 0.1\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.1);
     }
 
     #[test]

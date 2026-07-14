@@ -155,6 +155,12 @@ pub struct RunRecord {
     /// NULL until something resolves it; once set, every later spawn,
     /// resume, or hook run of this run reuses it.
     pub agent_profile: Option<String>,
+    /// Which routing arm the run took (routing 3/3, issue #66): `None` =
+    /// mainline, `"explore"` = diverted to a comparison profile, `"escalated"`
+    /// = climbed to a stronger profile mid-run. Keeps `meguri stats routing`
+    /// able to separate the three even though escalation overwrites
+    /// `agent_profile` in place.
+    pub routing_arm: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -210,6 +216,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         current_turn_id: row.get("current_turn_id")?,
         agent_session_id: row.get("agent_session_id")?,
         agent_profile: row.get("agent_profile")?,
+        routing_arm: row.get("routing_arm")?,
         error: row.get("error")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
@@ -645,6 +652,20 @@ impl Store {
             c.execute(
                 "UPDATE runs SET agent_profile = ?2 WHERE id = ?1",
                 params![id, profile],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the run's routing arm (routing 3/3, issue #66): `Some("explore")`
+    /// or `Some("escalated")`, or `None` to leave it on the mainline. Written
+    /// when a run is diverted to an explore profile, or when it escalates
+    /// (unless it is already an explore run — explore takes priority).
+    pub fn update_run_routing_arm(&self, id: &str, arm: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET routing_arm = ?2 WHERE id = ?1",
+                params![id, arm],
             )?;
             Ok(())
         })
