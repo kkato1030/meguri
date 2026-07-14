@@ -1,0 +1,117 @@
+# issue-149 spec — `[projects.prompts]`: ロール別 preamble を turn プロンプトに注入する
+
+turn プロンプトには、issue ごとではなくプロジェクト全体に常時かかる恒常規律
+(ガードレール必読・編集ペルソナ遵守・品質基準)を差し込む場所がない。`CLAUDE.md` は
+claude 以外のプロファイルに届かずロール別にも出し分けられない。issue 本文への転記は
+起票者全員に強制されて漏れる。config にロール → preamble(repo 相対パス)のマップを持ち、
+turn プロンプト生成時に埋め込む。worker には品質基準を、planner には企画ガイドラインを、
+reviewer には監査観点を、とロール別に渡せるのが要点。
+
+設計判断の durable な部分(埋め込み vs 参照・挿入位置・ロール語彙・合成順・欠落方針)は
+**ADR 0012**(本 PR 同梱)に置いた。ここは実装を収束させるための足場である。
+
+## スペックの深さ — なぜ design 寄りか
+
+未決の設計判断が複数あり(注入方式・ロール語彙の齟齬・top/project 合成の粒度・挿入位置・
+配線)、かつ **config スキーマという公開契約**に触れる(veto ルール: migration/rollback 必須)。
+ただし追加はすべて任意・後方互換で、永続状態・DB スキーマには一切触れないため、実装効果
+自体は局所的。よって normal spec に「代替案 / migration・rollback / test 戦略」を足した
+design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここは受け入れ基準と変更箇所に絞る。
+
+## 決定(要点、詳細は ADR 0012)
+
+- **注入方式 = 埋め込み**。ロールに該当する preamble ファイルを worktree から読み、プロンプト
+  本文の冒頭に現物として入れる。参照行にはしない(agent がファイルを読むことに依存させない)。
+- **挿入位置 = 本文冒頭**。完了契約は末尾のままで最終権威を保つ。preamble は「プロジェクトの
+  恒常規律」とラベル付けし、契約に劣後する前文として枠付けする。
+- **ロール語彙 = routing の6ロール + `all`**。`src/routing.rs` の `KNOWN_ROLES` と
+  `DEPRECATED_ROLE_ALIASES` を再利用する。旧名は正規化して受け、未知キーは config 検証で弾く。
+  issue 記述の `spec-reviewer` / `impl-reviewer` は旧名 — 現行では `pr-reviewer` /
+  `self-reviewer` に正規化される。
+- **合成 = `all` → ロール別を連結、上書きはキー単位**。per-project の同キーが top-level を
+  上書きし、無ければ top-level に落ちる(`language_for` の流儀を map に広げた形)。
+- **欠落 = warn + イベント発火で続行**。turn は落とさない。`doctor` は別途 strict に検出。
+
+## 変更箇所
+
+### 1. config: 2つの任意セクション追加 — `src/config.rs`
+
+- `Config` に `#[serde(default)] pub prompts: HashMap<String, String>`(top-level `[prompts]`、
+  ロール名/`all` → repo 相対パス)。
+- `ProjectConfig` に同型の `#[serde(default)] pub prompts: HashMap<String, String>`
+  (`[projects.prompts]`)。
+- 解決ヘルパ `preambles_for(&self, project, role) -> Vec<(String /*key*/, String /*rel path*/)>`:
+  `all` とロール `role` それぞれについて per-project → top-level のキー単位フォールバックで
+  パスを引き、`[all, role]` の順で存在するものだけ返す。
+- `Config::validate` にキー検証を追加: `prompts` / `[projects.prompts]` の各キーは
+  `routing::canonical_role` を通して `KNOWN_ROLES` に含まれるか、`all` のどちらか。外れたら
+  `bail!`(routing の未知ロール拒否と同じメッセージ調)。
+- `INIT_TEMPLATE` にコメント例を追記(過剰採用を避ける一言 —「CLAUDE.md で足りるなら不要」)。
+
+### 2. 配線: preamble の解決・読み込み・埋め込み — `src/engine/flow.rs` + `src/turn/`
+
+- 解決と読み込みは flow 層に置く(`Deps` が config/project/store を持つため)。
+  `run_turn`(author)は `routing::routing_role_for_loop(&run.loop_kind)`、`run_review_turn`
+  は `"self-reviewer"` を routing ロールとして `run_turn_in` に渡す。
+- `run_turn_in` で `preambles_for` → 各パスを `worktree.join(rel)` から読む。読めたものを
+  「## プロジェクトの恒常規律(以下に従うこと。ただし meguri の完了契約・検証ルールが優先)」
+  のラベル付きブロックに `all` → ロール順で連結する。
+- 位置の責務は `src/turn/prompts.rs` が持つ: `prepare_turn` / `write_prompt_file` に
+  `preamble: &str` 引数を足し、`<!-- meguri prompt -->` ヘッダの直後・`{body}` の前に置く
+  (完了契約は末尾のまま)。prompts.rs は Config に依存させず、組み立て済みテキストを受け取って
+  **配置だけ**する(解決は flow、配置は turn の分担)。空文字なら現状と完全に同一の出力。
+
+### 3. 欠落ポリシー: warn + イベント — `src/engine/flow.rs`
+
+- パスが worktree に無い / 読めない場合、`deps.store.emit(Some(&run.id), "prompt.preamble_missing",
+  json!({ "role": …, "key": …, "path": rel }))` + warn ログを出し、その preamble を飛ばして続行。
+  `worktree_setup` の非 `required` 既定と同じ「死なない」方針。成功時は
+  `prompt.preamble_injected`(roles/paths)を observability として発火してよい。
+
+### 4. `meguri doctor`: primary clone 上の存在検証 — `src/main.rs`
+
+- `doctor_schedules` の `body_file` 検査と同型の新セクション: 各 project の `prompts` /
+  top-level `prompts` を列挙し、`project.repo_path.join(rel)` の存在を確認。無ければ ❌ で
+  問題として報告(実行時は warn 続行だが、doctor は設定ミス = typo を捕まえる役)。
+
+## 受け入れ基準
+
+- [ ] `[prompts]` / `[projects.prompts]` が role→path マップとしてパースされる。
+- [ ] 未知ロールキーは config 読み込みで拒否される。旧ロール名(`spec-reviewer` 等)と `all`
+      は受理される。
+- [ ] `preambles_for` が per-project→top-level のキー単位上書きを行い、`all`→ロールの順で返す
+      (role のみ / `all` のみ / 両方 / どちらも無し の各ケース)。
+- [ ] turn プロンプトで、該当 preamble が本文冒頭・完了契約より前に埋め込まれる。設定が空の
+      プロジェクトは現状と同一のプロンプトになる(後方互換)。
+- [ ] preamble パスが欠落しても turn は続行し、`prompt.preamble_missing` イベントが出る。
+- [ ] `meguri doctor` が、設定済みだが primary clone に無いパスを ❌ で報告する。
+- [ ] README / config ドキュメントに新セクションと「CLAUDE.md との住み分け」を追記。
+- [ ] `cargo fmt --check` / `clippy -D warnings` / `nextest run` / `cargo test --doc` が通る。
+
+## test 戦略
+
+- **config**(`src/config.rs` unit): パース、未知キー拒否、旧名/`all` 受理、`preambles_for` の
+  合成4ケース。
+- **配置**(`src/turn/prompts.rs` unit): 非空 preamble が本文の前・契約の前に入ること、
+  空 preamble で現行出力と一致すること(既存 `prompt_file_contains_contract_and_turn_id` を拡張)。
+- **欠落**(flow 層 / `FakeStore` で): 欠落時に `prompt.preamble_missing` が記録され turn 続行。
+- **doctor**(`src/main.rs`): 存在パス ✅ / 欠落パス ❌ を返す小テスト。
+- 実 tmux/git を使う統合テスト(`tests/*.rs`)までは要らない — 埋め込みは純テキスト整形で、
+  既存の疑似エージェント経路に新しい振る舞いを足さないため。
+
+## migration / rollback(veto: config は公開契約)
+
+- **追加的・後方互換**: 任意の2セクションが増えるだけ。未設定なら preamble は注入されず、
+  プロンプトは現状と一字一句同じ。既存 config は無改変で読める。
+- **永続状態なし**: DB スキーマ・sqlite・run 状態には触れない。マイグレーション対象データは無い。
+- **rollback**: config からセクションを消す(即無効化)、またはコードを revert すれば
+  プロンプトは現行形に戻る。段階的な巻き戻しは不要。
+
+## 代替案(退けた理由は ADR 0012)
+
+- **参照行方式**: agent の読み込みに依存し「必ず届く」要件を満たさない。→ 埋め込みを採用。
+- **top/project の wholesale 上書き**(`pr`/`review`/`clean` 流儀): top-level `all` を置いた上で
+  per-project でロールを足すたびに `all` を再宣言させられ、`all` 合成の意図と噛み合わない。
+  → キー単位上書きを採用。
+- **独自ロール語彙**: routing と別の語彙は二重管理と「静かなフォールバック」を招く。
+  → routing の `KNOWN_ROLES` を正典として共有。
