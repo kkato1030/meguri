@@ -48,6 +48,7 @@ fn deps_with_store(forge: Arc<FakeForge>, store: meguri::store::Store) -> Deps {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         cadence: Vec::new(),
+        prompts: Default::default(),
     };
     Deps::with_label_source(
         store,

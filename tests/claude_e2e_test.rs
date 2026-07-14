@@ -163,6 +163,7 @@ async fn real_claude_implements_issue_in_tmux() {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         cadence: Vec::new(),
+        prompts: Default::default(),
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),

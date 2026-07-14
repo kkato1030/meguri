@@ -9,6 +9,7 @@ pub mod engine;
 pub mod events;
 pub mod forge;
 pub mod gitops;
+pub mod launch;
 pub mod mux;
 pub mod notify;
 pub mod routing;

@@ -77,7 +77,7 @@ async fn full_turn_happy_path_in_tmux() {
     let dir = tempfile::tempdir().unwrap();
     let control = RecordingControl::new();
 
-    let prepared = prepare_turn(dir.path(), "Implement the feature.").unwrap();
+    let prepared = prepare_turn(dir.path(), "Implement the feature.", "").unwrap();
 
     // Turn 1: the trigger line is the agent's initial prompt argument.
     let pane = mux
@@ -129,7 +129,7 @@ async fn fake_agent_reports_session_id_through_result_contract() {
     let dir = tempfile::tempdir().unwrap();
     let control = RecordingControl::new();
 
-    let prepared = prepare_turn(dir.path(), "Implement the feature.").unwrap();
+    let prepared = prepare_turn(dir.path(), "Implement the feature.", "").unwrap();
 
     let pane = mux
         .spawn_pane(&PaneSpec {
@@ -183,7 +183,7 @@ async fn fake_agent_resumed_with_session_argv_reports_it_back() {
     let dir = tempfile::tempdir().unwrap();
     let control = RecordingControl::new();
 
-    let prepared = prepare_turn(dir.path(), "Pick up where you left off.").unwrap();
+    let prepared = prepare_turn(dir.path(), "Pick up where you left off.", "").unwrap();
 
     // The recovery spawn shape: `<agent> --resume <id> <trigger>`.
     let pane = mux
@@ -237,7 +237,7 @@ async fn blocked_turn_waits_for_human_answer_in_tmux() {
     let dir = tempfile::tempdir().unwrap();
     let control = RecordingControl::new();
 
-    let prepared = prepare_turn(dir.path(), "Do something needing approval.").unwrap();
+    let prepared = prepare_turn(dir.path(), "Do something needing approval.", "").unwrap();
 
     let pane = mux
         .spawn_pane(&PaneSpec {

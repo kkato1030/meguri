@@ -4,3 +4,13 @@
 # 統合テストは実時間 sleep / tmux IO バウンドで CPU をほぼ使わないため、
 # CI ランナー(ubuntu-latest = 4 vCPU)のコア数より広い並列度で回す。
 test-threads = 16
+
+[[profile.ci.overrides]]
+# cleaner_test は各テストがハードコードされた 60秒のタイムアウト
+# (run_to_outcome)でくくられている。テスト自体は1ターンで終わる軽い処理だが、
+# 16並列 / 4 vCPU という意図的な過剰並列のもとでは、たまたま他の重いテスト
+# (tmux 実プロセスを使うものなど)にスケジューリングを圧迫されただけで
+# 60秒を超えることがある(実際に CI で1件だけ発生: 60.338s で timeout)。
+# ロジックのバグではなく環境要因のフレークなので、リトライで吸収する。
+filter = 'binary(cleaner_test)'
+retries = 2

@@ -206,6 +206,13 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // Cadence rules (issue #148): shape is already validated at load;
             // here we show each rule's current window consumption.
             doctor_cadence(cfg, store.as_ref());
+            // Repo config (issue #165): lint each project's `meguri.toml`,
+            // failing on a host-only key or TOML error (deny_unknown_fields).
+            ok &= doctor_repo_configs(cfg);
+            // Role preambles (issue #149): each configured path must resolve to
+            // a real file inside the project's clone (and not escape it via a
+            // symlink) — the same containment gate the turn uses.
+            ok &= doctor_prompts(cfg);
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -225,6 +232,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// ADR 0003). Returns false if any enabled project fails; projects that did
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
+    use meguri::config::AutoMergeMode;
     use meguri::engine::auto_merger::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
@@ -247,15 +255,29 @@ async fn check_auto_merge(cfg: &Config) -> bool {
             .await
         {
             Ok(policy) => match validate_policy(am, &policy) {
-                Ok(()) => println!(
-                    "✅ {label}: repo settings OK (strategy={}, protection {})",
-                    am.strategy.as_str(),
-                    if policy.protected_with_required_checks {
-                        "present"
-                    } else {
-                        "not required"
-                    },
-                ),
+                Ok(()) => match am.mode {
+                    AutoMergeMode::Native => println!(
+                        "✅ {label}: repo settings OK (mode=native, strategy={}, protection {})",
+                        am.strategy.as_str(),
+                        if policy.protected_with_required_checks {
+                            "present"
+                        } else {
+                            "not required"
+                        },
+                    ),
+                    AutoMergeMode::Orchestrator => {
+                        // No server-side gate exists in this mode — remind the
+                        // operator that meguri's own verification is the gate.
+                        println!(
+                            "✅ {label}: repo settings OK (mode=orchestrator, strategy={})",
+                            am.strategy.as_str(),
+                        );
+                        println!(
+                            "   ⚠️  orchestrator mode: no server-side merge gate — \
+                             meguri's own check_command + self-review is the only gate"
+                        );
+                    }
+                },
                 Err(problems) => {
                     println!("❌ {label}: {}", problems.join("; "));
                     ok = false;
@@ -360,6 +382,74 @@ fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
             println!("  ✅ {}/{} ({mode}) — {usage}", project.id, rule.label);
         }
     }
+}
+
+/// Doctor's repo-config section (issue #165): lint each project's repo root
+/// `meguri.toml`. Doctor holds no run, so it reads the primary clone's working
+/// tree (`<repo_path>/meguri.toml`) — advisory, not the run's pinned value. A
+/// host-only key or malformed TOML fails (deny_unknown_fields); an absent file
+/// is the silent, valid opt-out. Follows routing/schedules' "never silently
+/// fall back" principle so a boundary violation surfaces here, not as a no-op.
+fn doctor_repo_configs(cfg: &Config) -> bool {
+    use meguri::config::RepoConfig;
+
+    let mut printed_header = false;
+    let mut ok = true;
+    for project in &cfg.projects {
+        match RepoConfig::load_from_worktree(&project.repo_path) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ✅ {}: meguri.toml OK", project.id);
+            }
+            Err(e) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ❌ {}: {e:#}", project.id);
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// Doctor's preamble section (issue #149): for every project, every preamble
+/// path that could be injected for it — the top-level `[prompts]` overlaid by
+/// its own `[projects.prompts]` — must resolve to a real file inside the
+/// project's clone. Missing paths and symlink escapes are both reported as ❌
+/// (config validate already rejects absolute / `..` values, so those never
+/// reach here). Projects with no preambles configured print nothing.
+fn doctor_prompts(cfg: &Config) -> bool {
+    use meguri::config::{PreambleResolution, resolve_preamble_within};
+
+    let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
+    if !has_any {
+        return true;
+    }
+    let mut ok = true;
+    println!("\npreambles:");
+    for project in &cfg.projects {
+        for (key, rel) in cfg.effective_prompts(project) {
+            let (mark, detail) = match resolve_preamble_within(&project.repo_path, &rel) {
+                PreambleResolution::Content(_) => ("✅", rel.to_string()),
+                PreambleResolution::Missing => {
+                    ok = false;
+                    ("❌", format!("{rel} not found in clone"))
+                }
+                PreambleResolution::Escapes => {
+                    ok = false;
+                    ("❌", format!("{rel} escapes the clone (symlink)"))
+                }
+            };
+            println!("  {mark} {}/{key} — {detail}", project.id);
+        }
+    }
+    ok
 }
 
 /// Doctor's workspace section (issue #154): list each `[[workspaces]]` group
@@ -485,6 +575,25 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+    ok &= doctor_launch(cfg);
+    ok
+}
+
+/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
+/// resolved (no legacy/off state, unlike routing). Explicit launch config
+/// errors (an unknown role key) are startup errors, surfaced here like
+/// routing's.
+fn doctor_launch(cfg: &Config) -> bool {
+    use meguri::{launch, routing};
+    let mut ok = true;
+    if let Err(e) = launch::validate(cfg) {
+        println!("  ❌ launch config: {e:#}");
+        ok = false;
+    }
+    println!("launch mode:");
+    for role in routing::KNOWN_ROLES {
+        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    }
     ok
 }
 
@@ -605,6 +714,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
         }
