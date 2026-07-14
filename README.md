@@ -233,12 +233,15 @@ Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meg
 ```toml
 [pr.auto_merge]
 enabled = false                  # master switch
+mode = "native"                  # native (arm GitHub auto-merge) | orchestrator (meguri merges itself)
 strategy = "squash"              # squash | merge | rebase (no fallback if the repo forbids it)
 require_branch_protection = true # refuse to arm without required-checks branch protection
 opt_in = "label"                 # label (needs meguri:automerge) | all (every eligible meguri PR)
 ```
 
 When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). Note also the review gap until auto-merge 3/3: the reviewer gate (`require_clean_review`) that makes meguri's own review a precondition arrives in a later issue, so until then an opt-in PR can merge on green required checks before meguri has reviewed it — rely on branch protection for the bar you want.
+
+**`mode` — native vs orchestrator.** The default `native` is described above: meguri only arms, GitHub decides. But **private repos on the Free plan cannot enable "Allow auto-merge" at all** (the API silently ignores the PATCH) and have no branch protection, so `native` always fails fast there — the same constraint meguri itself hit in `docs/adr/0004-automerge-gate-renovate-side-on-free-private.md`. `mode = "orchestrator"` is the fallback for exactly those repos: the eligibility gate is identical (same branch / link / label / thread checks), but instead of arming, **meguri merges the PR itself** (`gh pr merge --squash`-equivalent, pinned to the reviewed head) as soon as GitHub reports it `MERGEABLE`. `CONFLICTING` goes to the conflict-resolver and `UNKNOWN` waits for the next sweep. Because there is no server-side gate, orchestrator mode **explicitly accepts meguri's own pre-PR verification (`check_command` + self-review) as the only gate** (`docs/adr/0009-auto-merge-orchestrator-side-merge-on-free-private.md`); `meguri doctor` prints a reminder to that effect. Orchestrator mode requires `require_branch_protection = false` (config validation rejects the contradiction). Keep `native` wherever "Allow auto-merge" *can* be enabled — a server-side gate is always stronger than an in-process one.
 
 ## Configuration
 
