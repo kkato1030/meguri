@@ -261,23 +261,62 @@ impl LabelTaskSource {
         Ok(false)
     }
 
-    /// Decide (and spend) one candidate's cadence allowance for this pass.
-    /// `Skip` = fail-closed (two rules match — a single `cadence_label` cannot
-    /// count both) or the window is full; `Unbucketed` = no rule applies;
-    /// `Reserved` = a slot was free and is now taken.
-    fn reserve_cadence(
+    /// Run every discovery gate — not-before → dependencies → cadence — on one
+    /// candidate and spend the pass's cadence allowance. The single gate
+    /// implementation shared by `discover` (which keeps the `Emit`s and drops
+    /// the rest) and [`LabelTaskSource::dispositions`] (which reports the reason
+    /// for every candidate). Sharing it — and the same `remaining` map — is why
+    /// `meguri tasks` shows exactly what discover would run: a second same-bucket
+    /// candidate this pass is `WaitingCadence`, not `Ready`, even when the store
+    /// count alone is still under the limit.
+    ///
+    /// The caller filters hold / working / already-shipped issues first; those
+    /// are not cadence/not-before waits.
+    async fn evaluate(
         &self,
         issue: &forge::Issue,
         now: u64,
         remaining: &mut HashMap<String, i64>,
-    ) -> Result<CadenceReservation> {
+    ) -> Result<Evaluation> {
+        // not-before (before dependencies): a garbled marker or a future
+        // instant holds the issue.
+        match cadence::parse_not_before(&issue.body) {
+            Err(e) => {
+                return Ok(Evaluation::Hold(
+                    cadence::Disposition::UnparsableNotBefore { raw: e.raw },
+                ));
+            }
+            Ok(nb) => {
+                if let Some(until) = cadence::not_before_wait(nb, now) {
+                    return Ok(Evaluation::Hold(cadence::Disposition::WaitingNotBefore {
+                        until,
+                    }));
+                }
+            }
+        }
+        // dependencies.
+        if has_unresolved_blockers(&*self.forge, issue.number).await {
+            return Ok(Evaluation::Hold(cadence::Disposition::Blocked));
+        }
+        // cadence (last, so the shared allowance is spent only on
+        // dependency-cleared candidates).
         let label = match cadence::cadence_bucket(&issue.labels, &self.cadence) {
             Ok(Some(label)) => label,
-            Ok(None) => return Ok(CadenceReservation::Unbucketed),
-            Err(_) => return Ok(CadenceReservation::Skip),
+            Ok(None) => {
+                return Ok(Evaluation::Emit {
+                    cadence_label: None,
+                });
+            }
+            Err(labels) => {
+                return Ok(Evaluation::Hold(
+                    cadence::Disposition::ConflictingCadenceLabels { labels },
+                ));
+            }
         };
         let Some(rule) = self.cadence.iter().find(|r| r.label == label) else {
-            return Ok(CadenceReservation::Unbucketed); // unreachable: bucket came from a rule
+            return Ok(Evaluation::Emit {
+                cadence_label: None,
+            }); // unreachable: bucket came from a rule
         };
         if !remaining.contains_key(&label) {
             let start = cadence::window_start(rule, now);
@@ -286,25 +325,67 @@ impl LabelTaskSource {
                 .cadence_consumed(&self.project_id, &label, start)?;
             remaining.insert(label.clone(), i64::from(cadence::limit(rule)) - consumed);
         }
-        match remaining.get_mut(&label) {
-            Some(rem) if *rem > 0 => {
-                *rem -= 1;
-                Ok(CadenceReservation::Reserved(label))
+        let rem = remaining.get(&label).copied().unwrap_or(0);
+        if rem > 0 {
+            if let Some(r) = remaining.get_mut(&label) {
+                *r -= 1;
             }
-            _ => Ok(CadenceReservation::Skip),
+            Ok(Evaluation::Emit {
+                cadence_label: Some(label),
+            })
+        } else {
+            // Window full. Effective consumption = limit - remaining, so this
+            // pass's own reservations count too (limit/limit when this pass
+            // took the last slot; above limit if the store was already over).
+            let max = cadence::limit(rule);
+            let consumed = (i64::from(max) - rem).max(0) as u32;
+            Ok(Evaluation::Hold(cadence::Disposition::WaitingCadence {
+                label,
+                consumed,
+                max,
+                resets_at: cadence::resets_at(rule, now),
+            }))
         }
+    }
+
+    /// Every candidate issue for `kind` with the reason discovery would (or
+    /// would not) run it — the read-only view behind `meguri tasks` (issue
+    /// #148). Same gate order and same per-pass cadence allowance as `discover`,
+    /// so a `Ready` here is exactly what discover emits. hold / working /
+    /// already-shipped issues are dropped, as discover drops them.
+    pub async fn dispositions(
+        &self,
+        kind: TaskKind,
+    ) -> Result<Vec<(forge::Issue, cadence::Disposition)>> {
+        let (label, loop_kind) = kind.label_and_loop();
+        let issues = self.forge.list_issues_with_label(label).await?;
+        let now = (self.clock)();
+        let mut remaining: HashMap<String, i64> = HashMap::new();
+        let mut out = Vec::new();
+        for issue in issues {
+            if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
+                continue;
+            }
+            if self.already_shipped(loop_kind, &issue)? {
+                continue;
+            }
+            let disp = match self.evaluate(&issue, now, &mut remaining).await? {
+                Evaluation::Emit { .. } => cadence::Disposition::Ready,
+                Evaluation::Hold(d) => d,
+            };
+            out.push((issue, disp));
+        }
+        Ok(out)
     }
 }
 
-/// The outcome of the cadence gate for one candidate (see
-/// [`LabelTaskSource::reserve_cadence`]).
-enum CadenceReservation {
-    /// Skip this candidate silently (window full, or conflicting labels).
-    Skip,
-    /// No cadence rule applies; emit with `cadence_label = None`.
-    Unbucketed,
-    /// A slot was reserved; emit with this bucket stamped.
-    Reserved(String),
+/// The outcome of the discovery gates for one candidate (see
+/// [`LabelTaskSource::evaluate`]).
+enum Evaluation {
+    /// Passes every gate; discover emits a Task with this bucket stamped.
+    Emit { cadence_label: Option<String> },
+    /// Held by a gate; the disposition carries the reason for `meguri tasks`.
+    Hold(cadence::Disposition),
 }
 
 #[async_trait]
@@ -326,23 +407,12 @@ impl TaskSource for LabelTaskSource {
             if self.already_shipped(loop_kind, &issue)? {
                 continue;
             }
-            // not-before gate (before dependencies): a garbled marker or a
-            // future instant silently drops the issue — no label, no comment.
-            match cadence::parse_not_before(&issue.body) {
-                Err(_) => continue,
-                Ok(nb) if cadence::not_before_wait(nb, now).is_some() => continue,
-                Ok(_) => {}
-            }
-            if has_unresolved_blockers(&*self.forge, issue.number).await {
-                continue;
-            }
-            // cadence gate (last, so the shared window allowance is spent only
-            // on dependency-cleared candidates): match the bucket, then check
-            // this pass's remaining quota.
-            let cadence_label = match self.reserve_cadence(&issue, now, &mut remaining)? {
-                CadenceReservation::Skip => continue,
-                CadenceReservation::Unbucketed => None,
-                CadenceReservation::Reserved(label) => Some(label),
+            // The not-before / dependency / cadence gates, shared with the
+            // `meguri tasks` view: a held candidate is silently dropped (no
+            // label, no comment); an emitted one carries its reserved bucket.
+            let cadence_label = match self.evaluate(&issue, now, &mut remaining).await? {
+                Evaluation::Hold(_) => continue,
+                Evaluation::Emit { cadence_label } => cadence_label,
             };
             tasks.push(Task {
                 key: TaskKey::Issue(issue.number),
@@ -369,6 +439,23 @@ impl TaskSource for LabelTaskSource {
             return Ok(None);
         }
         if !(issue.has_label(forge::LABEL_READY) || issue.has_label(forge::LABEL_PLAN)) {
+            return Ok(None);
+        }
+        // not-before / cadence can newly apply between discovery and claim: the
+        // body or labels may have been edited after the run was created. Re-run
+        // those gates, like the hold / trigger-label re-checks above — if the
+        // issue is no longer actionable it is a benign race (the run ends
+        // Skipped, no `working` label written). The cadence *window-full* check
+        // is deliberately omitted: the run being claimed is itself the
+        // consumption, so counting it would reject our own claim; only a newly
+        // *conflicting* bucket (two rules now match — the stamp can no longer be
+        // trusted) fails closed here.
+        match cadence::parse_not_before(&issue.body) {
+            Err(_) => return Ok(None),
+            Ok(nb) if cadence::not_before_wait(nb, (self.clock)()).is_some() => return Ok(None),
+            Ok(_) => {}
+        }
+        if cadence::cadence_bucket(&issue.labels, &self.cadence).is_err() {
             return Ok(None);
         }
         self.forge.add_label(n, forge::LABEL_WORKING).await?;

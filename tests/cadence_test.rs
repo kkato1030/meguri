@@ -6,11 +6,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use meguri::cadence::Disposition;
 use meguri::config::{CadenceRule, ReconcileConfig};
-use meguri::forge::LABEL_READY;
 use meguri::forge::fake::FakeForge;
+use meguri::forge::{Forge, LABEL_READY, LABEL_WORKING};
 use meguri::store::{RunStatus, Store, parse_ts};
-use meguri::tasks::{EpochClock, LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
+use meguri::tasks::{
+    EpochClock, LOCAL_HOST, LabelTaskSource, LocalTaskSource, TaskKey, TaskKind, TaskSource,
+};
 
 fn ts(s: &str) -> u64 {
     parse_ts(s).unwrap_or_else(|| panic!("bad ts {s}"))
@@ -302,4 +305,89 @@ async fn blocked_candidate_does_not_consume_the_quota() {
     let src = label_source(forge, store, vec![day("sns", 1)], clock);
 
     assert_eq!(discovered_issues(&src, TaskKind::Work).await, vec![2]);
+}
+
+// ---- the `meguri tasks` disposition view -----------------------------------
+
+#[tokio::test]
+async fn dispositions_share_the_pass_allowance_with_discover() {
+    // Finding: the queue view must decrement the same remaining counter as
+    // discovery, not read the store per issue. Two sns issues, limit 1, nothing
+    // consumed yet → discover emits one; the view shows one ready, one waiting.
+    let forge = Arc::new(FakeForge::with_issue(1, "A", "", &[LABEL_READY, "sns"]));
+    forge.add_issue(2, "B", "", &[LABEL_READY, "sns"]);
+    let store = Store::open_in_memory().unwrap();
+    let (clock, _time) = movable_clock(base_now());
+    let src = label_source(forge, store, vec![day("sns", 1)], clock);
+
+    let rows = src.dispositions(TaskKind::Work).await.unwrap();
+    let by_num: Vec<(i64, Disposition)> = rows.into_iter().map(|(i, d)| (i.number, d)).collect();
+    assert_eq!(by_num[0].0, 1);
+    assert_eq!(by_num[0].1, Disposition::Ready);
+    assert_eq!(by_num[1].0, 2);
+    match &by_num[1].1 {
+        Disposition::WaitingCadence {
+            label,
+            consumed,
+            max,
+            ..
+        } => {
+            assert_eq!(label, "sns");
+            assert_eq!(*consumed, 1); // effective: this pass took the only slot
+            assert_eq!(*max, 1);
+        }
+        other => panic!("expected WaitingCadence, got {other:?}"),
+    }
+    // And discover agrees: exactly issue 1 runs.
+    assert_eq!(discovered_issues(&src, TaskKind::Work).await, vec![1]);
+}
+
+// ---- claim re-verifies the gates (a late body/label edit) ------------------
+
+#[tokio::test]
+async fn claim_rechecks_not_before_added_after_discovery() {
+    let forge = Arc::new(FakeForge::with_issue(1, "Launch", "", &[LABEL_READY]));
+    let store = Store::open_in_memory().unwrap();
+    let (clock, _time) = movable_clock(base_now());
+    let src = label_source(forge.clone(), store, Vec::new(), clock);
+
+    // Discovered while actionable...
+    assert_eq!(discovered_issues(&src, TaskKind::Work).await, vec![1]);
+    // ...but a future not-before is added to the body before the claim lands.
+    forge
+        .update_issue_body(1, "<!-- meguri:not-before 2999-01-01 -->")
+        .await
+        .unwrap();
+    assert!(
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // No `working` label written (benign race → Skipped, no forge trace).
+    assert!(!forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
+}
+
+#[tokio::test]
+async fn claim_rechecks_cadence_label_conflict_added_after_discovery() {
+    let forge = Arc::new(FakeForge::with_issue(1, "Post", "", &[LABEL_READY, "sns"]));
+    let store = Store::open_in_memory().unwrap();
+    let (clock, _time) = movable_clock(base_now());
+    let src = label_source(
+        forge.clone(),
+        store,
+        vec![day("sns", 5), day("nl", 5)],
+        clock,
+    );
+
+    assert_eq!(discovered_issues(&src, TaskKind::Work).await, vec![1]);
+    // A second cadence label is added, so the bucket is now ambiguous.
+    forge.add_label(1, "nl").await.unwrap();
+    assert!(
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
 }

@@ -124,7 +124,9 @@ pub fn cadence_bucket(
 }
 
 /// discovery が1タスクに下す判定。CLI(`meguri tasks`)はこれをそのまま理由
-/// 表示に使い、discovery の挙動と表示がずれないようにする。
+/// 表示に使い、discovery の挙動と表示がずれないようにする。判定は
+/// [`LabelTaskSource::evaluate`](crate::tasks) が discovery と共有する単一の
+/// ゲート実装で行うため、ここは表示用の enum だけを持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
     /// どのゲートにも掛からず、消化してよい。
@@ -133,52 +135,18 @@ pub enum Disposition {
     WaitingNotBefore { until: u64 },
     /// not-before マーカー/フィールドが解析不能(fail-closed で止まっている)。
     UnparsableNotBefore { raw: String },
+    /// 未解決の依存(ブロッカー)で止まっている。
+    Blocked,
     /// 2つ以上の cadence rule に一致(fail-closed)。
     ConflictingCadenceLabels { labels: Vec<String> },
-    /// cadence の窓が埋まっている。
+    /// cadence の窓が埋まっている(過去の消化 + 同一 discovery pass での予約を
+    /// 含めた実効消化数が上限に達している)。
     WaitingCadence {
         label: String,
         consumed: u32,
         max: u32,
         resets_at: Option<u64>,
     },
-}
-
-/// not-before の解析結果と cadence バケツ判定・窓消化状況から disposition を
-/// 決める純粋関数。discovery のゲート順(not-before → …(依存)… → cadence)に
-/// 揃えてあるが、依存(ブロッカー)チェックは forge 呼び出しなのでここには含めず、
-/// 呼び出し側が別に扱う。`cadence_status` は該当ラベルの
-/// `(consumed, max, resets_at)` を返すクロージャ(store から算出)。
-pub fn disposition(
-    not_before: Result<Option<u64>, NotBeforeParseError>,
-    bucket: Result<Option<String>, Vec<String>>,
-    now: u64,
-    cadence_status: impl FnOnce(&str) -> (u32, u32, Option<u64>),
-) -> Disposition {
-    match not_before {
-        Err(e) => return Disposition::UnparsableNotBefore { raw: e.raw },
-        Ok(nb) => {
-            if let Some(until) = not_before_wait(nb, now) {
-                return Disposition::WaitingNotBefore { until };
-            }
-        }
-    }
-    match bucket {
-        Err(labels) => return Disposition::ConflictingCadenceLabels { labels },
-        Ok(Some(label)) => {
-            let (consumed, max, resets_at) = cadence_status(&label);
-            if consumed >= max {
-                return Disposition::WaitingCadence {
-                    label,
-                    consumed,
-                    max,
-                    resets_at,
-                };
-            }
-        }
-        Ok(None) => {}
-    }
-    Disposition::Ready
 }
 
 #[cfg(test)]
@@ -293,43 +261,5 @@ mod tests {
         let err = cadence_bucket(&["sns".into(), "nl".into()], &rules).unwrap_err();
         assert_eq!(err.len(), 2);
         assert!(err.contains(&"sns".to_string()) && err.contains(&"nl".to_string()));
-    }
-
-    #[test]
-    fn disposition_orders_notbefore_then_cadence() {
-        let now = ts("2026-07-20T00:00:00Z");
-        let full = |_: &str| (1u32, 1u32, None);
-        let open = |_: &str| (0u32, 1u32, None);
-
-        // not-before が最優先。
-        assert!(matches!(
-            disposition(Ok(Some(now + 10)), Ok(Some("sns".into())), now, full),
-            Disposition::WaitingNotBefore { .. }
-        ));
-        // 解析不能は fail-closed。
-        assert!(matches!(
-            disposition(
-                Err(NotBeforeParseError { raw: "x".into() }),
-                Ok(None),
-                now,
-                open
-            ),
-            Disposition::UnparsableNotBefore { .. }
-        ));
-        // ラベル競合は fail-closed。
-        assert!(matches!(
-            disposition(Ok(None), Err(vec!["a".into(), "b".into()]), now, open),
-            Disposition::ConflictingCadenceLabels { .. }
-        ));
-        // 窓が埋まっていれば cadence 待ち。
-        assert!(matches!(
-            disposition(Ok(None), Ok(Some("sns".into())), now, full),
-            Disposition::WaitingCadence { .. }
-        ));
-        // どれにも掛からなければ Ready。
-        assert_eq!(
-            disposition(Ok(None), Ok(Some("sns".into())), now, open),
-            Disposition::Ready
-        );
     }
 }

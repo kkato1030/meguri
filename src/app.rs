@@ -610,25 +610,34 @@ fn cmd_tasks_local(project: &ProjectConfig, all: bool) -> Result<()> {
 }
 
 /// Github-mode listing: the discovery queue (`ready`/`plan` issues) with each
-/// issue's live disposition, computed from the same primitives discovery uses.
+/// issue's live disposition. Goes through `LabelTaskSource::dispositions`, the
+/// same gate pipeline (and per-pass cadence allowance) discovery uses — so what
+/// shows `ready` is exactly what discover would run: a second same-bucket issue
+/// this pass reads `cadence 待ち`, not `ready`, even when the store count alone
+/// is still under the limit.
 async fn cmd_tasks_github(cfg: &Config, project: &ProjectConfig) -> Result<()> {
     let store = open_store()?;
-    let (forge, _ts) = build_coordination(cfg, project, &store)?;
-    let forge = forge.context("github-mode project has no forge")?;
-    let now = crate::engine::scheduler_fire::epoch_now();
+    let source = LabelTaskSource::new(
+        Arc::new(GhForge::new(project.repo_slug.as_deref().context(
+            "github-mode project has no repo_slug (config validation should have caught this)",
+        )?)),
+        store,
+        project.id.clone(),
+        cfg.reconcile,
+        project.cadence.clone(),
+    );
 
-    let mut issues = forge
-        .list_issues_with_label(crate::forge::LABEL_READY)
-        .await?;
-    for issue in forge
-        .list_issues_with_label(crate::forge::LABEL_PLAN)
-        .await?
-    {
-        if !issues.iter().any(|i| i.number == issue.number) {
-            issues.push(issue);
+    // ready (worker) and plan (planner) are separate discovery passes, each
+    // with its own cadence allowance — mirror that here (an issue rarely carries
+    // both trigger labels; dedup by number keeps it listed once if it does).
+    let mut rows: Vec<(crate::forge::Issue, crate::cadence::Disposition)> =
+        source.dispositions(TaskKind::Work).await?;
+    for row in source.dispositions(TaskKind::Plan).await? {
+        if !rows.iter().any(|(i, _)| i.number == row.0.number) {
+            rows.push(row);
         }
     }
-    if issues.is_empty() {
+    if rows.is_empty() {
         println!(
             "no {}/{} issues",
             crate::forge::LABEL_READY,
@@ -636,67 +645,46 @@ async fn cmd_tasks_github(cfg: &Config, project: &ProjectConfig) -> Result<()> {
         );
         return Ok(());
     }
-    issues.sort_by_key(|i| i.number);
+    rows.sort_by_key(|(i, _)| i.number);
 
     println!("{:>6}  STATE", "ISSUE");
-    for issue in issues {
-        let state = github_disposition(&*forge, &store, project, &issue, now).await?;
-        println!("{:>6}  {state}", format!("#{}", issue.number));
+    for (issue, disposition) in rows {
+        println!(
+            "{:>6}  {}",
+            format!("#{}", issue.number),
+            format_disposition(&disposition)
+        );
         println!("        {}", issue.title);
     }
     Ok(())
 }
 
-/// A one-line disposition string for a github issue, in the same gate order
-/// discovery uses (not-before → dependencies → cadence). Shares every decision
-/// primitive with `LabelTaskSource::discover` so display and behavior agree.
-async fn github_disposition(
-    forge: &dyn Forge,
-    store: &Store,
-    project: &ProjectConfig,
-    issue: &crate::forge::Issue,
-    now: u64,
-) -> Result<String> {
-    // not-before (before dependencies).
-    match crate::cadence::parse_not_before(&issue.body) {
-        Err(e) => return Ok(format!("⏳ not-before 待ち(解析不能: {})", e.raw)),
-        Ok(nb) => {
-            if let Some(until) = crate::cadence::not_before_wait(nb, now) {
-                return Ok(format!(
-                    "⏳ not-before 待ち(until {})",
-                    crate::store::format_epoch(until)
-                ));
-            }
+/// One-line rendering of a [`crate::cadence::Disposition`] for `meguri tasks`.
+fn format_disposition(disposition: &crate::cadence::Disposition) -> String {
+    use crate::cadence::Disposition;
+    use crate::store::format_epoch;
+    match disposition {
+        Disposition::Ready => "✅ ready".to_string(),
+        Disposition::WaitingNotBefore { until } => {
+            format!("⏳ not-before 待ち(until {})", format_epoch(*until))
         }
-    }
-    // dependencies.
-    let blocked = forge
-        .blocked_by(issue.number)
-        .await
-        .map(|bs| bs.iter().any(|b| !b.resolved()))
-        .unwrap_or(true);
-    if blocked {
-        return Ok("⛔ blocked(未解決の依存)".to_string());
-    }
-    // cadence (last).
-    match crate::cadence::cadence_bucket(&issue.labels, &project.cadence) {
-        Err(labels) => Ok(format!("⚠️  cadence ラベル競合({})", labels.join(", "))),
-        Ok(None) => Ok("✅ ready".to_string()),
-        Ok(Some(label)) => {
-            let Some(rule) = project.cadence.iter().find(|r| r.label == label) else {
-                return Ok("✅ ready".to_string());
-            };
-            let start = crate::cadence::window_start(rule, now);
-            let consumed = store.cadence_consumed(&project.id, &label, start)?;
-            let max = i64::from(crate::cadence::limit(rule));
-            if consumed >= max {
-                let resets = crate::cadence::resets_at(rule, now)
-                    .map(|t| format!(", resets {}", crate::store::format_epoch(t)))
-                    .unwrap_or_default();
-                Ok(format!("⏳ cadence 待ち({label} {consumed}/{max}{resets})"))
-            } else {
-                Ok(format!("✅ ready({label} {consumed}/{max})"))
-            }
+        Disposition::UnparsableNotBefore { raw } => {
+            format!("⏳ not-before 待ち(解析不能: {raw})")
+        }
+        Disposition::Blocked => "⛔ blocked(未解決の依存)".to_string(),
+        Disposition::ConflictingCadenceLabels { labels } => {
+            format!("⚠️  cadence ラベル競合({})", labels.join(", "))
+        }
+        Disposition::WaitingCadence {
+            label,
+            consumed,
+            max,
+            resets_at,
+        } => {
+            let resets = resets_at
+                .map(|t| format!(", resets {}", format_epoch(t)))
+                .unwrap_or_default();
+            format!("⏳ cadence 待ち({label} {consumed}/{max}{resets})")
         }
     }
 }
