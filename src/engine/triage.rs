@@ -87,11 +87,16 @@ pub const MARKER_HEAD_NONE: &str = "none";
 const WORKFLOW_LABEL_PREFIX: &str = "meguri:";
 
 /// Hidden marker embedded in the report issue body: which head the report
-/// covers, when the last sweep (or failed attempt) ran, and the largest open
-/// issue number seen at that time (the new-issue signal). The issue body is
-/// the durable scan state — nothing is kept locally ("Authority").
-pub fn triage_marker(head: &str, scanned: u64, max_issue: i64) -> String {
-    format!("<!-- meguri:triage head={head} scanned={scanned} max_issue={max_issue} -->")
+/// covers, when the last sweep (or failed attempt) ran, the largest open
+/// issue number seen at that time (the new-issue signal), and (`advise`
+/// mode) whether that sweep left proposal backlog behind because
+/// `max_actions_per_tick` cut it off. The issue body is the durable scan
+/// state — nothing is kept locally ("Authority").
+pub fn triage_marker(head: &str, scanned: u64, max_issue: i64, backlog: bool) -> String {
+    let backlog = backlog as u8;
+    format!(
+        "<!-- meguri:triage head={head} scanned={scanned} max_issue={max_issue} backlog={backlog} -->"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +107,11 @@ pub struct TriageMarker {
     /// Largest open issue number at the last sweep (drives the new-issue
     /// signal: any open issue above this re-triggers a sweep).
     pub max_issue: i64,
+    /// `advise` mode: the last sweep hit `max_actions_per_tick` with
+    /// actionable recommendations still unwritten. Absent in a marker
+    /// predating this field, which parses as `false` (no known backlog) —
+    /// the same as a sweep that fully drained its recommendations.
+    pub backlog: bool,
 }
 
 pub fn parse_triage_marker(body: &str) -> Option<TriageMarker> {
@@ -110,6 +120,7 @@ pub fn parse_triage_marker(body: &str) -> Option<TriageMarker> {
     let mut head = None;
     let mut scanned = None;
     let mut max_issue = None;
+    let mut backlog = false;
     for part in fields.split_whitespace() {
         if let Some(v) = part.strip_prefix("head=") {
             head = Some(v.to_string());
@@ -117,22 +128,27 @@ pub fn parse_triage_marker(body: &str) -> Option<TriageMarker> {
             scanned = v.parse().ok();
         } else if let Some(v) = part.strip_prefix("max_issue=") {
             max_issue = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("backlog=") {
+            backlog = v == "1";
         }
     }
     Some(TriageMarker {
         head: head?,
         scanned: scanned?,
         max_issue: max_issue?,
+        backlog,
     })
 }
 
 /// The discovery decision, pure so it unit-tests without a forge. Sweep when
 /// nothing was ever recorded, or when *something changed* — the head moved,
-/// an open issue numbered above the last scan appeared, or (`advise` mode)
-/// a previously proposed issue's content drifted from its evidence-comment
-/// marker — **and** the interval elapsed. The interval rate-limits every
-/// signal, so a failed sweep that only advances `scanned` still paces the
-/// retry. A truly unchanged state is never re-swept, however old.
+/// an open issue numbered above the last scan appeared, the previous sweep
+/// left `advise` proposal backlog behind (`marker.backlog`), or (`advise`
+/// mode) a previously proposed issue's content drifted from its
+/// evidence-comment marker — **and** the interval elapsed. The interval
+/// rate-limits every signal, so a failed sweep that only advances `scanned`
+/// still paces the retry. A truly unchanged state is never re-swept, however
+/// old.
 pub fn needs_triage_scan(
     marker: Option<&TriageMarker>,
     current_head: &str,
@@ -144,8 +160,10 @@ pub fn needs_triage_scan(
     match marker {
         None => true,
         Some(m) => {
-            let changed =
-                m.head != current_head || max_open_issue > m.max_issue || advise_content_changed;
+            let changed = m.head != current_head
+                || max_open_issue > m.max_issue
+                || advise_content_changed
+                || m.backlog;
             changed && now.saturating_sub(m.scanned) >= interval_secs
         }
     }
@@ -268,6 +286,11 @@ pub struct TriageCheckpoint {
     /// new-issue signal is not recorded as consumed).
     #[serde(default)]
     pub prev_max_issue: i64,
+    /// Marker backlog found at claim time — carried through a skipped sweep
+    /// so a `GiveUp` that never reaches `apply_advise` doesn't silently drop
+    /// a still-pending `advise` backlog from an earlier sweep.
+    #[serde(default)]
+    pub prev_backlog: bool,
     /// Verified agent recommendations, carried from execute to settle.
     #[serde(default)]
     pub recommendations: Vec<TriageItem>,
@@ -571,6 +594,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut TriageCheckpoint) -
     cp.head_sha = head;
     cp.prev_head = marker.as_ref().map(|m| m.head.clone()).unwrap_or_default();
     cp.prev_max_issue = marker.as_ref().map(|m| m.max_issue).unwrap_or(0);
+    cp.prev_backlog = marker.as_ref().map(|m| m.backlog).unwrap_or(false);
     deps.store.emit(
         Some(&run.id),
         "triage.claimed",
@@ -662,23 +686,40 @@ async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool
     Ok(marker.hash != content_hash(issue))
 }
 
+/// Whether `issue` carries an advise evidence-comment marker whose hash no
+/// longer matches its current content. Unlike `content_changed_since_advise`
+/// (used by `gather_candidates`, where "never proposed" should also count as
+/// eligible), a genuinely never-proposed issue returns `false` here — it has
+/// no marker to drift from, and treating every ordinary untriaged issue as
+/// drifted would defeat the point of rate-limiting this signal.
+async fn marker_drifted(deps: &Deps, issue: &Issue) -> Result<bool> {
+    let Some(marker) = latest_advise_marker(deps, issue.number).await? else {
+        return Ok(false);
+    };
+    Ok(marker.hash != content_hash(issue))
+}
+
 /// The discovery-time counterpart of `content_changed_since_advise`: whether
-/// *any* open, proposed issue has drifted from its evidence-comment marker.
-/// Without this, editing a proposed issue's title/body alone (no new issue
-/// filed, no default-branch push) never sets `needs_triage_scan`'s `changed`
-/// flag, so the sweep that would notice the drift — and `gather_candidates`'s
-/// own per-issue check — is never even scheduled. `off`/`report` never
-/// propose, so this always short-circuits to `false` there.
+/// *any* open, non-engaged issue has drifted from its evidence-comment
+/// marker. Without this, editing a proposed issue's title/body alone (no new
+/// issue filed, no default-branch push) never sets `needs_triage_scan`'s
+/// `changed` flag, so the sweep that would notice the drift — and
+/// `gather_candidates`'s own per-issue check — is never even scheduled. This
+/// deliberately does *not* filter to "still carries a proposal label": a
+/// human rejecting a proposal (removing the label) doesn't erase the
+/// evidence comment's marker, and an edit after that rejection is exactly
+/// the "content changed, so re-triage anyway" case the marker is meant to
+/// catch — filtering on the label would silently miss it. `off`/`report`
+/// never propose, so this always short-circuits to `false` there.
 async fn advise_backlog_changed(deps: &Deps) -> Result<bool> {
     if deps.config.triage_for(&deps.project).mode != TriageMode::Advise {
         return Ok(false);
     }
     for issue in deps.forge().list_open_issues().await? {
-        let proposed = issue
-            .labels
-            .iter()
-            .any(|l| forge::TRIAGE_PROPOSAL_LABELS.contains(&l.as_str()));
-        if proposed && content_changed_since_advise(deps, &issue).await? {
+        if issue.labels.iter().any(|l| is_engaged_label(l)) {
+            continue; // a real workflow label or hold: not triage's business
+        }
+        if marker_drifted(deps, &issue).await? {
             return Ok(true);
         }
     }
@@ -928,7 +969,7 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) {
     } else {
         &cp.prev_head
     };
-    let marker = triage_marker(prev_head, epoch_now(), cp.prev_max_issue);
+    let marker = triage_marker(prev_head, epoch_now(), cp.prev_max_issue, cp.prev_backlog);
     if cp.report_issue == 0 {
         let body = format!(
             "{marker}\n🔀 **meguri triage report** — initializing: the first \
@@ -989,9 +1030,11 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
     let triage_cfg = deps.config.triage_for(&deps.project);
     let ignore = triage_cfg.ignore.clone();
     let mode = triage_cfg.mode;
-    if mode == TriageMode::Advise {
-        apply_advise(deps, run, &cp.recommendations).await;
-    }
+    let backlog = if mode == TriageMode::Advise {
+        apply_advise(deps, run, &cp.recommendations).await
+    } else {
+        false
+    };
     let max_open = max_open_issue(deps).await.unwrap_or(cp.prev_max_issue);
     let body = render_report(
         &cp.head_sha,
@@ -1001,6 +1044,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
         &cp.recommendations,
         &ignore,
         mode,
+        backlog,
     );
 
     let issue = if cp.report_issue == 0 {
@@ -1028,6 +1072,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
             "head": cp.head_sha,
             "recommendations": cp.recommendations.len(),
             "max_issue": max_open,
+            "backlog": backlog,
         }),
     )?;
     Ok(issue)
@@ -1037,15 +1082,27 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
 /// `triage.max_actions_per_tick` recommended issues. Best-effort — one
 /// issue's failure (closed mid-run, forge hiccup, ...) is logged and skipped
 /// rather than failing the whole sweep; the report and the scan marker still
-/// get written regardless.
-async fn apply_advise(deps: &Deps, run: &RunRecord, recommendations: &[TriageItem]) {
+/// get written regardless. Returns whether actionable backlog remains — a
+/// recommendation that could have proposed something but didn't (budget cut
+/// it off, or the write itself failed) — which the caller records on the
+/// marker so the next `needs_triage_scan` fires on it even if neither the
+/// head nor the open-issue set otherwise moved.
+async fn apply_advise(deps: &Deps, run: &RunRecord, recommendations: &[TriageItem]) -> bool {
     let cfg = deps.config.triage_for(&deps.project);
     let ignore = cfg.ignore.clone();
     let budget = cfg.max_actions_per_tick;
     let mut used = 0u64;
+    let mut backlog = false;
     for item in recommendations {
         if used >= budget {
-            break;
+            // Budget cut it off before we could even check whether it's a
+            // genuine no-op (already engaged, ignored, unchanged hash) — an
+            // occasionally-overeager but safe approximation: the next sweep
+            // re-checks properly, this only decides whether one is due.
+            if proposal_label(item.recommendation).is_some() {
+                backlog = true;
+            }
+            continue;
         }
         match propose_one(deps, item, &ignore).await {
             Ok(true) => {
@@ -1057,9 +1114,15 @@ async fn apply_advise(deps: &Deps, run: &RunRecord, recommendations: &[TriageIte
                 );
             }
             Ok(false) => {}
-            Err(e) => tracing::warn!("triage advise on issue #{}: {e:#}", item.issue),
+            Err(e) => {
+                // The attempt itself failed — the hash didn't move, so this
+                // is backlog too, not a resolved no-op.
+                backlog = true;
+                tracing::warn!("triage advise on issue #{}: {e:#}", item.issue);
+            }
         }
     }
+    backlog
 }
 
 /// One issue's proposal attempt: label + evidence comment, gated by `ignore`,
@@ -1200,6 +1263,7 @@ fn ignored(patterns: &[String], haystacks: &[&str]) -> bool {
 /// The ignore list is applied here, at render time, so adding a pattern makes
 /// the row vanish on the next sweep. Rendered even with zero recommendations —
 /// the marker must advance or the same state would be swept again.
+#[allow(clippy::too_many_arguments)]
 pub fn render_report(
     head: &str,
     scanned: u64,
@@ -1208,6 +1272,7 @@ pub fn render_report(
     items: &[TriageItem],
     ignore: &[String],
     mode: TriageMode,
+    backlog: bool,
 ) -> String {
     let mut items: Vec<&TriageItem> = items
         .iter()
@@ -1231,8 +1296,14 @@ pub fn render_report(
          untriaged open issues at `{short}`, swept {scanned_display}. Issues \
          that stop being untriaged (you labeled them, or they closed) drop off \
          on the next sweep.\n",
-        marker = triage_marker(head, scanned, max_issue),
+        marker = triage_marker(head, scanned, max_issue, backlog),
     );
+    if backlog {
+        body.push_str(
+            "\n⏳ `max_actions_per_tick` を使い切ったため、一部の提案は次回スイープへ持ち越し \
+             です。\n",
+        );
+    }
 
     if items.is_empty() {
         body.push_str("\n_No open issues to triage._\n");
@@ -1293,24 +1364,33 @@ mod tests {
 
     #[test]
     fn marker_roundtrip_including_none() {
-        let m = triage_marker("abc123", 1_700_000_000, 42);
+        let m = triage_marker("abc123", 1_700_000_000, 42, false);
         let parsed = parse_triage_marker(&format!("{m}\nreport body")).unwrap();
         assert_eq!(parsed.head, "abc123");
         assert_eq!(parsed.scanned, 1_700_000_000);
         assert_eq!(parsed.max_issue, 42);
+        assert!(!parsed.backlog);
 
-        let none = triage_marker(MARKER_HEAD_NONE, 7, 0);
+        let backlogged = triage_marker("abc123", 1_700_000_000, 42, true);
+        assert!(parse_triage_marker(&backlogged).unwrap().backlog);
+
+        let none = triage_marker(MARKER_HEAD_NONE, 7, 0, false);
         let parsed = parse_triage_marker(&none).unwrap();
         assert_eq!(parsed.head, MARKER_HEAD_NONE);
         assert_eq!(parsed.scanned, 7);
         assert_eq!(parsed.max_issue, 0);
 
         assert_eq!(parse_triage_marker("no marker here"), None);
-        // A marker missing max_issue is rejected (all three fields required).
+        // A marker missing max_issue is rejected (head/scanned/max_issue are
+        // required; backlog alone is optional for pre-#87-followup markers).
         assert_eq!(
             parse_triage_marker("<!-- meguri:triage head=x scanned=1 -->"),
             None
         );
+        // A marker predating the backlog field parses as backlog=false.
+        let old =
+            parse_triage_marker("<!-- meguri:triage head=x scanned=1 max_issue=2 -->").unwrap();
+        assert!(!old.backlog);
     }
 
     #[test]
@@ -1320,6 +1400,13 @@ mod tests {
             head: head.into(),
             scanned,
             max_issue,
+            backlog: false,
+        };
+        let mb = |head: &str, scanned: u64, max_issue: i64, backlog: bool| TriageMarker {
+            head: head.into(),
+            scanned,
+            max_issue,
+            backlog,
         };
         // No marker: always scan.
         assert!(needs_triage_scan(None, "abc", 5, 1000, day, false));
@@ -1408,18 +1495,46 @@ mod tests {
             day,
             true,
         ));
+        // marker.backlog alone (last sweep hit max_actions_per_tick), head
+        // and max_issue both still, drift signal quiet: still scans once the
+        // interval elapsed — the third independent trigger.
+        assert!(!needs_triage_scan(
+            Some(&mb("abc", 1000, 5, true)),
+            "abc",
+            5,
+            1000 + day - 1,
+            day,
+            false,
+        ));
+        assert!(needs_triage_scan(
+            Some(&mb("abc", 1000, 5, true)),
+            "abc",
+            5,
+            1000 + day,
+            day,
+            false,
+        ));
+        // backlog=false alongside otherwise-identical state: back to quiet.
+        assert!(!needs_triage_scan(
+            Some(&mb("abc", 1000, 5, false)),
+            "abc",
+            5,
+            1000 + day,
+            day,
+            false,
+        ));
     }
 
     #[test]
     fn replace_marker_swaps_in_place_or_prepends() {
-        let body = format!("{}\nrecs", triage_marker("old", 1, 3));
-        let updated = replace_marker(&body, &triage_marker("old", 99, 3));
+        let body = format!("{}\nrecs", triage_marker("old", 1, 3, false));
+        let updated = replace_marker(&body, &triage_marker("old", 99, 3, false));
         assert_eq!(parse_triage_marker(&updated).unwrap().scanned, 99);
         assert!(updated.contains("recs"));
         assert_eq!(updated.matches("meguri:triage").count(), 1);
 
-        let updated = replace_marker("plain body", &triage_marker("h", 2, 0));
-        assert!(updated.starts_with(&triage_marker("h", 2, 0)));
+        let updated = replace_marker("plain body", &triage_marker("h", 2, 0, false));
+        assert!(updated.starts_with(&triage_marker("h", 2, 0, false)));
         assert!(updated.contains("plain body"));
     }
 
@@ -1554,8 +1669,9 @@ mod tests {
             &sample_items(),
             &[],
             TriageMode::Report,
+            false,
         );
-        assert!(body.starts_with(&triage_marker("0123456789abcdef", 1_700_000_000, 90)));
+        assert!(body.starts_with(&triage_marker("0123456789abcdef", 1_700_000_000, 90, false)));
         assert!(body.contains("`0123456789ab`"), "{body}");
         assert!(body.contains("| Issue | 推薦 | 確信度 | 複雑度 | 根拠 |"));
         assert!(body.contains("| #81 | ready | 0.82 | small | clear scope, one file |"));
@@ -1574,9 +1690,27 @@ mod tests {
             &sample_items(),
             &[],
             TriageMode::Advise,
+            false,
         );
         assert!(body.contains("meguri:triage-"));
         assert!(body.contains("triage.ignore"));
+        assert!(!body.contains("max_actions_per_tick"));
+    }
+
+    #[test]
+    fn backlog_marker_and_footer_note_survive_render() {
+        let body = render_report(
+            "head",
+            1,
+            "now",
+            90,
+            &sample_items(),
+            &[],
+            TriageMode::Advise,
+            true,
+        );
+        assert!(parse_triage_marker(&body).unwrap().backlog);
+        assert!(body.contains("max_actions_per_tick"), "{body}");
     }
 
     #[test]
@@ -1589,6 +1723,7 @@ mod tests {
             &sample_items(),
             &["#81".to_string()],
             TriageMode::Report,
+            false,
         );
         assert!(!body.contains("| #81 |"));
         assert!(body.contains("| #90 |"));
@@ -1602,6 +1737,7 @@ mod tests {
             &sample_items(),
             &["auth backend".to_string()],
             TriageMode::Report,
+            false,
         );
         assert!(!body.contains("| #90 |"));
         assert!(body.contains("| #81 |"));
@@ -1609,8 +1745,8 @@ mod tests {
 
     #[test]
     fn empty_report_still_carries_the_marker() {
-        let body = render_report("h", 7, "now", 0, &[], &[], TriageMode::Report);
-        assert!(body.contains(&triage_marker("h", 7, 0)));
+        let body = render_report("h", 7, "now", 0, &[], &[], TriageMode::Report, false);
+        assert!(body.contains(&triage_marker("h", 7, 0, false)));
         assert!(body.contains("_No open issues to triage._"));
     }
 

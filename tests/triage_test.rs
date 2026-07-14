@@ -338,7 +338,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
     // max_issue = the candidate; the report issue takes the next number.
     let body = format!(
         "{}\nrecommendation for #60",
-        triage_marker(&env.head_sha, epoch_now(), CANDIDATE)
+        triage_marker(&env.head_sha, epoch_now(), CANDIDATE, false)
     );
     let report = env
         .forge
@@ -366,7 +366,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
             report,
             &format!(
                 "{}\nrecommendation for #60",
-                triage_marker(&env.head_sha, stale_scanned, CANDIDATE)
+                triage_marker(&env.head_sha, stale_scanned, CANDIDATE, false)
             ),
         )
         .await
@@ -411,7 +411,7 @@ async fn new_issue_triggers_rescan_even_with_a_still_head() {
     let stale_scanned = epoch_now() - 7 * 3600;
     let body = format!(
         "{}\nrecommendation for #60",
-        triage_marker(&env.head_sha, stale_scanned, CANDIDATE)
+        triage_marker(&env.head_sha, stale_scanned, CANDIDATE, false)
     );
     env.forge
         .create_issue(triage::REPORT_TITLE, &body, &[LABEL_TRIAGE_REPORT])
@@ -434,7 +434,7 @@ async fn hold_on_the_report_issue_stops_the_loop() {
     // Even a sweep that is otherwise overdue is skipped under hold.
     let body = format!(
         "{}\nold report",
-        triage_marker("some-old-head", epoch_now() - 48 * 3600, 0)
+        triage_marker("some-old-head", epoch_now() - 48 * 3600, 0, false)
     );
     let report = env
         .forge
@@ -786,6 +786,100 @@ async fn advise_mode_content_edit_alone_triggers_rediscovery() {
     // discovery alone must still notice: `report`/`advise`'s README/ADR
     // promise ("content change re-triages") has to hold even when neither
     // of the other two signals fires.
+    env.forge
+        .update_issue_body(CANDIDATE, "totally different ask now")
+        .await
+        .unwrap();
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_budget_backlog_alone_triggers_rediscovery() {
+    // interval_hours = 0, same reasoning as the content-edit test above.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        max_actions_per_tick: 1,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "ready", "confidence": 0.7,
+                "estimated_complexity": "small", "rationale": "also clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // budget=1 leaves one of the two proposals unwritten.
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    let proposed = usize::from(!c60.labels.is_empty()) + usize::from(!c61.labels.is_empty());
+    assert_eq!(proposed, 1, "#60={:?} #61={:?}", c60.labels, c61.labels);
+
+    // The report marker records the leftover backlog...
+    let report = report_issue(&env).await.unwrap();
+    let marker = parse_triage_marker(&report.body).unwrap();
+    assert!(marker.backlog, "{}", report.body);
+    assert!(
+        report.body.contains("max_actions_per_tick"),
+        "{}",
+        report.body
+    );
+
+    // ...and discovery alone notices it: no new issue, no head move, yet a
+    // sweep is still due — otherwise the un-proposed leftover would be
+    // stranded until some unrelated trigger happened to fire (README/ADR's
+    // "the rest carry over to the next sweep" promise).
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_rejected_then_edited_issue_alone_triggers_rediscovery() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1: propose `ready`.
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, READY_REC);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // Human rejects: the proposal label is removed. Content unchanged, so
+    // discovery stays quiet.
+    env.forge
+        .remove_label(CANDIDATE, LABEL_TRIAGE_READY)
+        .await
+        .unwrap();
+    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // The rejected issue's content changes — no new issue, no push, and no
+    // proposal label anymore either. Discovery must still notice: the
+    // evidence comment's hidden marker survives the label removal, so a
+    // rejected-then-edited issue is not stuck behind an unrelated trigger.
     env.forge
         .update_issue_body(CANDIDATE, "totally different ask now")
         .await
