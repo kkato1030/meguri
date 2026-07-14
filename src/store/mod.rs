@@ -63,13 +63,25 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // issue #148: cadence — runs.cadence_label + tasks.not_before + an index
     // for the window COUNT. Simple ALTERs; runs was already recreated by 0007.
     ("0011_cadence", include_str!("migrations/0011_cadence.sql")),
+    // issue #168: panes.role -> panes.lane (+ value remap review/impl-review
+    // -> pr-review/self-review). Same rebuild-the-table shape as 0006.
+    // Renumbered from 0011 after main claimed it for cadence (#148).
+    (
+        "0012_panes_lane",
+        include_str!("migrations/0012_panes_lane.sql"),
+    ),
+    // issue #168: runs.loop_kind 'guard' -> 'pr-reviewer'. Pure data UPDATE.
+    (
+        "0013_loop_kind_pr_reviewer",
+        include_str!("migrations/0013_loop_kind_pr_reviewer.sql"),
+    ),
     // routing 3/3 (#66): runs.routing_arm — mainline / explore / escalated.
     // A single ADD COLUMN on the runs table recreated by 0007_tasks. Renumbered
-    // to 0012 after main claimed 0011 for cadence; an independent ALTER, so the
-    // order relative to 0011_cadence doesn't matter.
+    // to 0014 after main claimed 0012/0013 for the pane/role rename (#168); an
+    // independent ALTER, so its order relative to those doesn't matter.
     (
-        "0012_routing_arm",
-        include_str!("migrations/0012_routing_arm.sql"),
+        "0014_routing_arm",
+        include_str!("migrations/0014_routing_arm.sql"),
     ),
 ];
 
@@ -313,6 +325,67 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn migration_loop_kind_pr_reviewer_renames_guard_runs_in_place() {
+        // Issue #168: a pre-existing 'guard' run must resume, count toward
+        // budget, and be reaped under its new 'pr-reviewer' loop_kind after
+        // the migration — a pure data UPDATE, no schema change.
+        let conn = Connection::open_in_memory().unwrap();
+        let idx = MIGRATIONS
+            .iter()
+            .position(|(n, _)| *n == "0013_loop_kind_pr_reviewer")
+            .unwrap();
+        apply_migrations(&conn, idx); // everything before this migration
+
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                               status, created_at)
+             VALUES ('run-guard', 'proj', 'guard', 5, 'old', 'running', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
+                               status, created_at)
+             VALUES ('run-worker', 'proj', 'worker', 6, 'old', 'running', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[idx].1).unwrap();
+
+        let loop_kind: String = conn
+            .query_row(
+                "SELECT loop_kind FROM runs WHERE id = 'run-guard'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loop_kind, "pr-reviewer");
+        // Unrelated loop kinds are untouched.
+        let other: String = conn
+            .query_row(
+                "SELECT loop_kind FROM runs WHERE id = 'run-worker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, "worker");
+
+        // The renamed run is still findable (resume) and still counts as
+        // active under its new loop_kind (budget/reaper continuity).
+        let active: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id = 'proj'
+                   AND loop_kind = 'pr-reviewer' AND issue_number = 5
+                   AND status IN ('queued','running','interrupted'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(active, "the migrated run must still count as active");
     }
 
     #[test]

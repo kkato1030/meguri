@@ -204,7 +204,7 @@ fn default_review_lenses() -> Vec<String> {
 /// `[review.guard]` — the optional external GitHub guard review, toggled
 /// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
 /// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
-/// off (opt-in; external-bot compatible). Its output is a `meguri/guard-review`
+/// off (opt-in; external-bot compatible). Its output is a `meguri/pr-review`
 /// commit status + a folded PR-body `<details>` — never inline threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardConfig {

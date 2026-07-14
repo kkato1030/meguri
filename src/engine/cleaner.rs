@@ -30,7 +30,7 @@ use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
-use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
@@ -310,7 +310,7 @@ pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                     super::reaper::release_pane(
                         deps,
                         run.issue_number,
-                        ROLE_AUTHOR,
+                        LANE_AUTHOR,
                         "stopped by user",
                     )
                     .await;
@@ -403,7 +403,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 super::reaper::release_pane(
                     deps,
                     run.issue_number,
-                    ROLE_AUTHOR,
+                    LANE_AUTHOR,
                     "cleaner sweep gave up",
                 )
                 .await;
@@ -422,7 +422,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         super::reaper::release_pane(
             deps,
             run.issue_number,
-            ROLE_AUTHOR,
+            LANE_AUTHOR,
             "cleaner sweep finished",
         )
         .await;

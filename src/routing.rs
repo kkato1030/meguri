@@ -135,11 +135,12 @@ pub const DEFAULT_PROFILE: &str = "default";
 /// Roles routing knows about: the 6 *kinds of work* a user answers "which
 /// model should do this?" for, independent from the finer-grained internal
 /// loop kinds (`runs.loop_kind`) — see [`routing_role_for_loop`] for that
-/// mapping (ADR 0003 revision, issue #167). `self-reviewer` and `pr-reviewer`
-/// are not loop kinds at all but the profiles of the internal self-review
-/// turn (ADR 0006/0008) and the advisory guard-loop review on a published PR
-/// (ADR 0008); both are shared across the plan and impl kinds (spec and impl
-/// are managed by the same model). Explicit entries for anything outside this
+/// mapping (ADR 0003 revision, issue #167). `self-reviewer` is not a loop
+/// kind at all but the profile of the internal self-review turn (ADR
+/// 0006/0008); `pr-reviewer` is both a role and the `pr-reviewer` loop's own
+/// `runs.loop_kind` (the advisory external review on a published PR, ADR
+/// 0008). Both are shared across the plan and impl kinds (spec and impl are
+/// managed by the same model). Explicit entries for anything outside this
 /// set are a startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
@@ -168,17 +169,17 @@ const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Map a loop kind (`runs.loop_kind`) to its routing role — the fine↔coarse
-/// bridge this ADR revision introduces (same pattern as `role_for_loop` for
+/// bridge this ADR revision introduces (same pattern as `lane_for_loop` for
 /// pane lanes, `src/engine/mod.rs`). Internal loop kinds stay
 /// fine-grained (budget/stats stay observable per loop); routing only cares
 /// about the 6-role grouping. `self-reviewer` has no loop kind of its own —
 /// it is resolved directly by name where the internal self-review turn runs
-/// (`impl_review_lane`).
+/// (`self_review_lane`).
 pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
     match loop_kind {
         "planner" => "planner",
         "fixer" | "ci-fixer" | "conflict-resolver" => "fixer",
-        "guard" => "pr-reviewer",
+        "pr-reviewer" => "pr-reviewer",
         "cleaner" => "cleaner",
         // "worker" | "spec-worker", and anything unrecognized.
         _ => "worker",
@@ -269,8 +270,8 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         "planner" => &["claude-opus", DEFAULT_PROFILE],
         // Cross-vendor on purpose: reviewing with the author's model shares its
         // blind spots (and spares the Claude quota). Both the internal
-        // self-review turn and the advisory pr-reviewer (guard loop) review
-        // key off this.
+        // self-review turn and the advisory pr-reviewer loop's review key off
+        // this.
         "self-reviewer" | "pr-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
         // The bulk of consumption (worker, incl. the spec-triggered worker)
         // and the narrow-scope fix-up work (fixer, incl. ci-fixer / conflict
@@ -786,7 +787,7 @@ conflict-resolver = "codex"
         assert_eq!(routing_role_for_loop("fixer"), "fixer");
         assert_eq!(routing_role_for_loop("ci-fixer"), "fixer");
         assert_eq!(routing_role_for_loop("conflict-resolver"), "fixer");
-        assert_eq!(routing_role_for_loop("guard"), "pr-reviewer");
+        assert_eq!(routing_role_for_loop("pr-reviewer"), "pr-reviewer");
         assert_eq!(routing_role_for_loop("cleaner"), "cleaner");
     }
 

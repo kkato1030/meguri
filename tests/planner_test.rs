@@ -370,7 +370,7 @@ async fn planner_self_reviews_the_spec_before_opening_the_pr() {
                     "verdict": "clean", "review": "spec looks sound", "findings": [],
                 });
                 std::fs::write(
-                    wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+                    wt.join(meguri::engine::self_review::REVIEW_FILE),
                     body.to_string(),
                 )
                 .unwrap();
