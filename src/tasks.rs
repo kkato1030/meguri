@@ -146,7 +146,17 @@ pub trait TaskSource: Send + Sync {
 
     /// Claim a task as one atomic operation. `None` is a benign race (someone
     /// else took it, or it is no longer actionable) and ends the run Skipped.
-    async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>>;
+    /// `cadence_label` is the bucket the run was stamped with at creation
+    /// (issue #148): the label source re-verifies the issue still falls under
+    /// exactly that bucket, since a label edit between creation and claim would
+    /// otherwise let the run consume a bucket it no longer belongs to. Ignored
+    /// by the local source (local tasks carry no cadence).
+    async fn claim(
+        &self,
+        key: &TaskKey,
+        host: &str,
+        cadence_label: Option<&str>,
+    ) -> Result<Option<Task>>;
 
     /// Release a claim (`meguri stop`, needs-plan demotion).
     async fn release(&self, key: &TaskKey) -> Result<()>;
@@ -427,7 +437,12 @@ impl TaskSource for LabelTaskSource {
         Ok(tasks)
     }
 
-    async fn claim(&self, key: &TaskKey, _host: &str) -> Result<Option<Task>> {
+    async fn claim(
+        &self,
+        key: &TaskKey,
+        _host: &str,
+        cadence_label: Option<&str>,
+    ) -> Result<Option<Task>> {
         let TaskKey::Issue(n) = *key else {
             return Ok(None); // a local key can never belong to the label source
         };
@@ -445,18 +460,24 @@ impl TaskSource for LabelTaskSource {
         // body or labels may have been edited after the run was created. Re-run
         // those gates, like the hold / trigger-label re-checks above — if the
         // issue is no longer actionable it is a benign race (the run ends
-        // Skipped, no `working` label written). The cadence *window-full* check
-        // is deliberately omitted: the run being claimed is itself the
-        // consumption, so counting it would reject our own claim; only a newly
-        // *conflicting* bucket (two rules now match — the stamp can no longer be
-        // trusted) fails closed here.
+        // Skipped, no `working` label written).
         match cadence::parse_not_before(&issue.body) {
             Err(_) => return Ok(None),
             Ok(nb) if cadence::not_before_wait(nb, (self.clock)()).is_some() => return Ok(None),
             Ok(_) => {}
         }
-        if cadence::cadence_bucket(&issue.labels, &self.cadence).is_err() {
-            return Ok(None);
+        // The run was stamped with `cadence_label` at creation. If the issue no
+        // longer falls under exactly that bucket — a label edit switched the
+        // rule, added one to a previously unbucketed issue, dropped it, or made
+        // two rules conflict — the stamp can no longer be trusted: skip. The run
+        // ends Skipped, which `cadence_consumed` ignores, so the stale stamp
+        // consumes nothing and the issue is re-discovered (and re-stamped
+        // correctly) next tick. The *window-full* check stays out: the run being
+        // claimed is itself the consumption, so counting it would reject its own
+        // claim.
+        match cadence::cadence_bucket(&issue.labels, &self.cadence) {
+            Ok(current) if current.as_deref() == cadence_label => {}
+            _ => return Ok(None),
         }
         self.forge.add_label(n, forge::LABEL_WORKING).await?;
         // A fresh claim supersedes a previous run's escalation: the human is
@@ -573,7 +594,12 @@ impl TaskSource for LocalTaskSource {
         Ok(tasks)
     }
 
-    async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>> {
+    async fn claim(
+        &self,
+        key: &TaskKey,
+        host: &str,
+        _cadence_label: Option<&str>,
+    ) -> Result<Option<Task>> {
         let TaskKey::Local(id) = *key else {
             return Ok(None);
         };
@@ -670,7 +696,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].key, key);
 
-        assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_some());
+        assert!(src.claim(&key, LOCAL_HOST, None).await.unwrap().is_some());
         assert!(forge.labels_of(7).contains(&LABEL_WORKING.to_string()));
 
         src.escalate(&key, "stuck").await.unwrap();
@@ -686,7 +712,7 @@ mod tests {
 
         // A local key can never belong to the label source.
         assert!(
-            src.claim(&TaskKey::Local(1), LOCAL_HOST)
+            src.claim(&TaskKey::Local(1), LOCAL_HOST, None)
                 .await
                 .unwrap()
                 .is_none()

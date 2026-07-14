@@ -358,8 +358,9 @@ async fn claim_rechecks_not_before_added_after_discovery() {
         .update_issue_body(1, "<!-- meguri:not-before 2999-01-01 -->")
         .await
         .unwrap();
+    // The run carried no bucket (no cadence rules).
     assert!(
-        src.claim(&TaskKey::Issue(1), LOCAL_HOST)
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST, None)
             .await
             .unwrap()
             .is_none()
@@ -381,13 +382,75 @@ async fn claim_rechecks_cadence_label_conflict_added_after_discovery() {
     );
 
     assert_eq!(discovered_issues(&src, TaskKind::Work).await, vec![1]);
-    // A second cadence label is added, so the bucket is now ambiguous.
+    // A second cadence label is added, so the bucket is now ambiguous — the run
+    // was stamped `sns`, but no single bucket matches now.
     forge.add_label(1, "nl").await.unwrap();
     assert!(
-        src.claim(&TaskKey::Issue(1), LOCAL_HOST)
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST, Some("sns"))
             .await
             .unwrap()
             .is_none()
     );
     assert!(!forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
+}
+
+#[tokio::test]
+async fn claim_rejects_bucket_label_swapped_after_discovery() {
+    // The run was stamped `sns`, but the label was swapped to `nl` before claim:
+    // a single rule still matches, yet consuming `sns` would leave `nl` free to
+    // over-run. The stamp no longer matches → benign race → None.
+    let forge = Arc::new(FakeForge::with_issue(1, "Post", "", &[LABEL_READY, "sns"]));
+    let store = Store::open_in_memory().unwrap();
+    let (clock, _time) = movable_clock(base_now());
+    let src = label_source(
+        forge.clone(),
+        store,
+        vec![day("sns", 5), day("nl", 5)],
+        clock,
+    );
+
+    let tasks = src.discover(TaskKind::Work).await.unwrap();
+    assert_eq!(tasks[0].cadence_label.as_deref(), Some("sns"));
+
+    forge.remove_label(1, "sns").await.unwrap();
+    forge.add_label(1, "nl").await.unwrap();
+    assert!(
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST, Some("sns"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
+}
+
+#[tokio::test]
+async fn claim_rejects_bucket_added_to_unbucketed_run() {
+    // The run carried no bucket (issue had no cadence label at discovery), but a
+    // cadence label was added before claim. Running it would consume nothing
+    // while the issue is now `sns` → over-run. Stamp mismatch → None.
+    let forge = Arc::new(FakeForge::with_issue(1, "Post", "", &[LABEL_READY]));
+    let store = Store::open_in_memory().unwrap();
+    let (clock, _time) = movable_clock(base_now());
+    let src = label_source(forge.clone(), store, vec![day("sns", 5)], clock);
+
+    let tasks = src.discover(TaskKind::Work).await.unwrap();
+    assert_eq!(tasks[0].cadence_label, None);
+
+    forge.add_label(1, "sns").await.unwrap();
+    assert!(
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
+
+    // Sanity: a run correctly stamped `sns` still claims.
+    assert!(
+        src.claim(&TaskKey::Issue(1), LOCAL_HOST, Some("sns"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(forge.labels_of(1).contains(&LABEL_WORKING.to_string()));
 }
