@@ -24,7 +24,9 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
     `meguri:clean-report` も `meguri:*` プレフィックスで自動的に除外される。
   - 再走査の律速は cleaner の `needs_scan()` 条件(default-branch head 移動 + `interval_hours`
     経過)に加え、**マーカーの `max_issue`(前回走査時点の最大 open issue 番号)より大きい番号の
-    open issue が存在すれば head が静止していても再走査する**。triage の入力は issue 集合なので、
+    open issue が存在すれば head が静止していても再走査する**(ただし律速は常に interval —
+    新規 issue シグナルも `interval_hours` の経過を待ってから発火する。これで失敗時に `scanned`
+    を進めるだけで全シグナルの再試行が interval に律速される)。triage の入力は issue 集合なので、
     head の移動だけを律速にすると「head 静止中に立った新規 issue を次の push まで拾わない」
     under-triage になるため。既存 issue の更新(updatedAt)に追従する*再*トリアージは v1 #87 の
     スコープで、v0 は新規 issue の初回トリアージにのみ反応する。過剰トリアージは v0 では単なる
@@ -37,10 +39,12 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
   (working tree clean + HEAD 不変)+ JSON パース検証を行い、失敗は **静かに諦めて次回巡回**
   (escalate しない)。
 - **settle**: 判定をまとめて推薦テーブル本文を全上書きで書く。**唯一の forge write はこのレポート
-  issue の create/update**。cleaner と同様レポート issue は閉じないので、自分の pane / worktree は
+  issue の create/update**(下記 quiet-skip の initializing レポート issue 作成もこの内側)。
+  cleaner と同様レポート issue は閉じないので、自分の pane / worktree は
   自分で回収する(reaper に残さない)。
 - 単体テスト: マーカー round-trip、`needs_scan` 判定表(head 移動 / interval / `max_issue` 超えの
-  新規 issue による再走査)、`triage-report.json` のパース、
+  新規 issue による再走査 / initializing マーカー `head=none max_issue=0` が interval 経過後に
+  再走査になること)、`triage-report.json` のパース、
   レポート本文レンダリング(推薦テーブル + マーカー + ignore 適用)、プロンプト内容、
   discover の対象フィルタ(ワークフローラベル付き / hold / blocker を除外)を FakeForge で検証。
 - e2e テスト(`tests/triage_test.rs`、cleaner_test と同じ FakeForge + FakeMux + ローカル origin 構成、
@@ -52,8 +56,11 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
     **以外の** issue の本文・ラベル・コメントが不変(triage 対象 issue に何も書いていないこと)。
   - レポート issue に `meguri:hold` → discover が空。
   - agent が成果物を出さない / JSON が壊れている / checkout が pristine でない → run は静かに skip、
-    `meguri:needs-human` なし・コメントなし・新規 issue なし、マーカーの `scanned` のみ更新して
-    次回 interval まで律速される。
+    `meguri:needs-human` なし・コメントなし。レポート issue が既にあればマーカーの `scanned` のみ
+    更新して(head は記録しない)次回 interval まで律速される。**初回巡回の失敗でレポート issue が
+    まだ無い場合は、cleaner の `settle_skip` と同型に `head=none max_issue=0` マーカーの
+    initializing レポート issue を作成する**(`scanned` の置き場がないと poll ごとの再試行に
+    なるため。レポート issue 以外への write は失敗時もゼロ)。
   - settle 後に pane が閉じ worktree ディレクトリが消えている(reaper に残さない)。
 
 ## 判定の出力スキーマ(v0)
@@ -87,7 +94,8 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 
 - **`src/engine/triage.rs`(新規)**: `TriageLoop`、`TriageCheckpoint`、判定型
   (`Recommendation` / `Complexity` / `TriageItem` / `TriageReportFile`)、execute プロンプト、
-  検証、`render_report`、settle。cleaner.rs をひな形に。
+  検証、`render_report`、settle、quiet-skip(cleaner の `settle_skip` と同型)。
+  cleaner.rs をひな形に。
 - **`src/engine/mod.rs`**: `pub mod triage;` と `default_loops()` へ `TriageLoop` を cleaner の後に追加。
 - **`src/forge/mod.rs`**: ラベル定数 `LABEL_TRIAGE_REPORT = "meguri:triage-report"` を追加。
   `Forge` trait に **`list_open_issues()`**(全 open issue 列挙)を追加。
@@ -129,6 +137,11 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
    切り詰め等を後続で検討)。
 6. **失敗は静かに諦める**: 誤検知が壊すものが無いので `needs-human` escalation も bot ループ防止も
    不要(cleaner と同じ)。永続失敗時も marker の `scanned` だけ進めて次回 interval まで待つ。
+   初回巡回の失敗ではまだレポート issue が無く `scanned` を保存する場所がないため、cleaner の
+   `settle_skip` と同型に **`head=none` の initializing レポート issue の作成だけは許す**
+   (作らないと poll ごとの再試行になり「interval まで律速」が成り立たない)。これもレポート
+   issue への create なので「唯一の forge write はレポート issue の create/update」の
+   書き込み境界は変わらない。
 
 ## 非スコープ(別 issue)
 
