@@ -31,8 +31,17 @@ worker / planner ループへ自動投入する。read-only(v0)→ 提案(v1)→
 - 昇格のたびに **理由コメント**を1件残す(confidence / 複雑度 / 根拠 / 差し戻し手順)。
 - 閾値未満・`apply` 外・`needs-human` / `skip` / `hold` は据え置き(per-issue の書き込みなし。中央レポートには載る)。
 - **既定 `mode = "off"`**。auto は明示設定でのみ動く(オプトイン)。
+- **`confidence_threshold` は `0.0..=1.0` に validation する**。範囲外(負値 → 全昇格の暴走側、
+  `1.0` 超 → 黙って全停止)を config load 時に `bail!` で弾く。誤設定を危険側にも不可解な停止にも倒さない。
 - **人間ラベル非上書き / 却下尊重**: 既に本ワークフローラベル・`meguri:hold` があれば触らない
   (書き込み直前に fresh に再読)。人間が昇格した本ラベルを剥がしたら、内容が変わるまで再昇格しない。
+- **advise→auto 移行と却下尊重を両立**(マーカーの適用レベル + 提案ラベルの有無で判定):
+  - **real マーカーが現ハッシュと一致** → 抑止(昇格済み、または昇格後に人間が剥がした = 却下)。内容が
+    変わるまで触らない。
+  - **proposal マーカーが現ハッシュと一致**:提案ラベルが **まだ付いている**(保留中)なら auto では候補/
+    再走査対象にして real 昇格へ escalate(ADR 0017 の移行要件)。提案ラベルが **外されている**(人間が却下
+    した痕跡)なら抑止(issue #88 の「剥がした痕跡があれば触らない」)。
+  - `report`/`advise` の既存挙動は不変(同一ハッシュのマーカーはレベルを問わず再提案を抑止)。
 - **レート制限**: `max_actions_per_tick`(既定 3)で 1 tick の本ラベル付与数を上限。積み残しは
   マーカーの `backlog=1` で次スイープを起動。
 - **bot ループ防止**: 昇格済み issue は本ラベルを持つため再トリアージ候補から外れる(別マーカー不要)。
@@ -48,6 +57,9 @@ worker / planner ループへ自動投入する。read-only(v0)→ 提案(v1)→
     (既定 `["ready"]`)を追加。`apply` は `ready|plan` のみを認識する typed enum の集合が望ましい
     (`needs-human`/`skip`/`hold` は昇格対象になる本ラベルを持たないので受け付けない。未知値は parse error に
     して誤設定を早期に弾く)。両方 `#[serde(default = ...)]`。
+  - `Config::validate()`(1362 行〜)の `for p in &self.projects` ループに `validate_triage(p)` を追加し、
+    `triage_for(p).confidence_threshold` が `0.0..=1.0` 外なら `bail!`(既存の `validate_cadence` /
+    `validate_schedules` と同じ形)。
   - `INIT_TEMPLATE` にコメントで `[triage] mode = "auto"` の例を追記(任意だが推奨)。
 - `src/engine/triage.rs`
   - `discover()` の mode ゲートに `Auto` を追加(現状 `Report | Advise`)。
@@ -57,12 +69,17 @@ worker / planner ループへ自動投入する。read-only(v0)→ 提案(v1)→
   - 新昇格パス `promote_one`(v1 の `propose_one` を土台に):`confidence_threshold` と `apply` ゲート、
     `ready`/`plan` → `meguri:ready`/`meguri:plan` のマッピング(`needs-human` は昇格しない — `real_label()` は
     `NeedsHuman` も map するが promote 経路では ready/plan だけを扱う)、既存 `meguri:triage-*` 提案ラベルの除去、
-    本ラベル付与、理由コメント(昇格マーカー付き)、`triage.promoted` emit。既存の「fresh 再読で engaged なら
-    無操作」「ハッシュ一致なら無操作」ガードを踏襲。
+    本ラベル付与、理由コメント(昇格マーカー付き)、`triage.promoted` emit。fresh 再読で engaged なら無操作。
+    **ハッシュ一致スキップは real マーカーのときだけ**(proposal マーカー一致 + 提案ラベル健在なら昇格へ進む。
+    提案ラベルが外れていれば却下として無操作)。
   - 冪等マーカー拡張:`advise_marker` に適用レベル(`applied=proposal|real`)を足し、`parse` を対応。
-    `latest_advise_marker` は種別を問わず最新の triage マーカーを返す(内容ドリフト判定は共通、
-    auto スキップは「最新が real かつハッシュ一致」のときだけ)。旧マーカー(レベル欠落)は `proposal`
-    として後方互換に解釈。
+    旧マーカー(レベル欠落)は `proposal` として後方互換に解釈。
+  - **候補化/再走査 signal を marker-level + 提案ラベル aware にする**:`content_changed_since_advise`
+    (`gather_candidates` 用)と `marker_drifted`(`advise_backlog_changed` 用)は現状ハッシュしか見ないので、
+    このままだと advise 済み(proposal マーカー・同一ハッシュ)の issue が auto でも候補にも再走査 signal にも
+    ならず `promote_one` へ届かない。auto モードでは上記「受け入れ基準」の判定に合わせる:proposal マーカー
+    一致 + 提案ラベル健在 → eligible、real マーカー一致または提案ラベル外れ(却下)→ 抑止。`report`/`advise`
+    は現状維持。
   - `render_report`: auto 用フッター分岐(昇格済み行の表示、差し戻し手順)。
 - ADR: `docs/adr/0017-triage-auto-promotes-real-labels-guarded.md`(本 PR で作成済み)。
 
@@ -83,7 +100,10 @@ worker / planner ループへ自動投入する。read-only(v0)→ 提案(v1)→
    `ready|plan` のみ認識する。**要合意**:この逸脱でよいか(代替は「フェーズ + ボールの複合付与」まで設計
    することだが、over-engineering と判断)。
 3. **冪等マーカーは v1 を拡張(別立てにしない)。** 1 issue = 最新の triage マーカー1つが真実。
-   `applied` レベルで proposal/real を区別し、advise→auto 移行時の再昇格と却下尊重を両立(ADR 0017 決定3)。
+   `applied` レベルで proposal/real を区別。auto では **real 一致だけが抑止**、proposal 一致は提案ラベルが
+   健在なら escalate・外れていれば却下として抑止 — これで advise→auto 移行と却下尊重を両立(ADR 0017 決定3)。
+   注意:v1 の「マーカー一致なら候補化/再走査も止める」を auto にそのまま流用すると proposal 済み issue が
+   `promote_one` へ届かないので、候補化/再走査 signal 側も同じ判定に揃える(上記「触るファイル」)。
 4. **昇格済み除外は本ラベル自身で足りる**(別マーカー不要、ADR 0017 決定4)。
 
 ## migration & rollback
@@ -112,7 +132,12 @@ worker / planner ループへ自動投入する。read-only(v0)→ 提案(v1)→
   - `needs-human` / `hold` / `skip` は本ラベルへ昇格せず無操作(`needs-human` を単独ボールラベルとして
     付けない = フェーズラベル 0 個の anomaly を作らない)。
   - engaged(本ラベル・`meguri:hold`)issue は fresh 再読で無操作(人間ラベル非上書き)。
+  - `confidence_threshold` の config validation:`0.0..=1.0` は通り、負値・`1.0` 超は `bail!`
+    (`Config::validate` のテスト側に追加)。
   - 却下尊重:real マーカーがハッシュ一致なら再昇格しない / 内容が変われば貼り直す。
+  - **advise→auto 移行**:proposal マーカー・同一ハッシュ・提案ラベル健在の issue が、auto では候補化され
+    (`content_changed_since_advise` / `marker_drifted` が eligible を返す)`promote_one` まで届いて real 昇格
+    する。提案ラベルが外れている(却下)同型の issue は抑止される。
   - マーカー拡張の roundtrip(旧マーカー = `proposal` 後方互換)。
   - `max_actions_per_tick` 超過で backlog=1、レポートフッター表示。
   - auto フッターが本ラベル・差し戻し手順に言及。
