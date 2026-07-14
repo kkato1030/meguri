@@ -13,7 +13,7 @@
 //! past. The default overlap guard skips (but still consumes the window) while
 //! the schedule's last-created item is still open.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use super::Deps;
@@ -106,7 +106,7 @@ async fn fire_one(deps: &Deps, sched: &ScheduleConfig, now: u64) -> Result<()> {
 
     // Fire: enqueue one item and record the new key.
     let title = render_title(&sched.title, now);
-    let body = render_body(deps, sched)?;
+    let body = render_body(deps, sched).await?;
     let key = enqueue(deps, sched, &title, &body).await?;
     deps.store.record_schedule_fire(
         &deps.project.id,
@@ -169,21 +169,32 @@ fn render_title(template: &str, now: u64) -> String {
     template.replace("{{date}}", &cron::date_utc(now))
 }
 
-/// Resolve the body from `body` (inline) or `body_file` (repo-relative), then
-/// append the hidden provenance marker. Exactly one source is present (config
-/// validation guarantees it).
-fn render_body(deps: &Deps, sched: &ScheduleConfig) -> Result<String> {
+/// Resolve the body from `body` (inline) or `body_file`, then append the hidden
+/// provenance marker. Exactly one source is present (config validation
+/// guarantees it). `body_file` is read from the default branch, not the working
+/// tree (ADR 0015), so a working-tree-only edit never reaches an issue body.
+async fn render_body(deps: &Deps, sched: &ScheduleConfig) -> Result<String> {
     let base = match (&sched.body, &sched.body_file) {
         (Some(inline), _) => inline.clone(),
         (None, Some(rel)) => {
-            let path = deps.project.repo_path.join(rel);
-            std::fs::read_to_string(&path).with_context(|| {
-                format!(
-                    "schedule {:?}: cannot read body_file {}",
-                    sched.name,
-                    path.display()
-                )
-            })?
+            let read = crate::gitops::read_file_at_default_branch(
+                &deps.project.repo_path,
+                &deps.project.default_branch,
+                rel,
+            )
+            .await
+            .with_context(|| format!("schedule {:?}: reading body_file {rel}", sched.name))?;
+            match read {
+                crate::gitops::DefaultBranchFile::Content(text) => text,
+                crate::gitops::DefaultBranchFile::Absent => bail!(
+                    "schedule {:?}: body_file {rel} is not on the default branch",
+                    sched.name
+                ),
+                crate::gitops::DefaultBranchFile::NotRegularFile => bail!(
+                    "schedule {:?}: body_file {rel} is not a regular file on the default branch",
+                    sched.name
+                ),
+            }
         }
         (None, None) => String::new(), // unreachable after validation
     };
