@@ -95,6 +95,40 @@ impl Store {
         })
     }
 
+    /// Register (or re-point) a lane's resumable session without a live pane
+    /// (direct launch mode, issue #169): creates the row if the lane has
+    /// never had one, or updates its worktree/session id if it has. Unlike
+    /// [`Store::upsert_pane`], `mux_kind`/`mux_session`/`mux_pane_id` are left
+    /// untouched (absent on a fresh row) — "lane" now means "issue-scoped
+    /// resumable context", pane being merely optional.
+    pub fn upsert_pane_session(
+        &self,
+        project_id: &str,
+        issue_number: i64,
+        role: &str,
+        worktree_path: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO panes (project_id, issue_number, role, worktree_path,
+                                    agent_session_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT (project_id, issue_number, role) DO UPDATE SET
+                   worktree_path = ?4, agent_session_id = ?5, updated_at = ?6",
+                params![
+                    project_id,
+                    issue_number,
+                    role,
+                    worktree_path,
+                    session_id,
+                    now()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_pane(
         &self,
         project_id: &str,
@@ -202,6 +236,49 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upsert_pane_session_creates_a_paneless_row_and_updates_it() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().is_none());
+
+        // A direct-mode lane's first completed turn: no pane was ever
+        // spawned, so plain save_pane_session (an UPDATE) would no-op.
+        store
+            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/demo/b1", Some("sess-1"))
+            .unwrap();
+        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        assert_eq!(pane.mux_pane_id, None);
+        assert_eq!(pane.mux_kind, None);
+        assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b1"));
+        assert_eq!(pane.agent_session_id.as_deref(), Some("sess-1"));
+
+        // A later turn updates worktree + session without disturbing role.
+        store
+            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/demo/b2", Some("sess-2"))
+            .unwrap();
+        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b2"));
+        assert_eq!(pane.agent_session_id.as_deref(), Some("sess-2"));
+        assert_eq!(pane.role, ROLE_AUTHOR);
+    }
+
+    #[test]
+    fn upsert_pane_session_preserves_an_existing_pane_mapping() {
+        // A lane that already has a live pane (e.g. it ran in pane mode
+        // before) keeps its mux_kind/mux_pane_id when a direct-style session
+        // upsert touches the same row.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_pane("demo", 7, ROLE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
+            .unwrap();
+        store
+            .upsert_pane_session("demo", 7, ROLE_AUTHOR, "/wt/a", Some("sess-1"))
+            .unwrap();
+        let pane = store.get_pane("demo", 7, ROLE_AUTHOR).unwrap().unwrap();
+        assert_eq!(pane.mux_pane_id.as_deref(), Some("%1"));
+        assert_eq!(pane.agent_session_id.as_deref(), Some("sess-1"));
+    }
 
     #[test]
     fn pane_upsert_reuse_and_reclaim() {

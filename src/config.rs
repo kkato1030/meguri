@@ -51,6 +51,12 @@ repo_slug = "owner/repo"
 # id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
 # projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
 
+# [prompts]                            # ロール別 preamble: turn プロンプト冒頭に埋め込む恒常規律(issue #149)
+# all = "ops/agents/guardrails.md"     # 全ロール共通。値は repo 相対パス(絶対パス/`..` は不可)
+# worker = "ops/agents/worker.md"      # キーは routing のロール名(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
+# [projects.prompts]                   # per-project override(キー単位で [prompts] を上書き)。ADR 0012
+# planner = "ops/agents/planner.md"    # 常時読み込みで足りるなら CLAUDE.md を使い、これは使わない(過剰採用を避ける)
+
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
@@ -88,6 +94,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
+    /// (no legacy/off state) — a role with no entry here still resolves
+    /// through the built-in recommendation table.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
     /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
     /// presence switches role routing on (see [`routing`]), so a
@@ -119,6 +130,12 @@ pub struct Config {
     pub review: ReviewConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
+    /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
+    /// the shared `all` key) → repo-relative path to a file whose contents are
+    /// injected into the turn prompt. Per-project `[projects.prompts]` overrides
+    /// it per canonical key. See [`Config::preambles_for`] and ADR 0012.
+    #[serde(default)]
+    pub prompts: HashMap<String, String>,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
     /// Static groupings of related projects (issue #154). Purely declarative —
@@ -306,6 +323,19 @@ pub enum AutoMergeOptIn {
     All,
 }
 
+/// How auto-merge finalizes an eligible PR (ADR 0003 / 0009). `native` arms
+/// GitHub-native auto-merge and lets GitHub (branch protection + required
+/// checks) decide. `orchestrator` is the fallback for repos where native
+/// auto-merge can't be enabled (private + Free): meguri merges the PR itself
+/// once GitHub reports it MERGEABLE, accepting its own pre-PR verification
+/// (`check_command` + self-review) as the only gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoMergeMode {
+    Native,
+    Orchestrator,
+}
+
 /// `[pr.auto_merge]` — opt-in GitHub-native auto-merge. meguri never decides
 /// "safe to merge"; it arms auto-merge on eligible PRs and GitHub (branch
 /// protection + required checks) decides (ADR 0003).
@@ -314,6 +344,11 @@ pub struct AutoMergeConfig {
     /// Master switch; off by default.
     #[serde(default = "default_auto_merge_enabled")]
     pub enabled: bool,
+    /// How eligible PRs are finalized: arm GitHub-native auto-merge (`native`,
+    /// the default) or merge them directly (`orchestrator`, the private+Free
+    /// fallback).
+    #[serde(default = "default_auto_merge_mode")]
+    pub mode: AutoMergeMode,
     /// Merge strategy to arm with (no fallback if the repo forbids it).
     #[serde(default = "default_merge_strategy")]
     pub strategy: crate::forge::MergeStrategy,
@@ -329,6 +364,7 @@ impl Default for AutoMergeConfig {
     fn default() -> Self {
         Self {
             enabled: default_auto_merge_enabled(),
+            mode: default_auto_merge_mode(),
             strategy: default_merge_strategy(),
             require_branch_protection: default_require_branch_protection(),
             opt_in: default_auto_merge_opt_in(),
@@ -338,6 +374,9 @@ impl Default for AutoMergeConfig {
 
 fn default_auto_merge_enabled() -> bool {
     false
+}
+fn default_auto_merge_mode() -> AutoMergeMode {
+    AutoMergeMode::Native
 }
 fn default_merge_strategy() -> crate::forge::MergeStrategy {
     crate::forge::MergeStrategy::Squash
@@ -410,6 +449,13 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
+    /// Extra args that make the launch non-interactive, for `direct` launch
+    /// mode (issue #169): the full command line is `{command} {args}
+    /// {direct_args} [{resume_args} <session-id>] <trigger>`, run as a plain
+    /// subprocess instead of inside a mux pane. Defaults to Claude Code's
+    /// `-p` (headless one-shot).
+    #[serde(default = "default_agent_direct_args")]
+    pub direct_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -426,6 +472,7 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
+            direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
         }
@@ -453,6 +500,39 @@ pub enum RoutingMode {
     /// Roles absent from `[routing.roles]` resolve to `default`; the
     /// recommendation table is off.
     Manual,
+}
+
+/// How a role's turns are launched (issue #169, ADR 0012): `pane` keeps the
+/// historical live mux pane (a human can attach; the turn engine nudges a
+/// quiet agent); `direct` spawns the agent CLI as a plain subprocess for one
+/// turn and reads its exit + the result file — no pane, no attach, no
+/// nudging. Orthogonal to `[routing]`'s profile axis: this only decides
+/// *how* the chosen profile is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    Pane,
+    Direct,
+}
+
+impl LaunchMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// `[launch]`: role→launch-mode resolution (issue #169). Unlike `[routing]`,
+/// there is no legacy/off state — a role with no explicit entry always
+/// resolves through the built-in recommendation table
+/// ([`crate::launch::recommended_mode`]); an explicit `[launch.roles]` entry
+/// always wins over it. See `crate::launch`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchConfig {
+    #[serde(default)]
+    pub roles: HashMap<String, LaunchMode>,
 }
 
 /// `[routing]`: role→profile resolution. Present = routing is active (auto or
@@ -565,6 +645,10 @@ fn default_agent_args() -> Vec<String> {
 
 fn default_agent_resume_args() -> Vec<String> {
     vec!["--resume".into()]
+}
+
+fn default_agent_direct_args() -> Vec<String> {
+    vec!["-p".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,6 +1005,12 @@ pub struct ProjectConfig {
     /// Cron schedules that periodically enqueue issues/tasks (issue #146).
     #[serde(default)]
     pub schedules: Vec<ScheduleConfig>,
+    /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
+    /// Same shape as the top-level `[prompts]`; a per-project entry overrides
+    /// the top-level one for the same canonical role key. See
+    /// [`Config::preambles_for`] and ADR 0012.
+    #[serde(default)]
+    pub prompts: HashMap<String, String>,
 }
 
 fn default_branch() -> String {
@@ -999,8 +1089,24 @@ impl Config {
                     p.id
                 );
             }
+            // orchestrator auto-merge assumes no branch protection (ADR 0009):
+            // it is the fallback for repos where server-side gates don't exist.
+            // Pairing it with `require_branch_protection = true` is a
+            // contradiction — reject it so the operator explicitly opts out and
+            // acknowledges meguri's own verification is the only gate.
+            let am = &self.pr_for(p).auto_merge;
+            if am.mode == AutoMergeMode::Orchestrator && am.require_branch_protection {
+                anyhow::bail!(
+                    "project {:?} has auto_merge.mode = \"orchestrator\" but \
+                     require_branch_protection = true — orchestrator mode has no \
+                     server-side gate, so set require_branch_protection = false to \
+                     acknowledge meguri's own verification is the only gate",
+                    p.id
+                );
+            }
             self.validate_schedules(p)?;
         }
+        self.validate_prompts()?;
         Ok(())
     }
 
@@ -1152,6 +1258,145 @@ impl Config {
     pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
         project.clean.as_ref().unwrap_or(&self.clean)
     }
+
+    /// The preamble paths to inject for a role, in injection order: the shared
+    /// `all` entry first, then the role-specific one (issue #149, ADR 0012).
+    /// `role` must be canonical (a `KNOWN_ROLES` value); keys in the maps are
+    /// matched after canonicalization, so a deprecated alias such as
+    /// `spec-reviewer` still resolves for the `pr-reviewer` turn. A per-project
+    /// entry overrides the top-level one for the same key. Returns
+    /// `(key, rel_path)` for whichever of `all`/`role` are configured.
+    pub fn preambles_for(&self, project: &ProjectConfig, role: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for key in ["all", role] {
+            if let Some(rel) = preamble_in_map(&project.prompts, key)
+                .or_else(|| preamble_in_map(&self.prompts, key))
+            {
+                out.push((key.to_string(), rel));
+            }
+        }
+        out
+    }
+
+    /// Every preamble path that could be injected for `project`, as
+    /// `(canonical_key, rel_path)`, with per-project entries overriding
+    /// top-level ones by canonical key. Used by `meguri doctor` to check that
+    /// each configured path actually resolves inside the project's clone.
+    pub fn effective_prompts(&self, project: &ProjectConfig) -> Vec<(String, String)> {
+        let mut merged: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (k, v) in self.prompts.iter().chain(project.prompts.iter()) {
+            merged.insert(canonical_preamble_key(k).to_string(), v.clone());
+        }
+        merged.into_iter().collect()
+    }
+
+    /// Preamble config invariants (issue #149): every key is `all` or a known
+    /// routing role (aliases allowed), no alias+canonical pair collides on the
+    /// same role within one map, and every path is safely repo-relative.
+    fn validate_prompts(&self) -> Result<()> {
+        check_prompt_map(&self.prompts, "[prompts]")?;
+        for p in &self.projects {
+            let label = format!("project {:?} [projects.prompts]", p.id);
+            check_prompt_map(&p.prompts, &label)?;
+        }
+        Ok(())
+    }
+}
+
+/// Find the preamble path for canonical key `want` in one map, matching each
+/// entry's key by its canonical form (`all` matches literally).
+fn preamble_in_map(map: &HashMap<String, String>, want: &str) -> Option<String> {
+    map.iter()
+        .find(|(k, _)| canonical_preamble_key(k) == want)
+        .map(|(_, v)| v.clone())
+}
+
+/// Canonicalize a preamble map key: `all` stays literal, everything else goes
+/// through the routing role aliases (`spec-reviewer` → `pr-reviewer`, …).
+fn canonical_preamble_key(key: &str) -> &str {
+    if key == "all" {
+        "all"
+    } else {
+        crate::routing::canonical_role(key)
+    }
+}
+
+/// Validate one preamble map's keys and path values (see
+/// [`Config::validate_prompts`]).
+fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, rel) in map {
+        let canon = canonical_preamble_key(key);
+        if canon != "all" && !crate::routing::KNOWN_ROLES.contains(&canon) {
+            anyhow::bail!(
+                "{label} has unknown role key {key:?} — valid keys: all, {}",
+                crate::routing::KNOWN_ROLES.join(", ")
+            );
+        }
+        if !seen.insert(canon.to_string()) {
+            anyhow::bail!(
+                "{label} sets role {canon:?} more than once (an alias and its \
+                 canonical name both map to it) — keep one"
+            );
+        }
+        validate_repo_relative(rel).with_context(|| format!("{label} key {key:?}"))?;
+    }
+    Ok(())
+}
+
+/// Reject a configured preamble path that could escape the repo lexically: an
+/// absolute path, or one containing a `..` component. This is the first of two
+/// gates (ADR 0012); the second, [`resolve_preamble_within`], follows symlinks
+/// at read time. Preamble contents are embedded into the agent prompt, so a
+/// path outside the tree would leak secrets to the agent.
+pub fn validate_repo_relative(rel: &str) -> Result<()> {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        anyhow::bail!("preamble path {rel:?} must be repo-relative, not absolute");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("preamble path {rel:?} must not contain `..`");
+    }
+    Ok(())
+}
+
+/// Outcome of resolving a configured preamble path against a root directory.
+#[derive(Debug)]
+pub enum PreambleResolution {
+    /// Resolved inside `root`; carries the file contents.
+    Content(String),
+    /// The path does not exist (or could not be canonicalized/read).
+    Missing,
+    /// The real path — reached through a symlink — lies outside `root`.
+    Escapes,
+}
+
+/// Read a repo-relative preamble path against `root`, following symlinks, and
+/// return its contents only if the real file stays within `root` (ADR 0012).
+/// The second containment gate behind [`validate_repo_relative`]: a repo-internal
+/// symlink pointing outside the tree passes the lexical check but is caught here.
+/// Missing paths and containment failures never error — the caller treats both
+/// as "skip this preamble, keep going".
+pub fn resolve_preamble_within(root: &Path, rel: &str) -> PreambleResolution {
+    let canon_root = match std::fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(_) => return PreambleResolution::Missing,
+    };
+    let canon_full = match std::fs::canonicalize(root.join(rel)) {
+        Ok(p) => p,
+        Err(_) => return PreambleResolution::Missing,
+    };
+    if !canon_full.starts_with(&canon_root) {
+        return PreambleResolution::Escapes;
+    }
+    match std::fs::read_to_string(&canon_full) {
+        Ok(s) => PreambleResolution::Content(s),
+        Err(_) => PreambleResolution::Missing,
+    }
 }
 
 /// Hot reload for a long-lived process (`meguri watch`): re-reads the config
@@ -1232,6 +1477,14 @@ impl ConfigReloader {
             tracing::warn!(
                 "config reload rejected: no projects configured — keeping the last good config"
             );
+            return None;
+        }
+        // `[launch.roles]` typos are a loud startup error (`crate::launch::
+        // validate`, issue #169) — a hot reload must reject the same way
+        // instead of silently applying an ignored override.
+        if let Err(e) = crate::launch::validate(&next) {
+            self.last_seen = Some(raw);
+            tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
             return None;
         }
 
@@ -1455,6 +1708,7 @@ draft = false
         let cfg: Config = toml::from_str("").unwrap();
         let am = &cfg.pr.auto_merge;
         assert!(!am.enabled);
+        assert_eq!(am.mode, AutoMergeMode::Native);
         assert_eq!(am.strategy, crate::forge::MergeStrategy::Squash);
         assert!(am.require_branch_protection);
         assert_eq!(am.opt_in, AutoMergeOptIn::Label);
@@ -1465,6 +1719,7 @@ draft = false
         let raw = r#"
 [pr.auto_merge]
 enabled = true
+mode = "orchestrator"
 strategy = "rebase"
 require_branch_protection = false
 opt_in = "all"
@@ -1472,9 +1727,49 @@ opt_in = "all"
         let cfg: Config = toml::from_str(raw).unwrap();
         let am = &cfg.pr.auto_merge;
         assert!(am.enabled);
+        assert_eq!(am.mode, AutoMergeMode::Orchestrator);
         assert_eq!(am.strategy, crate::forge::MergeStrategy::Rebase);
         assert!(!am.require_branch_protection);
         assert_eq!(am.opt_in, AutoMergeOptIn::All);
+    }
+
+    #[test]
+    fn orchestrator_mode_rejects_required_branch_protection() {
+        // orchestrator + the default require_branch_protection = true is a
+        // contradiction and must fail validation (ADR 0009).
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[projects.pr.auto_merge]
+enabled = true
+mode = "orchestrator"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("orchestrator"), "{err}");
+        assert!(err.contains("require_branch_protection"), "{err}");
+    }
+
+    #[test]
+    fn orchestrator_mode_with_protection_off_validates() {
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+
+[projects.pr.auto_merge]
+enabled = true
+mode = "orchestrator"
+require_branch_protection = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let p = cfg.project("demo").unwrap();
+        assert_eq!(cfg.pr_for(p).auto_merge.mode, AutoMergeMode::Orchestrator);
     }
 
     #[test]
@@ -1643,6 +1938,30 @@ language = "English"
         std::fs::write(&path, "language = \"B\"\n").unwrap();
         assert!(r.poll(|_, _| -> Result<()> { Ok(()) }).is_none());
         assert!(!r.current().projects.is_empty());
+    }
+
+    #[test]
+    fn reloader_rejects_unknown_launch_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            "language = \"B\"\n[launch.roles]\nnonsense = \"direct\"\n",
+        )
+        .unwrap();
+        let mut applied = false;
+        assert!(
+            r.poll(|_, _| -> Result<()> {
+                applied = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!applied, "an unknown launch role must reject before apply");
+        assert_ne!(r.current().language.as_deref(), Some("B"));
     }
 
     #[test]
@@ -2166,5 +2485,145 @@ allow_overlap = true
         let cfg: Config = toml::from_str(&empty).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("no projects"), "{err}");
+    }
+
+    const A_PROJECT: &str =
+        "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";
+
+    #[test]
+    fn prompts_parse_and_key_validation() {
+        // Known roles, deprecated aliases, and `all` all load and validate.
+        let raw = format!(
+            "[prompts]\nall = \"a.md\"\nworker = \"w.md\"\nspec-reviewer = \"r.md\"\n{A_PROJECT}"
+        );
+        let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
+        assert_eq!(cfg.prompts.get("all").map(String::as_str), Some("a.md"));
+
+        // An unknown role key is rejected at load.
+        let bad = format!("[prompts]\nnonsense = \"x.md\"\n{A_PROJECT}");
+        let err = Config::parse(&bad, Path::new("t.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown role key"), "{err:#}");
+    }
+
+    #[test]
+    fn prompts_alias_and_canonical_collision_rejected() {
+        let bad =
+            format!("[prompts]\npr-reviewer = \"a.md\"\nspec-reviewer = \"b.md\"\n{A_PROJECT}");
+        let err = Config::parse(&bad, Path::new("t.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("more than once"), "{err:#}");
+    }
+
+    #[test]
+    fn prompts_absolute_and_parent_paths_rejected() {
+        let abs = format!("[prompts]\nworker = \"/etc/passwd\"\n{A_PROJECT}");
+        let err = Config::parse(&abs, Path::new("t.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("repo-relative"), "{err:#}");
+
+        let parent = format!("[prompts]\nworker = \"../../secret\"\n{A_PROJECT}");
+        let err = Config::parse(&parent, Path::new("t.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("`..`"), "{err:#}");
+    }
+
+    #[test]
+    fn validate_repo_relative_helper() {
+        assert!(validate_repo_relative("ops/agents/worker.md").is_ok());
+        assert!(validate_repo_relative("/etc/passwd").is_err());
+        assert!(validate_repo_relative("../escape").is_err());
+        assert!(validate_repo_relative("a/../../escape").is_err());
+    }
+
+    #[test]
+    fn preambles_for_composition_and_override() {
+        let raw = format!(
+            "[prompts]\nall = \"all.md\"\nworker = \"top-worker.md\"\n\
+             {A_PROJECT}[projects.prompts]\nworker = \"proj-worker.md\"\n"
+        );
+        let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
+        let p = cfg.project("p").unwrap();
+
+        // both `all` and the role, in that order; per-project role wins.
+        assert_eq!(
+            cfg.preambles_for(p, "worker"),
+            vec![
+                ("all".to_string(), "all.md".to_string()),
+                ("worker".to_string(), "proj-worker.md".to_string()),
+            ]
+        );
+        // a role with no entry falls back to just `all`.
+        assert_eq!(
+            cfg.preambles_for(p, "planner"),
+            vec![("all".to_string(), "all.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn preambles_for_resolves_aliases_and_top_project_override() {
+        // Old name at top-level, canonical name per-project: project wins, and
+        // the alias still resolves for the canonical role.
+        let raw = format!(
+            "[prompts]\nspec-reviewer = \"top-review.md\"\n\
+             {A_PROJECT}[projects.prompts]\npr-reviewer = \"proj-review.md\"\n"
+        );
+        let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
+        let p = cfg.project("p").unwrap();
+        assert_eq!(
+            cfg.preambles_for(p, "pr-reviewer"),
+            vec![("pr-reviewer".to_string(), "proj-review.md".to_string())]
+        );
+
+        // Old name only, at top-level, resolves for the canonical role turn.
+        let raw2 = format!("[prompts]\nspec-reviewer = \"review.md\"\n{A_PROJECT}");
+        let cfg2 = Config::parse(&raw2, Path::new("t.toml")).unwrap();
+        let p2 = cfg2.project("p").unwrap();
+        assert_eq!(
+            cfg2.preambles_for(p2, "pr-reviewer"),
+            vec![("pr-reviewer".to_string(), "review.md".to_string())]
+        );
+
+        // A role with nothing configured returns nothing.
+        assert!(cfg2.preambles_for(p2, "cleaner").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_preamble_within_containment() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // (c) a real file inside root → read.
+        std::fs::write(root.path().join("ok.md"), "inside").unwrap();
+        assert!(matches!(
+            resolve_preamble_within(root.path(), "ok.md"),
+            PreambleResolution::Content(s) if s == "inside"
+        ));
+
+        // (d) a missing path → Missing.
+        assert!(matches!(
+            resolve_preamble_within(root.path(), "nope.md"),
+            PreambleResolution::Missing
+        ));
+
+        // (b) a symlink pointing inside root → read.
+        std::fs::write(root.path().join("target.md"), "linked-inside").unwrap();
+        symlink(
+            root.path().join("target.md"),
+            root.path().join("in-link.md"),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_preamble_within(root.path(), "in-link.md"),
+            PreambleResolution::Content(s) if s == "linked-inside"
+        ));
+
+        // (a) a symlink escaping root (the exfiltration case) → Escapes.
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "secret").unwrap();
+        symlink(&secret, root.path().join("escape.md")).unwrap();
+        assert!(matches!(
+            resolve_preamble_within(root.path(), "escape.md"),
+            PreambleResolution::Escapes
+        ));
     }
 }

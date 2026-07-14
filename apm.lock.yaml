@@ -2,3 +2,11 @@ lockfile_version: '1'
 generated_at: '2026-07-13T00:58:53.187211+00:00'
 apm_version: 0.24.0
 dependencies: []
+local_deployed_files:
+- .claude/rules/docs.md
+- .claude/rules/overview.md
+- .claude/rules/rust.md
+local_deployed_file_hashes:
+  .claude/rules/docs.md: sha256:147ca80a1ba971830597607be7ffb196e23c1aac7c65abdd7d663e065ad50965
+  .claude/rules/overview.md: sha256:6952902cc75f3f1e9025927b78204638eefadfb82bcadfe17ca6ff41713232a5
+  .claude/rules/rust.md: sha256:1f848668d79cf3f6f09c8d7c65af4afe640de87a8f80c0cc74ba729635794896

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, LaunchMode, ProjectConfig};
 use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
@@ -107,6 +107,15 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     );
 
     let mut config = Config::default();
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so a self-review turn (if a test enables
+    // review.enabled) doesn't fall through to its recommended `direct` mode,
+    // which would spawn a *real* `claude` subprocess instead of going
+    // through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     // These takeover tests don't script the self-review turn; the dedicated
@@ -130,6 +139,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(

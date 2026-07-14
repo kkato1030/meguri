@@ -271,7 +271,7 @@ pub async fn run_guard(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
             match claimed_pr(deps, run_id) {
-                Some(pr) => escalate_on_pr(deps, pr, &msg).await,
+                Some(pr) => escalate_on_pr(deps, &run, pr, &msg).await,
                 None => flow::escalate_on_forge(deps, run.issue_number, &msg).await,
             }
             Err(e)
@@ -372,20 +372,21 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     Ok(())
 }
 
-async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
+async fn escalate_on_pr(deps: &Deps, run: &RunRecord, pr: i64, reason: &str) {
     let _ = deps
         .forge()
         .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
         .await;
     let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+    // The closing "how to look at this" sentence is launch-mode-aware
+    // (issue #169): a direct-mode pr-reviewer has no pane to attach to.
+    let hint = flow::attach_hint(deps, run);
     let _ = deps
         .forge()
         .comment_pr(
             pr,
             &format!(
-                "🔁 **meguri** could not finish guarding this PR and needs a human.\n\n> {reason}\n\n\
-                 The agent's pane (if still open) has the full context — \
-                 see `meguri ps` / `meguri attach` on the host running meguri."
+                "🔁 **meguri** could not finish guarding this PR and needs a human.\n\n> {reason}\n\n{hint}"
             ),
         )
         .await;
@@ -869,6 +870,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,

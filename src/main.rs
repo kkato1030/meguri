@@ -196,6 +196,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
             ok &= doctor_schedules(cfg);
+            // Role preambles (issue #149): each configured path must resolve to
+            // a real file inside the project's clone (and not escape it via a
+            // symlink) — the same containment gate the turn uses.
+            ok &= doctor_prompts(cfg);
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -215,6 +219,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// ADR 0003). Returns false if any enabled project fails; projects that did
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
+    use meguri::config::AutoMergeMode;
     use meguri::engine::auto_merger::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
@@ -237,15 +242,29 @@ async fn check_auto_merge(cfg: &Config) -> bool {
             .await
         {
             Ok(policy) => match validate_policy(am, &policy) {
-                Ok(()) => println!(
-                    "✅ {label}: repo settings OK (strategy={}, protection {})",
-                    am.strategy.as_str(),
-                    if policy.protected_with_required_checks {
-                        "present"
-                    } else {
-                        "not required"
-                    },
-                ),
+                Ok(()) => match am.mode {
+                    AutoMergeMode::Native => println!(
+                        "✅ {label}: repo settings OK (mode=native, strategy={}, protection {})",
+                        am.strategy.as_str(),
+                        if policy.protected_with_required_checks {
+                            "present"
+                        } else {
+                            "not required"
+                        },
+                    ),
+                    AutoMergeMode::Orchestrator => {
+                        // No server-side gate exists in this mode — remind the
+                        // operator that meguri's own verification is the gate.
+                        println!(
+                            "✅ {label}: repo settings OK (mode=orchestrator, strategy={})",
+                            am.strategy.as_str(),
+                        );
+                        println!(
+                            "   ⚠️  orchestrator mode: no server-side merge gate — \
+                             meguri's own check_command + self-review is the only gate"
+                        );
+                    }
+                },
                 Err(problems) => {
                     println!("❌ {label}: {}", problems.join("; "));
                     ok = false;
@@ -308,6 +327,40 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 s.kind.as_str(),
                 s.cron,
             );
+        }
+    }
+    ok
+}
+
+/// Doctor's preamble section (issue #149): for every project, every preamble
+/// path that could be injected for it — the top-level `[prompts]` overlaid by
+/// its own `[projects.prompts]` — must resolve to a real file inside the
+/// project's clone. Missing paths and symlink escapes are both reported as ❌
+/// (config validate already rejects absolute / `..` values, so those never
+/// reach here). Projects with no preambles configured print nothing.
+fn doctor_prompts(cfg: &Config) -> bool {
+    use meguri::config::{PreambleResolution, resolve_preamble_within};
+
+    let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
+    if !has_any {
+        return true;
+    }
+    let mut ok = true;
+    println!("\npreambles:");
+    for project in &cfg.projects {
+        for (key, rel) in cfg.effective_prompts(project) {
+            let (mark, detail) = match resolve_preamble_within(&project.repo_path, &rel) {
+                PreambleResolution::Content(_) => ("✅", rel.to_string()),
+                PreambleResolution::Missing => {
+                    ok = false;
+                    ("❌", format!("{rel} not found in clone"))
+                }
+                PreambleResolution::Escapes => {
+                    ok = false;
+                    ("❌", format!("{rel} escapes the clone (symlink)"))
+                }
+            };
+            println!("  {mark} {}/{key} — {detail}", project.id);
         }
     }
     ok
@@ -436,6 +489,25 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+    ok &= doctor_launch(cfg);
+    ok
+}
+
+/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
+/// resolved (no legacy/off state, unlike routing). Explicit launch config
+/// errors (an unknown role key) are startup errors, surfaced here like
+/// routing's.
+fn doctor_launch(cfg: &Config) -> bool {
+    use meguri::{launch, routing};
+    let mut ok = true;
+    if let Err(e) = launch::validate(cfg) {
+        println!("  ❌ launch config: {e:#}");
+        ok = false;
+    }
+    println!("launch mode:");
+    for role in routing::KNOWN_ROLES {
+        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    }
     ok
 }
 
@@ -556,6 +628,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
         }
