@@ -479,6 +479,56 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `meguri stats collab`: compare the collab planes (off vs advisor) of
+/// advisor-eligible runs while holding routing (profile, arm) constant, so the
+/// effect of the collab layer shows in durable orchestration-plane signals
+/// (issue #121). Same sqlite direct-read as `stats routing` (works with watch
+/// stopped). Rows are already sorted by (role, profile, arm), so an `off` and
+/// an `advisor` row for the same routing sit next to each other.
+pub fn cmd_stats_collab(project: Option<&str>) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let window = cfg.drift.window;
+
+    let rows = store.collab_stats(project, window)?;
+    if rows.is_empty() {
+        match project {
+            Some(p) => println!("no collab stats yet for project {p}"),
+            None => println!("no collab stats yet"),
+        }
+        return Ok(());
+    }
+    println!("collab stats — last {window} scored run(s) per (role, profile, arm, collab)\n");
+    println!(
+        "{:<8} {:<12} {:<16} {:<10} {:<8} {:>5} {:>8} {:>9} {:>9}",
+        "PROJECT", "ROLE", "PROFILE", "ARM", "COLLAB", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
+    );
+    for r in &rows {
+        let profile = if r.agent_profile.is_empty() {
+            "(unrouted)"
+        } else {
+            &r.agent_profile
+        };
+        let dur = r
+            .avg_duration_secs
+            .map(|s| format!("{s:.0}s"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<8} {:<12} {:<16} {:<10} {:<8} {:>5} {:>7.0}% {:>9.1} {:>9}",
+            r.project_id,
+            r.loop_kind,
+            profile,
+            r.routing_arm,
+            r.collab_mode,
+            r.runs,
+            r.success_rate,
+            r.avg_turns,
+            dur,
+        );
+    }
+    Ok(())
+}
+
 /// `meguri add`: queue a local task. Phase 1 only serves local-mode projects
 /// (silent mode's `meguri queue --issue` is Phase 2); a task added to a github
 /// project would never be discovered, so refuse it loudly instead.

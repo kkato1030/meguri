@@ -199,6 +199,13 @@ pub enum StatsCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Compare collab planes (off vs advisor) per (role, profile, arm) — the
+    /// effect of the collab layer on durable orchestration-plane signals (#121)
+    Collab {
+        /// Restrict to one project id (default: all projects, project column)
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

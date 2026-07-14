@@ -83,6 +83,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0014_routing_arm",
         include_str!("migrations/0014_routing_arm.sql"),
     ),
+    (
+        "0015_collab_mode",
+        include_str!("migrations/0015_collab_mode.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

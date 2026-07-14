@@ -483,6 +483,15 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     };
 
     if step == STEP_EXECUTE {
+        // Collab measurement (issue #121): stamp the intended collab plane so
+        // `meguri stats collab` can compare advisor-on vs advisor-off. Only the
+        // 'advisor' case is written; other runs stay NULL (read as 'off'), which
+        // keeps the inert regime when `[collab]` is off. Independent of the
+        // best-effort spawn below — we record the intended plane, not spawn luck.
+        if crate::collab::run_gets_advisor(&deps.config, &run) {
+            deps.store
+                .update_run_collab_mode(&run.id, crate::collab::COLLAB_MODE_ADVISOR)?;
+        }
         // Collab advisor (issue #111): spawn the plan-author advisor before the
         // worker's turns so its consult block can join the first prompt.
         // Best-effort — a failure leaves the worker untouched. Re-run on resume
