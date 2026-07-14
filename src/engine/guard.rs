@@ -853,6 +853,7 @@ mod tests {
                 review: None,
                 worktree_setup: Default::default(),
                 schedules: Vec::new(),
+                prompts: Default::default(),
             };
             let deps = Deps::with_label_source(
                 crate::store::Store::open_in_memory().unwrap(),

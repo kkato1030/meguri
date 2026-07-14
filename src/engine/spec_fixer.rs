@@ -12,7 +12,7 @@
 //! `spec-reviewing`, re-guard on the next push", but never assigned the push.
 //! The impl side has a symmetric driver (a red rollup → the ci-fixer; human /
 //! external-bot threads → the fixer); the plan side had none, so every spec PR
-//! parked on its first findings (ADR 0012). `spec_fixer` is that missing
+//! parked on its first findings (ADR 0013). `spec_fixer` is that missing
 //! driver.
 //!
 //! Convergence dedups on the head sha, more cleanly than the ci-fixer: after a
@@ -131,7 +131,7 @@ pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> 
 /// guard is still red — park the PR on `meguri:needs-human`. Best-effort like
 /// the ci-fixer's; the label is what stops rediscovery. This does NOT page a
 /// human via the `turn.awaiting_human` notifier (no turn is running at
-/// discovery time); notifying the park is #153's job (ADR 0012).
+/// discovery time); notifying the park is #153's job (ADR 0013).
 async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
     // Runs are keyed by the PR's canonical *issue* (issue #92), which the spec
     // PR's own number usually differs from — so the re-run hint must name the
@@ -438,6 +438,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            prompts: Default::default(),
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),

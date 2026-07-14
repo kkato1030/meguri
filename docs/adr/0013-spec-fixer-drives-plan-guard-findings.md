@@ -1,4 +1,4 @@
-# ADR 0012: guard(Plan) の findings は `spec_fixer` が planner author lane で駆動する
+# ADR 0013: guard(Plan) の findings は `spec_fixer` が planner author lane で駆動する
 
 - Status: proposed
 - Date: 2026-07-14
