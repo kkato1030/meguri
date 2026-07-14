@@ -38,8 +38,10 @@ guard(Plan) の findings を拾う `spec_fixer` を追加する。**
   clean なら `spec-ready` へ、findings なら `spec-reviewing` のまま次ラウンドへ。hidden
   marker も追加の状態も要らない — dedup キーは head sha そのもの。
 - **ラウンド上限 ≤3**: 同一 issue の spec_fixer 成功回数(`succeeded_run_count`)で数える。
-  `ci_fixer` の `MAX_CI_FIX_RUNS` と同じ仕組み・同じ値。超過は `meguri:needs-human`
-  (#153 / ADR 0009 の awaiting_human と合流)。
+  `ci_fixer` の `MAX_CI_FIX_RUNS` と同じ仕組み・同じ値。超過時は `ci_fixer` と同型で
+  PR に `meguri:needs-human` ラベル + コメント + store event を残して **park するだけ**。
+  能動的な人間通知(`turn.awaiting_human` の notifier)は出さない — これは discover 時点で
+  turn が走っておらず `StoreControl::event` の経路に乗らないため。park の通知は #153 の担当。
 
 ### なぜこの形か(検討した代替)
 
@@ -75,7 +77,8 @@ needs-human に落ちて止まる。
 - ループが 1 つ増える。discover は候補 spec PR ごとに `commit_status` を 1 回叩く
   (`ci_fixer` の rollup poll と同じ粒度)。PR 一覧は per-tick キャッシュを共有する。
 - #153 とは補完関係: 本 ADR は「まず自動で直す」側、#153 は「上限超過や clean-park を
-  人間に通知する」側。両者の needs-human 経路は awaiting_human に合流する。
+  人間に通知する」側。本 ADR は `meguri:needs-human` に park するところまでを担い、その park を
+  awaiting_human で能動通知するのは #153 に委ねる（本 issue では通知しない）。
 
 ## Out of scope
 
