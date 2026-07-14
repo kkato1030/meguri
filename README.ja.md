@@ -248,12 +248,15 @@ watch のポーリングに相乗りする sweep が、**すべて**満たした
 ```toml
 [pr.auto_merge]
 enabled = false                  # マスタースイッチ
+mode = "native"                  # native(GitHub auto-merge を arm)| orchestrator(meguri 自身がマージ)
 strategy = "squash"              # squash | merge | rebase(リポジトリで不許可なら fallback せず拒否)
 require_branch_protection = true # required checks 付き protection がなければ arm しない
 opt_in = "label"                 # label(meguri:automerge が必要) | all(全 meguri PR が対象)
 ```
 
 `enabled = true` なのにリポジトリが auto-merge を honor できない（auto-merge 不許可・strategy 不許可・protection なし）場合、`meguri watch` 起動時と `meguri doctor` で **fail-fast** します（マージ時に静かに劣化させない）。逃げ道は同じ `require_branch_protection = false` で、注意点が二つ: protection 検出は **classic branch protection API のみ**（rulesets は検出できない）で、その参照には **admin 権限のトークン**が必要です（admin でないトークンは HTTP 403 になり、meguri はそれを「protection なし」に倒さずエラーとして返します）。また meguri 自身のレビューをマージ前提にしたい場合は **impl guard**（`review.guard.impl = true`）を有効化してください: auto-merge は `meguri/guard-review` が success の PR だけ arm します（ADR 0008）。impl guard が OFF ならこの gate は無いので、オプトイン PR は meguri の外部レビュー前でも required checks さえ通れば merge され得ます — 求める品質バーは branch protection（と必須の内部 self-review）で担保してください。
+
+**`mode` — native と orchestrator。** 既定の `native` は上記のとおり（meguri は arm するだけ、判断は GitHub）。しかし **private + Free プランのリポジトリでは "Allow auto-merge" 自体が有効化できず**（API PATCH が黙って無視される）branch protection も無いため、`native` は必ず fail-fast します — meguri 自身が `docs/adr/0004-automerge-gate-renovate-side-on-free-private.md` で直面したのと同じ制約です。`mode = "orchestrator"` はまさにその環境向けのフォールバックで、適格判定（ブランチ / リンク / ラベル / スレッド）は native と同一のまま、arm する代わりに **GitHub が `MERGEABLE` を返した時点で meguri 自身が直接マージ**します（`gh pr merge --squash` 相当、レビュー済み head に固定）。`CONFLICTING` は conflict-resolver に委ね、`UNKNOWN` は次の sweep に持ち越します。サーバ側ゲートが無いため、orchestrator モードは **meguri 自身の PR 前検証（`check_command` + self-review）を唯一のゲートとして明示的に受容**します（`docs/adr/0009-auto-merge-orchestrator-side-merge-on-free-private.md`）。`meguri doctor` もその旨を注意表示します。orchestrator モードは `require_branch_protection = false` が必須です（矛盾する組み合わせは config 検証で弾かれます）。"Allow auto-merge" を有効化**できる**環境では `native` のままにしてください — サーバ側ゲートは常にプロセス内ゲートより強いためです。
 
 ## 設定
 

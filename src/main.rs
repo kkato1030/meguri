@@ -215,6 +215,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// ADR 0003). Returns false if any enabled project fails; projects that did
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
+    use meguri::config::AutoMergeMode;
     use meguri::engine::auto_merger::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
@@ -237,15 +238,29 @@ async fn check_auto_merge(cfg: &Config) -> bool {
             .await
         {
             Ok(policy) => match validate_policy(am, &policy) {
-                Ok(()) => println!(
-                    "✅ {label}: repo settings OK (strategy={}, protection {})",
-                    am.strategy.as_str(),
-                    if policy.protected_with_required_checks {
-                        "present"
-                    } else {
-                        "not required"
-                    },
-                ),
+                Ok(()) => match am.mode {
+                    AutoMergeMode::Native => println!(
+                        "✅ {label}: repo settings OK (mode=native, strategy={}, protection {})",
+                        am.strategy.as_str(),
+                        if policy.protected_with_required_checks {
+                            "present"
+                        } else {
+                            "not required"
+                        },
+                    ),
+                    AutoMergeMode::Orchestrator => {
+                        // No server-side gate exists in this mode — remind the
+                        // operator that meguri's own verification is the gate.
+                        println!(
+                            "✅ {label}: repo settings OK (mode=orchestrator, strategy={})",
+                            am.strategy.as_str(),
+                        );
+                        println!(
+                            "   ⚠️  orchestrator mode: no server-side merge gate — \
+                             meguri's own check_command + self-review is the only gate"
+                        );
+                    }
+                },
                 Err(problems) => {
                     println!("❌ {label}: {}", problems.join("; "));
                     ok = false;

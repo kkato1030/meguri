@@ -13,8 +13,10 @@ use serde_json::json;
 
 use super::Deps;
 use super::guard::GUARD_STATUS;
-use crate::config::{AutoMergeConfig, AutoMergeOptIn};
-use crate::forge::{self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, PullRequest};
+use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn};
+use crate::forge::{
+    self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, MergeableState, PullRequest,
+};
 
 /// Head-branch prefix identifying meguri's own PRs — auto-merge only ever
 /// touches branches meguri opened (same guard as the fixer / conflict
@@ -66,19 +68,19 @@ pub fn linked_issue(body: &str) -> Option<i64> {
         .ok()
 }
 
-/// The fail-fast / arm gate (ADR 0003): every reason the repository's merge
-/// settings forbid arming with `cfg`. Empty result = armable. Shared by the
-/// sweep's per-PR gate (condition 7), `meguri watch` startup, and
+/// The fail-fast / arm gate (ADR 0003 / 0009): every reason the repository's
+/// merge settings forbid finalizing PRs with `cfg`. Empty result = OK. Shared
+/// by the sweep's per-PR gate (condition 7), `meguri watch` startup, and
 /// `meguri doctor`.
+///
+/// The checks are mode-aware. `native` requires all three (auto-merge allowed,
+/// strategy allowed, and — when required — branch protection). `orchestrator`
+/// merges the PR itself with no server-side gate, so it only needs the
+/// strategy to be allowed (`gh pr merge --squash` still fails if the repo
+/// forbids squash); "Allow auto-merge" and branch protection are irrelevant to
+/// it (ADR 0009).
 pub fn validate_policy(cfg: &AutoMergeConfig, policy: &MergePolicy) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
-    if !policy.auto_merge_allowed {
-        problems.push(
-            "repository does not allow auto-merge (enable \"Allow auto-merge\" in \
-             the repo's settings)"
-                .to_string(),
-        );
-    }
     if !policy.allows(cfg.strategy) {
         problems.push(format!(
             "merge strategy `{}` is not allowed by the repository (ADR 0003 forbids \
@@ -86,13 +88,23 @@ pub fn validate_policy(cfg: &AutoMergeConfig, policy: &MergePolicy) -> Result<()
             cfg.strategy.as_str()
         ));
     }
-    if cfg.require_branch_protection && !policy.protected_with_required_checks {
-        problems.push(
-            "base branch has no classic branch protection with required status checks \
-             (set `require_branch_protection = false` to arm without it, e.g. on \
-             rulesets or without an admin token)"
-                .to_string(),
-        );
+    if cfg.mode == AutoMergeMode::Native {
+        if !policy.auto_merge_allowed {
+            problems.push(
+                "repository does not allow auto-merge (enable \"Allow auto-merge\" in \
+                 the repo's settings, or use `mode = \"orchestrator\"` on private+Free \
+                 repos where it cannot be enabled)"
+                    .to_string(),
+            );
+        }
+        if cfg.require_branch_protection && !policy.protected_with_required_checks {
+            problems.push(
+                "base branch has no classic branch protection with required status checks \
+                 (set `require_branch_protection = false` to arm without it, e.g. on \
+                 rulesets or without an admin token)"
+                    .to_string(),
+            );
+        }
     }
     if problems.is_empty() {
         Ok(())
@@ -157,26 +169,31 @@ async fn process_pr(
     if !opted_in(deps, am, pr, issue_number).await? {
         return Ok(());
     }
-    // 5: idempotency / human-override marker for the current head. Placed
-    // before the GraphQL thread fetch so steady-state armed PRs cost one
-    // comments read, not a review-threads query, each poll.
+    // 5: idempotency / human-override marker for the current head (native
+    // only). Placed before the GraphQL thread fetch so steady-state armed PRs
+    // cost one comments read, not a review-threads query, each poll. In
+    // orchestrator mode nothing writes this marker (the merge closes the PR, so
+    // idempotency is the forge's state), so the check is a harmless no-op.
     let comments = deps.forge().pr_comments(pr.number).await?;
     if head_already_armed(&comments, &pr.head_sha) {
         return Ok(());
     }
     // 6: zero unresolved review threads. Stricter than `thread_awaits_fixer`:
     // a fixer reply parks a thread but does not mean the reviewer accepted, so
-    // we require actual resolution before arming.
+    // we require actual resolution before arming/merging. In orchestrator mode
+    // this is part of the gate too — an unresolved thread means self-review has
+    // not accepted (ADR 0009).
     let threads = deps.forge().list_review_threads(pr.number).await?;
     if threads.iter().any(|t| !t.resolved) {
         return Ok(());
     }
     // 6b: the guard gate (ADR 0008 §5). When the impl guard is enabled, the
-    // auto-merger only arms a head whose `meguri/guard-review` status is
+    // auto-merger only proceeds on a head whose `meguri/guard-review` status is
     // success — a failure is escalated to a human, and an absent/pending
     // status simply waits (no-op, retried next sweep). When the impl guard is
     // disabled there is no status to require, so this condition is skipped
     // (never demand a status nothing produces — the ADR 0007 deadlock trap).
+    // Applies to both native (arm) and orchestrator (direct merge) modes.
     match guard_gate(deps, pr).await? {
         GuardGate::Proceed => {}
         GuardGate::Wait => return Ok(()),
@@ -185,9 +202,10 @@ async fn process_pr(
             return Ok(());
         }
     }
-    // 7: repository merge settings (fetched once per sweep). A mismatch here
-    // means the config passed startup fail-fast but the repo changed since —
-    // warn and skip rather than error.
+    // 7: repository merge settings (fetched once per sweep, reused across PRs).
+    // A mismatch here means the config passed startup fail-fast but the repo
+    // changed since — warn and skip rather than error. orchestrator mode also
+    // fetches it, but only to confirm the configured strategy is allowed.
     if policy.is_none() {
         *policy = Some(
             deps.forge()
@@ -205,7 +223,10 @@ async fn process_pr(
         return Ok(());
     }
 
-    arm(deps, am, pr).await
+    match am.mode {
+        AutoMergeMode::Native => arm(deps, am, pr).await,
+        AutoMergeMode::Orchestrator => merge_directly(deps, am, pr).await,
+    }
 }
 
 /// Whether this PR is opted into auto-merge: `opt_in = "all"`, the PR carries
@@ -334,6 +355,55 @@ async fn arm(deps: &Deps, am: &AutoMergeConfig, pr: &PullRequest) -> Result<()> 
     Ok(())
 }
 
+/// orchestrator mode (ADR 0009): meguri merges the eligible PR itself instead
+/// of arming. GitHub-native auto-merge cannot be enabled on a private+Free
+/// repo, so meguri's own pre-PR verification is the gate — here it only
+/// confirms GitHub sees no conflicts before merging.
+///
+/// `MERGEABLE` → ready (if draft) and `merge_pr` (pinned to the confirmed head
+/// via `--match-head-commit`; a moved head is rejected, TOCTOU-safe). Anything
+/// else is a silent skip retried next sweep: `CONFLICTING` is the
+/// conflict-resolver's (ADR 0007), `UNKNOWN` is GitHub still computing.
+async fn merge_directly(deps: &Deps, am: &AutoMergeConfig, pr: &PullRequest) -> Result<()> {
+    match deps.forge().pr_mergeable(pr.number).await? {
+        MergeableState::Mergeable => {}
+        MergeableState::Conflicting | MergeableState::Unknown => return Ok(()),
+    }
+
+    if pr.is_draft {
+        deps.forge().mark_pr_ready(pr.number).await?;
+        deps.store
+            .emit(None, "pr.readied", json!({ "pr": pr.number }))?;
+    }
+
+    deps.forge()
+        .merge_pr(pr.number, am.strategy, &pr.head_sha)
+        .await?;
+
+    // The audit comment carries no arm marker: orchestrator never arms, and the
+    // merge closes the PR (dropping it from `list_open_prs`), so idempotency is
+    // the forge's state, not a marker. Keeping the marker out also preserves
+    // merge-watch's invariant that only `ARMED_MARKER_PREFIX` PRs are watched.
+    deps.forge()
+        .comment_pr(
+            pr.number,
+            &orchestrator_merged_comment(am.strategy, &pr.head_sha),
+        )
+        .await?;
+    deps.store.emit(
+        None,
+        "pr.automerge_merged",
+        json!({ "pr": pr.number, "head": pr.head_sha, "strategy": am.strategy.as_str() }),
+    )?;
+    tracing::info!(
+        "PR #{}: pr.automerge_merged (orchestrator, {} at {})",
+        pr.number,
+        am.strategy.as_str(),
+        short_sha(&pr.head_sha)
+    );
+    Ok(())
+}
+
 /// The comment posted when auto-merge was armed (marker + human line).
 fn armed_comment(strategy: MergeStrategy, head_sha: &str) -> String {
     format!(
@@ -353,6 +423,19 @@ fn merged_comment(strategy: MergeStrategy, head_sha: &str) -> String {
         "{marker}\n🔁 **meguri** — GitHub が既にマージ可能と判定していたため \
          `{short}` で auto-merge ({strat}) を確定しました。",
         marker = armed_marker(head_sha),
+        strat = strategy.as_str(),
+        short = short_sha(head_sha),
+    )
+}
+
+/// The comment posted when orchestrator mode merged the PR directly. Unlike
+/// [`merged_comment`] it carries **no** arm marker — orchestrator never arms
+/// (ADR 0009), and leaving the marker out keeps merge-watch from ever treating
+/// an orchestrator-merged PR as armed.
+fn orchestrator_merged_comment(strategy: MergeStrategy, head_sha: &str) -> String {
+    format!(
+        "🔁 **meguri** — ネイティブ auto-merge が使えないため(orchestrator モード) \
+         `{short}` を meguri が直接 {strat} マージしました。",
         strat = strategy.as_str(),
         short = short_sha(head_sha),
     )
@@ -422,6 +505,38 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_orchestrator_ignores_auto_merge_and_protection() {
+        // orchestrator merges directly, so "Allow auto-merge" and branch
+        // protection are irrelevant — a repo that allows neither still passes.
+        let cfg = AutoMergeConfig {
+            mode: AutoMergeMode::Orchestrator,
+            require_branch_protection: false,
+            ..AutoMergeConfig::default()
+        };
+        let p = policy(false, vec![MergeStrategy::Squash], false);
+        assert!(
+            validate_policy(&cfg, &p).is_ok(),
+            "{:?}",
+            validate_policy(&cfg, &p)
+        );
+    }
+
+    #[test]
+    fn validate_policy_orchestrator_still_requires_the_strategy() {
+        // `gh pr merge --squash` fails if the repo forbids squash, so the
+        // strategy check stays even in orchestrator mode.
+        let cfg = AutoMergeConfig {
+            mode: AutoMergeMode::Orchestrator,
+            require_branch_protection: false,
+            ..AutoMergeConfig::default() // squash
+        };
+        let p = policy(false, vec![MergeStrategy::Merge], false);
+        let problems = validate_policy(&cfg, &p).unwrap_err();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("squash"));
+    }
+
+    #[test]
     fn comments_carry_the_head_marker() {
         let armed = armed_comment(MergeStrategy::Squash, "0123456789abcdef");
         assert!(armed.contains(&armed_marker("0123456789abcdef")));
@@ -432,6 +547,17 @@ mod tests {
         assert!(merged.contains(&armed_marker("abc")));
         assert!(merged.contains("rebase"));
         assert!(merged.contains("確定"));
+    }
+
+    #[test]
+    fn orchestrator_comment_carries_no_arm_marker() {
+        // Acceptance criterion 2: the orchestrator audit comment must not carry
+        // the arm marker, or merge-watch would treat the PR as armed.
+        let c = orchestrator_merged_comment(MergeStrategy::Squash, "0123456789abcdef");
+        assert!(!c.contains(ARMED_MARKER_PREFIX), "{c}");
+        assert!(c.contains("`0123456789ab`"), "{c}");
+        assert!(c.contains("squash"));
+        assert!(c.contains("orchestrator"));
     }
 
     #[test]
