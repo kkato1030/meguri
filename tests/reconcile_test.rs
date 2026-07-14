@@ -35,6 +35,7 @@ fn deps_with(forge: Arc<FakeForge>, store: Store, reconcile: ReconcileConfig) ->
         clean: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
