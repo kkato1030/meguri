@@ -1085,3 +1085,172 @@ async fn watch_applies_reloaded_config_to_new_runs() {
         "runs spawned after the reload see the new config"
     );
 }
+
+/// A loop with no discoverable targets, so the only way its `drive` fires is
+/// via the scheduler's per-tick interrupted/queued redispatch.
+struct NoDiscoveryLoop {
+    kind: &'static str,
+    dispatched: Arc<Mutex<Vec<String>>>,
+    /// How long `drive` sits before flipping the run's status away from
+    /// `interrupted`, simulating the async gap between `dispatch` spawning
+    /// the driver and the driver actually recording `running`.
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl Loop for NoDiscoveryLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, _deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        Ok(vec![])
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        self.dispatched.lock().unwrap().push(run_id.to_string());
+        tokio::time::sleep(self.delay).await;
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "no-discovery://pr".into(),
+        })
+    }
+}
+
+/// #183 regression: a run that goes `interrupted` (pane died mid-execute)
+/// while `watch` is already several ticks into its loop must resume from its
+/// checkpoint on a later tick, not only at the next orchestrator restart.
+/// Discovery is neutered (`NoDiscoveryLoop` never returns a target), so the
+/// only path that can drive this run is the per-tick redispatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_redispatches_a_run_interrupted_after_watch_is_already_running() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let store = deps.store.clone();
+    let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(NoDiscoveryLoop {
+            kind: "no-discovery",
+            dispatched: dispatched.clone(),
+            delay: Duration::from_millis(10),
+        })],
+        poll_interval: Duration::from_millis(80),
+        max_concurrent: 2,
+        reload: None,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    // Let several ticks pass with no runs at all, so `watch` is well past
+    // its startup-only recovery pass before the "pane death" happens.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        dispatched.lock().unwrap().is_empty(),
+        "nothing should dispatch before the run exists"
+    );
+
+    let run = store
+        .create_run_for_loop("proj", "no-discovery", 183, "Mid-flight pane death")
+        .unwrap();
+    store
+        .update_run_status(
+            &run.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(r) = store.get_run(&run.id).unwrap()
+            && r.status == RunStatus::Succeeded
+        {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "run never redispatched after mid-flight interruption: {:?}",
+                store.get_run(&run.id).unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    assert_eq!(dispatched.lock().unwrap().clone(), vec![run.id.clone()]);
+}
+
+/// #183 acceptance criteria 2+3: redispatch respects the `max_concurrent`
+/// slot budget, and `active_run_ids` keeps a run whose driver is still in
+/// flight (even before its DB status catches up to `running`) from being
+/// dispatched a second time on a later tick.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_redispatch_respects_slots_and_avoids_double_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let store = deps.store.clone();
+    let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let run_a = store
+        .create_run_for_loop("proj", "no-discovery", 201, "Pane death A")
+        .unwrap();
+    store
+        .update_run_status(
+            &run_a.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+    let run_b = store
+        .create_run_for_loop("proj", "no-discovery", 202, "Pane death B")
+        .unwrap();
+    store
+        .update_run_status(
+            &run_b.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(NoDiscoveryLoop {
+            kind: "no-discovery",
+            dispatched: dispatched.clone(),
+            // Long enough that several ticks land while each run is mid-flight
+            // and its store status still reads `interrupted`.
+            delay: Duration::from_millis(400),
+        })],
+        poll_interval: Duration::from_millis(80),
+        max_concurrent: 1,
+        reload: None,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a = store.get_run(&run_a.id).unwrap().unwrap().status;
+        let b = store.get_run(&run_b.id).unwrap().unwrap().status;
+        if a == RunStatus::Succeeded && b == RunStatus::Succeeded {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("both interrupted runs never succeeded: a={a:?} b={b:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    // Exactly one dispatch per run — no duplicates from the slot-1 budget
+    // colliding with the still-interrupted-looking in-flight run.
+    let log = dispatched.lock().unwrap().clone();
+    assert_eq!(
+        log.len(),
+        2,
+        "expected exactly one dispatch per run: {log:?}"
+    );
+    assert!(log.contains(&run_a.id));
+    assert!(log.contains(&run_b.id));
+}
