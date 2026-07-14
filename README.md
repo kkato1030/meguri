@@ -85,6 +85,30 @@ repo_slug = "owner/repo"
 
 Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
+### Let coding agents propose meguri
+
+meguri ships a Claude Code **skill** so a coding agent can notice when a repo would benefit from
+meguri and offer to set it up — honestly, disclosing the unattended-shell trade-off up front (see
+[ADR 0009](docs/adr/0009-agent-skill-distribution-symptom-trigger-honest-pitch.md) and
+[ADR 0012](docs/adr/0012-acquisition-skill-as-apm-subpath-github-ref.md)). Two channels, by whether
+meguri already runs in the repo:
+
+- **Not using meguri yet** — install the skill at the **user level** with
+  [apm](https://github.com/microsoft/apm), so an agent can suggest meguri in any repo, even one that
+  has never seen it:
+
+  ```bash
+  # replace vX.Y.Z with the latest release tag: https://github.com/kkato1030/meguri/releases/latest
+  apm install -g --target claude kkato1030/meguri/skills/meguri#vX.Y.Z
+  ```
+
+  `--target claude` is not optional: without it apm deploys only to `~/.agents/skills/`, which Claude
+  Code doesn't read, so the skill never fires. Pin the ref to a release tag (`#vX.Y.Z`) — an unpinned
+  ref tracks `main` and drifts.
+
+- **Already running meguri here** — the retention counterpart, `meguri agent-skills install`, folds
+  meguri's repo-level rule fragment into this repo's `AGENTS.md` / `CLAUDE.md` (coming with #150).
+
 ## Use
 
 ```bash
@@ -447,6 +471,24 @@ pr-reviewer = "codex"     # (the old `reviewer` / `spec-reviewer` / `guard` keys
 - **manual** turns the table off: roles you don't list run `default`.
 - **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected). Config keys from before the role redesign (`reviewer`, `spec-reviewer`, `guard`, `impl-reviewer`, `self-review`, `spec-worker`, `conflict-resolver`, `ci-fixer`) still resolve as aliases of the new names.
 - The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
+
+### Role preambles (`[prompts]`, optional)
+
+Standing project discipline — "read this guardrail before you start", "follow this editorial persona", "don't commit anything that misses this quality bar" — is the same for every issue, not per-issue. `[prompts]` injects it into the turn prompt, keyed by routing role, so the worker gets quality bars, the planner gets planning guidelines, the reviewer gets audit lenses. The value is a **repo-relative** path; the file's contents are embedded at the top of the prompt (a preface — the completion contract stays last and wins).
+
+```toml
+[prompts]                          # top-level default (applies to every project)
+all = "ops/agents/guardrails.md"   # shared by every role
+worker = "ops/agents/worker.md"    # keys are the 6 routing roles (worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
+
+[projects.prompts]                 # per-project override, per key
+planner = "ops/agents/planner.md"
+```
+
+- **Embedded, not referenced** — the discipline reaches the agent whether the profile is Claude or Codex, and whether or not the agent bothers to open the file (that CLI-independence is the point; [ADR 0012](docs/adr/0012-role-preamble-injected-into-turn-prompt.md)).
+- **`all` then the role**, both injected; per-project entries override the top-level one **per key** (the same role vocabulary and aliases as `[routing.roles]`; an unknown role key aborts config load).
+- **Missing is non-fatal** — a path that doesn't exist (or a symlink that escapes the worktree) is skipped with a warning and a `prompt.preamble_missing` event; the turn still runs. `meguri doctor` reports configured paths that don't resolve inside the clone.
+- **When to reach for it vs. `CLAUDE.md`**: if the same always-on context suffices for every role and only Claude runs, [agent instructions (apm)](#agent-instructions-apm) / `CLAUDE.md` already covers it — use `[prompts]` when you need per-role text or CLI-independent delivery, and keep the files short (bulky context belongs in `CLAUDE.md`).
 
 ## Development
 

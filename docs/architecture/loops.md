@@ -116,10 +116,10 @@ conflict_resolver → ci_fixer → fixer → spec_worker → spec_reviewer → w
 
 README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue-lane-pane-session-lifetime](../adr/0004-issue-lane-pane-session-lifetime.md)の lane モデル)で再構成したもの。事実の一次情報は README とコード(`src/engine/*.rs` の各 loop 冒頭コメント)にあり、ここは表として横断しやすくしたものに過ぎない。
 
-| loop | lane(role) | trigger | 鍵 | worktree | 正常終了 | pane 後始末 |
+| loop | lane | trigger | 鍵 | worktree | 正常終了 | pane 後始末 |
 |---|---|---|---|---|---|---|
 | planner | author | `meguri:plan` issue | issue | 新 branch | spec PR 作成、issue: `plan`→`speccing` | 維持(author pane) |
-| spec_reviewer | review(独立) | `spec-reviewing` PR、head 未レビュー | issue + `review` lane | read-only detached、`review-<issue>` 固定 | clean → PR: `spec-ready` / findings → PR コメント、次の push 待ち | 維持(独立 pane) |
+| pr_reviewer | pr-review(独立) | Plan: `spec-reviewing` PR(既定 on)/ Impl: 実装 PR(opt-in)、head 未レビュー | issue + `pr-review` lane | read-only detached、`pr-reviewer-<issue>` 固定 | `meguri/pr-review` commit status + PR 本文 `<details>` 要約(Plan の clean は PR: `spec-ready`)、次の push 待ち | 維持(独立 pane) |
 | spec_worker | author(継続) | `spec-ready` PR | issue(branch から復元) | 既存 branch を継ぐ | 実装 commit → 同一 PR、issue: `speccing`→`implementing` | 維持、author pane を継続 |
 | worker | author | `meguri:ready` issue | issue | 新 branch | self-review(内部)→ PR `Closes #N`、issue: `ready`→`implementing` | 維持(author pane) |
 | fixer | author(継続) | PR の未解決スレッド(人間/外部bot) | issue(branch から復元) | PR head に attach | スレッドに返信、再レビュー待ち | 維持、author pane を継続 |
@@ -129,7 +129,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 
 補足:
 
-- **author lane** は同じ branch を編集する loop 全員(planner → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。**review lane** は spec_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
+- **author lane** は同じ branch を編集する loop 全員(planner → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。**pr-review lane** は pr_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
 - pane・worktree はいずれも issue が寿命の単位で、issue が close されると `reaper::sweep` が回収する(watch 実行中はポーリングのたびに、一発実行では `meguri prune`)。
 - 表に無い `auto_merger.sweep` / `merge_watch.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
 
@@ -194,17 +194,8 @@ fixer 家族(`review-fixer` / `conflict-fixer` 等)の内部 rename、および
 | [0005-issue-labels-two-axis-phase-and-ball](../adr/0005-issue-labels-two-axis-phase-and-ball.md) | issue ラベルは「フェーズ × ボールの所在」の2軸。無ラベル = 未トリアージが一義になる。 |
 | [0006-ai-implementation-review-is-an-internal-loop](../adr/0006-ai-implementation-review-is-an-internal-loop.md) | AI 実装レビューは内部ループ。GitHub は人間・外部レビューにだけ残す。 |
 | [0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md) | merge-watch は fixer 系ループに委譲し、どのループも拾わない stall だけを backstop する。 |
-| 0008-symmetric-plan-impl-review-loop(**in-flight**、#132 / PR #140、未マージ) | plan/impl ループの対称化: 内部 self-review は必須(多角視点)、GitHub guard レビューは任意。着地待ち — §6 参照。 |
+| [0008-symmetric-plan-impl-review-loop](../adr/0008-symmetric-plan-impl-review-loop.md) | plan/impl レビューループの対称化: 内部 self-review は必須(多角視点)、外部 GitHub レビュー(pr-reviewer)は任意。 |
 
-## 6. 注意: #132 / ADR 0008 は in-flight
+## 6. 注意: 本 doc の全面追随は #172 で行う
 
-**#132(spec/impl ループの対称化)で loop モデルが大きく動く。** issue #132 の spec は spec PR [#140](https://github.com/kkato1030/meguri/pull/140) として進行中で、着地予定のファイル名は `docs/adr/0008-symmetric-plan-impl-review-loop.md` — ただし本 doc 作成時点ではまだ `main` にマージされていない(`docs/adr/0008-agent-instructions-via-apm.md` が既に 0008 を使っているため、着地時の採番は別番号にずれる可能性がある。#132 のリンクは着地後に確認して直すこと)。
-
-着地すると想定される変化:
-
-- `spec_reviewer` が `guard(kind)` へ一般化される(`kind = Plan | Impl` パラメータ化)。spec_reviewer は guard の Plan 特化版に格下げされる。
-- 内部 self-review(多角視点)が spec 側にも必須化される(現行は impl 側のみ必須、spec 側は GitHub 上の spec_reviewer が必須ループ)。
-- `plan_delivery = separate | combined` の project config が増え、spec PR と impl PR が1本にまとまる `combined` モードが選べるようになる。
-- guard レビューの出力先が commit status + PR 本文 `<details>` になり、auto-merge の arm 条件に `guard-review success` が加わる。
-
-**本 doc は #132 着地前の現行モデルを正として書いている。** #132 の実装が着地したら、本 doc(特に §1 パイプライン図・§3 ライフサイクル表)を追随して更新する — #132 自体の文書フェーズ(spec に記載の Done の目安「新 ADR で本設計を記録」)でこの doc も一緒に更新するのが望ましい。
+#132(spec/impl ループの対称化)は [ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) として着地済み。#168 で内部命名を新 role 語彙に追随させた(§3 の表と「語彙」節は更新済み)が、本 doc 全体の書き直し(特に §1 パイプライン図)は issue #172 のスコープで行う。

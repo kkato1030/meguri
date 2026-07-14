@@ -85,6 +85,21 @@ repo_slug = "owner/repo"
 
 それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
 
+### コーディングエージェントに meguri を勧めさせる
+
+meguri は Claude Code の **skill** を同梱しています。これにより、コーディングエージェントが「このリポジトリは meguri が向いている」と気づき、無人シェル実行のトレードオフを最初に開示したうえで導入を提案できます（[ADR 0009](docs/adr/0009-agent-skill-distribution-symptom-trigger-honest-pitch.md) / [ADR 0012](docs/adr/0012-acquisition-skill-as-apm-subpath-github-ref.md)）。リポジトリで meguri が既に動いているかで、配布は 2 チャネルに分かれます:
+
+- **まだ meguri を使っていない** — [apm](https://github.com/microsoft/apm) で skill を**ユーザーレベル**に入れます。こうすると、meguri を一度も見たことのないリポジトリでもエージェントが提案できます:
+
+  ```bash
+  # vX.Y.Z は最新リリースタグに置き換える: https://github.com/kkato1030/meguri/releases/latest
+  apm install -g --target claude kkato1030/meguri/skills/meguri#vX.Y.Z
+  ```
+
+  `--target claude` は省略できません。省略すると apm は `~/.agents/skills/` にしか展開せず、Claude Code はそこを読まないため skill が発火しません。参照は必ずリリースタグ（`#vX.Y.Z`）にピンしてください — ピンしない参照は `main` に追従してドリフトします。
+
+- **すでに meguri が動いている** — 定着側の対になるコマンド `meguri agent-skills install` が、meguri のリポジトリレベルの rule 断片をこのリポジトリの `AGENTS.md` / `CLAUDE.md` に畳み込みます（#150 で提供予定）。
+
 ## 使い方
 
 ```bash
@@ -400,6 +415,24 @@ body_file = "ops/daily-tidy.md" # repo 相対の本文ファイル — または
 - 定義は hot reload(#73)対象です。スケジュールを足す/変えると次 tick から効き、`watch` の再起動は不要です。`meguri doctor` は cron 式・名前の一意性・本文の排他・`body_file` の実在を検証し、`meguri schedules` は各定義を最終発火・次回発火とともに一覧します。
 
 local mode には planner が無いため、`kind = "plan"` は github 専用です — local の `plan` スケジュールは config ロード時に拒否されます(タスクが消化されないため)。
+
+### ロール別 preamble(`[prompts]`、オプトイン)
+
+「作業前にこのガードレールを読む」「この編集ペルソナに従う」「この品質基準を満たさないものはコミットしない」といった、issue 個別ではなくプロジェクト全体に常時かかる規律を、ロール別に turn プロンプトへ埋め込みます。worker には品質基準、planner には企画ガイドライン、reviewer には監査観点、と出し分けられます。値は **repo 相対パス**で、その中身がプロンプト冒頭(前文 — 完了契約は末尾のままで優先されます)に埋め込まれます。
+
+```toml
+[prompts]                          # top-level 既定(全プロジェクトに適用)
+all = "ops/agents/guardrails.md"   # 全ロール共通
+worker = "ops/agents/worker.md"    # キーは routing の6ロール(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
+
+[projects.prompts]                 # per-project override(キー単位で上書き)
+planner = "ops/agents/planner.md"
+```
+
+- **参照ではなく埋め込み** — profile が Claude でも Codex でも、agent がファイルを開こうと開くまいと、規律が届きます(この CLI 非依存が存在理由の半分。[ADR 0012](docs/adr/0012-role-preamble-injected-into-turn-prompt.md))。
+- **`all` → ロール別**の順で両方注入。per-project エントリはキー単位で top-level を上書きします(語彙・別名は `[routing.roles]` と同一。未知のロールキーは config ロードで拒否)。
+- **欠落は致命ではない** — 存在しないパスや worktree 外へ抜ける symlink は warn + `prompt.preamble_missing` イベントで飛ばし、turn は続行します。`meguri doctor` は clone 内に解決しないパスを報告します。
+- **`CLAUDE.md` との使い分け**: 全ロール同一の常時コンテキストで足り、Claude だけで回すなら [エージェント向け指示(apm)](#エージェント向け指示apm) / `CLAUDE.md` で十分です。ロール別テキストや CLI 非依存の配達が要るときだけ `[prompts]` を使い、ファイルは短く保ってください(かさばる内容は `CLAUDE.md` の担当)。
 
 ## 開発
 
