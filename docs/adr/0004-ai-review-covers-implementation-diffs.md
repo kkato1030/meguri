@@ -2,7 +2,10 @@
 
 ## ステータス
 
-採用(issue #84、impl-reviewer v0)
+置換済み(issue #84、impl-reviewer v0)。**[ADR 0006](0006-ai-implementation-review-is-an-internal-loop.md)
+が置換する** — 「AI が自分の実装 diff もレビューする / 人間 merge が唯一のハードゲート /
+閉ループに構造的な栓」という骨子は 0006 に引き継がれ、変わったのは閉ループを回す場所
+(forge 上の外部ループ → run の worktree 内の内部ループ)だけ。以下は歴史的記録として残す。
 
 ## コンテキスト
 

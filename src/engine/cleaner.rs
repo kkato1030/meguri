@@ -30,7 +30,8 @@ use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
-use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
+use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for cleaner runs.
@@ -239,8 +240,11 @@ impl super::Loop for CleanerLoop {
     /// reviewer: the head marker is the dedup, succeeded sweeps must not
     /// block future ones.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // forge-driven loop; inert in local mode
+        }
         let issues = deps
-            .forge
+            .forge()
             .list_issues_with_label(forge::LABEL_CLEAN_REPORT)
             .await?;
         // More than one report issue (races, manual creation): the smallest
@@ -260,8 +264,9 @@ impl super::Loop for CleanerLoop {
             return Ok(Vec::new());
         }
         Ok(vec![Target {
-            issue_number: report.map(|i| i.number).unwrap_or(0),
+            key: TaskKey::Issue(report.map(|i| i.number).unwrap_or(0)),
             title: REPORT_TITLE.to_string(),
+            cadence_label: None,
         }])
     }
 
@@ -296,12 +301,19 @@ pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                 WorkerOutcome::Stopped => {
                     deps.store
                         .update_run_status(run_id, RunStatus::Cancelled, None)?;
-                    if let Some(pane_id) = &run.mux_pane_id {
-                        let _ = deps
-                            .mux
-                            .kill_pane(&crate::mux::PaneId(pane_id.clone()))
-                            .await;
-                    }
+                    // Go through the shared release path (session save +
+                    // mark_pane_reclaimed), like flow::finalize_cancelled —
+                    // not a raw kill_pane off run.mux_pane_id, which used to
+                    // leave the pane row dangling until the next dead-pane
+                    // sweep (issue #169; under the recommended `direct`
+                    // launch mode for cleaner this is a no-op, no live pane).
+                    super::reaper::release_pane(
+                        deps,
+                        run.issue_number,
+                        LANE_AUTHOR,
+                        "stopped by user",
+                    )
+                    .await;
                     deps.store.emit(Some(run_id), "run.cancelled", json!({}))?;
                 }
                 WorkerOutcome::Interrupted(reason) => {
@@ -391,7 +403,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 super::reaper::release_pane(
                     deps,
                     run.issue_number,
-                    ROLE_AUTHOR,
+                    LANE_AUTHOR,
                     "cleaner sweep gave up",
                 )
                 .await;
@@ -410,7 +422,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         super::reaper::release_pane(
             deps,
             run.issue_number,
-            ROLE_AUTHOR,
+            LANE_AUTHOR,
             "cleaner sweep finished",
         )
         .await;
@@ -459,7 +471,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut CleanCheckpoint) ->
         // host, a manual one), defer to it — the next discovery targets its
         // real number and the unique run index applies.
         let issues = deps
-            .forge
+            .forge()
             .list_issues_with_label(forge::LABEL_CLEAN_REPORT)
             .await?;
         if let Some(issue) = issues.into_iter().min_by_key(|i| i.number) {
@@ -470,7 +482,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut CleanCheckpoint) ->
         }
         None
     } else {
-        let issue = deps.forge.get_issue(run.issue_number).await?;
+        let issue = deps.forge().get_issue(run.issue_number).await?;
         if issue.has_label(forge::LABEL_HOLD) {
             return Ok(Prepared::Skip(format!(
                 "report issue #{} is on hold ({})",
@@ -516,6 +528,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) ->
         &wt,
         &deps.project.default_branch,
         &cp.head_sha,
+        &deps.project.worktree_setup.exclude,
     )
     .await?;
     deps.store
@@ -525,7 +538,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) ->
         "worktree.created",
         json!({ "head": cp.head_sha, "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    flow::run_worktree_setup(deps, run, &wt).await
 }
 
 fn execute_prompt(cp: &CleanCheckpoint, language: Option<&str>) -> String {
@@ -690,7 +703,7 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) {
              interval (`clean.interval_hours`)."
         );
         match deps
-            .forge
+            .forge()
             .create_issue(REPORT_TITLE, &body, &[forge::LABEL_CLEAN_REPORT])
             .await
         {
@@ -705,14 +718,14 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) {
         }
         return;
     }
-    let body = match deps.forge.get_issue(cp.report_issue).await {
+    let body = match deps.forge().get_issue(cp.report_issue).await {
         Ok(issue) => replace_marker(&issue.body, &marker),
         Err(e) => {
             tracing::warn!("cannot re-read report issue #{}: {e:#}", cp.report_issue);
             return;
         }
     };
-    if let Err(e) = deps.forge.update_issue_body(cp.report_issue, &body).await {
+    if let Err(e) = deps.forge().update_issue_body(cp.report_issue, &body).await {
         tracing::warn!("cannot update report issue #{}: {e:#}", cp.report_issue);
     }
 }
@@ -744,7 +757,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) -> Result<i6
 
     let issue = if cp.report_issue == 0 {
         let number = deps
-            .forge
+            .forge()
             .create_issue(REPORT_TITLE, &body, &[forge::LABEL_CLEAN_REPORT])
             .await?;
         deps.store.emit(
@@ -754,7 +767,9 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) -> Result<i6
         )?;
         number
     } else {
-        deps.forge.update_issue_body(cp.report_issue, &body).await?;
+        deps.forge()
+            .update_issue_body(cp.report_issue, &body)
+            .await?;
         cp.report_issue
     };
     deps.store.emit(
@@ -822,7 +837,7 @@ async fn phase_label_anomaly(deps: &Deps) -> Result<Vec<PhaseLabelAnomaly>> {
     // has a ball but zero phase labels (it appears under no phase query).
     let mut seen: std::collections::HashMap<i64, forge::Issue> = std::collections::HashMap::new();
     for label in PHASE_LABELS.iter().chain(BALL_LABELS.iter()) {
-        for issue in deps.forge.list_issues_with_label(label).await? {
+        for issue in deps.forge().list_issues_with_label(label).await? {
             seen.entry(issue.number).or_insert(issue);
         }
     }
@@ -855,7 +870,7 @@ async fn phase_label_anomaly(deps: &Deps) -> Result<Vec<PhaseLabelAnomaly>> {
 /// exempt (they are alive by definition).
 async fn stale_branches(deps: &Deps, head_sha: &str, stale_days: u64) -> Result<Vec<StaleBranch>> {
     let pr_heads: Vec<String> = deps
-        .forge
+        .forge()
         .list_open_prs()
         .await?
         .into_iter()
@@ -901,7 +916,7 @@ async fn orphan_working(deps: &Deps) -> Result<Vec<OrphanWorking>> {
         .collect();
     let mut orphans = Vec::new();
     for issue in deps
-        .forge
+        .forge()
         .list_issues_with_label(forge::LABEL_WORKING)
         .await?
     {
@@ -913,7 +928,11 @@ async fn orphan_working(deps: &Deps) -> Result<Vec<OrphanWorking>> {
             });
         }
     }
-    for pr in deps.forge.list_prs_with_label(forge::LABEL_WORKING).await? {
+    for pr in deps
+        .forge()
+        .list_prs_with_label(forge::LABEL_WORKING)
+        .await?
+    {
         if !active.contains(&pr.number) {
             orphans.push(OrphanWorking {
                 number: pr.number,

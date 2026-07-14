@@ -18,7 +18,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::run_git;
 use meguri::mux::PaneId;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_AUTHOR, Store};
+use meguri::store::{LANE_AUTHOR, Store};
 
 async fn init_origin_and_clone(root: &Path) -> (PathBuf, PathBuf) {
     let origin = root.join("origin.git");
@@ -70,11 +70,14 @@ async fn setup() -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    config.review.enabled = false; // resume/session behavior, not self-review, is under test
     config.agent.session_dir = Some(session_root.clone());
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
@@ -82,16 +85,21 @@ async fn setup() -> TestEnv {
         pr: None,
         clean: None,
         triage: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: mux.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        mux.clone(),
         forge,
         config,
         project,
-    };
+    );
     TestEnv {
         deps,
         mux,
@@ -106,18 +114,18 @@ async fn setup() -> TestEnv {
 fn seed_pane_session(env: &TestEnv, session: &str) {
     let store = &env.deps.store;
     store
-        .upsert_pane("proj", 7, ROLE_AUTHOR, "fake", "meguri", "%gone", "/wt/old")
+        .upsert_pane("proj", 7, LANE_AUTHOR, "fake", "meguri", "%gone", "/wt/old")
         .unwrap();
     store
-        .save_pane_session("proj", 7, ROLE_AUTHOR, Some(session))
+        .save_pane_session("proj", 7, LANE_AUTHOR, Some(session))
         .unwrap();
-    store.mark_pane_reclaimed("proj", 7, ROLE_AUTHOR).unwrap();
+    store.mark_pane_reclaimed("proj", 7, LANE_AUTHOR).unwrap();
 }
 
 fn pane_session(env: &TestEnv) -> Option<String> {
     env.deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .and_then(|p| p.agent_session_id)
 }
@@ -359,6 +367,7 @@ worker = "p-worker"
     let mut config: Config = toml::from_str(toml).unwrap();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
+    config.review.enabled = false; // resume behavior, not self-review, is under test
     config
 }
 

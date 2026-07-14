@@ -1,1 +1,12 @@
 /target
+
+# apm compiled artifacts (issue #137): apm.yml / apm.lock.yaml / .apm/ are the
+# source of truth and are committed; everything `apm install` / `apm compile`
+# generates from them is worktree-local so a one-line instructions edit
+# doesn't produce a regeneration diff on every parallel branch.
+CLAUDE.md
+AGENTS.md
+.claude/rules/
+.codex/
+apm_modules/
+.agents/

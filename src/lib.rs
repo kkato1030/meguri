@@ -1,16 +1,21 @@
 pub mod agent_session;
+pub mod agent_skills;
 pub mod app;
+pub mod cadence;
 pub mod cli;
 pub mod config;
+pub mod cron;
 pub mod daemon;
 pub mod engine;
 pub mod events;
 pub mod forge;
 pub mod gitops;
+pub mod launch;
 pub mod mux;
 pub mod notify;
 pub mod routing;
 pub mod store;
+pub mod tasks;
 pub mod turn;
 
 pub use config::Config;

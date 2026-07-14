@@ -16,32 +16,38 @@ fn fake_agent_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_agent.sh")
 }
 
-async fn cleanup_workspace(label: &str) {
-    // Find and close the test workspace, best-effort.
+/// The workspace id herdr assigned to `label`, if such a workspace exists.
+async fn workspace_id_for(label: &str) -> Option<String> {
     let out = tokio::process::Command::new("herdr")
         .args(["workspace", "list"])
         .output()
         .await
-        .ok();
-    let Some(out) = out else { return };
+        .ok()?;
     let raw = String::from_utf8_lossy(&out.stdout);
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
-        return;
-    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
     let workspaces = parsed
         .pointer("/result/workspaces")
         .and_then(|w| w.as_array())
         .cloned()
         .unwrap_or_default();
-    for ws in workspaces {
-        if ws.get("label").and_then(|l| l.as_str()) == Some(label)
-            && let Some(id) = ws.get("workspace_id").and_then(|i| i.as_str())
-        {
-            let _ = tokio::process::Command::new("herdr")
-                .args(["workspace", "close", id])
-                .output()
-                .await;
-        }
+    workspaces.into_iter().find_map(|ws| {
+        (ws.get("label").and_then(|l| l.as_str()) == Some(label))
+            .then(|| {
+                ws.get("workspace_id")
+                    .and_then(|i| i.as_str())
+                    .map(str::to_string)
+            })
+            .flatten()
+    })
+}
+
+async fn cleanup_workspace(label: &str) {
+    // Find and close the test workspace, best-effort.
+    if let Some(id) = workspace_id_for(label).await {
+        let _ = tokio::process::Command::new("herdr")
+            .args(["workspace", "close", &id])
+            .output()
+            .await;
     }
 }
 
@@ -106,6 +112,50 @@ async fn herdr_spawn_send_read_kill() {
     mux.kill_pane(&pane).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!mux.pane_alive(&pane).await.unwrap());
+
+    cleanup_workspace(&label).await;
+}
+
+/// Acceptance (issue #105): a project-scoped label (`<base>:<project>`, the
+/// real per-project workspace) gets its own workspace, and the spawned tab's
+/// pane belongs to it — the pane id `wN:pM` is prefixed with that workspace id.
+/// Also exercises the "existing pane" path: kill by id still works.
+#[tokio::test]
+async fn herdr_spawn_lands_in_project_workspace() {
+    if !herdr_enabled() {
+        eprintln!("skipping: set MEGURI_TEST_HERDR=1 with a live herdr server");
+        return;
+    }
+    let label = format!("meguri-test-{}:proj", std::process::id());
+    let mux = HerdrMux::new(&label);
+    let dir = tempfile::tempdir().unwrap();
+
+    let pane = mux
+        .spawn_pane(&PaneSpec {
+            title: "fake".into(),
+            cwd: dir.path().to_path_buf(),
+            command: vec![
+                "bash".into(),
+                fake_agent_path().to_string_lossy().to_string(),
+            ],
+            env: vec![],
+        })
+        .await
+        .expect("spawn pane");
+
+    let ws_id = workspace_id_for(&label)
+        .await
+        .expect("project-scoped workspace was created");
+    assert_eq!(
+        pane.0.split(':').next(),
+        Some(ws_id.as_str()),
+        "pane {} should live in workspace {ws_id}",
+        pane.0
+    );
+
+    // Existing-pane operations address the pane by id (no label needed).
+    assert!(mux.pane_alive(&pane).await.unwrap());
+    mux.kill_pane(&pane).await.unwrap();
 
     cleanup_workspace(&label).await;
 }
@@ -220,9 +270,12 @@ async fn herdr_tile_pane_preserves_live_process() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(mux.pane_alive(&pane).await.unwrap());
 
-    // Move the live pane into the dashboard tab.
-    let dashboard = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
-    mux.tile_pane(&pane, &dashboard, Split::Down)
+    // Move the live pane into the dashboard tab (dedicated dashboard workspace,
+    // scoped to this test so it is cleaned up).
+    let dash_label = format!("{label}:top");
+    let dashboard = mux.ensure_dashboard(&dash_label).await.expect("dashboard");
+    assert!(dashboard.fresh, "first ensure_dashboard must be fresh");
+    mux.tile_pane(&pane, &dashboard.tile, Split::Down)
         .await
         .expect("tile pane");
 
@@ -239,11 +292,17 @@ async fn herdr_tile_pane_preserves_live_process() {
         "moved pane no longer responds to input: {tail:?}"
     );
 
-    // Idempotent dashboard: a second ensure returns the same tab.
-    let again = mux.ensure_dashboard("meguri:top").await.expect("dashboard");
-    assert_eq!(again, dashboard, "ensure_dashboard must reuse the tab");
+    // Idempotent dashboard: a second ensure reuses the same tile tab and does
+    // not report a fresh status pane (so the render loop is not restarted).
+    let again = mux.ensure_dashboard(&dash_label).await.expect("dashboard");
+    assert_eq!(
+        again.tile, dashboard.tile,
+        "ensure_dashboard must reuse the tab"
+    );
+    assert!(!again.fresh, "second ensure_dashboard must not be fresh");
 
     mux.kill_pane(&pane).await.unwrap();
+    cleanup_workspace(&dash_label).await;
     cleanup_workspace(&label).await;
 }
 

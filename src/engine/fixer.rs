@@ -10,6 +10,11 @@
 //! (done) or answers again (next fixer round). Spec-ready and merged PRs are
 //! the spec worker's and the humans' territory — the fixer never touches them.
 //!
+//! Since ADR 0006 the AI's implementation review is an internal loop that
+//! never posts threads, so the fixer's discovery naturally narrows to
+//! **human and external-bot** review threads — GitHub stays the transport
+//! only where a human actually sits.
+//!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
 //! (recovered from the `meguri/<issue>-…` head branch), so the fixer joins
 //! the issue's author lane — same pane, same live session as the worker or
@@ -24,9 +29,10 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, open_pr_for_issue};
-use crate::forge::{self, PullRequest, ReviewThread};
+use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable};
+use crate::forge::{self, ReviewThread};
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for fixer runs.
@@ -36,10 +42,6 @@ pub const KIND: &str = "fixer";
 /// Discovery treats a thread whose last comment starts with this as parked.
 pub const FIXER_REPLY_MARKER: &str = "🔁 meguri";
 
-/// Head-branch prefix identifying meguri's own PRs (the fixer only amends —
-/// and the impl-reviewer only reviews — work meguri opened).
-pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
-
 /// A thread the fixer still owes a fix: unresolved, and the ball is in
 /// meguri's court (the last comment is not meguri's reply).
 pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
@@ -48,30 +50,6 @@ pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
             .comments
             .last()
             .is_some_and(|c| !c.body.starts_with(FIXER_REPLY_MARKER))
-}
-
-/// Whether the fixer may touch this PR at all (independent of threads).
-fn pr_is_fixable(pr: &PullRequest) -> Option<String> {
-    if pr.state != "open" {
-        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
-    }
-    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
-        return Some(format!(
-            "PR #{} head `{}` was not opened by meguri",
-            pr.number, pr.head_branch
-        ));
-    }
-    if pr.has_label(forge::LABEL_SPEC_READY) {
-        return Some(format!(
-            "PR #{} is {} (the worker owns the branch)",
-            pr.number,
-            forge::LABEL_SPEC_READY
-        ));
-    }
-    if pr.has_label(forge::LABEL_HOLD) {
-        return Some(format!("PR #{} is on hold", pr.number));
-    }
-    None
 }
 
 /// The fixer as a schedulable loop: reviewed meguri PRs in, fix pushes out.
@@ -90,16 +68,23 @@ impl super::Loop for FixerLoop {
     /// Targets are keyed by the PR's canonical issue (the head branch always
     /// encodes it — meguri branches only).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
+        let combined = is_combined(deps);
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
-            if pr_is_fixable(&pr).is_some() || pr.has_label(forge::LABEL_WORKING) {
+        for pr in deps.open_prs.get(deps).await? {
+            if pr_is_touchable(&pr, combined).is_some() {
                 continue;
             }
-            let threads = deps.forge.list_review_threads(pr.number).await?;
+            let threads = deps.forge().list_review_threads(pr.number).await?;
             if threads.iter().any(thread_awaits_fixer) {
                 targets.push(Target {
-                    issue_number: canonical_key(&pr),
+                    // The fixer targets the PR's canonical issue (issue #92),
+                    // carried as an Issue key through the coordination layer.
+                    key: TaskKey::Issue(canonical_key(&pr)),
                     title: pr.title,
+                    cadence_label: None,
                 });
             }
         }
@@ -163,18 +148,11 @@ impl Flavor for FixerFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_fixable(&pr) {
+        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
         }
-        if pr.has_label(forge::LABEL_WORKING) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is already claimed ({})",
-                pr.number,
-                forge::LABEL_WORKING
-            )));
-        }
         let threads: Vec<ReviewThread> = deps
-            .forge
+            .forge()
             .list_review_threads(pr.number)
             .await?
             .into_iter()
@@ -187,7 +165,7 @@ impl Flavor for FixerFlavor {
             )));
         }
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store
@@ -259,7 +237,14 @@ impl Flavor for FixerFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Fixing review comments doesn't change the nature of the change
+    /// (issue #136): keep the subject the establishing turn set instead of
+    /// letting a fix's wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: park every addressed thread with a marker reply (this
@@ -269,7 +254,7 @@ impl Flavor for FixerFlavor {
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
         let pr = cp.pr_number.context("fixer checkpoint has no PR number")?;
         for thread_id in &cp.thread_ids {
-            deps.forge
+            deps.forge()
                 .reply_review_thread(
                     pr,
                     thread_id,
@@ -286,7 +271,7 @@ impl Flavor for FixerFlavor {
             "threads.replied",
             json!({ "pr": pr, "threads": cp.thread_ids }),
         )?;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -295,7 +280,7 @@ impl Flavor for FixerFlavor {
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
         if let Some(pr) = flow::claimed_pr(deps, &run.id) {
-            deps.forge
+            deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
@@ -310,17 +295,21 @@ impl Flavor for FixerFlavor {
             flow::escalate_on_forge(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        // Launch-mode-aware closing sentence (issue #169): a direct-mode
+        // fixer has no pane to attach to.
+        let hint = flow::attach_hint(deps, run);
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
                     "🔁 **meguri** could not address the review comments on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
+                     PR and needs a human.\n\n> {reason}\n\n{hint}"
                 ),
             )
             .await;
@@ -331,6 +320,11 @@ impl Flavor for FixerFlavor {
 mod tests {
     use super::*;
     use crate::forge::ReviewComment;
+
+    #[test]
+    fn fix_turns_never_establish_a_new_subject() {
+        assert!(!FixerFlavor.sets_subject());
+    }
 
     fn thread(resolved: bool, last_body: &str) -> ReviewThread {
         ReviewThread {
@@ -368,52 +362,9 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn fixable_guards_state_ownership_and_labels() {
-        let pr = PullRequest {
-            number: 3,
-            title: "Add feature (#9)".into(),
-            body: String::new(),
-            url: "https://fake.example/pr/3".into(),
-            head_branch: "meguri/9-add-feature-abc123".into(),
-            head_sha: String::new(),
-            state: "open".into(),
-            labels: vec![],
-        };
-        assert!(pr_is_fixable(&pr).is_none());
-
-        let merged = PullRequest {
-            state: "merged".into(),
-            ..pr.clone()
-        };
-        assert!(pr_is_fixable(&merged).unwrap().contains("merged"));
-
-        let human = PullRequest {
-            head_branch: "feature/manual".into(),
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_fixable(&human)
-                .unwrap()
-                .contains("not opened by meguri")
-        );
-
-        let spec_ready = PullRequest {
-            labels: vec![forge::LABEL_SPEC_READY.to_string()],
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_fixable(&spec_ready)
-                .unwrap()
-                .contains(forge::LABEL_SPEC_READY)
-        );
-
-        let held = PullRequest {
-            labels: vec![forge::LABEL_HOLD.to_string()],
-            ..pr
-        };
-        assert!(pr_is_fixable(&held).unwrap().contains("hold"));
-    }
+    // Touchability (open / meguri branch / spec-ready / hold / working /
+    // needs-human) is the shared `pr_is_touchable` guard's job — see its
+    // tests in `engine::mod`.
 
     #[test]
     fn prompt_lists_threads_and_forbids_push() {
@@ -442,24 +393,32 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-                clean: None,
-                triage: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

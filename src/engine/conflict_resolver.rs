@@ -18,6 +18,13 @@
 //! (a base that keeps re-conflicting that often deserves a human;
 //! `meguri run --issue N` can force another round).
 //!
+//! Touchability (open / meguri branch / `spec-ready` / hold / working /
+//! needs-human) is [`super::pr_is_touchable`], shared with fixer and
+//! ci_fixer: until issue #170 this loop carried its own copy that never
+//! gained the `spec-ready` gate the other two got under ADR 0008, so a
+//! resolver could merge the base into a branch the spec worker still owned
+//! under combined delivery. Lifting it here closed that gap.
+//!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*
 //! (recovered from the `meguri/<issue>-…` head branch), so conflicts are
 //! resolved in the issue's author lane — same pane, same live session as
@@ -31,10 +38,14 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, open_pr_for_issue};
-use crate::forge::{self, MergeableState, PullRequest};
+use super::{
+    Deps, MEGURI_BRANCH_PREFIX, Target, canonical_key, is_combined, open_pr_for_issue,
+    pr_is_touchable,
+};
+use crate::forge::{self, MergeableState};
 use crate::gitops;
 use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for conflict-resolver runs.
@@ -43,28 +54,6 @@ pub const KIND: &str = "conflict-resolver";
 /// Successful resolves budgeted per PR; beyond this, discovery stays quiet
 /// (see the module docs on convergence).
 pub const MAX_RESOLVE_RUNS: i64 = 3;
-
-/// Head-branch prefix identifying meguri's own PRs (the resolver only
-/// touches work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
-
-/// Whether the resolver may touch this PR at all (independent of its
-/// mergeability).
-fn pr_is_resolvable(pr: &PullRequest) -> Option<String> {
-    if pr.state != "open" {
-        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
-    }
-    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
-        return Some(format!(
-            "PR #{} head `{}` was not opened by meguri",
-            pr.number, pr.head_branch
-        ));
-    }
-    if pr.has_label(forge::LABEL_HOLD) {
-        return Some(format!("PR #{} is on hold", pr.number));
-    }
-    None
-}
 
 /// The conflict resolver as a schedulable loop: CONFLICTING meguri PRs in,
 /// pushed merge commits out.
@@ -81,12 +70,13 @@ impl super::Loop for ConflictResolverLoop {
     /// the per-PR resolve budget stops a resolve→re-conflict ping-pong; the
     /// active-run unique index dedups concurrent rounds as usual.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // PR loops are inert in local mode
+        }
+        let combined = is_combined(deps);
         let mut targets = Vec::new();
-        for pr in deps.forge.list_open_prs().await? {
-            if pr_is_resolvable(&pr).is_some()
-                || pr.has_label(forge::LABEL_WORKING)
-                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-            {
+        for pr in deps.open_prs.get(deps).await? {
+            if pr_is_touchable(&pr, combined).is_some() {
                 continue;
             }
             let issue = canonical_key(&pr);
@@ -97,12 +87,13 @@ impl super::Loop for ConflictResolverLoop {
             {
                 continue;
             }
-            if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
                 continue;
             }
             targets.push(Target {
-                issue_number: issue,
+                key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -144,24 +135,10 @@ impl Flavor for ConflictResolverFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_resolvable(&pr) {
+        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
         }
-        if pr.has_label(forge::LABEL_WORKING) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is already claimed ({})",
-                pr.number,
-                forge::LABEL_WORKING
-            )));
-        }
-        if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is escalated ({})",
-                pr.number,
-                forge::LABEL_NEEDS_HUMAN
-            )));
-        }
-        if deps.forge.pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+        if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{} is no longer conflicting",
                 pr.number
@@ -173,7 +150,7 @@ impl Flavor for ConflictResolverFlavor {
         let base_sha =
             gitops::fetch_base_tip(&deps.project.repo_path, &deps.project.default_branch).await?;
 
-        deps.forge
+        deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
             .await?;
         deps.store.emit(
@@ -284,7 +261,14 @@ impl Flavor for ConflictResolverFlavor {
 
     /// Unused: the PR already exists, so open-pr never creates one.
     fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-        format!("{} (#{})", cp.issue_title, run.issue_number)
+        flow::default_pr_title(run, cp)
+    }
+
+    /// Resolving a conflict doesn't change the nature of the change (issue
+    /// #136): keep the subject the establishing turn set instead of letting
+    /// the resolution's wording flap the PR title.
+    fn sets_subject(&self) -> bool {
+        false
     }
 
     /// After the push: leave a durable trace on the PR (the resolution is
@@ -298,7 +282,7 @@ impl Flavor for ConflictResolverFlavor {
             .context("conflict-resolver checkpoint has no PR number")?;
         let base = cp.base_sha.as_deref().unwrap_or("?");
         let _ = deps
-            .forge
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
@@ -309,7 +293,7 @@ impl Flavor for ConflictResolverFlavor {
                 ),
             )
             .await;
-        deps.forge
+        deps.forge()
             .remove_pr_label(pr, forge::LABEL_WORKING)
             .await
             .ok();
@@ -318,7 +302,7 @@ impl Flavor for ConflictResolverFlavor {
 
     async fn release_claim(&self, deps: &Deps, run: &RunRecord) {
         if let Some(pr) = flow::claimed_pr(deps, &run.id) {
-            deps.forge
+            deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
@@ -333,17 +317,21 @@ impl Flavor for ConflictResolverFlavor {
             flow::escalate_on_forge(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps.forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-        let _ = deps.forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
         let _ = deps
-            .forge
+            .forge()
+            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
+            .await;
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        // Launch-mode-aware closing sentence (issue #169): a direct-mode
+        // fixer has no pane to attach to.
+        let hint = flow::attach_hint(deps, run);
+        let _ = deps
+            .forge()
             .pr_comment(
                 pr,
                 &format!(
                     "🔁 **meguri** could not resolve the merge conflicts on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
+                     PR and needs a human.\n\n> {reason}\n\n{hint}"
                 ),
             )
             .await;
@@ -356,41 +344,13 @@ mod tests {
     use crate::gitops::run_git_sync;
 
     #[test]
-    fn resolvable_guards_state_ownership_and_hold() {
-        let pr = PullRequest {
-            number: 3,
-            title: "Add feature (#9)".into(),
-            body: String::new(),
-            url: "https://fake.example/pr/3".into(),
-            head_branch: "meguri/9-add-feature-abc123".into(),
-            head_sha: String::new(),
-            state: "open".into(),
-            labels: vec![],
-        };
-        assert!(pr_is_resolvable(&pr).is_none());
-
-        let merged = PullRequest {
-            state: "merged".into(),
-            ..pr.clone()
-        };
-        assert!(pr_is_resolvable(&merged).unwrap().contains("merged"));
-
-        let human = PullRequest {
-            head_branch: "feature/manual".into(),
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_resolvable(&human)
-                .unwrap()
-                .contains("not opened by meguri")
-        );
-
-        let held = PullRequest {
-            labels: vec![forge::LABEL_HOLD.to_string()],
-            ..pr
-        };
-        assert!(pr_is_resolvable(&held).unwrap().contains("hold"));
+    fn resolve_turns_never_establish_a_new_subject() {
+        assert!(!ConflictResolverFlavor.sets_subject());
     }
+
+    // Touchability (open / meguri branch / spec-ready / hold / working /
+    // needs-human) is the shared `pr_is_touchable` guard's job — see its
+    // tests in `engine::mod`.
 
     #[test]
     fn prompt_pins_the_base_and_forbids_push_and_rebase() {
@@ -510,24 +470,32 @@ mod tests {
 
     fn fake_deps() -> Deps {
         use std::sync::Arc;
-        Deps {
-            store: crate::store::Store::open_in_memory().unwrap(),
-            mux: Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge: Arc::new(crate::forge::fake::FakeForge::default()),
-            notifier: crate::notify::fake::recording_notifier().0,
-            config: crate::config::Config::default(),
-            project: crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
-                repo_slug: "me/proj".into(),
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-                clean: None,
-                triage: None,
-            },
-        }
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
     }
 }

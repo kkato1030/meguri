@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig, TriageConfig, TriageMode};
+use meguri::config::{Config, LaunchMode, ProjectConfig, TriageConfig, TriageMode};
 use meguri::engine::triage::{
     self, MARKER_HEAD_NONE, REPORT_FILE, TriageLoop, parse_triage_marker, run_triage, triage_marker,
 };
@@ -85,44 +85,53 @@ async fn setup_with_triage(triage: TriageConfig) -> TestEnv {
 
     // A ready bystander (engaged, excluded) and an unlabeled candidate.
     let forge = Arc::new(FakeForge::default());
-    forge.issues.lock().unwrap().push(Issue {
-        number: BYSTANDER,
-        title: "bystander".into(),
-        body: "must stay untouched".into(),
-        labels: vec![LABEL_READY.to_string()],
-    });
-    forge.issues.lock().unwrap().push(Issue {
-        number: CANDIDATE,
-        title: "add caching".into(),
-        body: "we should cache X".into(),
-        labels: vec![],
-    });
+    forge.add_issue(
+        BYSTANDER,
+        "bystander",
+        "must stay untouched",
+        &[LABEL_READY],
+    );
+    forge.add_issue(CANDIDATE, "add caching", "we should cache X", &[]);
 
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     config.triage = triage;
+    // Play the scripted agent through FakeMux (pane protocol); pin triage to
+    // pane so it doesn't fall through to its recommended `direct` mode, which
+    // would spawn a real `claude` subprocess instead of the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("triage".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone.clone(),
-        repo_slug: "me/proj".into(),
+        repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
+        mode: Default::default(),
+        deliver: None,
         clean: None,
         triage: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
-    let deps = Deps {
-        store: Store::open_in_memory().unwrap(),
-        mux: Arc::new(FakeMux::new(false)),
-        forge: forge.clone(),
+    let deps = Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
+        forge.clone(),
         config,
         project,
-        notifier: meguri::notify::fake::recording_notifier().0,
-    };
+    );
     TestEnv {
         deps,
         forge,
@@ -256,7 +265,7 @@ async fn first_sweep_creates_report_issue_and_touches_nothing_else() {
     // Discovery: no report issue yet → the synthetic target 0.
     let targets = TriageLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![0]
     );
 
@@ -360,7 +369,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .unwrap();
     let targets = TriageLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.issue_number).collect::<Vec<_>>(),
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![report]
     );
 
@@ -411,12 +420,7 @@ async fn new_issue_triggers_rescan_even_with_a_still_head() {
     assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
 
     // A brand-new unlabeled issue appears above max_issue → rescan, head still.
-    env.forge.issues.lock().unwrap().push(Issue {
-        number: 70,
-        title: "new bug".into(),
-        body: "just filed".into(),
-        labels: vec![],
-    });
+    env.forge.add_issue(70, "new bug", "just filed", &[]);
     assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
 }
 
@@ -508,12 +512,7 @@ async fn ignore_list_silences_recommendations() {
 async fn incomplete_report_is_corrected_then_succeeds() {
     let env = setup().await;
     // A second unlabeled candidate, so an under-report can drop one.
-    env.forge.issues.lock().unwrap().push(Issue {
-        number: 61,
-        title: "second".into(),
-        body: "also untriaged".into(),
-        labels: vec![],
-    });
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
 
     let run = create_triage_run(&env, 0);
     // First turn covers only #60 (drops #61 → coverage correction); the

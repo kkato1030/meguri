@@ -37,7 +37,8 @@ use super::{Deps, Target};
 use crate::config::TriageMode;
 use crate::forge::{self, Issue};
 use crate::gitops;
-use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
+use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for triage runs.
@@ -233,11 +234,14 @@ impl super::Loop for TriageLoop {
     /// Gated on `[triage] mode == report`: the loop is opt-in, so it is a
     /// no-op until a human turns it on.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
+        if deps.forge.is_none() {
+            return Ok(Vec::new()); // forge-driven loop; inert in local mode
+        }
         if deps.config.triage_for(&deps.project).mode != TriageMode::Report {
             return Ok(Vec::new());
         }
         let issues = deps
-            .forge
+            .forge()
             .list_issues_with_label(forge::LABEL_TRIAGE_REPORT)
             .await?;
         // More than one report issue (races, manual creation): the smallest
@@ -258,8 +262,9 @@ impl super::Loop for TriageLoop {
             return Ok(Vec::new());
         }
         Ok(vec![Target {
-            issue_number: report.map(|i| i.number).unwrap_or(0),
+            key: TaskKey::Issue(report.map(|i| i.number).unwrap_or(0)),
             title: REPORT_TITLE.to_string(),
+            cadence_label: None,
         }])
     }
 
@@ -275,7 +280,7 @@ impl super::Loop for TriageLoop {
 /// reading as perpetual "new work". 0 when there are no other open issues.
 async fn max_open_issue(deps: &Deps) -> Result<i64> {
     Ok(deps
-        .forge
+        .forge()
         .list_open_issues()
         .await?
         .iter()
@@ -313,12 +318,16 @@ pub async fn run_triage(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                 WorkerOutcome::Stopped => {
                     deps.store
                         .update_run_status(run_id, RunStatus::Cancelled, None)?;
-                    if let Some(pane_id) = &run.mux_pane_id {
-                        let _ = deps
-                            .mux
-                            .kill_pane(&crate::mux::PaneId(pane_id.clone()))
-                            .await;
-                    }
+                    // Go through the shared release path (session save +
+                    // mark_pane_reclaimed), like the cleaner — not a raw
+                    // kill_pane, which would leave the pane row dangling.
+                    super::reaper::release_pane(
+                        deps,
+                        run.issue_number,
+                        LANE_AUTHOR,
+                        "stopped by user",
+                    )
+                    .await;
                     deps.store.emit(Some(run_id), "run.cancelled", json!({}))?;
                 }
                 WorkerOutcome::Interrupted(reason) => {
@@ -408,7 +417,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 super::reaper::release_pane(
                     deps,
                     run.issue_number,
-                    ROLE_AUTHOR,
+                    LANE_AUTHOR,
                     "triage sweep gave up",
                 )
                 .await;
@@ -423,7 +432,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         let issue = settle(deps, &run, &cp).await?;
         // The report issue never closes, so the reaper would keep this pane
         // and detached worktree forever — triage reclaims them itself.
-        super::reaper::release_pane(deps, run.issue_number, ROLE_AUTHOR, "triage sweep finished")
+        super::reaper::release_pane(deps, run.issue_number, LANE_AUTHOR, "triage sweep finished")
             .await;
         remove_worktree_best_effort(deps, &run, &worktree).await;
         return Ok(WorkerOutcome::Succeeded {
@@ -470,7 +479,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut TriageCheckpoint) -
         // host, a manual one), defer to it — the next discovery targets its
         // real number and the unique run index applies.
         let issues = deps
-            .forge
+            .forge()
             .list_issues_with_label(forge::LABEL_TRIAGE_REPORT)
             .await?;
         if let Some(issue) = issues.into_iter().min_by_key(|i| i.number) {
@@ -481,7 +490,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut TriageCheckpoint) -
         }
         None
     } else {
-        let issue = deps.forge.get_issue(run.issue_number).await?;
+        let issue = deps.forge().get_issue(run.issue_number).await?;
         if issue.has_label(forge::LABEL_HOLD) {
             return Ok(Prepared::Skip(format!(
                 "report issue #{} is on hold ({})",
@@ -529,6 +538,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -
         &wt,
         &deps.project.default_branch,
         &cp.head_sha,
+        &deps.project.worktree_setup.exclude,
     )
     .await?;
     deps.store
@@ -538,7 +548,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -
         "worktree.created",
         json!({ "head": cp.head_sha, "path": wt.to_string_lossy() }),
     )?;
-    Ok(())
+    flow::run_worktree_setup(deps, run, &wt).await
 }
 
 /// The untriaged open issues this sweep considers: open, no `meguri:` label
@@ -546,7 +556,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -
 /// number for a stable prompt and report.
 async fn gather_candidates(deps: &Deps) -> Result<Vec<Issue>> {
     let mut candidates = Vec::new();
-    for issue in deps.forge.list_open_issues().await? {
+    for issue in deps.forge().list_open_issues().await? {
         if issue
             .labels
             .iter()
@@ -554,13 +564,23 @@ async fn gather_candidates(deps: &Deps) -> Result<Vec<Issue>> {
         {
             continue;
         }
-        if flow::has_unresolved_blockers(deps, issue.number).await {
+        if has_unresolved_blockers(deps, issue.number).await {
             continue;
         }
         candidates.push(issue);
     }
     candidates.sort_by_key(|i| i.number);
     Ok(candidates)
+}
+
+/// Dependency gate (looper ADR-0004): a GitHub-native `blocked_by` that isn't
+/// closed-as-completed keeps the issue out of triage. Unreadable blockers count
+/// as unresolved, never the reverse.
+async fn has_unresolved_blockers(deps: &Deps, issue: i64) -> bool {
+    match deps.forge().blocked_by(issue).await {
+        Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
+        Err(_) => true,
+    }
 }
 
 fn execute_prompt(candidates: &[Issue], sha: &str, language: Option<&str>) -> String {
@@ -804,7 +824,7 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) {
              interval (`triage.interval_hours`)."
         );
         match deps
-            .forge
+            .forge()
             .create_issue(REPORT_TITLE, &body, &[forge::LABEL_TRIAGE_REPORT])
             .await
         {
@@ -819,7 +839,7 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) {
         }
         return;
     }
-    let body = match deps.forge.get_issue(cp.report_issue).await {
+    let body = match deps.forge().get_issue(cp.report_issue).await {
         Ok(issue) => replace_marker(&issue.body, &marker),
         Err(e) => {
             tracing::warn!(
@@ -829,7 +849,7 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) {
             return;
         }
     };
-    if let Err(e) = deps.forge.update_issue_body(cp.report_issue, &body).await {
+    if let Err(e) = deps.forge().update_issue_body(cp.report_issue, &body).await {
         tracing::warn!(
             "cannot update triage report issue #{}: {e:#}",
             cp.report_issue
@@ -865,7 +885,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
 
     let issue = if cp.report_issue == 0 {
         let number = deps
-            .forge
+            .forge()
             .create_issue(REPORT_TITLE, &body, &[forge::LABEL_TRIAGE_REPORT])
             .await?;
         deps.store.emit(
@@ -875,7 +895,9 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
         )?;
         number
     } else {
-        deps.forge.update_issue_body(cp.report_issue, &body).await?;
+        deps.forge()
+            .update_issue_body(cp.report_issue, &body)
+            .await?;
         cp.report_issue
     };
     deps.store.emit(

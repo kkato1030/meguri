@@ -13,6 +13,7 @@ use meguri::forge::{Forge, LABEL_IMPLEMENTING, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
+use meguri::tasks::TaskKey;
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -61,25 +62,34 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
-    Deps {
-        store: Store::open_in_memory().unwrap(),
-        notifier: meguri::notify::fake::recording_notifier().0,
-        mux: Arc::new(FakeMux::new(false)),
+    config.review.enabled = false; // self-review not under test in the scheduler suite
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        mode: Default::default(),
+        deliver: None,
+        default_branch: "main".into(),
+        language: None,
+        check_command: None,
+        worktree_root: Some(root.join("worktrees")),
+        pr: None,
+        clean: None,
+        triage: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
+    };
+    Deps::with_label_source(
+        Store::open_in_memory().unwrap(),
+        Arc::new(FakeMux::new(false)),
         forge,
         config,
-        project: ProjectConfig {
-            id: "proj".into(),
-            repo_path: clone,
-            repo_slug: "me/proj".into(),
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(root.join("worktrees")),
-            pr: None,
-            clean: None,
-            triage: None,
-        },
-    }
+        project,
+    )
 }
 
 /// Scripted pane-side agent (same protocol as worker_test).
@@ -562,8 +572,9 @@ impl Loop for FixedLoop {
             return Ok(vec![]);
         }
         Ok(vec![Target {
-            issue_number: 99,
+            key: TaskKey::Issue(99),
             title: "Fixed target".into(),
+            cadence_label: None,
         }])
     }
 
@@ -604,8 +615,9 @@ impl Loop for StubLoop {
                     .issue_has_succeeded_run(&deps.project.id, self.kind, *n)?
             {
                 targets.push(Target {
-                    issue_number: *n,
+                    key: TaskKey::Issue(*n),
                     title: format!("stub {n}"),
+                    cadence_label: None,
                 });
             }
         }
@@ -798,8 +810,9 @@ impl Loop for RecordingLoop {
                 continue;
             }
             targets.push(Target {
-                issue_number: *issue,
+                key: TaskKey::Issue(*issue),
                 title: format!("target {issue}"),
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -1008,8 +1021,9 @@ impl Loop for LanguageRecordingLoop {
                 .issue_has_succeeded_run(&deps.project.id, self.kind(), n)?
             {
                 targets.push(Target {
-                    issue_number: n,
+                    key: TaskKey::Issue(n),
                     title: format!("lang {n}"),
+                    cadence_label: None,
                 });
             }
         }
@@ -1077,4 +1091,173 @@ async fn watch_applies_reloaded_config_to_new_runs() {
         Some("日本語"),
         "runs spawned after the reload see the new config"
     );
+}
+
+/// A loop with no discoverable targets, so the only way its `drive` fires is
+/// via the scheduler's per-tick interrupted/queued redispatch.
+struct NoDiscoveryLoop {
+    kind: &'static str,
+    dispatched: Arc<Mutex<Vec<String>>>,
+    /// How long `drive` sits before flipping the run's status away from
+    /// `interrupted`, simulating the async gap between `dispatch` spawning
+    /// the driver and the driver actually recording `running`.
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl Loop for NoDiscoveryLoop {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn discover(&self, _deps: &Deps) -> anyhow::Result<Vec<Target>> {
+        Ok(vec![])
+    }
+
+    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
+        self.dispatched.lock().unwrap().push(run_id.to_string());
+        tokio::time::sleep(self.delay).await;
+        deps.store
+            .update_run_status(run_id, RunStatus::Succeeded, None)?;
+        Ok(WorkerOutcome::Succeeded {
+            pr_url: "no-discovery://pr".into(),
+        })
+    }
+}
+
+/// #183 regression: a run that goes `interrupted` (pane died mid-execute)
+/// while `watch` is already several ticks into its loop must resume from its
+/// checkpoint on a later tick, not only at the next orchestrator restart.
+/// Discovery is neutered (`NoDiscoveryLoop` never returns a target), so the
+/// only path that can drive this run is the per-tick redispatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_redispatches_a_run_interrupted_after_watch_is_already_running() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let store = deps.store.clone();
+    let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(NoDiscoveryLoop {
+            kind: "no-discovery",
+            dispatched: dispatched.clone(),
+            delay: Duration::from_millis(10),
+        })],
+        poll_interval: Duration::from_millis(80),
+        max_concurrent: 2,
+        reload: None,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    // Let several ticks pass with no runs at all, so `watch` is well past
+    // its startup-only recovery pass before the "pane death" happens.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        dispatched.lock().unwrap().is_empty(),
+        "nothing should dispatch before the run exists"
+    );
+
+    let run = store
+        .create_run_for_loop("proj", "no-discovery", 183, "Mid-flight pane death")
+        .unwrap();
+    store
+        .update_run_status(
+            &run.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(r) = store.get_run(&run.id).unwrap()
+            && r.status == RunStatus::Succeeded
+        {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "run never redispatched after mid-flight interruption: {:?}",
+                store.get_run(&run.id).unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    assert_eq!(dispatched.lock().unwrap().clone(), vec![run.id.clone()]);
+}
+
+/// #183 acceptance criteria 2+3: redispatch respects the `max_concurrent`
+/// slot budget, and `active_run_ids` keeps a run whose driver is still in
+/// flight (even before its DB status catches up to `running`) from being
+/// dispatched a second time on a later tick.
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_redispatch_respects_slots_and_avoids_double_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
+    let store = deps.store.clone();
+    let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let run_a = store
+        .create_run_for_loop("proj", "no-discovery", 201, "Pane death A")
+        .unwrap();
+    store
+        .update_run_status(
+            &run_a.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+    let run_b = store
+        .create_run_for_loop("proj", "no-discovery", 202, "Pane death B")
+        .unwrap();
+    store
+        .update_run_status(
+            &run_b.id,
+            RunStatus::Interrupted,
+            Some("pane died during execute"),
+        )
+        .unwrap();
+
+    let scheduler = Scheduler {
+        projects: vec![deps],
+        loops: vec![Arc::new(NoDiscoveryLoop {
+            kind: "no-discovery",
+            dispatched: dispatched.clone(),
+            // Long enough that several ticks land while each run is mid-flight
+            // and its store status still reads `interrupted`.
+            delay: Duration::from_millis(400),
+        })],
+        poll_interval: Duration::from_millis(80),
+        max_concurrent: 1,
+        reload: None,
+    };
+    let watch = tokio::spawn(async move { scheduler.watch().await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a = store.get_run(&run_a.id).unwrap().unwrap().status;
+        let b = store.get_run(&run_b.id).unwrap().unwrap().status;
+        if a == RunStatus::Succeeded && b == RunStatus::Succeeded {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("both interrupted runs never succeeded: a={a:?} b={b:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.abort();
+
+    // Exactly one dispatch per run — no duplicates from the slot-1 budget
+    // colliding with the still-interrupted-looking in-flight run.
+    let log = dispatched.lock().unwrap().clone();
+    assert_eq!(
+        log.len(),
+        2,
+        "expected exactly one dispatch per run: {log:?}"
+    );
+    assert!(log.contains(&run_a.id));
+    assert!(log.contains(&run_b.id));
 }
