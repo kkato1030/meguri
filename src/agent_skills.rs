@@ -125,6 +125,7 @@ pub enum FileOutcome {
     Blocked,
 }
 
+#[derive(Debug)]
 pub struct FileReport {
     pub path: PathBuf,
     pub outcome: FileOutcome,
@@ -133,6 +134,7 @@ pub struct FileReport {
     pub diff: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct InstallReport {
     pub target: Target,
     pub files: Vec<FileReport>,
@@ -144,6 +146,19 @@ impl InstallReport {
     }
 }
 
+/// Read `path`'s existing content, if any. A missing file reads as `None`
+/// ("nothing here yet, safe to create"); any other read failure (permission
+/// denied, invalid UTF-8, ...) is a real problem, not an empty slate — it's
+/// surfaced as an error rather than silently treated as safe to overwrite
+/// without `--force`.
+fn read_existing(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// Write `content` to `path`. If `path` already exists with different
 /// content, only overwrite when `force` — otherwise report `Blocked` with a
 /// diff so the caller can show it without touching the file.
@@ -152,8 +167,8 @@ fn write_managed(path: &Path, content: &str, force: bool) -> Result<FileReport> 
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    match std::fs::read_to_string(path) {
-        Err(_) => {
+    match read_existing(path)? {
+        None => {
             std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
             Ok(FileReport {
                 path: path.to_path_buf(),
@@ -161,12 +176,12 @@ fn write_managed(path: &Path, content: &str, force: bool) -> Result<FileReport> 
                 diff: None,
             })
         }
-        Ok(prev) if prev == content => Ok(FileReport {
+        Some(prev) if prev == content => Ok(FileReport {
             path: path.to_path_buf(),
             outcome: FileOutcome::Unchanged,
             diff: None,
         }),
-        Ok(prev) => {
+        Some(prev) => {
             let diff = line_diff(&prev, content);
             if force {
                 std::fs::write(path, content)
@@ -294,7 +309,7 @@ fn write_managed_fragment(path: &Path, block: &str, force: bool) -> Result<FileR
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let Some(prev) = std::fs::read_to_string(path).ok() else {
+    let Some(prev) = read_existing(path)? else {
         std::fs::write(path, block).with_context(|| format!("writing {}", path.display()))?;
         return Ok(FileReport {
             path: path.to_path_buf(),
@@ -380,8 +395,23 @@ pub fn status_user_skill(target: Target, home: &Path) -> Vec<StatusEntry> {
         .collect()
 }
 
+/// Same "up to date" definition `install_project_fragment` uses: the marker
+/// span matches the embedded fragment, regardless of any repo-owned content
+/// left outside it. A whole-file comparison would flag repos that only have
+/// their own notes around an already-current block as drifted, and steer
+/// them toward `--force`, which would delete those notes for nothing.
 pub fn status_project_fragment(target: Target, repo_root: &Path) -> StatusEntry {
-    status_of(&target.project_rule_path(repo_root), &rule_fragment_block())
+    let path = target.project_rule_path(repo_root);
+    let block = rule_fragment_block();
+    let state = match std::fs::read_to_string(&path) {
+        Err(_) => StatusState::Missing,
+        Ok(actual) if actual == block => StatusState::UpToDate,
+        Ok(actual) => match upsert_marked_span(&actual, &block) {
+            Some(merged) if merged == actual => StatusState::UpToDate,
+            _ => StatusState::Drifted,
+        },
+    };
+    StatusEntry { path, state }
 }
 
 #[cfg(test)]
@@ -460,6 +490,24 @@ mod tests {
     }
 
     #[test]
+    fn install_user_skill_errors_instead_of_overwriting_an_unreadable_file() {
+        let home = tempfile::tempdir().unwrap();
+        let skill_md = home.path().join(".claude/skills/meguri/SKILL.md");
+        std::fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        // Invalid UTF-8: read_to_string fails, but this is not "file absent".
+        std::fs::write(&skill_md, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        let err = install_user_skill(Target::Claude, home.path(), false).unwrap_err();
+        assert!(err.to_string().contains("reading"), "{err:#}");
+        // Untouched — an unreadable file must never be silently replaced,
+        // force or not, since we can't show the user what they'd lose.
+        assert_eq!(
+            std::fs::read(&skill_md).unwrap(),
+            vec![0xFF, 0xFE, 0x00, 0xFF]
+        );
+    }
+
+    #[test]
     fn install_project_fragment_wraps_in_markers_and_is_idempotent() {
         let repo = tempfile::tempdir().unwrap();
         let report = install_project_fragment(Target::Claude, repo.path(), false).unwrap();
@@ -530,6 +578,18 @@ mod tests {
     }
 
     #[test]
+    fn install_project_fragment_errors_instead_of_overwriting_an_unreadable_file() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+
+        let err = install_project_fragment(Target::Claude, repo.path(), true).unwrap_err();
+        assert!(err.to_string().contains("reading"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 0xFE, 0x00, 0xFF]);
+    }
+
+    #[test]
     fn status_reports_missing_up_to_date_and_drifted() {
         let home = tempfile::tempdir().unwrap();
         let before = status_user_skill(Target::Claude, home.path());
@@ -557,6 +617,39 @@ mod tests {
         assert_eq!(
             status_project_fragment(Target::Claude, repo.path()).state,
             StatusState::UpToDate
+        );
+    }
+
+    #[test]
+    fn status_project_fragment_is_up_to_date_with_repo_owned_notes_around_it() {
+        let repo = tempfile::tempdir().unwrap();
+        install_project_fragment(Target::Claude, repo.path(), false).unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        let installed = std::fs::read_to_string(&path).unwrap();
+        // A repo maintainer appends their own notes around the managed block.
+        std::fs::write(
+            &path,
+            format!("# repo notes\n\nsome context.\n\n{installed}\nmore notes.\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            status_project_fragment(Target::Claude, repo.path()).state,
+            StatusState::UpToDate
+        );
+    }
+
+    #[test]
+    fn status_project_fragment_flags_a_stale_marker_body_as_drifted() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join(".claude/rules/meguri.md");
+        let stale = format!("{MARKER_BEGIN}\nold body\n{MARKER_END}\n");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &stale).unwrap();
+
+        assert_eq!(
+            status_project_fragment(Target::Claude, repo.path()).state,
+            StatusState::Drifted
         );
     }
 }
