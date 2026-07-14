@@ -55,6 +55,25 @@ pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
 /// the cleaner's: its body is a snapshot of the current triage
 /// recommendations for untriaged open issues, rewritten on every sweep.
 pub const LABEL_TRIAGE_REPORT: &str = "meguri:triage-report";
+/// Triage v1 advise (issue #87): proposes `meguri:ready` on the issue itself.
+/// A human promotes it verbatim; meguri never applies the real label.
+pub const LABEL_TRIAGE_READY: &str = "meguri:triage-ready";
+/// Triage v1 advise (issue #87): proposes `meguri:plan`, same rules as
+/// [`LABEL_TRIAGE_READY`].
+pub const LABEL_TRIAGE_PLAN: &str = "meguri:triage-plan";
+/// Triage v1 advise (issue #87): proposes `meguri:needs-human`, same rules as
+/// [`LABEL_TRIAGE_READY`].
+pub const LABEL_TRIAGE_NEEDS_HUMAN: &str = "meguri:triage-needs-human";
+/// All three triage-advise proposal labels. They carry the `meguri:` prefix
+/// (so worker/planner discovery — keyed on the exact real labels, never a
+/// prefix scan — cannot mistake one for a go-ahead) but are deliberately
+/// excluded from the two-axis phase/ball vocabulary: a proposal is not yet a
+/// decision, so it must not read as "engaged" to triage's own re-triage gate.
+pub const TRIAGE_PROPOSAL_LABELS: [&str; 3] = [
+    LABEL_TRIAGE_READY,
+    LABEL_TRIAGE_PLAN,
+    LABEL_TRIAGE_NEEDS_HUMAN,
+];
 
 /// GitHub's three merge strategies. This is the forge's vocabulary and config
 /// deserializes straight into it (`serde(lowercase)`); ADR 0003 forbids
@@ -470,6 +489,10 @@ pub trait Forge: Send + Sync {
     /// Post a conversation comment on a pull request.
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
+    /// Bodies of an issue's conversation comments, oldest first (triage
+    /// advise's hidden-marker lookup, issue #87 — the per-issue mirror of
+    /// [`Forge::pr_comments`]).
+    async fn issue_comments(&self, issue: i64) -> Result<Vec<String>>;
     /// Comment on a pull request (same number space, different command).
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()>;
     async fn create_pr(
