@@ -965,6 +965,30 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn issue_comments(&self, issue: i64) -> Result<Vec<String>> {
+        let raw = self
+            .gh(&[
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "comments",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue view comments")?;
+        Ok(v.get("comments")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|c| c.get("body").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()> {
         self.gh(&[
             "pr",

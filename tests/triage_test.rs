@@ -16,7 +16,10 @@ use meguri::engine::triage::{
 };
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, Issue, LABEL_HOLD, LABEL_READY, LABEL_TRIAGE_REPORT};
+use meguri::forge::{
+    Forge, Issue, LABEL_HOLD, LABEL_READY, LABEL_TRIAGE_PLAN, LABEL_TRIAGE_READY,
+    LABEL_TRIAGE_REPORT,
+};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -335,7 +338,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
     // max_issue = the candidate; the report issue takes the next number.
     let body = format!(
         "{}\nrecommendation for #60",
-        triage_marker(&env.head_sha, epoch_now(), CANDIDATE)
+        triage_marker(&env.head_sha, epoch_now(), CANDIDATE, false)
     );
     let report = env
         .forge
@@ -363,7 +366,7 @@ async fn rediscovery_respects_head_marker_and_interval() {
             report,
             &format!(
                 "{}\nrecommendation for #60",
-                triage_marker(&env.head_sha, stale_scanned, CANDIDATE)
+                triage_marker(&env.head_sha, stale_scanned, CANDIDATE, false)
             ),
         )
         .await
@@ -408,7 +411,7 @@ async fn new_issue_triggers_rescan_even_with_a_still_head() {
     let stale_scanned = epoch_now() - 7 * 3600;
     let body = format!(
         "{}\nrecommendation for #60",
-        triage_marker(&env.head_sha, stale_scanned, CANDIDATE)
+        triage_marker(&env.head_sha, stale_scanned, CANDIDATE, false)
     );
     env.forge
         .create_issue(triage::REPORT_TITLE, &body, &[LABEL_TRIAGE_REPORT])
@@ -431,7 +434,7 @@ async fn hold_on_the_report_issue_stops_the_loop() {
     // Even a sweep that is otherwise overdue is skipped under hold.
     let body = format!(
         "{}\nold report",
-        triage_marker("some-old-head", epoch_now() - 48 * 3600, 0)
+        triage_marker("some-old-head", epoch_now() - 48 * 3600, 0, false)
     );
     let report = env
         .forge
@@ -545,4 +548,355 @@ async fn incomplete_report_is_corrected_then_succeeds() {
     let report = report_issue(&env).await.unwrap();
     assert!(report.body.contains("| #60 | ready"), "{}", report.body);
     assert!(report.body.contains("| #61 | plan"), "{}", report.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_proposes_label_and_evidence_comment_on_recommended_issues() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        ..TriageConfig::default()
+    })
+    .await;
+    // A second candidate that gets a `hold` recommendation — report-only,
+    // never labeled or commented on.
+    env.forge.add_issue(61, "vague ask", "needs a human", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                "estimated_complexity": "small", "rationale": "clear small change", "missing_info": null},
+               {"issue": 61, "recommendation": "hold", "confidence": 0.3,
+                "estimated_complexity": "medium", "rationale": "wait for discussion", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // ready → labeled + one evidence comment carrying the hidden marker.
+    let candidate = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert_eq!(candidate.labels, vec![LABEL_TRIAGE_READY.to_string()]);
+    let comments = env.forge.comments_of(CANDIDATE);
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].starts_with("<!-- meguri:triage-advise hash="));
+    assert!(comments[0].contains("clear small change"));
+    assert!(comments[0].contains(LABEL_READY));
+
+    // hold → report-only, nothing written on the issue itself.
+    let held = env.forge.get_issue(61).await.unwrap();
+    assert!(held.labels.is_empty());
+    assert!(env.forge.comments_of(61).is_empty());
+
+    // The bystander (already a real workflow label) is never touched.
+    assert!(env.forge.comments_of(BYSTANDER).is_empty());
+    let bystander = env.forge.get_issue(BYSTANDER).await.unwrap();
+    assert_eq!(bystander.labels, vec![LABEL_READY.to_string()]);
+
+    // The report is still published, its footer now describing the advise flow.
+    let report = report_issue(&env).await.unwrap();
+    assert!(report.body.contains("| #60 | ready"), "{}", report.body);
+    assert!(report.body.contains("| #61 | hold"), "{}", report.body);
+    assert!(report.body.contains("meguri:triage-"), "{}", report.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_throttles_writes_by_max_actions_per_tick() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        max_actions_per_tick: 1,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "ready", "confidence": 0.7,
+                "estimated_complexity": "small", "rationale": "also clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    let proposed = usize::from(!c60.labels.is_empty()) + usize::from(!c61.labels.is_empty());
+    assert_eq!(
+        proposed, 1,
+        "max_actions_per_tick=1 must cap the tick to one proposal: #60={:?} #61={:?}",
+        c60.labels, c61.labels
+    );
+
+    // Both recommendations still land in the report regardless of the budget.
+    let report = report_issue(&env).await.unwrap();
+    assert!(report.body.contains("| #60 |"), "{}", report.body);
+    assert!(report.body.contains("| #61 |"), "{}", report.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes() {
+    // interval_hours = 0: only the "changed" half of the rescan gate matters,
+    // so each sweep below just needs a new issue to be due, no marker surgery.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1: propose `ready` on the candidate.
+    let run1 = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, READY_REC);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run1.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(env.forge.comments_of(CANDIDATE).len(), 1);
+    let report = report_issue(&env).await.unwrap();
+
+    // Human rejects: removes the proposal label. A new issue forces a
+    // rescan, and — even though #60 no longer carries a proposal label —
+    // its content hasn't changed since the evidence marker, so the rejection
+    // must stick all the way up in candidate gathering: #60 is not offered
+    // to the agent at all (the scripted report covering only #71 passes the
+    // exact-coverage check), gets no label and no new comment, and is not
+    // re-listed in the central report.
+    env.forge
+        .remove_label(CANDIDATE, LABEL_TRIAGE_READY)
+        .await
+        .unwrap();
+    env.forge.add_issue(71, "unrelated", "new", &[]);
+    let run2 = create_triage_run(&env, report.number);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 71, "recommendation": "ready", "confidence": 0.6,
+                "estimated_complexity": "small", "rationale": "new one", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run2.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "a report covering only #71 must satisfy coverage — the rejected, \
+         unchanged #60 must not be a candidate: {outcome:?}"
+    );
+    assert!(
+        env.forge
+            .get_issue(CANDIDATE)
+            .await
+            .unwrap()
+            .labels
+            .is_empty(),
+        "a rejected proposal must not come back while the content is unchanged"
+    );
+    assert_eq!(
+        env.forge.comments_of(CANDIDATE).len(),
+        1,
+        "no duplicate comment"
+    );
+    // #71 is fresh, so it gets its own proposal.
+    assert_eq!(
+        env.forge.get_issue(71).await.unwrap().labels,
+        vec![LABEL_TRIAGE_READY.to_string()]
+    );
+    // ...and the rewritten central report re-lists only #71, not the
+    // rejected #60.
+    let report2 = env.forge.get_issue(report.number).await.unwrap();
+    assert!(report2.body.contains("| #71 |"), "{}", report2.body);
+    assert!(
+        !report2.body.contains("| #60 |"),
+        "a rejected, unchanged issue must not re-appear in the report: {}",
+        report2.body
+    );
+
+    // Now the candidate's content actually changes — re-triage is warranted,
+    // and this time the new recommendation (`plan`) lands for real.
+    env.forge
+        .update_issue_body(CANDIDATE, "totally different ask now")
+        .await
+        .unwrap();
+    env.forge.add_issue(72, "another", "new", &[]);
+    let run3 = create_triage_run(&env, report.number);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "plan", "confidence": 0.4,
+                "estimated_complexity": "large", "rationale": "actually needs a spec", "missing_info": null},
+               {"issue": 72, "recommendation": "ready", "confidence": 0.6,
+                "estimated_complexity": "small", "rationale": "another one", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run3.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    let candidate = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert_eq!(candidate.labels, vec![LABEL_TRIAGE_PLAN.to_string()]);
+    assert_eq!(
+        env.forge.comments_of(CANDIDATE).len(),
+        2,
+        "the content change must produce a fresh evidence comment"
+    );
+    // The edited issue is back in the central report as well.
+    let report3 = env.forge.get_issue(report.number).await.unwrap();
+    assert!(report3.body.contains("| #60 | plan"), "{}", report3.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_content_edit_alone_triggers_rediscovery() {
+    // interval_hours = 0: isolates the advise-drift signal from the interval
+    // rate-limit so this test can assert on discovery directly, the way
+    // `new_issue_triggers_rescan_even_with_a_still_head` does for the
+    // new-issue signal.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1: propose `ready` on the candidate.
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, READY_REC);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // Head still, no new issue, content unchanged: quiet, as usual.
+    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // The candidate's title/body changes — no push, no new issue — and
+    // discovery alone must still notice: `report`/`advise`'s README/ADR
+    // promise ("content change re-triages") has to hold even when neither
+    // of the other two signals fires.
+    env.forge
+        .update_issue_body(CANDIDATE, "totally different ask now")
+        .await
+        .unwrap();
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_budget_backlog_alone_triggers_rediscovery() {
+    // interval_hours = 0, same reasoning as the content-edit test above.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        max_actions_per_tick: 1,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "ready", "confidence": 0.7,
+                "estimated_complexity": "small", "rationale": "also clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // budget=1 leaves one of the two proposals unwritten.
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    let proposed = usize::from(!c60.labels.is_empty()) + usize::from(!c61.labels.is_empty());
+    assert_eq!(proposed, 1, "#60={:?} #61={:?}", c60.labels, c61.labels);
+
+    // The report marker records the leftover backlog...
+    let report = report_issue(&env).await.unwrap();
+    let marker = parse_triage_marker(&report.body).unwrap();
+    assert!(marker.backlog, "{}", report.body);
+    assert!(
+        report.body.contains("max_actions_per_tick"),
+        "{}",
+        report.body
+    );
+
+    // ...and discovery alone notices it: no new issue, no head move, yet a
+    // sweep is still due — otherwise the un-proposed leftover would be
+    // stranded until some unrelated trigger happened to fire (README/ADR's
+    // "the rest carry over to the next sweep" promise).
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advise_mode_rejected_then_edited_issue_alone_triggers_rediscovery() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1: propose `ready`.
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, READY_REC);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // Human rejects: the proposal label is removed. Content unchanged, so
+    // discovery stays quiet.
+    env.forge
+        .remove_label(CANDIDATE, LABEL_TRIAGE_READY)
+        .await
+        .unwrap();
+    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // The rejected issue's content changes — no new issue, no push, and no
+    // proposal label anymore either. Discovery must still notice: the
+    // evidence comment's hidden marker survives the label removal, so a
+    // rejected-then-edited issue is not stuck behind an unrelated trigger.
+    env.forge
+        .update_issue_body(CANDIDATE, "totally different ask now")
+        .await
+        .unwrap();
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
 }
