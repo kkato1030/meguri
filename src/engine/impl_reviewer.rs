@@ -105,10 +105,19 @@ pub(crate) async fn self_review(
     let base = deps.project.default_branch.clone();
     let language = deps.config.language_for(&deps.project);
 
+    // Resume-safety: a prior run already reached a clean verdict (possibly on
+    // the last allowed round). The phase is done — don't re-review, and don't
+    // let the cap backstop below mistake this clean-at-cap checkpoint for a
+    // non-converged one (issue #176).
+    if cp.self_review_converged {
+        return Ok(flow::StepFlow::Continue);
+    }
+
     loop {
         // Backstop / resume guard: the cap is spent and the last verdict was
-        // not clean — the diff did not converge, so a human decides (ADR 0012;
-        // was "publish as-is" before #176).
+        // not clean (converged short-circuits above) — the diff did not
+        // converge, so a human decides (ADR 0012; was "publish as-is" before
+        // #176).
         if cp.self_review_rounds >= max_rounds {
             return escalate_unconverged(deps, run, cp);
         }
@@ -153,6 +162,7 @@ pub(crate) async fn self_review(
         )?;
 
         if review.verdict == ReviewVerdict::Clean {
+            cp.self_review_converged = true;
             cp.self_review_pending.clear();
             persist(deps, run, cp)?;
             deps.store.emit(
@@ -547,6 +557,82 @@ mod tests {
         let mut run = store.get_run(&run.id).unwrap().unwrap();
         run.issue_title = Some("Add caching".into());
         run
+    }
+
+    fn fake_deps() -> Deps {
+        use std::sync::Arc;
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+        };
+        Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
+    }
+
+    /// A stand-in flavor whose only reachable method on the converged path is
+    /// `kind()` (defaulted); everything else must never be called.
+    struct DoneFlavor;
+
+    #[async_trait::async_trait]
+    impl Flavor for DoneFlavor {
+        fn trigger_label(&self) -> &'static str {
+            ""
+        }
+        fn execute_prompt(&self, _: &Deps, _: &RunRecord, _: &Checkpoint, _: &Path) -> String {
+            unreachable!("not reached on the converged path")
+        }
+        fn verify_work(
+            &self,
+            _: &RunRecord,
+            _: &Checkpoint,
+            _: &Path,
+        ) -> std::result::Result<(), String> {
+            unreachable!("not reached on the converged path")
+        }
+        fn pr_title(&self, _: &RunRecord, _: &Checkpoint) -> String {
+            unreachable!("not reached on the converged path")
+        }
+        async fn settle_labels(&self, _: &Deps, _: &RunRecord, _: &Checkpoint) -> Result<()> {
+            unreachable!("not reached on the converged path")
+        }
+    }
+
+    /// Resume-safety (issue #176): a clean verdict on the last allowed round
+    /// persists `self_review_converged` with `rounds == max_rounds`. On resume
+    /// the phase must publish (Continue), not re-run the cap backstop and
+    /// escalate an already-clean diff as unconverged.
+    #[tokio::test]
+    async fn converged_checkpoint_short_circuits_without_re_review() {
+        let deps = fake_deps();
+        let run = fake_run();
+        let mut cp = Checkpoint {
+            self_review_converged: true,
+            self_review_rounds: deps.config.review.max_rounds,
+            ..Default::default()
+        };
+        let flow = self_review(&deps, &run, &mut cp, Path::new("/nonexistent"), &DoneFlavor)
+            .await
+            .unwrap();
+        assert!(matches!(flow, flow::StepFlow::Continue));
     }
 
     fn cp_with_title() -> Checkpoint {

@@ -286,6 +286,12 @@ pub struct Checkpoint {
     /// the history it already built.
     #[serde(default)]
     pub self_review_log: Vec<super::impl_reviewer::RoundRecord>,
+    /// Set once self-review reached a clean verdict: the phase converged and the
+    /// PR may open. Persisted so a resume distinguishes a clean-at-cap checkpoint
+    /// (rounds == max but done) from a genuinely unconverged one — without it the
+    /// cap backstop would re-escalate an already-clean diff (issue #176).
+    #[serde(default)]
+    pub self_review_converged: bool,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
