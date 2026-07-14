@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, LaunchMode, ProjectConfig, TriageConfig, TriageMode};
+use meguri::config::{Config, LaunchMode, ProjectConfig, TriageAction, TriageConfig, TriageMode};
 use meguri::engine::triage::{
     self, MARKER_HEAD_NONE, REPORT_FILE, TriageLoop, parse_triage_marker, run_triage, triage_marker,
 };
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    Forge, Issue, LABEL_HOLD, LABEL_READY, LABEL_TRIAGE_PLAN, LABEL_TRIAGE_READY,
-    LABEL_TRIAGE_REPORT,
+    Forge, Issue, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_TRIAGE_PLAN,
+    LABEL_TRIAGE_READY, LABEL_TRIAGE_REPORT,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -899,4 +899,316 @@ async fn advise_mode_rejected_then_edited_issue_alone_triggers_rediscovery() {
         .await
         .unwrap();
     assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+// ---- v2 auto (issue #88) ---------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_promotes_above_threshold_and_leaves_the_rest() {
+    // apply defaults to ["ready"], confidence_threshold to 0.7.
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Auto,
+        ..TriageConfig::default()
+    })
+    .await;
+    // #61: a `plan` recommendation — not in the default apply, so report-only.
+    env.forge
+        .add_issue(61, "big rework", "vague and large", &[]);
+    // #62: a `ready` recommendation below the confidence bar — report-only.
+    env.forge.add_issue(62, "maybe cache", "unsure", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear small change", "missing_info": null},
+               {"issue": 61, "recommendation": "plan", "confidence": 0.9,
+                "estimated_complexity": "large", "rationale": "needs a spec", "missing_info": null},
+               {"issue": 62, "recommendation": "ready", "confidence": 0.5,
+                "estimated_complexity": "small", "rationale": "not sure", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // #60: ready ≥ 0.7 and in apply → real label + reason comment (applied=real).
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert_eq!(c60.labels, vec![LABEL_READY.to_string()]);
+    let comments = env.forge.comments_of(CANDIDATE);
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].contains("applied=real"), "{}", comments[0]);
+    assert!(comments[0].contains("clear small change"));
+    assert!(comments[0].contains(LABEL_READY));
+
+    // #61: plan is not in the default apply → untouched.
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    assert!(c61.labels.is_empty(), "{:?}", c61.labels);
+    assert!(env.forge.comments_of(61).is_empty());
+
+    // #62: ready below threshold → untouched.
+    let c62 = env.forge.get_issue(62).await.unwrap();
+    assert!(c62.labels.is_empty(), "{:?}", c62.labels);
+    assert!(env.forge.comments_of(62).is_empty());
+
+    // The engaged bystander is never touched.
+    assert!(env.forge.comments_of(BYSTANDER).is_empty());
+
+    // A `triage.promoted` audit event was recorded for #60 only.
+    let promoted: Vec<_> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "triage.promoted")
+        .collect();
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
+    assert_eq!(promoted[0].data["issue"], 60);
+    assert_eq!(promoted[0].data["label"], LABEL_READY);
+
+    // The report marks the promoted row and lists all three recommendations.
+    let report = report_issue(&env).await.unwrap();
+    assert!(report.body.contains("| #60 | ready"), "{}", report.body);
+    assert!(report.body.contains("✅ 昇格"), "{}", report.body);
+    assert!(report.body.contains("| #61 | plan"), "{}", report.body);
+    assert!(report.body.contains("| #62 | ready"), "{}", report.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_apply_ready_and_plan_promotes_both() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Auto,
+        apply: vec![TriageAction::Ready, TriageAction::Plan],
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "big rework", "needs a spec", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "plan", "confidence": 0.8,
+                "estimated_complexity": "large", "rationale": "spec-first", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    assert_eq!(
+        env.forge.get_issue(CANDIDATE).await.unwrap().labels,
+        vec![LABEL_READY.to_string()]
+    );
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    assert_eq!(c61.labels, vec![LABEL_PLAN.to_string()]);
+    assert!(
+        env.forge
+            .comments_of(61)
+            .iter()
+            .any(|c| c.contains("applied=real") && c.contains(LABEL_PLAN))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_never_promotes_needs_human() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Auto,
+        apply: vec![TriageAction::Ready, TriageAction::Plan],
+        ..TriageConfig::default()
+    })
+    .await;
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "needs-human", "confidence": 0.95,
+                "estimated_complexity": "medium", "rationale": "needs a decision", "missing_info": "which backend?"}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    // Even at 0.95 confidence, needs-human is a ball label (ADR 0005) — never
+    // applied alone, so the untriaged issue stays label-free (no phase-0 anomaly).
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert!(c60.labels.is_empty(), "{:?}", c60.labels);
+    assert!(!c60.has_label(LABEL_NEEDS_HUMAN));
+    assert!(env.forge.comments_of(CANDIDATE).is_empty());
+    // It still appears in the central report.
+    let report = report_issue(&env).await.unwrap();
+    assert!(
+        report.body.contains("| #60 | needs-human"),
+        "{}",
+        report.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_escalates_pending_proposal_and_respects_rejection() {
+    // Start in advise, propose on two issues, reject one, switch to auto, and
+    // verify the pending proposal is escalated while the rejection is respected
+    // (the advise→auto migration + rejection guardrail, ADR 0017 decision 3).
+    let mut env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
+
+    // Sweep 1 (advise): propose `ready` on #60 and #61.
+    let run1 = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "also clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run1.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    let report = report_issue(&env).await.unwrap();
+    assert_eq!(
+        env.forge.get_issue(CANDIDATE).await.unwrap().labels,
+        vec![LABEL_TRIAGE_READY.to_string()]
+    );
+
+    // Human rejects #61's proposal by removing the label (content unchanged).
+    env.forge
+        .remove_label(61, LABEL_TRIAGE_READY)
+        .await
+        .unwrap();
+
+    // Operator switches the loop to auto. The still-pending #60 makes discovery
+    // due (the advise→auto migration signal); without the level-aware check it
+    // would stay quiet and #60 would never reach promotion.
+    env.deps.config.triage.mode = TriageMode::Auto;
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // Sweep 2 (auto): #60 (pending proposal) is a candidate; the rejected #61
+    // is not — a report covering only #60 satisfies exact coverage.
+    let run2 = create_triage_run(&env, report.number);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run2.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "a report covering only the pending #60 must satisfy coverage — the \
+         rejected, unchanged #61 must not be a candidate: {outcome:?}"
+    );
+
+    // #60: the pending proposal is escalated to the real label; the proposal
+    // label is superseded and a real-level reason comment is added.
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert_eq!(
+        c60.labels,
+        vec![LABEL_READY.to_string()],
+        "a pending proposal must escalate to the real label under auto"
+    );
+    assert!(!c60.has_label(LABEL_TRIAGE_READY));
+    assert!(
+        env.forge
+            .comments_of(CANDIDATE)
+            .iter()
+            .any(|c| c.contains("applied=real"))
+    );
+
+    // #61: the rejection is respected — no label, no new comment.
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    assert!(
+        c61.labels.is_empty(),
+        "a rejected proposal must not be auto-promoted: {:?}",
+        c61.labels
+    );
+    assert_eq!(
+        env.forge.comments_of(61).len(),
+        1,
+        "no new comment on the rejected issue"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_throttles_promotions_by_max_actions_per_tick() {
+    let env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Auto,
+        max_actions_per_tick: 1,
+        ..TriageConfig::default()
+    })
+    .await;
+    env.forge.add_issue(61, "second", "also untriaged", &[]);
+
+    let run = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+               {"issue": 61, "recommendation": "ready", "confidence": 0.85,
+                "estimated_complexity": "small", "rationale": "also clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    let c61 = env.forge.get_issue(61).await.unwrap();
+    let promoted =
+        usize::from(c60.has_label(LABEL_READY)) + usize::from(c61.has_label(LABEL_READY));
+    assert_eq!(
+        promoted, 1,
+        "budget of 1 must cap promotions: #60={:?} #61={:?}",
+        c60.labels, c61.labels
+    );
+
+    // The leftover promotable recommendation is recorded as backlog so the next
+    // sweep fires even if nothing else moves.
+    let report = report_issue(&env).await.unwrap();
+    assert!(
+        parse_triage_marker(&report.body).unwrap().backlog,
+        "{}",
+        report.body
+    );
+    assert!(
+        report.body.contains("max_actions_per_tick"),
+        "{}",
+        report.body
+    );
 }

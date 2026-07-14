@@ -78,6 +78,13 @@ repo_slug = "owner/repo"
 #
 # [decompose]
 # materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
+#
+# [triage]                           # 未トリアージ issue を巡回し扱い方を推薦するループ(既定 off、ADR 0006/0015/0017)
+# mode = "off"                       # off | report(レポートのみ) | advise(提案ラベル) | auto(本ラベル自動付与)
+# confidence_threshold = 0.7         # auto: この確信度以上だけ昇格(0.0..=1.0)
+# apply = ["ready"]                  # auto: 昇格する推薦種別。信頼が積めたら ["ready", "plan"] へ
+# max_actions_per_tick = 3           # 1 スイープの書き込み上限
+# ignore = []                        # 誤検知を黙らせる substring
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -368,6 +375,19 @@ pub enum TriageMode {
     Auto,
 }
 
+/// A triage recommendation that `auto` mode (issue #88) may promote to its
+/// real phase label. Only `ready`/`plan` are promotable: they are the two-axis
+/// phase labels worker/planner discovery keys on (ADR 0005). `needs-human`
+/// (a ball label), `hold`, and `skip` are deliberately not accepted — an
+/// unknown value is a parse error, so a misconfigured `apply` fails fast (ADR
+/// 0017 decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriageAction {
+    Ready,
+    Plan,
+}
+
 /// Settings for the triage loop (read-only recommendation sweeps, issue #85).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriageConfig {
@@ -392,6 +412,19 @@ pub struct TriageConfig {
     /// is unchanged, so they stay candidates).
     #[serde(default = "default_triage_max_actions_per_tick")]
     pub max_actions_per_tick: u64,
+    /// `auto` mode only (issue #88): minimum agent-reported confidence for a
+    /// recommendation to be promoted to a real label. Below this, the
+    /// recommendation is left where it is (report/proposal only). Validated to
+    /// `0.0..=1.0` at load (a negative value would promote everything, a value
+    /// above 1.0 would silently promote nothing).
+    #[serde(default = "default_triage_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// `auto` mode only (issue #88): which recommendation kinds are promoted to
+    /// their real phase label. Default `["ready"]` — the safe staged-rollout
+    /// starting point (ADR 0017 decision 2); add `"plan"` once triage has
+    /// earned trust, since the planner is expensive.
+    #[serde(default = "default_triage_apply")]
+    pub apply: Vec<TriageAction>,
 }
 
 impl Default for TriageConfig {
@@ -401,6 +434,8 @@ impl Default for TriageConfig {
             interval_hours: default_triage_interval_hours(),
             ignore: Vec::new(),
             max_actions_per_tick: default_triage_max_actions_per_tick(),
+            confidence_threshold: default_triage_confidence_threshold(),
+            apply: default_triage_apply(),
         }
     }
 }
@@ -410,6 +445,12 @@ fn default_triage_interval_hours() -> u64 {
 }
 fn default_triage_max_actions_per_tick() -> u64 {
     3
+}
+fn default_triage_confidence_threshold() -> f64 {
+    0.7
+}
+fn default_triage_apply() -> Vec<TriageAction> {
+    vec![TriageAction::Ready]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1397,6 +1438,24 @@ impl Config {
             }
             self.validate_schedules(p)?;
             self.validate_cadence(p)?;
+            self.validate_triage(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject a triage config whose `auto`-mode safety gate is nonsensical: a
+    /// `confidence_threshold` outside `0.0..=1.0` (issue #88). A negative value
+    /// would clear every recommendation (runaway promotion); a value above 1.0
+    /// would promote nothing while looking configured (a silent halt). Both are
+    /// misconfigurations, so fail fast rather than act on them.
+    fn validate_triage(&self, p: &ProjectConfig) -> Result<()> {
+        let t = self.triage_for(p);
+        if !(0.0..=1.0).contains(&t.confidence_threshold) {
+            anyhow::bail!(
+                "project {:?} has triage.confidence_threshold = {} (must be within 0.0..=1.0)",
+                p.id,
+                t.confidence_threshold
+            );
         }
         Ok(())
     }
@@ -2863,6 +2922,46 @@ allow_overlap = true
         assert_eq!(schedules[1].kind, ScheduleKind::Plan);
         assert_eq!(schedules[1].body_file.as_deref(), Some("ops/plan.md"));
         assert!(schedules[1].allow_overlap);
+    }
+
+    #[test]
+    fn triage_confidence_threshold_out_of_range_is_rejected() {
+        for bad in ["-0.1", "1.5"] {
+            let raw = format!(
+                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                 [triage]\nconfidence_threshold = {bad}\n"
+            );
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("confidence_threshold"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn triage_confidence_threshold_in_range_and_default_ok() {
+        // Boundaries 0.0 and 1.0 are valid, and the default (no [triage]) is too.
+        for good in ["0.0", "0.7", "1.0"] {
+            let raw = format!(
+                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                 [triage]\nconfidence_threshold = {good}\n"
+            );
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            assert!(cfg.validate().is_ok(), "{good}");
+        }
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.triage.confidence_threshold, 0.7);
+        assert_eq!(cfg.triage.apply, vec![TriageAction::Ready]);
+    }
+
+    #[test]
+    fn triage_apply_rejects_unknown_recommendation_kind() {
+        // needs-human/hold/skip are not promotable, so they are not valid
+        // `apply` values — a typo fails fast at parse time.
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [triage]\napply = [\"ready\", \"needs-human\"]\n";
+        assert!(toml::from_str::<Config>(raw).is_err());
     }
 
     #[test]

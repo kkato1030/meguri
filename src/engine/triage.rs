@@ -58,7 +58,7 @@ use serde_json::json;
 pub use super::WorkerOutcome;
 use super::flow::{self, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
 use super::{Deps, Target};
-use crate::config::TriageMode;
+use crate::config::{TriageAction, TriageConfig, TriageMode};
 use crate::forge::{self, Issue};
 use crate::gitops;
 use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
@@ -317,7 +317,7 @@ impl super::Loop for TriageLoop {
         }
         if !matches!(
             deps.config.triage_for(&deps.project).mode,
-            TriageMode::Report | TriageMode::Advise
+            TriageMode::Report | TriageMode::Advise | TriageMode::Auto
         ) {
             return Ok(Vec::new());
         }
@@ -677,44 +677,79 @@ fn content_hash(issue: &Issue) -> String {
     tasks::body_digest(&format!("{}\n{}", issue.title, issue.body))
 }
 
-/// Whether an issue's content has moved on since its latest evidence
-/// comment's hidden marker. No marker at all (never proposed, a proposal
-/// label applied by hand, or a marker that predates this feature) counts as
-/// changed, so the issue is still offered for a fresh recommendation.
-async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool> {
+/// Whether triage still has an action to take on `issue`, judged from its
+/// latest evidence-comment marker. Content that moved since the marker is
+/// always eligible (re-triage). At unchanged content the answer depends on the
+/// mode and the marker's applied level (ADR 0017 decision 3):
+///
+/// - `report`/`advise`: an unchanged marker means "already actioned" — not
+///   eligible (v1 idempotency, preserved verbatim).
+/// - `auto`: a `real` marker means already promoted (or promoted then reverted
+///   = a human rejection) — not eligible. A `proposal` marker means the last
+///   action was only a v1 proposal: eligible **iff a proposal label is still
+///   present** (a pending proposal to escalate); if the label was removed, the
+///   human rejected it, so respect that until the content changes.
+///
+/// `no_marker` is the answer when the issue has no marker at all — `true` for
+/// candidate gathering (a never-triaged issue is a candidate), `false` for the
+/// drift re-scan signal (a never-proposed issue is not "drift", or every
+/// untriaged issue would re-trigger the sweep and defeat the rate limit).
+async fn triage_action_pending(deps: &Deps, issue: &Issue, no_marker: bool) -> Result<bool> {
     let Some(marker) = latest_advise_marker(deps, issue.number).await? else {
-        return Ok(true);
+        return Ok(no_marker);
     };
-    Ok(marker.hash != content_hash(issue))
+    if marker.hash != content_hash(issue) {
+        return Ok(true); // content moved: re-triage
+    }
+    if deps.config.triage_for(&deps.project).mode != TriageMode::Auto {
+        return Ok(false); // report/advise: unchanged marker = already actioned
+    }
+    match marker.applied {
+        AppliedLevel::Real => Ok(false), // already promoted, or rejected promotion
+        AppliedLevel::Proposal => Ok(has_proposal_label(issue)), // pending → escalate; rejected → respect
+    }
 }
 
-/// Whether `issue` carries an advise evidence-comment marker whose hash no
-/// longer matches its current content. Unlike `content_changed_since_advise`
-/// (used by `gather_candidates`, where "never proposed" should also count as
-/// eligible), a genuinely never-proposed issue returns `false` here — it has
-/// no marker to drift from, and treating every ordinary untriaged issue as
-/// drifted would defeat the point of rate-limiting this signal.
+/// Whether `issue` carries any triage `advise` proposal label.
+fn has_proposal_label(issue: &Issue) -> bool {
+    forge::TRIAGE_PROPOSAL_LABELS
+        .iter()
+        .any(|l| issue.has_label(l))
+}
+
+/// Whether an issue is eligible for a fresh triage recommendation. No marker at
+/// all (never proposed, a proposal label applied by hand, or a marker that
+/// predates this feature) counts as eligible, so the issue is offered.
+async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool> {
+    triage_action_pending(deps, issue, true).await
+}
+
+/// The discovery-time drift signal: whether triage has a pending action on
+/// `issue` per its marker. Unlike `content_changed_since_advise` (used by
+/// `gather_candidates`, where "never proposed" should also count as eligible),
+/// a genuinely never-proposed issue returns `false` here — it has no marker to
+/// drift from, and treating every ordinary untriaged issue as drifted would
+/// defeat the point of rate-limiting this signal.
 async fn marker_drifted(deps: &Deps, issue: &Issue) -> Result<bool> {
-    let Some(marker) = latest_advise_marker(deps, issue.number).await? else {
-        return Ok(false);
-    };
-    Ok(marker.hash != content_hash(issue))
+    triage_action_pending(deps, issue, false).await
 }
 
 /// The discovery-time counterpart of `content_changed_since_advise`: whether
-/// *any* open, non-engaged issue has drifted from its evidence-comment
-/// marker. Without this, editing a proposed issue's title/body alone (no new
-/// issue filed, no default-branch push) never sets `needs_triage_scan`'s
-/// `changed` flag, so the sweep that would notice the drift — and
-/// `gather_candidates`'s own per-issue check — is never even scheduled. This
-/// deliberately does *not* filter to "still carries a proposal label": a
-/// human rejecting a proposal (removing the label) doesn't erase the
-/// evidence comment's marker, and an edit after that rejection is exactly
-/// the "content changed, so re-triage anyway" case the marker is meant to
-/// catch — filtering on the label would silently miss it. `off`/`report`
-/// never propose, so this always short-circuits to `false` there.
+/// *any* open, non-engaged issue has a pending triage action per its
+/// evidence-comment marker. Without this, editing a proposed issue's
+/// title/body alone (no new issue filed, no default-branch push) never sets
+/// `needs_triage_scan`'s `changed` flag, so the sweep that would notice the
+/// drift — and `gather_candidates`'s own per-issue check — is never even
+/// scheduled. In `auto` mode it also fires on a still-pending proposal at
+/// unchanged content (a proposal label present with a `proposal`-level
+/// marker), so switching `advise`→`auto` actually reaches the promotion path
+/// (`marker_drifted` encodes that; ADR 0017). `off`/`report` never act
+/// per-issue, so this short-circuits to `false` there.
 async fn advise_backlog_changed(deps: &Deps) -> Result<bool> {
-    if deps.config.triage_for(&deps.project).mode != TriageMode::Advise {
+    if !matches!(
+        deps.config.triage_for(&deps.project).mode,
+        TriageMode::Advise | TriageMode::Auto
+    ) {
         return Ok(false);
     }
     for issue in deps.forge().list_open_issues().await? {
@@ -1023,19 +1058,22 @@ fn replace_marker(body: &str, marker: &str) -> String {
     format!("{}{}{}", &body[..start], marker, &body[start + len..])
 }
 
-/// settle: in `advise` mode, first propose (label + evidence comment) on the
-/// recommended issues themselves; then, always, render the snapshot body and
-/// write the report issue. `max_issue` is recorded fresh here (so the
-/// just-created report issue does not re-trigger the next sweep). Returns the
-/// report issue number.
+/// settle: `advise` proposes (label + evidence comment) and `auto` promotes
+/// (real phase label + reason comment) on the recommended issues themselves;
+/// then, always, render the snapshot body and write the report issue.
+/// `max_issue` is recorded fresh here (so the just-created report issue does
+/// not re-trigger the next sweep). Returns the report issue number.
 async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i64> {
     let triage_cfg = deps.config.triage_for(&deps.project);
     let ignore = triage_cfg.ignore.clone();
     let mode = triage_cfg.mode;
-    let backlog = if mode == TriageMode::Advise {
-        apply_advise(deps, run, &cp.recommendations).await
-    } else {
-        false
+    let (promoted, backlog) = match mode {
+        TriageMode::Advise => (
+            Vec::new(),
+            apply_advise(deps, run, &cp.recommendations).await,
+        ),
+        TriageMode::Auto => apply_auto(deps, run, &cp.recommendations).await,
+        TriageMode::Off | TriageMode::Report => (Vec::new(), false),
     };
     let max_open = max_open_issue(deps).await.unwrap_or(cp.prev_max_issue);
     let body = render_report(
@@ -1047,6 +1085,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
         &ignore,
         mode,
         backlog,
+        &promoted,
     );
 
     let issue = if cp.report_issue == 0 {
@@ -1172,6 +1211,123 @@ async fn propose_one(deps: &Deps, item: &TriageItem, ignore: &[String]) -> Resul
     Ok(true)
 }
 
+/// `auto` write path: promote (real phase label + reason comment) up to
+/// `triage.max_actions_per_tick` recommendations that clear `confidence_threshold`
+/// and are listed in `apply`. Best-effort like `apply_advise` — one issue's
+/// failure is logged and skipped. Returns `(promoted issue numbers, backlog)`,
+/// where `backlog` means a promotable recommendation was left unwritten (budget
+/// cut it off, or the write failed), so the caller records it on the marker and
+/// the next `needs_triage_scan` fires even if nothing else moved.
+async fn apply_auto(
+    deps: &Deps,
+    run: &RunRecord,
+    recommendations: &[TriageItem],
+) -> (Vec<i64>, bool) {
+    let cfg = deps.config.triage_for(&deps.project);
+    let ignore = cfg.ignore.clone();
+    let budget = cfg.max_actions_per_tick;
+    let mut used = 0u64;
+    let mut promoted = Vec::new();
+    let mut backlog = false;
+    for item in recommendations {
+        // "Could this recommendation ever promote?" — in `apply`, and over the
+        // confidence bar. Sub-threshold / non-`apply` items are never backlog.
+        let promotable = promote_label(item.recommendation, &cfg.apply).is_some()
+            && item.confidence >= cfg.confidence_threshold;
+        if used >= budget {
+            if promotable {
+                backlog = true;
+            }
+            continue;
+        }
+        match promote_one(deps, item, cfg, &ignore).await {
+            Ok(true) => {
+                used += 1;
+                promoted.push(item.issue);
+                let label = promote_label(item.recommendation, &cfg.apply).unwrap_or_default();
+                let _ = deps.store.emit(
+                    Some(&run.id),
+                    "triage.promoted",
+                    json!({
+                        "issue": item.issue,
+                        "recommendation": item.recommendation.as_str(),
+                        "label": label,
+                        "confidence": item.confidence,
+                    }),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // The attempt failed — the hash didn't move, so a promotable
+                // item is still backlog, not a resolved no-op.
+                if promotable {
+                    backlog = true;
+                }
+                tracing::warn!("triage auto-promote on issue #{}: {e:#}", item.issue);
+            }
+        }
+    }
+    (promoted, backlog)
+}
+
+/// One issue's promotion attempt: apply the real phase label + a reason
+/// comment, gated by `apply`/`confidence_threshold`, `ignore`, a fresh
+/// human-override re-read, and the marker idempotency/rejection check. Returns
+/// whether a label was actually applied (what counts against the budget).
+async fn promote_one(
+    deps: &Deps,
+    item: &TriageItem,
+    cfg: &TriageConfig,
+    ignore: &[String],
+) -> Result<bool> {
+    let Some(label) = promote_label(item.recommendation, &cfg.apply) else {
+        return Ok(false); // needs-human/hold/skip, or not listed in `apply`
+    };
+    if item.confidence < cfg.confidence_threshold {
+        return Ok(false); // below the safety gate
+    }
+    if ignored(
+        ignore,
+        &[
+            &format!("#{}", item.issue),
+            item.recommendation.as_str(),
+            &item.rationale,
+            item.missing_info.as_deref().unwrap_or(""),
+        ],
+    ) {
+        return Ok(false);
+    }
+    let issue = deps.forge().get_issue(item.issue).await?;
+    if issue.labels.iter().any(|l| is_engaged_label(l)) {
+        return Ok(false); // a real label already, or held — never override a human
+    }
+    let hash = content_hash(&issue);
+    if let Some(prev) = latest_advise_marker(deps, item.issue).await?
+        && prev.hash == hash
+    {
+        // Same content as the last triage action. Suppress when it was already
+        // a real promotion (idempotent, or a human reverted it = rejection), or
+        // when a prior proposal at this content was rejected (proposal marker,
+        // no proposal label left). Escalate only a still-pending proposal.
+        match prev.applied {
+            AppliedLevel::Real => return Ok(false),
+            AppliedLevel::Proposal if !has_proposal_label(&issue) => return Ok(false),
+            AppliedLevel::Proposal => {}
+        }
+    }
+    // Supersede any triage proposal labels with the real one.
+    for stale in forge::TRIAGE_PROPOSAL_LABELS {
+        if issue.has_label(stale) {
+            deps.forge().remove_label(item.issue, stale).await?;
+        }
+    }
+    deps.forge().add_label(item.issue, label).await?;
+    deps.forge()
+        .comment(item.issue, &render_promote_comment(item, label, &hash))
+        .await?;
+    Ok(true)
+}
+
 /// The `advise` proposal label for a recommendation, or `None` for `hold`/
 /// `skip` — those stay report-only, there is nothing actionable to propose.
 fn proposal_label(rec: Recommendation) -> Option<&'static str> {
@@ -1183,7 +1339,8 @@ fn proposal_label(rec: Recommendation) -> Option<&'static str> {
     }
 }
 
-/// The real workflow label a human promotes the proposal to.
+/// The real workflow label a human promotes the proposal to (and the one
+/// `auto` mode applies directly).
 fn real_label(rec: Recommendation) -> Option<&'static str> {
     match rec {
         Recommendation::Ready => Some(forge::LABEL_READY),
@@ -1193,35 +1350,84 @@ fn real_label(rec: Recommendation) -> Option<&'static str> {
     }
 }
 
-/// Hidden marker embedded in the advise evidence comment: the content hash
-/// the proposal was made against. Both idempotency (don't re-propose the same
-/// content) and rejection-respect (don't re-propose after a human removes the
-/// label, as long as the content hasn't moved) read off this one field.
-fn advise_marker(hash: &str, recommendation: Recommendation) -> String {
+/// The real phase label `auto` mode would promote `rec` to, or `None` when it
+/// is not promotable in this config: only `ready`/`plan` (the two-axis phase
+/// labels, ADR 0005) and only when the recommendation is listed in `apply`.
+/// `needs-human`/`hold`/`skip` are never promoted (ADR 0017 decision 8).
+fn promote_label(rec: Recommendation, apply: &[TriageAction]) -> Option<&'static str> {
+    let action = match rec {
+        Recommendation::Ready => TriageAction::Ready,
+        Recommendation::Plan => TriageAction::Plan,
+        Recommendation::NeedsHuman | Recommendation::Hold | Recommendation::Skip => return None,
+    };
+    apply.contains(&action).then(|| real_label(rec)).flatten()
+}
+
+/// How far triage acted on an issue at a given content hash. `advise` writes a
+/// `Proposal` marker (a proposal label + evidence comment); `auto` writes a
+/// `Real` marker (a real phase label was applied). Distinguishing them lets
+/// `auto` escalate a still-pending proposal while respecting an already-made
+/// promotion / rejection (ADR 0017 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedLevel {
+    Proposal,
+    Real,
+}
+
+impl AppliedLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proposal => "proposal",
+            Self::Real => "real",
+        }
+    }
+}
+
+/// Hidden marker embedded in a triage evidence comment: the content hash the
+/// action was taken against, plus the applied level. Idempotency (don't repeat
+/// the same action), rejection-respect (don't re-act after a human removes the
+/// label, as long as the content hasn't moved), and the `advise`→`auto`
+/// escalation all read off these fields.
+fn advise_marker(hash: &str, recommendation: Recommendation, applied: AppliedLevel) -> String {
     format!(
-        "<!-- meguri:triage-advise hash={hash} recommendation={} -->",
-        recommendation.as_str()
+        "<!-- meguri:triage-advise hash={hash} recommendation={} applied={} -->",
+        recommendation.as_str(),
+        applied.as_str(),
     )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdviseMarker {
     hash: String,
+    /// A marker predating this field (v1 advise) parses as `Proposal` — the
+    /// only action v1 ever took.
+    applied: AppliedLevel,
 }
 
 fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
     let rest = comment.split("<!-- meguri:triage-advise ").nth(1)?;
     let fields = rest.split("-->").next()?;
-    let hash = fields
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("hash="))?;
+    let mut hash = None;
+    let mut applied = AppliedLevel::Proposal;
+    for part in fields.split_whitespace() {
+        if let Some(v) = part.strip_prefix("hash=") {
+            hash = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("applied=") {
+            applied = if v == "real" {
+                AppliedLevel::Real
+            } else {
+                AppliedLevel::Proposal
+            };
+        }
+    }
     Some(AdviseMarker {
-        hash: hash.to_string(),
+        hash: hash?,
+        applied,
     })
 }
 
 /// The most recent advise marker on `issue`, if any — last-wins, since only
-/// the latest proposal's hash matters for idempotency.
+/// the latest action's hash and level matter for idempotency.
 async fn latest_advise_marker(deps: &Deps, issue: i64) -> Result<Option<AdviseMarker>> {
     let comments = deps.forge().issue_comments(issue).await?;
     Ok(comments.iter().rev().find_map(|c| parse_advise_marker(c)))
@@ -1235,7 +1441,7 @@ fn render_advise_comment(item: &TriageItem, hash: &str) -> String {
     let mut body = format!(
         "{marker}\n🔀 **meguri triage 提案** — `{label}` を提案します(確信度 {confidence:.2}、\
          複雑度: {complexity})。\n\n{rationale}\n",
-        marker = advise_marker(hash, item.recommendation),
+        marker = advise_marker(hash, item.recommendation, AppliedLevel::Proposal),
         confidence = item.confidence,
         complexity = item.estimated_complexity.as_str(),
         rationale = item.rationale,
@@ -1250,6 +1456,32 @@ fn render_advise_comment(item: &TriageItem, hash: &str) -> String {
          自動昇格しません)。却下する場合は `{label}` ラベルを外すだけで構いません — 内容が変わる\
          まで再提案しません。誤検知が続くなら `triage.ignore` へどうぞ。\n",
         real = real_label(item.recommendation).unwrap_or_default(),
+    ));
+    body
+}
+
+/// The reason comment posted alongside an `auto` promotion: the hidden marker
+/// (recorded at `real` level), the human-readable rationale, and how to revert.
+/// Reversibility (ADR 0017): a human removes the label to roll it back.
+fn render_promote_comment(item: &TriageItem, label: &str, hash: &str) -> String {
+    let mut body = format!(
+        "{marker}\n🔀 **meguri triage 自動昇格** — `{label}` を付与しました(確信度 {confidence:.2}、\
+         複雑度: {complexity})。既存の worker / planner ループが着手します。\n\n{rationale}\n",
+        marker = advise_marker(hash, item.recommendation, AppliedLevel::Real),
+        confidence = item.confidence,
+        complexity = item.estimated_complexity.as_str(),
+        rationale = item.rationale,
+    );
+    if let Some(mi) = &item.missing_info
+        && !mi.is_empty()
+    {
+        body.push_str(&format!("\n⚠️ 要確認: {mi}\n"));
+    }
+    body.push_str(&format!(
+        "\n---\n差し戻すには `{label}` ラベルを外してください — 内容が変わるまで再昇格しません\
+         (worker が既に着手していれば run を止めるか `{hold}` を使ってください)。誤検知が続くなら \
+         `triage.ignore` へどうぞ。\n",
+        hold = forge::LABEL_HOLD,
     ));
     body
 }
@@ -1275,6 +1507,7 @@ pub fn render_report(
     ignore: &[String],
     mode: TriageMode,
     backlog: bool,
+    promoted: &[i64],
 ) -> String {
     let mut items: Vec<&TriageItem> = items
         .iter()
@@ -1318,6 +1551,14 @@ pub fn render_report(
             {
                 rationale.push_str(&format!("<br>⚠️ 要確認: {}", mi.replace('\n', " ")));
             }
+            // In `auto`, mark the rows this sweep actually promoted to a real
+            // label (reversibility: the reader sees exactly what was auto-started).
+            if promoted.contains(&it.issue) {
+                rationale.push_str(&format!(
+                    "<br>✅ 昇格: `{}` 付与",
+                    real_label(it.recommendation).unwrap_or_default()
+                ));
+            }
             body.push_str(&format!(
                 "| #{} | {} | {:.2} | {} | {} |\n",
                 it.issue,
@@ -1329,7 +1570,20 @@ pub fn render_report(
         }
     }
 
-    if mode == TriageMode::Advise {
+    if mode == TriageMode::Auto {
+        body.push_str(&format!(
+            "\n---\n**auto モード**: `apply` に含まれ確信度が `confidence_threshold` 以上の \
+             `ready` / `plan` 推薦は、対象 issue に本ラベル(`{ready}` / `{plan}`)を直接付与し、\
+             理由コメントを残します(上表の ✅ 昇格 行)。既存の worker / planner ループが着手します。\
+             差し戻すには本ラベルを外してください — 内容が変わるまで再昇格しません(着手済みなら run を \
+             止めるか `{hold}`)。閾値未満・`apply` 外・`needs-human` / `skip` / `hold` は据え置きで、\
+             ここに載るだけです。誤検知は `triage.ignore`(この本文の編集は毎スイープ上書きされます)、\
+             スイープ停止は `{hold}` をこの issue に。\n",
+            ready = forge::LABEL_READY,
+            plan = forge::LABEL_PLAN,
+            hold = forge::LABEL_HOLD,
+        ));
+    } else if mode == TriageMode::Advise {
         body.push_str(&format!(
             "\n---\n`ready` / `plan` / `needs-human` recommendations above also get a \
              proposal label (`meguri:triage-*`) and an evidence comment directly on \
@@ -1672,6 +1926,7 @@ mod tests {
             &[],
             TriageMode::Report,
             false,
+            &[],
         );
         assert!(body.starts_with(&triage_marker("0123456789abcdef", 1_700_000_000, 90, false)));
         assert!(body.contains("`0123456789ab`"), "{body}");
@@ -1693,6 +1948,7 @@ mod tests {
             &[],
             TriageMode::Advise,
             false,
+            &[],
         );
         assert!(body.contains("meguri:triage-"));
         assert!(body.contains("triage.ignore"));
@@ -1710,6 +1966,7 @@ mod tests {
             &[],
             TriageMode::Advise,
             true,
+            &[],
         );
         assert!(parse_triage_marker(&body).unwrap().backlog);
         assert!(body.contains("max_actions_per_tick"), "{body}");
@@ -1726,6 +1983,7 @@ mod tests {
             &["#81".to_string()],
             TriageMode::Report,
             false,
+            &[],
         );
         assert!(!body.contains("| #81 |"));
         assert!(body.contains("| #90 |"));
@@ -1740,6 +1998,7 @@ mod tests {
             &["auth backend".to_string()],
             TriageMode::Report,
             false,
+            &[],
         );
         assert!(!body.contains("| #90 |"));
         assert!(body.contains("| #81 |"));
@@ -1747,7 +2006,7 @@ mod tests {
 
     #[test]
     fn empty_report_still_carries_the_marker() {
-        let body = render_report("h", 7, "now", 0, &[], &[], TriageMode::Report, false);
+        let body = render_report("h", 7, "now", 0, &[], &[], TriageMode::Report, false, &[]);
         assert!(body.contains(&triage_marker("h", 7, 0, false)));
         assert!(body.contains("_No open issues to triage._"));
     }
@@ -1760,10 +2019,25 @@ mod tests {
             body: "b".into(),
             labels: vec![],
         });
-        let marker = advise_marker(&hash, Recommendation::Ready);
+        let marker = advise_marker(&hash, Recommendation::Ready, AppliedLevel::Proposal);
         let parsed = parse_advise_marker(&format!("{marker}\nsome rationale")).unwrap();
         assert_eq!(parsed.hash, hash);
+        assert_eq!(parsed.applied, AppliedLevel::Proposal);
         assert_eq!(parse_advise_marker("no marker here"), None);
+
+        // A `real` marker roundtrips its level.
+        let real = advise_marker(&hash, Recommendation::Plan, AppliedLevel::Real);
+        assert_eq!(
+            parse_advise_marker(&real).unwrap().applied,
+            AppliedLevel::Real
+        );
+        // A marker predating the `applied` field parses as `proposal` (v1's
+        // only action level), for backward compatibility.
+        let old = format!("<!-- meguri:triage-advise hash={hash} recommendation=ready -->");
+        assert_eq!(
+            parse_advise_marker(&old).unwrap().applied,
+            AppliedLevel::Proposal
+        );
 
         let changed_hash = content_hash(&Issue {
             number: 1,
@@ -1800,5 +2074,76 @@ mod tests {
         assert!(!is_engaged_label(forge::LABEL_TRIAGE_PLAN));
         assert!(!is_engaged_label(forge::LABEL_TRIAGE_NEEDS_HUMAN));
         assert!(!is_engaged_label("not-a-meguri-label"));
+    }
+
+    #[test]
+    fn promote_label_honors_apply_and_two_axis_model() {
+        use TriageAction::{Plan, Ready};
+        // Only recommendations listed in `apply` promote, and only ready/plan.
+        assert_eq!(
+            promote_label(Recommendation::Ready, &[Ready]),
+            Some(forge::LABEL_READY)
+        );
+        assert_eq!(promote_label(Recommendation::Plan, &[Ready]), None); // not in apply
+        assert_eq!(
+            promote_label(Recommendation::Plan, &[Ready, Plan]),
+            Some(forge::LABEL_PLAN)
+        );
+        // needs-human is a ball label (ADR 0005), never auto-promoted; hold/skip
+        // have no real label. None regardless of `apply`.
+        assert_eq!(
+            promote_label(Recommendation::NeedsHuman, &[Ready, Plan]),
+            None
+        );
+        assert_eq!(promote_label(Recommendation::Hold, &[Ready, Plan]), None);
+        assert_eq!(promote_label(Recommendation::Skip, &[Ready, Plan]), None);
+        // Empty apply promotes nothing.
+        assert_eq!(promote_label(Recommendation::Ready, &[]), None);
+    }
+
+    #[test]
+    fn auto_footer_mentions_real_labels_and_rollback() {
+        let body = render_report(
+            "head",
+            1,
+            "now",
+            90,
+            &sample_items(),
+            &[],
+            TriageMode::Auto,
+            false,
+            &[81],
+        );
+        // Real labels, not proposal labels, and how to revert.
+        assert!(body.contains(forge::LABEL_READY));
+        assert!(body.contains(forge::LABEL_PLAN));
+        assert!(!body.contains("meguri:triage-"));
+        assert!(body.contains("差し戻す"));
+        assert!(body.contains("triage.ignore"));
+        // The promoted row is marked with the label it received.
+        assert!(body.contains("✅ 昇格"), "{body}");
+    }
+
+    #[test]
+    fn promote_comment_carries_real_marker_and_rollback() {
+        let item = TriageItem {
+            issue: 81,
+            recommendation: Recommendation::Ready,
+            confidence: 0.9,
+            estimated_complexity: Complexity::Small,
+            rationale: "clear scope".into(),
+            missing_info: None,
+        };
+        let body = render_promote_comment(&item, forge::LABEL_READY, "deadbeef");
+        assert!(body.starts_with("<!-- meguri:triage-advise hash=deadbeef"));
+        assert!(body.contains("applied=real"), "{body}");
+        assert!(body.contains(forge::LABEL_READY));
+        assert!(body.contains("clear scope"));
+        assert!(body.contains("差し戻す"));
+        // Its marker parses back as a `real` promotion.
+        assert_eq!(
+            parse_advise_marker(&body).unwrap().applied,
+            AppliedLevel::Real
+        );
     }
 }
