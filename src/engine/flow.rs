@@ -620,7 +620,9 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
 ///
 /// The advisor is re-embodied, not resumed: any surviving advisor pane is torn
 /// down and a fresh one spawned ("捨てて張り直す"), so a resume or restart never
-/// adopts a stale individual.
+/// adopts a stale individual. The same applies to its cwd — the bare directory
+/// is deleted and recreated empty on every spawn, so files left by a crashed
+/// advisor (or one whose pane alone was reaped) never leak into the fresh one.
 pub(crate) async fn ensure_advisor(deps: &Deps, run: &RunRecord, worktree: &Path, cp: &Checkpoint) {
     if !crate::collab::run_gets_advisor(&deps.config, run) {
         return;
@@ -663,6 +665,19 @@ async fn spawn_advisor(
         .clone()
         .unwrap_or_else(crate::config::worktrees_root);
     let advisor_dir = root.join(&deps.project.id).join(format!("advisor-{issue}"));
+    // Re-embody, never reuse (ADR 0006 「捨てて張り直す」): a crashed advisor or
+    // a reaper orphan sweep (which kills only the pane) can leave files behind,
+    // and the fresh individual must not see a stale one's leftovers. Tear the
+    // directory down and recreate it empty.
+    match std::fs::remove_dir_all(&advisor_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("cannot clear stale advisor dir {}", advisor_dir.display())
+            });
+        }
+    }
     std::fs::create_dir_all(&advisor_dir)
         .with_context(|| format!("cannot create advisor dir {}", advisor_dir.display()))?;
 
@@ -2454,6 +2469,46 @@ mod tests {
         assert_eq!(pane.agent_session_id, None);
         assert!(!advisor_dir.exists());
         assert!(advisor_consult_section(&deps, &run).is_empty());
+    }
+
+    /// A crashed advisor — or a reaper orphan sweep that kills only the pane —
+    /// leaves files in the advisor cwd. Re-embodiment (ADR 0006) must not let
+    /// the fresh individual see them: the directory is recreated empty.
+    #[tokio::test]
+    async fn advisor_respawn_recreates_cwd_without_stale_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Leftovers from a previous individual that was never cleanly released.
+        let advisor_dir = root.path().join("proj").join("advisor-7");
+        std::fs::create_dir_all(advisor_dir.join("notes")).unwrap();
+        std::fs::write(advisor_dir.join("stale.md"), "old advisor state").unwrap();
+        std::fs::write(advisor_dir.join("notes").join("deep.md"), "nested").unwrap();
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        // The pane spawned and the cwd exists again — but empty: no stale files.
+        assert!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .unwrap()
+                .mux_pane_id
+                .is_some()
+        );
+        assert!(advisor_dir.exists());
+        assert_eq!(
+            std::fs::read_dir(&advisor_dir).unwrap().count(),
+            0,
+            "advisor cwd must be recreated empty on respawn"
+        );
     }
 
     #[tokio::test]
