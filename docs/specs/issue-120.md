@@ -8,13 +8,13 @@
 
 issue の「論点(planning で詰める)」への答え:
 
-1. **refine の実行形態 — headless 一発で確定。** AgentProfile に headless 呼び出しの型が無いので、**新フィールド `headless_args: Option<Vec<String>>` を `AgentProfile` に足す**(claude 系 builtin は `Some(["-p"])`)。`None`(headless 非対応)のプロファイルに当たったら refine をスキップして raw のまま、**一行警告**を出す(silent fallback にしない)。refine は agent の stdout を整形結果として受け取るだけで、agent 自身は forge も files も触らない。
+1. **refine の実行形態 — headless 一発で確定。** AgentProfile に headless 呼び出しの型が無いので、**新フィールド `headless_args: Option<Vec<String>>` を `AgentProfile` に足す**。`headless_args` は **headless 起動の完全な argv であり、対話 pane 用の `args` とは一切合成しない**(起動形は `{command} {headless_args} <prompt>`)。既存 `args` は yolo(`--dangerously-skip-permissions`)と model 指定が一体で入っている(builtin `claude-sonnet` は `["--dangerously-skip-permissions", "--model", "sonnet"]`)ため、`args` に append すると yolo が混入し、`args` を置き換えると model 指定が落ちて routing の意味が崩れる — だから流用せず独立の完全 argv にする。claude 系 builtin には **model 指定込み**で持たせる: `claude-sonnet` は `Some(["-p", "--model", "sonnet"])`、`claude-opus` は `Some(["-p", "--model", "opus"])`。これで routing が選んだモデルは維持しつつ、yolo は構造的に headless へ渡らない。`None`(headless 非対応)のプロファイルに当たったら refine をスキップして raw のまま、**一行警告**を出す(silent fallback にしない)。refine は agent の stdout を整形結果として受け取るだけで、agent 自身は forge も files も触らない。
 
 2. **refiner の routing — role `refiner` を routing に乗せる。** `routing::KNOWN_ROLES` に `"refiner"` を追加し、`recommended_chain("refiner")` を安価側(`["claude-sonnet", DEFAULT_PROFILE]`)に倒す。これで `[routing.roles] refiner = "..."` が `validate` を通り、`routing::resolve(cfg, "refiner", detect)` で解決できる。`[routing]` 無しなら default、の既存規律に従う。KNOWN_ROLES はこれ以降「loop_kind + one-shot コマンドの役割」を含む(ADR 0006 の帰結。doc コメントを更新する)。
 
 3. **project の指定と省略 — `--project <id>` オプションで受け、v1 で省略(推定)も実装する。** project を位置引数にすると、位置引数が 1 つだけの `meguri add "雑な一言"` で clap がそれを project と text のどちらとも判定できず曖昧になる。既存 CLI の規約(`meguri run --project` 等、project は常に `--project` オプション)に寄せ、**text を唯一の位置引数、project を `#[arg(long)]` の `Option<String>`** とする。`--project` 省略時は cwd が登録済み project の `repo_path` 配下なら推定する。曖昧(複数 project にマッチ、または cwd がどの repo_path 配下でもなく project が複数)なら明示エラー。
 
-4. **refine の読み取り範囲 — `repo_path` を read-only。** worktree は作らない。cwd = `repo_path` で headless agent を起動し、書き込み・コミットはさせない(refine のプロンプトは「出力のみ・ファイルを書くな・コミットするな」)。yolo フラグ(`--dangerously-skip-permissions`)は headless 呼び出しには渡さない。
+4. **refine の読み取り範囲 — `repo_path` を read-only。** worktree は作らない。cwd = `repo_path` で headless agent を起動し、書き込み・コミットはさせない(refine のプロンプトは「出力のみ・ファイルを書くな・コミットするな」)。yolo フラグ(`--dangerously-skip-permissions`)は headless 呼び出しには渡さない — `headless_args` が `args` から独立した完全 argv である(論点1)ことで構造的に保証される。
 
 5. **update の競合 — 軽い guard を入れる。** refine の update 前に body を再取得し、**投入時の raw body のままのときだけ**上書きする(title も同様に raw title のときだけ)。数秒の窓に人間が編集していたらその編集を尊重して refine の書き戻しをスキップ(一行の note)。
 
@@ -24,13 +24,13 @@ issue の「論点(planning で詰める)」への答え:
 
 `meguri add` は run/pane/store を作らない(ADR 0006: 寿命モデルの外)。必要なのは config と forge だけ — `build_deps` は使わず、`GhForge::new(&project.repo_slug)` を直に組む。
 
-1. **project 解決** — 明示 `--project` が最優先。無ければ cwd を各 `project.repo_path` と正規化して前方一致で推定。1 個に定まらなければ明示エラー。
+1. **project 解決** — 明示 `--project` が最優先。無ければ cwd と各 `project.repo_path` を canonicalize した上で、**path component 境界を尊重する `Path::starts_with`** で配下判定して推定する(文字列の前方一致だと `/repo` が `/repo2` に誤一致する)。1 個に定まらなければ明示エラー。
 2. **ラベル決定** — `--plan` → `[LABEL_PLAN]`、`--ready` → `[LABEL_READY]`、どちらも無し → `[]`(無ラベル = 未トリアージ)。`--plan` と `--ready` は排他(両方でエラー)。
 3. **capture** — `create_issue(title, body, labels)`。初期 title = 原文(長ければ 1 行分に切り詰め)、初期 body = 原文メモ verbatim(refine が一度も走らなくても原文は body に在る = 受け入れ基準 3)。
 4. **即時出力** — `issue #N created: <url>`。`create_issue` は番号のみ返す(確認済み)ので、**URL は `repo_slug` から合成**する(`https://github.com/{slug}/issues/{number}`)。trait シグネチャは変えない。
 5. `--raw` または headless 非対応プロファイル → ここで終了(非対応時は一行 note)。
 6. **refine(best-effort)** — `refining…` を出し、headless agent を起動(タイムアウトと Ctrl-C を tokio select で監視)。成功したら stdout をパースして整形 title/body を得る。**原文 verbatim フッタは meguri が付す**(モデル出力には含ませない)。論点5 の guard(raw のままか再取得確認)を通してから、`update_issue_title` + `update_issue_body`。`done` と整形結果の要約を出す。
-7. **どんな失敗でも raw のまま capture 成功を報告**(exit 0)— agent CLI 不在・非ゼロ終了・パース失敗・タイムアウト・Ctrl-C いずれも一行警告のみ。
+7. **capture 成功(= `create_issue` 成功)より後の失敗は、raw のまま capture 成功を報告**(exit 0)— agent CLI 不在・非ゼロ終了・パース失敗・タイムアウト・Ctrl-C いずれも一行警告のみ。逆に **`create_issue` 自体の失敗(認証切れ・ネットワーク障害・repo_slug 誤設定・権限不足)は issue が存在しないので通常のエラー**として非ゼロ exit で報告する — 「失敗させない」のは refine 以降の話であって、forge への issue 作成そのものではない(ADR 0006)。
 
 ### refine の入出力
 
@@ -52,8 +52,8 @@ issue の「論点(planning で詰める)」への答え:
 - `src/main.rs` — ディスパッチ追加。
 - `src/app.rs` — `cmd_add`。project 推定ヘルパ(cwd → repo_path)、capture→即時出力→(raw/非対応でなければ)refine→書き戻し。URL は repo_slug から合成。
 - `src/forge/mod.rs` / `gh.rs` / `fake.rs` — **`update_issue_title(number, title)` を新設**(`Forge` trait に title 更新が無いことを確認済み。gh 実装は `gh issue edit <n> --title`)。`create_issue` / `update_issue_body` / `add_label` は既存で足りる。
-- `src/config.rs` — `AgentProfile` に `headless_args: Option<Vec<String>>`(default `None`)。
-- `src/routing.rs` — `KNOWN_ROLES` に `"refiner"`、`recommended_chain` に `refiner` の安価チェーン、builtin claude プロファイルに `headless_args = Some(["-p"])`。doc コメント更新(役割 = loop_kind + one-shot)。
+- `src/config.rs` — `AgentProfile` に `headless_args: Option<Vec<String>>`(default `None`)。headless 起動の**完全な argv** であり `args` とは合成しない(論点1)。
+- `src/routing.rs` — `KNOWN_ROLES` に `"refiner"`、`recommended_chain` に `refiner` の安価チェーン、builtin claude プロファイルに model 指定込みの `headless_args`(`claude-sonnet` は `Some(["-p", "--model", "sonnet"])`、`claude-opus` は `Some(["-p", "--model", "opus"])`)。doc コメント更新(役割 = loop_kind + one-shot)。
 - refiner のプロンプトと headless 起動(`src/app.rs` 内、または小さな `src/refine.rs`)。
 - `README.md` / `README.ja.md` — 「投入口」の節を追加(現状「GitHub で issue を立ててラベルを貼る」しか無い)。`meguri add` の紹介と capture-first の要点、`--raw`/`--plan`/`--ready`、`--project` 省略。
 - `docs/adr/0006-capture-first-issue-intake.md` — 決定の記録(本 PR 同梱済み)。
@@ -73,7 +73,7 @@ issue の「論点(planning で詰める)」への答え:
 
 ## テスト計画
 
-`tests/add_test.rs` を新設し FakeForge に乗る。refine の headless 呼び出しは実 agent を起動できないので、**整形ステップを注入可能にする**(パース済み `{title, body}` を返すクロージャ/trait を `cmd_add` のコアに渡す形にリファクタし、テストは固定値を返す fake refiner を差し込む)。これで基準 2・3・6・8 を agent 抜きで検証できる。project 推定(基準 7)、ラベル(基準 4)、URL 合成、verbatim フッタは純関数として単体テストする。`update_issue_title` は fake に実装。既存の scheduler/planner/forge テストは非破壊。
+`tests/add_test.rs` を新設し FakeForge に乗る。refine の headless 呼び出しは実 agent を起動できないので、**整形ステップを注入可能にする**(パース済み `{title, body}` を返すクロージャ/trait を `cmd_add` のコアに渡す形にリファクタし、テストは固定値を返す fake refiner を差し込む)。これで基準 2・3・6・8 を agent 抜きで検証できる。project 推定(基準 7、`/repo` vs `/repo2` の境界ケース含む)、ラベル(基準 4)、URL 合成、verbatim フッタは純関数として単体テストする。builtin claude プロファイルの `headless_args` に `--model` が含まれ `--dangerously-skip-permissions` が含まれないことも単体テストで固定する(論点1・論点4 の構造保証)。`update_issue_title` は fake に実装。既存の scheduler/planner/forge テストは非破壊。
 
 ## スコープ / 割り切り(v1)
 
