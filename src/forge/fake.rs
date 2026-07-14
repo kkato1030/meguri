@@ -100,6 +100,11 @@ pub struct FakeForge {
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
     /// scenarios; exercised even though no current loop calls it).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
+    /// Issues whose update_issue_body fails (`meguri add` refine-writeback
+    /// forge-hiccup scenarios).
+    pub update_body_errors: Mutex<HashSet<i64>>,
+    /// Issues whose update_issue_title fails (same, title side).
+    pub update_title_errors: Mutex<HashSet<i64>>,
     /// Commit statuses meguri wrote: (head_sha, context) → latest state
     /// (ADR 0008 inspection history). Re-posting a context overwrites it.
     pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
@@ -696,11 +701,26 @@ impl Forge for FakeForge {
     }
 
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
+        if self.update_body_errors.lock().unwrap().contains(&number) {
+            bail!("injected update_issue_body failure for #{number}");
+        }
         let mut issues = self.issues.lock().unwrap();
         let Some(i) = issues.iter_mut().find(|i| i.number == number) else {
             bail!("issue #{number} not found");
         };
         i.body = body.to_string();
+        Ok(())
+    }
+
+    async fn update_issue_title(&self, number: i64, title: &str) -> Result<()> {
+        if self.update_title_errors.lock().unwrap().contains(&number) {
+            bail!("injected update_issue_title failure for #{number}");
+        }
+        let mut issues = self.issues.lock().unwrap();
+        let Some(i) = issues.iter_mut().find(|i| i.number == number) else {
+            bail!("issue #{number} not found");
+        };
+        i.title = title.to_string();
         Ok(())
     }
 

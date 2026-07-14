@@ -22,6 +22,36 @@ pub enum Command {
         #[arg(long)]
         probe: bool,
     },
+    /// Capture work with one line: a GitHub issue (github mode — created
+    /// immediately, then refined by an agent best-effort) or a local task
+    /// (local mode — queued for the watch)
+    Add {
+        /// The one-line memo / task title (in local mode, omit only when
+        /// --file supplies a heading)
+        text: Option<String>,
+        /// Project id from config.toml (default: inferred from the cwd, or the
+        /// sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// github mode: queue it for the planner (`meguri:plan`) instead of
+        /// the worker (local mode has no planner yet — issue #54)
+        #[arg(long)]
+        plan: bool,
+        /// github mode: also queue it for the worker loop (`meguri:ready`)
+        #[arg(long)]
+        ready: bool,
+        /// github mode: skip refine entirely, capture the raw memo (no LLM call)
+        #[arg(long)]
+        raw: bool,
+        /// local mode: read the task from a markdown file (first heading →
+        /// title, body → body)
+        #[arg(long)]
+        file: Option<String>,
+        /// local mode: hold the task until this instant (YYYY-MM-DD or RFC3339
+        /// UTC); discovered only once the time passes (issue #148)
+        #[arg(long)]
+        not_before: Option<String>,
+    },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
     /// Manage the resident watch: detach, OS supervision, status, logs
@@ -40,24 +70,6 @@ pub enum Command {
         /// Multiplexer override: herdr | tmux
         #[arg(long)]
         mux: Option<String>,
-    },
-    /// Queue a local task (local-mode projects; watch picks it up)
-    Add {
-        /// Project id from config.toml (defaults to the sole configured project)
-        #[arg(long)]
-        project: Option<String>,
-        /// Queue it for the planner instead of the worker
-        #[arg(long)]
-        plan: bool,
-        /// Read the task from a markdown file (first heading → title, body → body)
-        #[arg(long)]
-        file: Option<String>,
-        /// Hold the task until this instant (YYYY-MM-DD or RFC3339 UTC); it is
-        /// discovered only once the time passes (issue #148)
-        #[arg(long)]
-        not_before: Option<String>,
-        /// Task title (omit only when --file supplies a heading)
-        title: Option<String>,
     },
     /// List local tasks (needs_human is highlighted)
     Tasks {
