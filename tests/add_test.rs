@@ -146,6 +146,63 @@ async fn refine_guard_keeps_human_edit() {
     assert!(!issue.body.contains("AI body"));
 }
 
+#[tokio::test]
+async fn raw_capture_body_is_byte_for_byte() {
+    // The whole memo — leading/trailing whitespace and newlines — is the body.
+    let forge = Arc::new(FakeForge::default());
+    let memo = "  spaced\nmemo  ";
+    let n = add_core(&*forge, params(memo, &[]), None, None)
+        .await
+        .unwrap();
+    assert_eq!(forge.get_issue(n).await.unwrap().body, memo);
+}
+
+#[tokio::test]
+async fn refine_footer_preserves_memo_whitespace() {
+    let forge = Arc::new(FakeForge::default());
+    let memo = "  行頭スペースと\n改行を保つ  ";
+    let r = FixedRefiner(refined("整った題", "整った本文"));
+    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+        .await
+        .unwrap();
+    let issue = forge.get_issue(n).await.unwrap();
+    assert!(issue.body.ends_with("## 原文メモ\n  行頭スペースと\n改行を保つ  "));
+}
+
+#[tokio::test]
+async fn write_back_body_failure_leaves_issue_raw() {
+    // A forge hiccup on the body write happens first → the title is never
+    // touched → the issue stays fully raw, and add_core still returns Ok.
+    let forge = Arc::new(FakeForge::default());
+    let memo = "capture me";
+    forge.update_body_errors.lock().unwrap().insert(1);
+    let r = FixedRefiner(refined("AI title", "AI body"));
+    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+        .await
+        .unwrap();
+    let issue = forge.get_issue(n).await.unwrap();
+    assert_eq!(issue.title, memo);
+    assert_eq!(issue.body, memo);
+}
+
+#[tokio::test]
+async fn write_back_title_failure_keeps_a_coherent_issue() {
+    // Body is written before title, so a title-write failure never leaves a
+    // refined title on a raw body: worst case is a refined body (with the
+    // verbatim memo) under the raw one-line title. add_core returns Ok.
+    let forge = Arc::new(FakeForge::default());
+    let memo = "capture me";
+    forge.update_title_errors.lock().unwrap().insert(1);
+    let r = FixedRefiner(refined("AI title", "## 症状\nx"));
+    let n = add_core(&*forge, params(memo, &[]), Some(&r), None)
+        .await
+        .unwrap();
+    let issue = forge.get_issue(n).await.unwrap();
+    assert_eq!(issue.title, memo); // raw title stands
+    assert!(issue.body.contains("## 症状")); // refined body applied
+    assert!(issue.body.contains(memo)); // original memo still present
+}
+
 #[test]
 fn issue_url_is_composed_from_slug_and_number() {
     assert_eq!(
@@ -164,10 +221,11 @@ fn initial_title_takes_first_line_and_truncates() {
 }
 
 #[test]
-fn verbatim_footer_appends_the_original() {
-    let body = compose_refined_body("## 症状\nx", "  raw memo  ");
+fn verbatim_footer_keeps_the_original_byte_for_byte() {
+    // The refined scaffold is trimmed, but the original memo is embedded as-is.
+    let body = compose_refined_body("  ## 症状\nx  ", "  raw memo\n");
     assert!(body.starts_with("## 症状\nx"));
-    assert!(body.contains("## 原文メモ\nraw memo"));
+    assert!(body.ends_with("## 原文メモ\n  raw memo\n"));
 }
 
 #[test]

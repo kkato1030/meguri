@@ -16,7 +16,7 @@ use crate::engine::{self, Deps};
 use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
-use crate::refine::{HeadlessRefiner, Refiner};
+use crate::refine::{HeadlessRefiner, Refined, Refiner};
 use crate::notify::Notifier;
 use crate::store::{DesiredState, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
 
@@ -130,9 +130,14 @@ pub async fn add_core(
     refiner: Option<&dyn Refiner>,
     skip_note: Option<&str>,
 ) -> Result<i64> {
-    let text = params.text.trim();
-    let title0 = initial_title(text);
-    let body0 = text.to_string();
+    // The memo is stored verbatim (ADR 0006 原則2): the raw `params.text`
+    // becomes the body and the refined footer, so quoted leading/trailing
+    // whitespace and newlines survive. A trimmed view is only for validation,
+    // the title, and the refine prompt.
+    let raw = params.text;
+    let trimmed = raw.trim();
+    let title0 = initial_title(raw);
+    let body0 = raw.to_string();
 
     // Capture: the one step that may hard-fail (auth/network/slug/permissions).
     let number = forge
@@ -154,28 +159,55 @@ pub async fn add_core(
     print!("refining… ");
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    match refiner.refine(text, params.repo_path, params.language).await {
-        Ok(refined) => {
-            let new_body = compose_refined_body(&refined.body, text);
-            // Race guard (論点5): only overwrite while the issue is still the raw
-            // capture; a human edit in the refine window wins.
-            let current = forge
-                .get_issue(number)
-                .await
-                .context("re-reading the issue before refine write-back")?;
-            if current.title == title0 && current.body == body0 {
-                forge.update_issue_title(number, &refined.title).await?;
-                forge.update_issue_body(number, &new_body).await?;
-                println!("done\n  Title: {}", refined.title);
-            } else {
-                println!("done — issue was edited meanwhile; kept your version (refine skipped)");
-            }
-        }
+    let refined = match refiner.refine(trimmed, params.repo_path, params.language).await {
+        Ok(r) => r,
         Err(e) => {
             println!("skipped: {e:#} — issue #{number} left raw");
+            return Ok(number);
         }
+    };
+    // Everything past capture is best-effort (ADR 0006): a forge hiccup in the
+    // write-back must leave the raw issue standing and still report success,
+    // never fail the command or half-apply the refine.
+    if let Err(e) = write_back_refine(forge, number, &title0, &body0, &refined, raw).await {
+        println!("kept raw: {e:#}");
     }
     Ok(number)
+}
+
+/// Apply the refine result, best-effort and coherently. Re-reads first (race
+/// guard, 論点5): only overwrites while the issue is still the raw capture, so
+/// a human edit in the refine window wins. Body is written before title, and
+/// the title is skipped if the body write fails — so a forge error can never
+/// leave a refined title on a raw body. The worst partial state is a refined
+/// body (which still holds the verbatim memo) under the raw one-line title,
+/// which is coherent. Any error is returned for the caller to report.
+async fn write_back_refine(
+    forge: &dyn Forge,
+    number: i64,
+    raw_title: &str,
+    raw_body: &str,
+    refined: &Refined,
+    original: &str,
+) -> Result<()> {
+    let current = forge
+        .get_issue(number)
+        .await
+        .context("re-reading the issue before refine write-back")?;
+    if current.title != raw_title || current.body != raw_body {
+        println!("done — issue was edited meanwhile; kept your version (refine skipped)");
+        return Ok(());
+    }
+    forge
+        .update_issue_body(number, &compose_refined_body(&refined.body, original))
+        .await
+        .context("updating the issue body")?;
+    forge
+        .update_issue_title(number, &refined.title)
+        .await
+        .context("updating the issue title")?;
+    println!("done\n  Title: {}", refined.title);
+    Ok(())
 }
 
 /// Resolve the refiner's headless launch, or a human-readable reason it can't
@@ -279,13 +311,11 @@ pub fn initial_title(text: &str) -> String {
 
 /// Refined body followed by the verbatim original memo. This preservation is
 /// the orchestrator's job, never the model's (ADR 0006 原則2): the model's
-/// output is the scaffold, the original memo keeps authoring authority.
+/// output is the scaffold, the original memo keeps authoring authority. The
+/// original is embedded byte-for-byte (no trimming) — quoted whitespace and
+/// newlines are part of what the author wrote.
 pub fn compose_refined_body(refined_body: &str, original: &str) -> String {
-    format!(
-        "{}\n\n---\n## 原文メモ\n{}",
-        refined_body.trim(),
-        original.trim()
-    )
+    format!("{}\n\n---\n## 原文メモ\n{}", refined_body.trim(), original)
 }
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
