@@ -12,13 +12,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, WorkerOutcome, role_for_loop};
+use super::{Deps, StoreControl, WorkerOutcome, lane_for_loop};
 use crate::agent_session;
 use crate::config::Deliver;
 use crate::forge;
 use crate::gitops;
 use crate::mux::{PaneId, PaneSpec};
-use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
@@ -34,7 +34,7 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 
 /// Which side of the symmetric plan/impl loop a run is on (ADR 0008). The
 /// self-review turn frames its lenses differently for a spec/ADR document
-/// (Plan) than for a code diff (Impl); the guard reads it too.
+/// (Plan) than for a code diff (Impl); the pr-reviewer reads it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -280,7 +280,7 @@ pub struct Checkpoint {
     /// address; carried in-memory (via the checkpoint) rather than as forge
     /// threads.
     #[serde(default)]
-    pub self_review_pending: Vec<super::impl_reviewer::Finding>,
+    pub self_review_pending: Vec<super::self_review::Finding>,
     /// Set when the rounds cap was hit without a clean verdict: the PR is
     /// published anyway (the human merge gate is the backstop), and this
     /// drives the single footer line noting the non-convergence.
@@ -290,7 +290,7 @@ pub struct Checkpoint {
     /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
     /// the history it already built.
     #[serde(default)]
-    pub self_review_log: Vec<super::impl_reviewer::RoundRecord>,
+    pub self_review_log: Vec<super::self_review::RoundRecord>,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -455,7 +455,7 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
 
     if step == STEP_SELF_REVIEW {
         if flavor.self_reviews() && deps.config.review_for(&deps.project).enabled {
-            match super::impl_reviewer::self_review(deps, &run, &mut checkpoint, &worktree, flavor)
+            match super::self_review::self_review(deps, &run, &mut checkpoint, &worktree, flavor)
                 .await?
             {
                 StepFlow::Continue => {}
@@ -516,7 +516,7 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
         super::reaper::release_pane(
             deps,
             run.issue_number,
-            role_for_loop(&run.loop_kind),
+            lane_for_loop(&run.loop_kind),
             "keep_pane = never",
         )
         .await;
@@ -543,7 +543,7 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
     super::reaper::release_pane(
         deps,
         run.issue_number,
-        role_for_loop(&run.loop_kind),
+        lane_for_loop(&run.loop_kind),
         "stopped by user",
     )
     .await;
@@ -797,9 +797,9 @@ struct EnsuredPane {
 
 /// Get the lane's pane, spawning it (with the trigger as the agent's
 /// initial prompt argument) if it doesn't exist or died. The pane is keyed
-/// by `(project, issue, role)` and outlives runs (issue #92): every
+/// by `(project, issue, lane)` and outlives runs (issue #92): every
 /// branch-editing loop of the issue (planner, worker, fixer, …) shares the
-/// author lane's live session, while the reviewer keeps its own review
+/// author lane's live session, while the pr-reviewer keeps its own pr-review
 /// lane. When the lane has a native agent session id on record, a fresh
 /// spawn resumes it (`claude --resume <id> <trigger>`) so the agent keeps
 /// its conversation context; a resume that dies on the spot falls back to
@@ -811,11 +811,11 @@ async fn ensure_pane(
     lane: &Lane,
     initial_trigger: &str,
 ) -> Result<EnsuredPane> {
-    let role = lane.role;
+    let lane_name = lane.lane;
     let worktree_str = worktree.to_string_lossy();
     if let Some(record) = deps
         .store
-        .get_pane(&deps.project.id, run.issue_number, role)?
+        .get_pane(&deps.project.id, run.issue_number, lane_name)?
         && let Some(id) = &record.mux_pane_id
     {
         let pane = PaneId(id.clone());
@@ -840,7 +840,7 @@ async fn ensure_pane(
             // old pane can't see it. Retire it — session id saved — and
             // respawn below (the saved id makes the respawn a resume, so the
             // context follows the lane into the new worktree).
-            super::reaper::release_pane(deps, run.issue_number, role, "worktree moved").await;
+            super::reaper::release_pane(deps, run.issue_number, lane_name, "worktree moved").await;
         }
     }
 
@@ -851,7 +851,7 @@ async fn ensure_pane(
     // every reclamation.
     let session_id = deps
         .store
-        .get_pane(&deps.project.id, run.issue_number, role)?
+        .get_pane(&deps.project.id, run.issue_number, lane_name)?
         .and_then(|p| p.agent_session_id);
     if let Some(session_id) = session_id {
         let resumed = match spawn_agent_pane(
@@ -884,7 +884,7 @@ async fn ensure_pane(
         }
         // Forget the id and fall back to full re-injection.
         deps.store
-            .save_pane_session(&deps.project.id, run.issue_number, role, None)?;
+            .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
         deps.store.update_run_agent_session(&run.id, None)?;
         deps.store.emit(
             Some(&run.id),
@@ -911,7 +911,7 @@ async fn spawn_agent_pane(
     initial_trigger: &str,
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
-    let role = lane.role;
+    let lane_name = lane.lane;
     let profile_name = &lane.profile_name;
     let profile = &lane.profile;
     let worktree_str = worktree.to_string_lossy();
@@ -929,10 +929,10 @@ async fn spawn_agent_pane(
         env.push(("HERDR_AGENT".to_string(), hint.clone()));
     }
 
-    let title = if role == ROLE_AUTHOR {
+    let title = if lane_name == LANE_AUTHOR {
         format!("meguri#{}", run.issue_number)
     } else {
-        format!("meguri#{}:{role}", run.issue_number)
+        format!("meguri#{}:{lane_name}", run.issue_number)
     };
     let pane = deps
         .mux
@@ -952,7 +952,7 @@ async fn spawn_agent_pane(
     deps.store.upsert_pane(
         &deps.project.id,
         run.issue_number,
-        role,
+        lane_name,
         deps.mux.kind().as_str(),
         &deps.config.mux.session,
         &pane.0,
@@ -1034,7 +1034,7 @@ async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
 /// this explicitly lets the worker's self-review run its review turn in a
 /// separate lane under a different profile than the fix turns (ADR 0006).
 pub(crate) struct Lane {
-    role: &'static str,
+    lane: &'static str,
     profile_name: String,
     profile: crate::config::AgentProfile,
 }
@@ -1042,10 +1042,10 @@ pub(crate) struct Lane {
 /// The run's own lane: its loop's pane lane, under the profile pinned on the
 /// run (resolved and pinned lazily on first spawn).
 fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
-    let role = role_for_loop(&run.loop_kind);
+    let lane = lane_for_loop(&run.loop_kind);
     let (profile_name, profile) = resolve_run_profile(deps, run)?;
     Ok(Lane {
-        role,
+        lane,
         profile_name,
         profile,
     })
@@ -1057,7 +1057,7 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
 /// model than the author doing the fixes. Resolved without pinning the run's
 /// own profile. Shared by the plan and impl self-review (the loop is
 /// symmetric).
-fn impl_review_lane(deps: &Deps) -> Result<Lane> {
+fn self_review_lane(deps: &Deps) -> Result<Lane> {
     let profile_name = crate::routing::resolve(
         &deps.config,
         "self-reviewer",
@@ -1065,7 +1065,7 @@ fn impl_review_lane(deps: &Deps) -> Result<Lane> {
     )?;
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
     Ok(Lane {
-        role: crate::store::ROLE_IMPL_REVIEW,
+        lane: crate::store::LANE_SELF_REVIEW,
         profile_name,
         profile,
     })
@@ -1084,8 +1084,8 @@ pub(crate) async fn run_turn(
     run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
 }
 
-/// Run one prompt-turn in the worker's self-review (impl-review) lane under
-/// the `impl-reviewer` profile.
+/// Run one prompt-turn in the worker's self-review lane under the
+/// `self-reviewer` profile.
 pub(crate) async fn run_review_turn(
     deps: &Deps,
     run: &RunRecord,
@@ -1093,7 +1093,7 @@ pub(crate) async fn run_review_turn(
     purpose: &str,
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
-    let lane = impl_review_lane(deps)?;
+    let lane = self_review_lane(deps)?;
     run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
 }
 
@@ -1128,7 +1128,7 @@ async fn run_turn_in(
         .await_completion(&pane, worktree, &prepared.turn_id, &control)
         .await?;
 
-    record_agent_session(deps, run, worktree, lane.role, &pane, &ensured, &outcome).await?;
+    record_agent_session(deps, run, worktree, lane.lane, &pane, &ensured, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -1159,7 +1159,7 @@ async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
-    role: &str,
+    lane_name: &str,
     pane: &PaneId,
     ensured: &EnsuredPane,
     outcome: &TurnOutcome,
@@ -1181,7 +1181,7 @@ async fn record_agent_session(
                 deps.store.save_pane_session(
                     &deps.project.id,
                     run.issue_number,
-                    role,
+                    lane_name,
                     Some(&id),
                 )?;
                 deps.store.update_run_agent_session(&run.id, Some(&id))?;
@@ -1189,7 +1189,7 @@ async fn record_agent_session(
         }
         TurnOutcome::PaneDied if ensured.resumed => {
             deps.store
-                .save_pane_session(&deps.project.id, run.issue_number, role, None)?;
+                .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
             deps.store.update_run_agent_session(&run.id, None)?;
             deps.store.emit(
                 Some(&run.id),
@@ -1529,7 +1529,7 @@ pub(crate) fn compose_pr_body(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
     // A single footer line when the rounds cap was hit without a clean verdict
-    // (ADR 0006): the human/guard review is the backstop.
+    // (ADR 0006): the human/pr-review is the backstop.
     let self_review_note = if cp.self_review_unconverged {
         format!(
             "\n\n> 🔁 self-review: {} ラウンド回しても収束しませんでした（未解決の指摘が残ったまま公開しています。人間レビューで確認してください）。",

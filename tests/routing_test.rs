@@ -239,7 +239,7 @@ async fn every_loop_kind_spawns_from_its_role_resolved_profile() {
     // conflict-resolver) resolve to the same profile as their sibling.
     let cases = [
         ("planner", "p-planner", "planner-cli", "planner"),
-        ("guard", "p-reviewer", "reviewer-cli", "reviewer"),
+        ("pr-reviewer", "p-reviewer", "reviewer-cli", "reviewer"),
         ("worker", "p-worker", "worker-cli", "worker"),
         ("spec-worker", "p-worker", "worker-cli", "worker"),
         ("fixer", "p-fixer", "fixer-cli", "fixer"),

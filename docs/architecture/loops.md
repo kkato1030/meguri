@@ -144,6 +144,41 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 - **auto-merge = arm-only** — [ADR 0003-auto-merge-github-native-arm-only](../adr/0003-auto-merge-github-native-arm-only.md)。meguri は「マージして安全か」を自前で判定せず、条件の揃った PR に GitHub-native auto-merge(`gh pr merge --auto`)を arm するだけで、最終判断は GitHub(branch protection + required checks)に委ねる。opt-in(`[pr.auto_merge].enabled` + `meguri:automerge` ラベル)で、fail-fast(リポジトリが条件を honor できなければ起動時に拒否)。
 - **merge-watch = ドリフト検出であってマージ権威ではない** — [ADR 0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md)。conflict / red CI は conflict_resolver / ci_fixer が arm と無関係にすでに拾っているため、merge-watch はそれらに介入せず no-op にする(`needs-human` を貼れば fixer 系ループ自身を締め出しデッドロックする)。merge-watch が固有に escalate するのは「どのループも拾わないまま放置された arm 済み PR」だけ。
 
+## 語彙: role / loop kind / lane(issue #168)
+
+内部命名は3層に分かれ、"role" という語は routing 専用にする(issue #167/#168):
+
+- **role**(設定の粗粒度 = 仕事の種類)— `[routing.roles]` が振り分ける6分類
+  ([ADR 0003 改訂](../adr/0003-role-based-agent-routing.md)): planner /
+  worker / fixer / self-reviewer / pr-reviewer / cleaner。
+- **loop kind**(内部実行単位)— `runs.loop_kind` に入る値。role より細かい
+  (例: `worker` と `spec-worker` は同じ role "worker" だが loop kind は別)。
+- **lane**(pane・session の独立単位)— `(project, issue, lane)` で鍵る pane
+  の区画([ADR 0004](../adr/0004-issue-lane-pane-session-lifetime.md))。
+  `LANE_AUTHOR` / `LANE_PR_REVIEW` / `LANE_SELF_REVIEW` の3種。
+
+**命名規約: loop 名の qualifier は常にトリガー(入力)であり、成果物ではない。**
+
+- `fixer` — 未解決レビュースレッドがトリガー。
+- `ci_fixer`(loop kind `ci-fixer`)— 赤 CI がトリガー。
+- `conflict_resolver` — CONFLICTING 状態がトリガー。
+- `spec_worker`(loop kind `spec-worker`)— spec-ready PR がトリガー(spec と
+  いう「成果物」ではなく「入力」)。同じ読みで `review-fixer` のような複合名も
+  「レビュー(スレッド)に反応する fixer」と読める(現状そのものの loop kind は
+  存在しないが、命名する際はこの型に従う)。
+
+この規約により、"spec-worker" は「spec を作る worker」ではなく「spec-ready
+PR に反応する worker」と正しく読める。
+
+issue #168 は #167 が routing role 層で確定した語彙(`self-reviewer` /
+`pr-reviewer`)に内部命名を追随させた: loop kind `guard` → `pr-reviewer`、
+commit status `meguri/guard-review` → `meguri/pr-review`、lane `review` →
+`pr-review` / `impl-review` → `self-review`、`ROLE_*` 定数 → `LANE_*`、
+`impl_reviewer.rs` → `self_review.rs`、`handoff.rs` → `plan_handoff.rs`。
+fixer 家族(`review-fixer` / `conflict-fixer` 等)の内部 rename、および
+`worker` / `spec-worker` の rename は対象外(この節の命名規約を満たしている
+ため、rename する動機が薄い)。
+
 ## 5. ADR 索引(loop に関係するもの)
 
 縦の理由(個別決定とその背景)への入口。1決定1ファイルの原則どおり、詳細は各 ADR を参照。

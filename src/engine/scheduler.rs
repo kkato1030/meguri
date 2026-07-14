@@ -122,7 +122,7 @@ impl Scheduler {
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
                 // flips its issue speccing → ready so the worker implements it.
-                if let Err(e) = super::handoff::sweep(deps).await {
+                if let Err(e) = super::plan_handoff::sweep(deps).await {
                     tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Ride the poll: recompute routing outcome drift from run

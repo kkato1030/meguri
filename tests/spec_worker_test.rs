@@ -225,7 +225,7 @@ fn write_review(worktree: &Path, verdict: &str) {
         "verdict": verdict, "review": "self-review note", "findings": [],
     });
     std::fs::write(
-        worktree.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        worktree.join(meguri::engine::self_review::REVIEW_FILE),
         body.to_string(),
     )
     .unwrap();

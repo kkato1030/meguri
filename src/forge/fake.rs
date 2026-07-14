@@ -98,7 +98,7 @@ pub struct FakeForge {
     /// (the inline comments land in `threads`).
     pub pr_reviews: Mutex<Vec<(i64, String)>>,
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
-    /// scenarios; the impl-reviewer falls back to a summary comment).
+    /// scenarios; exercised even though no current loop calls it).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
     /// Commit statuses meguri wrote: (head_sha, context) → latest state
     /// (ADR 0008 inspection history). Re-posting a context overwrites it.

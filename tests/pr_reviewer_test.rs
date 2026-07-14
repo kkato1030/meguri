@@ -1,10 +1,10 @@
-//! End-to-end guard-loop tests with FakeMux + FakeForge and a real local git
-//! origin (ADR 0008). The guard is the optional external review, symmetric
-//! across plan and impl: its output is a `meguri/guard-review` commit status +
-//! a folded PR-body `<details>` — never inline threads. A clean plan guard
-//! flips `spec-reviewing → spec-ready`; the impl guard never touches spec
-//! labels. A scripted "agent" plays the pane side (same protocol as
-//! planner_test).
+//! End-to-end pr-reviewer-loop tests with FakeMux + FakeForge and a real
+//! local git origin (ADR 0008). The pr-reviewer is the optional external
+//! review, symmetric across plan and impl: its output is a `meguri/pr-review`
+//! commit status + a folded PR-body `<details>` — never inline threads. A
+//! clean plan review flips `spec-reviewing → spec-ready`; the impl review
+//! never touches spec labels. A scripted "agent" plays the pane side (same
+//! protocol as planner_test).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::guard::{self, DIFF_FILE, GUARD_STATUS, GuardLoop, REVIEW_FILE, run_guard};
+use meguri::engine::pr_reviewer::{
+    self, DIFF_FILE, PR_REVIEW_STATUS, PrReviewerLoop, REVIEW_FILE, run_pr_reviewer,
+};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
@@ -21,7 +23,7 @@ use meguri::forge::{
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_REVIEW, RunStatus, Store};
+use meguri::store::{LANE_PR_REVIEW, RunStatus, Store};
 
 const PR: i64 = 12;
 /// The canonical issue the PR's head branch encodes — runs are keyed by it.
@@ -82,8 +84,8 @@ struct TestEnv {
 }
 
 /// `labels` seed the PR (a plan PR carries `spec-reviewing`; an impl PR does
-/// not). `impl_guard` enables the impl-kind guard.
-async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
+/// not). `impl_review` enables the impl-kind review.
+async fn setup(labels: &[&str], impl_review: bool) -> TestEnv {
     let root = tempfile::tempdir().unwrap();
     let (_origin, clone) = init_origin_and_clone(root.path()).await;
     let head_sha = push_pr_branch(&clone).await;
@@ -106,7 +108,7 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
-    config.review.guard.impl_enabled = impl_guard;
+    config.review.guard.impl_enabled = impl_review;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -141,10 +143,15 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
     }
 }
 
-fn create_guard_run(env: &TestEnv) -> meguri::store::RunRecord {
+fn create_pr_reviewer_run(env: &TestEnv) -> meguri::store::RunRecord {
     env.deps
         .store
-        .create_run_for_loop("proj", guard::KIND, ISSUE, "Spec: Add caching layer (#5)")
+        .create_run_for_loop(
+            "proj",
+            pr_reviewer::KIND,
+            ISSUE,
+            "Spec: Add caching layer (#5)",
+        )
         .unwrap()
 }
 
@@ -222,40 +229,41 @@ where
     })
 }
 
-/// guard(Plan) clean: spec-reviewing → spec-ready, a success guard-review
+/// pr-reviewer(Plan) clean: spec-reviewing → spec-ready, a success pr-review
 /// status, a folded body `<details>`, and NO inline threads or comments —
 /// the fixer never reacts (criterion 3, 3a).
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_guard_clean_flips_to_spec_ready_via_status_and_body() {
+async fn plan_review_clean_flips_to_spec_ready_via_status_and_body() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_guard_run(&env);
+    let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_review(wt, "clean", "LGTM — spec covers the issue.");
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
+            .await
+            .expect("pr-review timed out")
+            .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
     let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
     assert_eq!(record.status, RunStatus::Succeeded);
-    assert_eq!(record.step, guard::STEP_SETTLE);
-    assert_eq!(record.loop_kind, guard::KIND);
+    assert_eq!(record.step, pr_reviewer::STEP_SETTLE);
+    assert_eq!(record.loop_kind, pr_reviewer::KIND);
 
-    // Plan guard drives the label state machine: spec-reviewing → spec-ready.
+    // Plan review drives the label state machine: spec-reviewing → spec-ready.
     let labels = env.forge.pr_labels_of(PR);
     assert!(labels.contains(&LABEL_SPEC_READY.to_string()), "{labels:?}");
     assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
 
-    // A success guard-review commit status on the reviewed head.
+    // A success pr-review commit status on the reviewed head.
     assert_eq!(
-        env.forge.commit_status_of(&env.head_sha, GUARD_STATUS),
+        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
         Some(CommitStatusState::Success)
     );
 
@@ -268,19 +276,23 @@ async fn plan_guard_clean_flips_to_spec_ready_via_status_and_body() {
         .find(|p| p.number == PR)
         .unwrap();
     assert!(pr.body.contains("<details>"), "body: {}", pr.body);
-    assert!(pr.body.contains("guard review (plan) — clean"));
+    assert!(pr.body.contains("pr review (plan) — clean"));
     assert!(
         env.forge.pr_comments_of(PR).is_empty(),
-        "guard posts no conversation comment"
+        "pr-reviewer posts no conversation comment"
     );
     assert!(
         env.forge.threads_of(PR).is_empty(),
-        "guard posts no inline review thread"
+        "pr-reviewer posts no inline review thread"
     );
 
-    // The agent reviewed the PR head in a `guard-<issue>` detached checkout.
+    // The agent reviewed the PR head in a `pr-reviewer-<issue>` detached checkout.
     let wt = find_worktree(&env.worktree_root).unwrap();
-    assert!(wt.ends_with(format!("guard-{ISSUE}")), "{}", wt.display());
+    assert!(
+        wt.ends_with(format!("pr-reviewer-{ISSUE}")),
+        "{}",
+        wt.display()
+    );
     assert_eq!(
         run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(),
         env.head_sha
@@ -288,23 +300,24 @@ async fn plan_guard_clean_flips_to_spec_ready_via_status_and_body() {
     assert!(wt.join(DIFF_FILE).exists());
 }
 
-/// guard(Plan) findings: a failure status, the summary in the body, and
+/// pr-reviewer(Plan) findings: a failure status, the summary in the body, and
 /// spec-reviewing kept for the next push. The reviewed head is deduped (the
-/// status is the key); a new head re-guards.
+/// status is the key); a new head is re-reviewed.
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
+async fn plan_review_findings_keep_reviewing_and_dedup_by_status() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_guard_run(&env);
+    let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_review(wt, "findings", "- The spec lacks acceptance criteria.");
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
+            .await
+            .expect("pr-review timed out")
+            .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
@@ -315,7 +328,7 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
     );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
     assert_eq!(
-        env.forge.commit_status_of(&env.head_sha, GUARD_STATUS),
+        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
         Some(CommitStatusState::Failure)
     );
     let pr = env
@@ -326,44 +339,46 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
         .unwrap();
     assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
 
-    // Idempotency: the reviewed head (now carrying a guard status) is skipped.
+    // Idempotency: the reviewed head (now carrying a pr-review status) is skipped.
     assert!(
-        GuardLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "same head must not be guarded twice"
+        PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "same head must not be reviewed twice"
     );
-    // A new push moves the head past the status → re-guarded.
+    // A new push moves the head past the status → re-reviewed.
     env.forge.set_pr_head(PR, "feedfacefeedface");
-    let targets = GuardLoop.discover(&env.deps).await.unwrap();
+    let targets = PrReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![ISSUE]
     );
 }
 
-/// guard(Impl): reviews an implementation PR, writes the guard status + body
-/// summary, and NEVER touches spec-* labels (criterion 3a). No inline threads.
+/// pr-reviewer(Impl): reviews an implementation PR, writes the pr-review
+/// status + body summary, and NEVER touches spec-* labels (criterion 3a). No
+/// inline threads.
 #[tokio::test(flavor = "multi_thread")]
-async fn impl_guard_reviews_without_touching_spec_labels() {
-    // An impl PR: no spec-reviewing label, impl guard enabled.
+async fn impl_review_reviews_without_touching_spec_labels() {
+    // An impl PR: no spec-reviewing label, impl review enabled.
     let env = setup(&[LABEL_IMPLEMENTING], true).await;
-    let run = create_guard_run(&env);
+    let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_review(wt, "findings", "- edge case unhandled");
         write_result(wt, turn_id, "success");
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
+            .await
+            .expect("pr-review timed out")
+            .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
-    // The impl guard writes the status + body but leaves labels as-is (only
+    // The impl review writes the status + body but leaves labels as-is (only
     // `implementing`, plus the claim which it releases).
     assert_eq!(
-        env.forge.commit_status_of(&env.head_sha, GUARD_STATUS),
+        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
         Some(CommitStatusState::Failure)
     );
     let labels = env.forge.pr_labels_of(PR);
@@ -380,25 +395,25 @@ async fn impl_guard_reviews_without_touching_spec_labels() {
         .into_iter()
         .find(|p| p.number == PR)
         .unwrap();
-    assert!(pr.body.contains("guard review (impl)"), "body: {}", pr.body);
+    assert!(pr.body.contains("pr review (impl)"), "body: {}", pr.body);
     assert!(env.forge.threads_of(PR).is_empty());
     assert!(env.forge.pr_comments_of(PR).is_empty());
 }
 
-/// guard(Impl) OFF (the default): impl PRs are not discovered.
+/// pr-reviewer(Impl) OFF (the default): impl PRs are not discovered.
 #[tokio::test(flavor = "multi_thread")]
-async fn impl_guard_off_discovers_nothing() {
+async fn impl_review_off_discovers_nothing() {
     let env = setup(&[LABEL_IMPLEMENTING], false).await;
     assert!(
-        GuardLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "impl guard is off by default"
+        PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "impl review is off by default"
     );
 }
 
-/// Discovery filters: held / claimed / already-guarded heads are skipped; a
-/// plan PR whose plan guard is off is skipped too.
+/// Discovery filters: held / claimed / already-reviewed heads are skipped; a
+/// plan PR whose plan review is off is skipped too.
 #[tokio::test(flavor = "multi_thread")]
-async fn discovery_filters_hold_claimed_and_guarded_heads() {
+async fn discovery_filters_hold_claimed_and_reviewed_heads() {
     let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
 
     env.forge.add_pr(
@@ -417,37 +432,38 @@ async fn discovery_filters_hold_claimed_and_guarded_heads() {
         "b14",
         "sha14",
     );
-    // Already guarded at its head.
+    // Already reviewed at its head.
     env.forge
-        .add_pr(15, "guarded", "", &[LABEL_SPEC_REVIEWING], "b15", "sha15");
+        .add_pr(15, "reviewed", "", &[LABEL_SPEC_REVIEWING], "b15", "sha15");
     env.forge
-        .set_commit_status_direct("sha15", GUARD_STATUS, CommitStatusState::Failure);
+        .set_commit_status_direct("sha15", PR_REVIEW_STATUS, CommitStatusState::Failure);
 
-    let targets = GuardLoop.discover(&env.deps).await.unwrap();
+    let targets = PrReviewerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
         vec![ISSUE]
     );
 
-    // Plan guard off → the spec PR is not discovered either.
+    // Plan review off → the spec PR is not discovered either.
     env.deps.config.review.guard.plan = false;
-    assert!(GuardLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty());
 }
 
 /// A benign race (label removed after discovery) skips quietly.
 #[tokio::test(flavor = "multi_thread")]
 async fn skips_quietly_when_label_removed_after_discovery() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_guard_run(&env);
+    let run = create_pr_reviewer_run(&env);
     env.forge
         .remove_pr_label(PR, LABEL_SPEC_REVIEWING)
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), run_guard(&env.deps, &run.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(30), run_pr_reviewer(&env.deps, &run.id))
+            .await
+            .expect("pr-review timed out")
+            .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Skipped(_)), "{outcome:?}");
     assert_eq!(
         env.deps.store.get_run(&run.id).unwrap().unwrap().status,
@@ -464,15 +480,15 @@ async fn skips_quietly_when_label_removed_after_discovery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn needs_human_escalates_on_the_pr() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_guard_run(&env);
+    let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_result(wt, turn_id, "needs_human");
     });
 
-    let result = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
+    let result = tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
         .await
-        .expect("guard timed out");
+        .expect("pr-review timed out");
     agent.abort();
     assert!(result.is_err());
     let labels = env.forge.pr_labels_of(PR);
@@ -487,8 +503,9 @@ async fn needs_human_escalates_on_the_pr() {
     assert!(comments[0].contains("needs a human"));
 }
 
-/// Issue #92: the guard's pane and worktree are keyed by the issue's review
-/// lane and survive rounds — a second guard of a new head reuses both.
+/// Issue #92: the pr-reviewer's pane and worktree are keyed by the issue's
+/// pr-review lane and survive rounds — a second review of a new head reuses
+/// both.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_round_reuses_pane_and_worktree() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
@@ -499,21 +516,28 @@ async fn second_round_reuses_pane_and_worktree() {
         write_result(wt, turn_id, "success");
     });
 
-    let run1 = create_guard_run(&env);
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run1.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let run1 = create_pr_reviewer_run(&env);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_pr_reviewer(&env.deps, &run1.id),
+    )
+    .await
+    .expect("pr-review timed out")
+    .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
     let pane1 = env
         .deps
         .store
-        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .get_pane("proj", ISSUE, LANE_PR_REVIEW)
         .unwrap()
         .unwrap();
     let pane1_id = pane1.mux_pane_id.expect("review pane registered");
     let wt = PathBuf::from(pane1.worktree_path.expect("worktree recorded"));
-    assert!(wt.ends_with(format!("guard-{ISSUE}")), "{}", wt.display());
+    assert!(
+        wt.ends_with(format!("pr-reviewer-{ISSUE}")),
+        "{}",
+        wt.display()
+    );
 
     // The author pushes a fix: the PR head moves.
     run_git(&clone, &["checkout", PR_BRANCH]).await.unwrap();
@@ -528,18 +552,21 @@ async fn second_round_reuses_pane_and_worktree() {
     run_git(&clone, &["checkout", "main"]).await.unwrap();
     env.forge.set_pr_head(PR, &head2);
 
-    let run2 = create_guard_run(&env);
-    let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run2.id))
-        .await
-        .expect("guard timed out")
-        .unwrap();
+    let run2 = create_pr_reviewer_run(&env);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_pr_reviewer(&env.deps, &run2.id),
+    )
+    .await
+    .expect("pr-review timed out")
+    .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
 
     let pane2 = env
         .deps
         .store
-        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .get_pane("proj", ISSUE, LANE_PR_REVIEW)
         .unwrap()
         .unwrap();
     assert_eq!(pane2.mux_pane_id.as_deref(), Some(pane1_id.as_str()));

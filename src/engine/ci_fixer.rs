@@ -45,7 +45,7 @@ pub const KIND: &str = "ci-fixer";
 pub const MAX_CI_FIX_RUNS: i64 = 3;
 
 /// Prefix of meguri's own commit-status contexts (`meguri/self-review`,
-/// `meguri/guard-review`). The ci-fixer must not treat these as fixable CI:
+/// `meguri/pr-review`). The ci-fixer must not treat these as fixable CI:
 /// they carry no failed-job log to diagnose, and an advisory-red guard status
 /// (ADR 0008) is deliberately not a merge blocker — picking it up would spin
 /// the ci-fixer on nothing and could wrongly escalate it (criterion 6).
@@ -409,12 +409,12 @@ mod tests {
 
     #[test]
     fn meguri_status_contexts_are_stripped_from_the_rollup() {
-        // A red `meguri/guard-review` advisory status (ADR 0008) must not make
+        // A red `meguri/pr-review` advisory status (ADR 0008) must not make
         // the ci-fixer think there is CI to fix (criterion 6).
         let rollup = CheckRollup {
             checks: vec![
                 CheckRun {
-                    name: "meguri/guard-review".into(),
+                    name: "meguri/pr-review".into(),
                     state: CheckState::Failure,
                     url: String::new(),
                 },
@@ -435,7 +435,7 @@ mod tests {
         let mixed = CheckRollup {
             checks: vec![
                 CheckRun {
-                    name: "meguri/guard-review".into(),
+                    name: "meguri/pr-review".into(),
                     state: CheckState::Failure,
                     url: String::new(),
                 },
