@@ -109,6 +109,9 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
+    // These takeover tests don't script the self-review turn; the dedicated
+    // self-review test (ADR 0011) enables it explicitly.
+    config.review.enabled = false;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -206,6 +209,26 @@ fn write_result_with_subject(worktree: &Path, turn_id: &str, status: &str, subje
         result["subject"] = serde_json::Value::String(subject.to_string());
     }
     std::fs::write(worktree.join(".meguri/result.json"), result.to_string()).unwrap();
+}
+
+/// The prompt delivered for one turn, so a scripted agent can tell the
+/// execute turn from the self-review turn (ADR 0011).
+fn prompt_of(worktree: &Path, turn_id: &str) -> String {
+    std::fs::read_to_string(worktree.join(format!(".meguri/prompt-{turn_id}.md")))
+        .unwrap_or_default()
+}
+
+/// Write the review turn's verdict file (the self-review lane reads this,
+/// not `result.json`).
+fn write_review(worktree: &Path, verdict: &str) {
+    let body = serde_json::json!({
+        "verdict": verdict, "review": "self-review note", "findings": [],
+    });
+    std::fs::write(
+        worktree.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        body.to_string(),
+    )
+    .unwrap();
 }
 
 /// Contents of the prompt files delivered to the (scripted) agent.
@@ -408,6 +431,76 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     // elsewhere: a second takeover of the same issue is never queued.
     env.forge.add_pr_label(1, LABEL_SPEC_READY).await.unwrap();
     assert!(SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty());
+}
+
+/// ADR 0011: the combined-delivery takeover runs the internal self-review
+/// over its implementation diff before the spec PR becomes the impl PR —
+/// symmetric with the worker and planner. Enabled here explicitly (the other
+/// takeover tests skip it); the scripted agent answers the review turn with a
+/// clean verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_worker_self_reviews_the_combined_impl_diff() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+
+    let run = create_spec_worker_run(&env);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            // The review turn reads a verdict file; the execute turn commits.
+            if prompt_of(&wt, &turn_id).contains("self-review round") {
+                write_review(&wt, "clean");
+            } else {
+                commit_implementation(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_spec_worker(&env.deps, &run.id))
+            .await
+            .expect("spec worker timed out")
+            .unwrap();
+    agent.abort();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "got {outcome:?}"
+    );
+
+    // A self-review actually ran over the takeover's diff and resolved clean.
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.reviewed".to_string()),
+        "the combined takeover must run self-review: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"self_review.clean".to_string()),
+        "{kinds:?}"
+    );
+
+    // The internal loop never touched the forge, and the folded <details>
+    // records the inspection history on the PR body (ADR 0008).
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "still no second PR");
+    assert!(
+        env.forge.threads_of(1).is_empty() && env.forge.pr_comments_of(1).is_empty(),
+        "self-review must post nothing on the forge"
+    );
+    assert!(
+        prs[0].body.contains("<details>") && prs[0].body.contains("self-review"),
+        "the PR body folds the self-review summary: {}",
+        prs[0].body
+    );
 }
 
 /// Acceptance (issue #136): the takeover's own execute turn authors a

@@ -455,9 +455,11 @@ pub enum RoutingMode {
 pub struct RoutingConfig {
     #[serde(default)]
     pub mode: RoutingMode,
-    /// Explicit per-role overrides. Keys are loop kinds (`planner`,
-    /// `reviewer`, `worker`, `spec-worker`, `fixer`, `conflict-resolver`);
-    /// values are profile names. An explicit entry always beats auto.
+    /// Explicit per-role overrides. Keys are the 6 routing roles (`planner`,
+    /// `worker`, `fixer`, `self-reviewer`, `pr-reviewer`, `cleaner`) — a
+    /// "kind of work" grouping, independent from the finer-grained internal
+    /// loop kinds (`runs.loop_kind`); see `crate::routing::KNOWN_ROLES`.
+    /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
 }

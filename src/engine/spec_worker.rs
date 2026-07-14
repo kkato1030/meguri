@@ -178,6 +178,20 @@ impl Flavor for SpecWorkerFlavor {
         forge::LABEL_SPEC_READY
     }
 
+    /// The combined-delivery takeover self-reviews its implementation diff
+    /// before advancing the spec PR into an implementation PR (ADR 0011).
+    /// ADR 0008 made the internal self-review mandatory on both sides of the
+    /// symmetric loop, but the spec worker opens no PR of its own, so the
+    /// literal "once before the PR opens" left the combined impl diff
+    /// unreviewed. Reading the rule as "once before advancing the public
+    /// state" puts this takeover on the review side too: the self-review reads
+    /// the diff against the default branch, and since the spec is pruned in
+    /// `execute`, that diff is the combined content actually shipped (ADR +
+    /// implementation code). Symmetric with the worker and the planner.
+    fn self_reviews(&self) -> bool {
+        true
+    }
+
     /// Claim the spec PR (labels live on the PR, the run is keyed by the
     /// issue). Any change that makes the PR untakeable between discovery and
     /// claim is a benign race — skip, don't escalate.
@@ -519,6 +533,14 @@ mod tests {
             SpecWorkerFlavor.execute_prompt(&deps, &run, &Checkpoint::default(), dir.path());
         assert!(prompt.contains("# Output language"));
         assert!(prompt.contains("日本語"));
+    }
+
+    #[test]
+    fn spec_worker_self_reviews_its_combined_impl_diff() {
+        // ADR 0011: the combined-delivery takeover must run the internal
+        // self-review over its implementation diff, symmetric with the worker
+        // and planner. A false here reopens the gap ADR 0008 set out to close.
+        assert!(SpecWorkerFlavor.self_reviews());
     }
 
     #[test]
