@@ -153,15 +153,18 @@ fenced code block をちょうど1個**置く:
   `validate_children`・`decompose_child_footer` は残して再利用する。
 
 ### 2. `src/engine/decompose_materializer.rs`(新規)— materialization sweep
-- handoff.rs と同型: watch poll で回る軽量掃引、run record / pane 無し、**全体が再入可能で冪等**。
-- discover: 上記の検出条件(**承認 head 条件を含む** — 「承認 head と読む head の一致」。不一致は
-  warn + `spec-reviewing` へ戻して skip)。drive: fetch 後に `origin/<branch>` の tip が承認を確認した
-  head_sha と一致することを確かめ(掃引中に動いていれば skip、次掃引が新 head で再判定)、**その sha
-  から**提案 spec を読み(`gitops` の `git show <sha>:docs/specs/issue-<N>.md`)、children ブロックを
-  parse・検証
+- handoff.rs と同型の**軽量掃引**: entrypoint は `pub async fn sweep(deps: &Deps) -> Result<()>` 1本
+  (`Loop` trait は実装しない — run record / pane を持たない。§4 で scheduler の poll tick から直接
+  呼ぶ)。全体が再入可能で冪等。
+- **対象の絞り込み**: 上記の検出条件(spec-ready・マーカー付き・open・head branch が issue を encode。
+  **承認 head 条件を含む** — 「承認 head と読む head の一致」。不一致は warn + `spec-reviewing` へ
+  戻して skip)。**1件の処理**: fetch 後に `origin/<branch>` の tip が承認を確認した head_sha と一致
+  することを確かめ(掃引中に動いていれば skip、次掃引が新 head で再判定)、**その sha から**提案 spec を
+  読み(`gitops` の `git show <sha>:docs/specs/issue-<N>.md`)、children ブロックを parse・検証
   (構文は上記「children ブロックの構文」、検証は `validate_children` 再利用)、下記の冪等シーケンスを
   index 順に走らせる。子の起票先 forge は `resolve_child_target`(`src/engine/planner.rs`)の再利用で
-  子ごとに解決する(`project` 指定の cross-repo 子も #154 どおり)。
+  子ごとに解決する(`project` 指定の cross-repo 子も #154 どおり)。handoff と同じく1 PR 単位で
+  `tracing::warn!` に握って続行する。
 - **冪等の要 = 子 body の安定 key + 親の依存 graph を正典にする**。子1件ごとに、body に
   `<!-- meguri:decompose-child parent=<parent_slug>#<N> idx=<i> -->` を入れて作成する(親は slug で
   修飾 — cross-repo 子でも一意。既存 `decompose_child_footer_ref` の親参照修飾と同じ理屈)。key は
@@ -207,11 +210,23 @@ fenced code block をちょうど1個**置く:
   branch でも sha でも良い)。git 操作は gitops に集約する規約に従う。materialization sweep は
   fetch の上で**承認を確認した head sha** を読む(「承認 head と読む head の一致」)。
 
-### 4. `src/engine/mod.rs` — `default_loops()` に materialization sweep を挿入
-- ADR 0001 の逆順(merge に近い順)で **SpecWorkerLoop の前後**に置く。materialization 対象の
-  残工程は「子を起こす」だけで実装より短いが、spec-ready を消費する点で spec-worker と同順帯。
-  spec-worker より前に置き、マーカー付き PR を materialization が先に掴む(spec-worker は
-  マーカーで除外するので競合しないが、順序でも保険を掛ける)。
+### 4. `src/engine/mod.rs` + `src/engine/scheduler.rs` — poll tick に sweep を差し込む
+materialization は run record / pane を持たない軽量掃引(ADR 0012 §2)なので、`default_loops()`
+(= `Loop` trait の一覧で、scheduler が run/pane 付きの仕事として扱う側)には**入れない**。handoff /
+reaper / auto_merger と同じく、`src/engine/scheduler.rs` の poll tick(`for deps in &self.projects`)
+から直接 `sweep(deps)` を呼ぶ。
+- `src/engine/mod.rs`: `pub mod decompose_materializer;` の宣言を1行足すだけ(既存 sweep モジュールと
+  同じ扱い)。
+- `src/engine/scheduler.rs`: poll tick の `for deps` ループ内に
+  ```rust
+  if let Err(e) = super::decompose_materializer::sweep(deps).await {
+      tracing::warn!("decompose materialize sweep failed for {}: {e:#}", deps.project.id);
+  }
+  ```
+  を **`handoff::sweep` の直後**に置く(両者とも ADR 0008 の spec フロー掃引で、materializer は
+  spec-ready の分解提案 PR を消費する隣接処理)。他の sweep と同じく1 project 単位で warn に握る。
+- discovery ループ(worker / spec-worker 等)は分解提案 PR をマーカーで除外するので、この掃引と
+  競合しない(順序ではなくマーカーが排他の根拠)。
 
 ### 5. `src/engine/spec_worker.rs` / `src/engine/handoff.rs` — 分解提案の除外
 - spec_worker `discover`: PR body にマーカーがあれば skip。
@@ -255,8 +270,9 @@ fenced code block をちょうど1個**置く:
 
 ## architecture impact
 
-- 新ループ1本(materialization sweep)を forge 純掃引として足す。既存の scheduler / run / pane
-  モデルには乗らない(handoff / reaper と同じ poll 相乗り)。
+- 掃引1本(materialization sweep、`Loop` ではない)を forge 純掃引として足す。`default_loops()` には
+  入れず scheduler の poll tick から直接呼ぶので、run record / pane モデルには乗らない(handoff /
+  reaper と同じ poll 相乗り)。
 - planner の分解出力型が「即時 filing」から「reviewable spec」へ移る。filing ロジックは共有関数に
   切り出して再利用するので、子起こしの挙動(footer マーカー・cross-repo scope・1レベル制限)は
   不変。
@@ -329,7 +345,7 @@ fenced code block をちょうど1個**置く:
 
 ## test strategy
 
-- **単体(loop 単位)**: FakeForge + マーカー付き PR で materialization sweep の discover フィルタ
+- **単体(sweep 単位)**: FakeForge + マーカー付き PR で `sweep(deps)` の対象絞り込み
   (spec-ready のみ / マーカー必須 / PR が open でないものは skip / **現 head が未承認なら skip +
   spec-reviewing 戻し**)、children parse・検証、子作成・`blocked_by` 順序、親 tracking 化、
   `close_pr` を検証。
