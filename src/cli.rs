@@ -164,7 +164,8 @@ pub enum AgentSkillsCommand {
         /// (`~/.claude/skills/meguri/`)
         #[arg(long)]
         project: bool,
-        /// Repo root for --project (defaults to the current directory)
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
         #[arg(long)]
         repo: Option<String>,
         /// Overwrite files that differ from the embedded source (without
@@ -182,7 +183,8 @@ pub enum AgentSkillsCommand {
         /// skill
         #[arg(long)]
         project: bool,
-        /// Repo root for --project (defaults to the current directory)
+        /// Repo root for --project (defaults to the Git toplevel of the
+        /// current directory; errors outside a Git repository)
         #[arg(long)]
         repo: Option<String>,
     },

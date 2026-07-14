@@ -1404,11 +1404,29 @@ pub fn cmd_agent_skills_status(target: &str, project: bool, repo: Option<&str>) 
     Ok(())
 }
 
+/// Resolve which repository `--project` writes to / reads from. `--repo` is
+/// taken verbatim (explicit escape hatch); without it the current directory
+/// is resolved to its Git toplevel so running from `docs/` or `src/` still
+/// targets `<repo root>/.claude/rules/`. Both `install` and `status` go
+/// through here, so they always agree on the location.
 fn agent_skills_repo_root(repo: Option<&str>) -> Result<PathBuf> {
     match repo {
         Some(r) => Ok(PathBuf::from(r)),
-        None => std::env::current_dir().context("resolving current directory"),
+        None => {
+            let cwd = std::env::current_dir().context("resolving current directory")?;
+            agent_skills_repo_root_from(&cwd)
+        }
     }
+}
+
+/// Cwd-independent core of [`agent_skills_repo_root`], split out so tests can
+/// exercise the resolution from an arbitrary directory without touching the
+/// process-wide current directory.
+fn agent_skills_repo_root_from(dir: &std::path::Path) -> Result<PathBuf> {
+    crate::gitops::repo_toplevel_sync(dir).context(
+        "`--project` targets the current Git repository; \
+         run this from inside a repository checkout or pass --repo <path>",
+    )
 }
 
 /// The exact `install` invocation that fixes drift reported by `status` for
@@ -1469,6 +1487,64 @@ fn print_agent_skills_status(entries: &[StatusEntry], remedy: &str) {
 mod tests {
     use super::*;
     use crate::store::now;
+
+    #[test]
+    fn agent_skills_repo_root_resolves_git_toplevel_from_subdirectory() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitops::run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Canonicalize both sides: macOS tempdirs live behind /var ->
+        // /private/var and git reports the resolved path.
+        assert_eq!(
+            agent_skills_repo_root_from(&sub)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_skills_repo_root_errors_clearly_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = agent_skills_repo_root_from(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--repo"), "error should suggest --repo: {msg}");
+        assert!(msg.contains("Git repository"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn agent_skills_repo_root_takes_explicit_repo_verbatim() {
+        // `--repo` is the escape hatch: no git resolution — install/status
+        // surface their own errors against whatever path was given.
+        assert_eq!(
+            agent_skills_repo_root(Some("/no/such/checkout")).unwrap(),
+            PathBuf::from("/no/such/checkout")
+        );
+    }
+
+    #[test]
+    fn agent_skills_install_and_status_agree_on_root_from_subdirectory() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitops::run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Same resolution `install --project` performs when run from src/.
+        let install_root = agent_skills_repo_root_from(&sub).unwrap();
+        agent_skills::install_project_fragment(Target::Claude, &install_root, false).unwrap();
+
+        // The fragment lands at the repo root, never under the subdirectory.
+        assert!(repo.path().join(".claude/rules/meguri.md").is_file());
+        assert!(!sub.join(".claude").exists());
+
+        // `status --project` from the same subdirectory resolves to the same
+        // root and therefore sees the install as up to date.
+        let status_root = agent_skills_repo_root_from(&sub).unwrap();
+        let entry = agent_skills::status_project_fragment(Target::Claude, &status_root);
+        assert_eq!(entry.state, StatusState::UpToDate);
+    }
 
     #[test]
     fn heartbeat_freshness_window() {
