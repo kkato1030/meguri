@@ -1,5 +1,13 @@
 # loop モデル横断 overview — 設計者向けの「loop の地図」
 
+> ⚠️ **注意: §1(パイプライン全体図)の本文と図は、ADR 0008 着地前・#168 rename 前の旧モデルの説明のまま(事実として誤っていた断定のみ現行に注記済み)。** 現行と異なる主な点:
+>
+> - (a) worker だけでなく **spec_worker / planner も内部 self-review を通る**([ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) / [ADR 0011](../adr/0011-combined-impl-diff-self-review.md) — `SpecWorkerFlavor::self_reviews()` は現在 `true`)。
+> - (b) `spec_reviewer` は plan/impl 両対応の **`pr_reviewer`(旧 guard)に一般化済み**(#168 rename)。
+> - (c) レビュー結果(findings)は PR コメントではなく **`meguri/pr-review` commit status + PR 本文の `<details>`** に載る。
+>
+> §3 のライフサイクル表・「語彙」節・§5 の ADR 索引は現行に更新済み。本 doc の全面追随(特に §1 の図の描き直し)は #172 で行う(§6)。
+
 ## この doc の位置づけ
 
 meguri の loop についての説明は今まで2系統に散らばっていた。
@@ -13,11 +21,9 @@ meguri の loop についての説明は今まで2系統に散らばっていた
 - **ADR** = 個別決定とその理由(引き続き正)。
 - **この doc** = 設計者向けの構造の地図。事実の二重管理を避けるため、詳細は README / ADR を参照し、この doc 自体はパイプライン図・優先度・ライフサイクル表・ADR 索引に徹する。
 
-> **この doc は現行モデルを正として書いている。** #132(spec/impl ループの対称化、ADR 0008 相当)が in-flight で、着地すると loop モデルが大きく動く。詳細は「[6. 注意: #132 / ADR 0008 は in-flight](#6-注意-132--adr-0008-は-in-flight)」を参照。
+## 1. パイプライン全体図(⚠️ 旧モデル — 冒頭の注意書きを参照)
 
-## 1. パイプライン全体図
-
-入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。**この2つは実装 diff の担保が非対称**: 直行(`meguri:ready`)経路は worker の内部 self-review(ADR 0006)を経てから PR を開くが、spec 先行経路は spec PR が(planner によって)既に open な状態で `spec_worker` が実装 commit を積むだけで完了し、`SpecWorkerFlavor` は `Flavor::self_reviews()` を override していない(既定 `false`)ため worker と同じ内部 self-review フェーズを通らない。`spec_reviewer` がレビューするのは `meguri:spec-reviewing` の spec PR head(=spec の内容)だけで、discovery は `meguri:spec-reviewing` ラベルの付いた PR に限られるため、`spec_worker` が実装 commit を積んで PR がそのラベルを離れた後は再び走らない — spec 先行経路には実装 diff に対する worker 相当の内部/GitHub レビューが無く、PR 公開後の人間・外部 bot のレビューと fixer 系ループだけがそれを担う。両経路とも最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。cleaner だけはこのパイプラインの外で独立に回る。
+入口は2つ — `meguri:plan`(spec 先行)と `meguri:ready`(直行)。**この2つは実装 diff の担保が非対称だった**(旧モデルの説明 — 冒頭の注意書き参照): 直行(`meguri:ready`)経路は worker の内部 self-review(ADR 0006)を経てから PR を開くが、spec 先行経路は spec PR が(planner によって)既に open な状態で `spec_worker` が実装 commit を積むだけで完了していた(※現在の `SpecWorkerFlavor::self_reviews()` は `true` — spec_worker も combined diff(ADR + 実装)に対して worker と同じ内部 self-review を通る。[ADR 0011](../adr/0011-combined-impl-diff-self-review.md))。`spec_reviewer` がレビューするのは `meguri:spec-reviewing` の spec PR head(=spec の内容)だけで、discovery は `meguri:spec-reviewing` ラベルの付いた PR に限られるため、`spec_worker` が実装 commit を積んで PR がそのラベルを離れた後は再び走らない — spec 先行経路には実装 diff に対する worker 相当の内部/GitHub レビューが無かった(※これも旧モデル — 現在は上記の内部 self-review と、opt-in の impl 側 pr-review(ADR 0008)がそれを担う)。両経路とも最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。cleaner だけはこのパイプラインの外で独立に回る。
 
 ```
 GitHub issue(未トリアージ、無ラベル)
@@ -44,10 +50,10 @@ GitHub issue(未トリアージ、無ラベル)
     実装 commit を同じ branch/PR に積む    issue: ready→implementing
     spec を削除(disposable、ADR 0001)          │
     issue: speccing→implementing              ▼
-    → そのまま完了(PR は既に open 済み)  self-review(内部ループ、ADR 0006、worker のみ)
-    ※ SpecWorkerFlavor は self_reviews() execute → validate → self-review ⇄ fix
-      を override しないため、右側の      (ラウンド上限まで、forge には一切触れない)
-      内部 self-review フェーズは通らない        │
+    → そのまま完了(PR は既に open 済み)  self-review(内部ループ、ADR 0006/0008)
+    ※ 旧注 — 現在は SpecWorkerFlavor も   execute → validate → self-review ⇄ fix
+      self_reviews() = true(ADR 0011)、 (ラウンド上限まで、forge には一切触れない)
+      同じ内部 self-review を通る               │
         │                                       ▼
         │                                PR open(`Closes #N`)
         │                                       │
@@ -94,7 +100,7 @@ cleaner (standalone) ── パイプラインの外を独立に回る
 現行の `default_loops()`(`src/engine/mod.rs`)の**登録順そのものが優先度**である。プリエンプションは無く、`Loop` trait に `priority()` のような機構も無い — 並び順そのものが仕様([ADR 0001-scheduler-priority-wip-first](../adr/0001-scheduler-priority-wip-first.md))。
 
 ```
-conflict_resolver → ci_fixer → fixer → spec_worker → spec_reviewer → worker → planner → cleaner
+conflict_resolver → ci_fixer → fixer → spec_worker → pr_reviewer → worker → planner → cleaner
 ```
 
 これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
