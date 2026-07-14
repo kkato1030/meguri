@@ -2,7 +2,7 @@
 //! dispatch. Loops discover targets (e.g. labeled GitHub issues); sqlite
 //! only tracks runs, and `runs.loop_kind` routes each run to its loop.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,24 @@ use super::{Deps, Loop};
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
 use crate::tasks::TaskKey;
+
+/// The slot budget is spent by *weight*, not run count (issue #111). A collab
+/// advisor is a real agent on the subscription quota, so a run that spawns one
+/// (collab active + advisor-eligible loop) weighs 2; every other run weighs 1.
+/// The map is run_id → weight, so `active_weight` sums the budget in flight.
+fn run_weight(deps: &Deps, run: &RunRecord) -> usize {
+    if crate::collab::advisor_active(&deps.config)
+        && crate::collab::supports_advisor_loop_kind(&run.loop_kind)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn active_weight(active: &HashMap<String, usize>) -> usize {
+    active.values().sum()
+}
 
 /// A fresh view of everything the watch derives from the config, produced by
 /// the `reload` hook when `config.toml` changed on disk.
@@ -44,7 +62,9 @@ impl Scheduler {
         self.recover(&store).await?;
 
         let mut running: JoinSet<String> = JoinSet::new();
-        let mut active_run_ids: HashSet<String> = HashSet::new();
+        // run_id → slot weight (issue #111): most runs weigh 1, a collab-advisor
+        // run weighs 2. The budget is the sum, not the count.
+        let mut active_run_ids: HashMap<String, usize> = HashMap::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -85,7 +105,7 @@ impl Scheduler {
                 tracing::warn!("redispatch failed: {e:#}");
             }
 
-            if active_run_ids.len() < self.max_concurrent
+            if active_weight(&active_run_ids) < self.max_concurrent
                 && let Err(e) = self.discover(&mut running, &mut active_run_ids).await
             {
                 tracing::warn!("discovery failed: {e:#}");
@@ -157,7 +177,7 @@ impl Scheduler {
     async fn discover(
         &self,
         running: &mut JoinSet<String>,
-        active: &mut HashSet<String>,
+        active: &mut HashMap<String, usize>,
     ) -> Result<()> {
         // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
         // conflict_resolver) below share one `list_open_prs` call per
@@ -167,7 +187,7 @@ impl Scheduler {
         }
         for lp in &self.loops {
             for deps in &self.projects {
-                if active.len() >= self.max_concurrent {
+                if active_weight(active) >= self.max_concurrent {
                     return Ok(());
                 }
                 let mut targets = lp.discover(deps).await?;
@@ -176,7 +196,7 @@ impl Scheduler {
                 // stable order across Issue/Local targets.
                 targets.sort_by_key(|t| t.key);
                 for target in targets {
-                    if active.len() >= self.max_concurrent {
+                    if active_weight(active) >= self.max_concurrent {
                         return Ok(());
                     }
                     // Unique active run per (project, loop, target) — enforced
@@ -224,13 +244,13 @@ impl Scheduler {
         &self,
         store: &Store,
         running: &mut JoinSet<String>,
-        active: &mut HashSet<String>,
+        active: &mut HashMap<String, usize>,
     ) -> Result<()> {
         for run in store.list_runs(true)? {
-            if active.len() >= self.max_concurrent {
+            if active_weight(active) >= self.max_concurrent {
                 break;
             }
-            if active.contains(&run.id) {
+            if active.contains_key(&run.id) {
                 continue;
             }
             if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
@@ -244,7 +264,7 @@ impl Scheduler {
         &self,
         run: &RunRecord,
         running: &mut JoinSet<String>,
-        active: &mut HashSet<String>,
+        active: &mut HashMap<String, usize>,
     ) {
         let Some(deps) = self
             .projects
@@ -259,6 +279,7 @@ impl Scheduler {
             );
             return;
         };
+        let weight = run_weight(&deps, run);
         let Some(lp) = self
             .loops
             .iter()
@@ -269,7 +290,7 @@ impl Scheduler {
             return;
         };
         let run_id = run.id.clone();
-        active.insert(run_id.clone());
+        active.insert(run_id.clone(), weight);
         running.spawn(async move {
             if let Err(e) = lp.drive(&deps, &run_id).await {
                 tracing::warn!("run {run_id} failed: {e:#}");
@@ -315,5 +336,94 @@ impl Scheduler {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
+    use crate::forge::fake::FakeForge;
+    use crate::store::Store;
+
+    fn deps_with_collab(mode: Option<CollabMode>) -> Deps {
+        let mut config = Config::default();
+        if let Some(mode) = mode {
+            config.collab = Some(CollabConfig {
+                mode,
+                advisor_role: "planner".into(),
+            });
+        }
+        let project = ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(FakeForge::default()),
+            config,
+            project,
+        )
+    }
+
+    fn run_of_kind(deps: &Deps, loop_kind: &str) -> RunRecord {
+        let run = deps
+            .store
+            .create_run_for_loop("proj", loop_kind, 7, "t")
+            .unwrap();
+        deps.store.get_run(&run.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn active_weight_sums_weights() {
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), 1usize);
+        m.insert("b".to_string(), 2usize);
+        assert_eq!(active_weight(&m), 3);
+        assert_eq!(active_weight(&HashMap::new()), 0);
+    }
+
+    #[test]
+    fn collab_advisor_run_weighs_two() {
+        // With `[collab] mode = "advisor"`, an advisor-eligible run books two
+        // slots (issue #111): the worker plus its advisor.
+        let deps = deps_with_collab(Some(CollabMode::Advisor));
+        assert_eq!(
+            run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
+            2
+        );
+        assert_eq!(
+            run_weight(&deps, &run_of_kind(&deps, crate::engine::spec_worker::KIND)),
+            2
+        );
+        // A non-advisor loop still weighs 1 even with collab on.
+        assert_eq!(run_weight(&deps, &run_of_kind(&deps, "planner")), 1);
+    }
+
+    #[test]
+    fn collab_off_every_run_weighs_one() {
+        for mode in [None, Some(CollabMode::Off)] {
+            let deps = deps_with_collab(mode);
+            assert_eq!(
+                run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
+                1
+            );
+        }
     }
 }

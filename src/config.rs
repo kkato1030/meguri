@@ -98,6 +98,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Collab advisor layer (`[collab]`, issue #111). Absent = feature off:
+    /// byte-for-byte the historical behavior (no advisor pane, worker prompt
+    /// unchanged). See [`crate::collab`] and ADR 0006 (collab-advisor).
+    #[serde(default)]
+    pub collab: Option<CollabConfig>,
     /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
     /// (no legacy/off state) — a role with no entry here still resolves
     /// through the built-in recommendation table.
@@ -560,6 +565,48 @@ pub struct RoutingConfig {
     /// you only set it when routing is already wanted.
     #[serde(default)]
     pub explore_ratio: f64,
+}
+
+/// Whether the collab advisor layer is active (`[collab] mode`, issue #111).
+/// `Off` (the default when the section is present) is byte-for-byte identical
+/// to no `[collab]` section — an explicit, inert placeholder; `Advisor` turns
+/// the layer on, which pairs with the startup agmsg detection
+/// ([`crate::collab::validate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CollabMode {
+    #[default]
+    Off,
+    Advisor,
+}
+
+/// `[collab]`: the opt-in advisor layer (issue #111, ADR 0006). Present with
+/// `mode = "advisor"` spawns a plan-author advisor pane alongside each worker
+/// run; absent or `mode = "off"` is the historical behavior. Process-bound
+/// like `mux.kind` / `[daemon]` — pinned at startup, not hot-reloaded — because
+/// its validity is only guaranteed by the startup agmsg check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollabConfig {
+    #[serde(default)]
+    pub mode: CollabMode,
+    /// The routing role whose profile the advisor borrows (default
+    /// `"planner"` — the model that wrote the spec). No new routing role is
+    /// introduced; see [`crate::collab`].
+    #[serde(default = "default_advisor_role")]
+    pub advisor_role: String,
+}
+
+impl Default for CollabConfig {
+    fn default() -> Self {
+        Self {
+            mode: CollabMode::default(),
+            advisor_role: default_advisor_role(),
+        }
+    }
+}
+
+fn default_advisor_role() -> String {
+    "planner".into()
 }
 
 /// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
@@ -1651,6 +1698,19 @@ impl ConfigReloader {
             );
             next.daemon = self.current.daemon.clone();
         }
+        // `[collab]` is process-bound (issue #111): `mode = "advisor"` is only
+        // ever validated against the agmsg CLI at startup (`collab::validate`),
+        // and `ConfigReloader::poll` deliberately does not re-run that startup
+        // validation. Pinning it here keeps a mid-flight edit from letting an
+        // un-validated `[collab]` take effect — which would turn a would-be
+        // loud startup error into a silent best-effort spawn failure.
+        if next.collab != self.current.collab {
+            tracing::warn!(
+                "[collab] is fixed for the daemon's lifetime — \
+                 restart `meguri watch` to apply it"
+            );
+            next.collab = self.current.collab.clone();
+        }
 
         match apply(&self.current, &next) {
             Ok(applied) => {
@@ -2145,6 +2205,51 @@ language = "English"
         assert_eq!(got.mux.kind, "auto");
         assert_eq!(got.daemon.throttle_secs, 10);
         assert_eq!(r.current().mux.session, "meguri");
+    }
+
+    #[test]
+    fn collab_defaults_to_none() {
+        // Absent section = feature off (issue #111).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.collab.is_none());
+    }
+
+    #[test]
+    fn parses_collab_section() {
+        let cfg: Config =
+            toml::from_str("[collab]\nmode = \"advisor\"\nadvisor_role = \"planner\"\n").unwrap();
+        let collab = cfg.collab.unwrap();
+        assert_eq!(collab.mode, CollabMode::Advisor);
+        assert_eq!(collab.advisor_role, "planner");
+
+        // A bare `[collab]` defaults to inert Off + planner.
+        let cfg: Config = toml::from_str("[collab]\n").unwrap();
+        let collab = cfg.collab.unwrap();
+        assert_eq!(collab.mode, CollabMode::Off);
+        assert_eq!(collab.advisor_role, "planner");
+    }
+
+    #[test]
+    fn reloader_pins_collab() {
+        // `[collab]` is process-bound (issue #111): a mid-flight edit that
+        // turns the advisor on must NOT take effect, because it would bypass
+        // the startup agmsg validation that only runs at `meguri watch` entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+        assert!(r.current().collab.is_none());
+
+        write_config(&path, "language = \"B\"\n[collab]\nmode = \"advisor\"");
+        let got = r.poll(|_, next| Ok(next.clone())).unwrap();
+        // The reloadable change went through…
+        assert_eq!(got.language.as_deref(), Some("B"));
+        // …but `[collab]` kept its startup value (absent = off).
+        assert!(
+            got.collab.is_none(),
+            "collab is pinned to the startup value"
+        );
+        assert!(r.current().collab.is_none());
     }
 
     #[test]

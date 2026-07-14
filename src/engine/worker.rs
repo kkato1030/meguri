@@ -111,6 +111,9 @@ impl Flavor for WorkerFlavor {
         } else {
             String::new()
         };
+        // Collab advisor consult block (issue #111): non-empty only when a live
+        // advisor pane exists for this run (collab on + spawn succeeded).
+        let consult_section = flow::advisor_consult_section(deps, run);
         match run.task_key() {
             // github issue: the familiar prompt, including the needs-plan
             // handoff (only the label flow has a planner to hand to).
@@ -135,7 +138,7 @@ impl Flavor for WorkerFlavor {
                  paragraph in `summary` explaining what you found and which decision \
                  is needed. meguri will hand the issue to the planning flow with that \
                  paragraph.\n\n\
-                 {pr_section}{lang_section}",
+                 {consult_section}{pr_section}{lang_section}",
                 title = cp.issue_title,
                 body = cp.issue_body,
             ),
@@ -328,6 +331,54 @@ mod tests {
         assert!(prompt.contains("# Issue: Add caching"));
         assert!(prompt.contains("# Needs a design decision first?"));
         assert!(prompt.contains(r#""status": "needs_plan""#));
+    }
+
+    #[test]
+    fn consult_block_only_appears_when_advisor_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            issue_body: "Cache the thing.".into(),
+            ..Default::default()
+        };
+        let flavor = WorkerFlavor {
+            separate_delivery: false,
+        };
+
+        // collab off (default): no consult block.
+        let (deps_off, run, _f) = fake_env(&[forge::LABEL_READY]);
+        let off = flavor.execute_prompt(&deps_off, &run, &cp, dir.path());
+        assert!(!off.contains("agmsg"), "collab off ⇒ no consult block");
+
+        // collab on, but the advisor spawn failed (no live pane): the prompt is
+        // byte-for-byte identical to collab-off (criteria 1/4 — never advertise
+        // an absent advisor).
+        let (mut deps_on, run_on, _f2) = fake_env(&[forge::LABEL_READY]);
+        deps_on.config.collab = Some(crate::config::CollabConfig {
+            mode: crate::config::CollabMode::Advisor,
+            advisor_role: "planner".into(),
+        });
+        let on_no_pane = flavor.execute_prompt(&deps_on, &run_on, &cp, dir.path());
+        assert_eq!(on_no_pane, off, "spawn failure ⇒ prompt unchanged");
+
+        // collab on + a live advisor pane (spawn succeeded): the block appears,
+        // carrying the team name and the agmsg scripts.
+        deps_on
+            .store
+            .upsert_pane(
+                "proj",
+                7,
+                crate::store::LANE_ADVISOR,
+                "fake",
+                "meguri",
+                "%adv",
+                "/tmp/adv",
+            )
+            .unwrap();
+        let on_live = flavor.execute_prompt(&deps_on, &run_on, &cp, dir.path());
+        assert!(on_live.contains("meguri-proj-7"), "team name in block");
+        assert!(on_live.contains("advisor"));
+        assert!(on_live.contains("agmsg"));
     }
 
     #[tokio::test]

@@ -343,7 +343,13 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
         json!({ "issue": run.issue_number, "step": run.step }),
     )?;
 
-    match drive(deps, &run, flavor).await {
+    let result = drive(deps, &run, flavor).await;
+    // Reap the collab advisor (issue #111) on every terminal path — success,
+    // needs-plan, decompose, stop, interrupt, failure — so it never outlives
+    // the worker run, independent of `keep_pane` (ADR 0006 principle 3). No-op
+    // when collab is off or there is no advisor.
+    release_advisor(deps, &run).await;
+    match result {
         Ok(outcome) => {
             match &outcome {
                 WorkerOutcome::Succeeded { pr_url } => {
@@ -479,6 +485,11 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     };
 
     if step == STEP_EXECUTE {
+        // Collab advisor (issue #111): spawn the plan-author advisor before the
+        // worker's turns so its consult block can join the first prompt.
+        // Best-effort — a failure leaves the worker untouched. Re-run on resume
+        // re-embodies the advisor ("捨てて張り直す").
+        ensure_advisor(deps, &run, &worktree, &checkpoint).await;
         match execute(deps, &run, &mut checkpoint, &worktree, flavor).await? {
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
@@ -597,6 +608,202 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
         )
         .await;
     }
+}
+
+/// Spawn the collab advisor pane for a worker run, best-effort (issue #111,
+/// ADR 0006 collab-advisor). A no-op unless `[collab] mode = "advisor"`, the
+/// loop kind is advisor-eligible (worker / spec-worker), and the target is a
+/// github issue. A failure never fails the run — it is logged and emitted, and
+/// the worker proceeds with no consult block (the prompt then matches
+/// collab-off byte for byte, since [`advisor_consult_section`] reads the live
+/// pane as its "spawn succeeded" signal).
+///
+/// The advisor is re-embodied, not resumed: any surviving advisor pane is torn
+/// down and a fresh one spawned ("捨てて張り直す"), so a resume or restart never
+/// adopts a stale individual.
+pub(crate) async fn ensure_advisor(deps: &Deps, run: &RunRecord, worktree: &Path, cp: &Checkpoint) {
+    if !crate::collab::advisor_active(&deps.config)
+        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
+        || !matches!(run.task_key(), TaskKey::Issue(_))
+    {
+        return;
+    }
+    if let Err(e) = spawn_advisor(deps, run, worktree, cp).await {
+        tracing::warn!(
+            "collab advisor spawn failed for issue #{}: {e:#} — worker proceeds without it",
+            run.issue_number
+        );
+        let _ = deps.store.emit(
+            Some(&run.id),
+            "collab.advisor_spawn_failed",
+            json!({ "issue": run.issue_number, "error": format!("{e:#}") }),
+        );
+    }
+}
+
+async fn spawn_advisor(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    cp: &Checkpoint,
+) -> Result<()> {
+    let issue = run.issue_number;
+    let (profile_name, profile) = resolve_advisor_profile(deps, run)?;
+
+    // Seed material: the merged spec if present, else the issue body. meguri
+    // reads it (the advisor needs no repo access).
+    let spec_rel = super::planner::spec_rel_path(issue);
+    let material = std::fs::read_to_string(worktree.join(&spec_rel))
+        .unwrap_or_else(|_| format!("# {}\n\n{}", cp.issue_title, cp.issue_body));
+    let team = crate::collab::team_name(&deps.project.id, issue);
+    let seed = crate::collab::advisor_seed_prompt(issue, &team, &material);
+
+    // A bare, git-unregistered empty directory: read-only by wiring (#121) —
+    // there is no repo copy to write into.
+    let root = deps
+        .project
+        .worktree_root
+        .clone()
+        .unwrap_or_else(crate::config::worktrees_root);
+    let advisor_dir = root.join(&deps.project.id).join(format!("advisor-{issue}"));
+    std::fs::create_dir_all(&advisor_dir)
+        .with_context(|| format!("cannot create advisor dir {}", advisor_dir.display()))?;
+
+    // Re-embody, never resume: tear down any surviving advisor pane first
+    // (release_pane_record guards the advisor lane against saving a session id).
+    super::reaper::release_pane(deps, issue, crate::store::LANE_ADVISOR, "advisor respawn").await;
+
+    deps.mux.ensure_session().await?;
+
+    let mut command = vec![profile.command.clone()];
+    command.extend(profile.args.iter().cloned());
+    command.push(seed);
+    let mut env = Vec::new();
+    if let Some(hint) = &profile.herdr_agent_hint {
+        env.push(("HERDR_AGENT".to_string(), hint.clone()));
+    }
+    let pane = deps
+        .mux
+        .spawn_pane(&PaneSpec {
+            title: format!("meguri#{issue}:advisor"),
+            cwd: advisor_dir.clone(),
+            command,
+            env,
+        })
+        .await?;
+    // Register on the advisor lane only. Unlike spawn_agent_pane we do NOT
+    // update_run_mux — the run's own pane is the worker's, not this one.
+    deps.store.upsert_pane(
+        &deps.project.id,
+        issue,
+        crate::store::LANE_ADVISOR,
+        deps.mux.kind().as_str(),
+        &deps.config.mux.session,
+        &pane.0,
+        &advisor_dir.to_string_lossy(),
+    )?;
+    deps.store.emit(
+        Some(&run.id),
+        "collab.advisor_spawned",
+        json!({ "issue": issue, "pane": pane.0, "profile": profile_name,
+                "team": team, "mux": deps.mux.kind().as_str() }),
+    )?;
+    Ok(())
+}
+
+/// Resolve the advisor's launch profile (issue #111): inherit the profile the
+/// plan author actually ran under — the pin on the issue's latest succeeded
+/// run of the advisor role (default `planner`). Fall back to a fresh
+/// resolution of the advisor role when there is no such pin or it has vanished
+/// from config. Best-effort: unlike the run's own `resolve_run_profile`, a
+/// vanished pin is not a loud error here (advisor spawn is best-effort).
+fn resolve_advisor_profile(
+    deps: &Deps,
+    run: &RunRecord,
+) -> Result<(String, crate::config::AgentProfile)> {
+    let role = crate::collab::advisor_role(&deps.config);
+    if let Some(name) =
+        deps.store
+            .latest_succeeded_agent_profile(&deps.project.id, role, run.issue_number)?
+    {
+        match crate::routing::profile_by_name(&deps.config, &name) {
+            Ok(profile) => return Ok((name, profile)),
+            Err(_) => {
+                let _ = deps.store.emit(
+                    Some(&run.id),
+                    "collab.advisor_profile_fallback",
+                    json!({ "issue": run.issue_number, "vanished_profile": name, "role": role }),
+                );
+            }
+        }
+    }
+    let name = crate::routing::resolve(&deps.config, role, &crate::routing::detect_command)?;
+    let profile = crate::routing::profile_by_name(&deps.config, &name)?;
+    Ok((name, profile))
+}
+
+/// Reap the advisor pane at the end of a worker run (issue #111): on every
+/// terminal path, independent of `keep_pane` (ADR 0006 principle 3). No-op when
+/// collab is off, the loop is not advisor-eligible, or no advisor pane exists.
+/// The session id is not saved on release (guarded in `release_pane_record`),
+/// and the bare advisor dir is removed.
+pub(crate) async fn release_advisor(deps: &Deps, run: &RunRecord) {
+    if !crate::collab::advisor_active(&deps.config)
+        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
+    {
+        return;
+    }
+    let Some(record) = deps
+        .store
+        .get_pane(
+            &deps.project.id,
+            run.issue_number,
+            crate::store::LANE_ADVISOR,
+        )
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    super::reaper::release_pane(
+        deps,
+        run.issue_number,
+        crate::store::LANE_ADVISOR,
+        "worker run ended",
+    )
+    .await;
+    if let Some(dir) = record.worktree_path {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The advisor consult block for the worker's execute prompt (issue #111 §4),
+/// or empty when it must not appear: collab off, loop not advisor-eligible, or
+/// the advisor pane is not live (spawn failed). Reading the live pane is the
+/// "spawn succeeded" signal, so a failed spawn yields the same bytes as
+/// collab-off — never advertising an absent advisor.
+pub(crate) fn advisor_consult_section(deps: &Deps, run: &RunRecord) -> String {
+    if !crate::collab::advisor_active(&deps.config)
+        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
+    {
+        return String::new();
+    }
+    let live = deps
+        .store
+        .get_pane(
+            &deps.project.id,
+            run.issue_number,
+            crate::store::LANE_ADVISOR,
+        )
+        .ok()
+        .flatten()
+        .and_then(|p| p.mux_pane_id)
+        .is_some();
+    if !live {
+        return String::new();
+    }
+    let team = crate::collab::team_name(&deps.project.id, run.issue_number);
+    crate::collab::worker_consult_block(&team)
 }
 
 /// The PR this run claimed, from its persisted checkpoint (release/escalate
@@ -2153,6 +2360,138 @@ mod tests {
             .create_run_for_loop("proj", "test-flavor", issue, "t")
             .unwrap();
         store.get_run(&run.id).unwrap().unwrap()
+    }
+
+    /// A worker run + a collab-advisor-on Deps rooted at `worktree_root`.
+    fn advisor_env(worktree_root: &Path) -> (Deps, RunRecord) {
+        use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::worker::KIND, 7, "t")
+            .unwrap();
+        let run = store.get_run(&run.id).unwrap().unwrap();
+        let config = Config {
+            collab: Some(CollabConfig {
+                mode: CollabMode::Advisor,
+                advisor_role: "planner".into(),
+            }),
+            ..Config::default()
+        };
+        let project = ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(worktree_root.to_path_buf()),
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            std::sync::Arc::new(crate::forge::fake::FakeForge::default()),
+            config,
+            project,
+        );
+        (deps, run)
+    }
+
+    #[tokio::test]
+    async fn advisor_spawns_before_execute_and_reaps_after() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        // No spec file in the worktree → the seed falls back to the issue body.
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Before spawn: no advisor pane, so no consult block.
+        assert!(advisor_consult_section(&deps, &run).is_empty());
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        // A live advisor pane exists, keyed on the advisor lane, and a bare
+        // advisor cwd was created (read-only by wiring — no repo checkout).
+        let pane = deps
+            .store
+            .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+            .unwrap()
+            .unwrap();
+        assert!(pane.mux_pane_id.is_some());
+        let advisor_dir = root.path().join("proj").join("advisor-7");
+        assert!(advisor_dir.exists());
+        // The worker's own run pane was NOT pointed at the advisor.
+        assert!(
+            deps.store
+                .get_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .mux_pane_id
+                .is_none()
+        );
+
+        // The consult block now appears, carrying the project-scoped team.
+        let block = advisor_consult_section(&deps, &run);
+        assert!(block.contains("meguri-proj-7"), "{block}");
+        assert!(block.contains("agmsg"));
+
+        // Release reaps the pane and removes the bare dir; no session id saved.
+        release_advisor(&deps, &run).await;
+        let pane = deps
+            .store
+            .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pane.mux_pane_id, None);
+        assert_eq!(pane.agent_session_id, None);
+        assert!(!advisor_dir.exists());
+        assert!(advisor_consult_section(&deps, &run).is_empty());
+    }
+
+    #[tokio::test]
+    async fn advisor_is_noop_for_ineligible_loops_and_when_off() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let cp = Checkpoint::default();
+
+        // collab on, but a non-advisor loop kind: no pane.
+        let (deps, mut run) = advisor_env(root.path());
+        run.loop_kind = "planner".into();
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+        assert!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .is_none()
+        );
+
+        // collab off: an eligible loop still spawns nothing.
+        let (mut deps, run) = advisor_env(root.path());
+        deps.config.collab = None;
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+        assert!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(advisor_consult_section(&deps, &run).is_empty());
     }
 
     #[test]

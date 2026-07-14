@@ -300,11 +300,12 @@ impl Flavor for SpecWorkerFlavor {
                exists and meguri pushes to it.\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
                worktrees.\n\n\
-             {pr_section}{lang_section}",
+             {consult_section}{pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
+            consult_section = flow::advisor_consult_section(deps, run),
             pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )

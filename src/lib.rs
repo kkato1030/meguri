@@ -2,6 +2,7 @@ pub mod agent_session;
 pub mod app;
 pub mod cadence;
 pub mod cli;
+pub mod collab;
 pub mod config;
 pub mod cron;
 pub mod daemon;

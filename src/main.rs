@@ -576,7 +576,33 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
         }
     }
     ok &= doctor_launch(cfg);
+    ok &= doctor_collab(cfg);
     ok
+}
+
+/// Collab advisor (issue #111): report `[collab]` and surface the same startup
+/// error `meguri watch` / `meguri run` would raise (agmsg missing / unknown
+/// advisor role), so `meguri doctor` catches a misconfigured advisor early.
+fn doctor_collab(cfg: &Config) -> bool {
+    use meguri::{collab, routing};
+    match &cfg.collab {
+        None => return true,
+        Some(c) if c.mode == meguri::config::CollabMode::Off => {
+            println!("collab: off (`[collab] mode = \"off\"`)");
+            return true;
+        }
+        Some(c) => {
+            println!("collab: advisor (role {})", c.advisor_role);
+        }
+    }
+    if let Err(e) = collab::validate(cfg, &routing::detect_command) {
+        println!("  ❌ collab config: {e:#}");
+        return false;
+    }
+    if let Some(script) = collab::agmsg_version_script() {
+        println!("  agmsg skill  → {}", script.display());
+    }
+    true
 }
 
 /// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always

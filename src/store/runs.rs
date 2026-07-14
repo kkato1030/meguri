@@ -413,6 +413,33 @@ impl Store {
         })
     }
 
+    /// The launch profile pinned on the issue's most recent *succeeded* run of
+    /// `loop_kind` (issue #111): the collab advisor uses this to inherit the
+    /// exact profile the plan author (e.g. the `planner` run) actually ran
+    /// under, so "the model that wrote the spec" advises. `None` when no such
+    /// run exists or it never pinned a profile.
+    pub fn latest_succeeded_agent_profile(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let profile = c
+                .query_row(
+                    "SELECT agent_profile FROM runs
+                     WHERE project_id = ?1 AND loop_kind = ?2 AND issue_number = ?3
+                       AND status = 'succeeded' AND agent_profile IS NOT NULL
+                       AND agent_profile <> ''
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![project_id, loop_kind, issue_number],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(profile)
+        })
+    }
+
     /// Whether a succeeded run of `loop_kind` already covers the issue's
     /// *current* body (issue #142): either a succeeded run whose `body_digest`
     /// matches `digest`, or a legacy NULL-digest succeeded run (pre-#142 —
