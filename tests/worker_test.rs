@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use meguri::config::{Config, PrConfig, ProjectConfig, RepoConfig, RepoPrConfig};
+use meguri::config::{Config, LaunchMode, PrConfig, ProjectConfig, RepoConfig, RepoPrConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
@@ -71,6 +71,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     // These happy-path tests don't exercise the self-review phase; the
     // dedicated self-review tests enable it explicitly.
     config.review.enabled = false;
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so the self-review tests below don't fall
+    // through to its recommended `direct` mode, which would spawn a *real*
+    // `claude` subprocess instead of going through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -1128,6 +1136,9 @@ mode = "manual"
 [routing.roles]
 worker = "p-worker"
 impl-reviewer = "p-review"
+
+[launch.roles]
+self-reviewer = "pane"
 "#,
     )
     .unwrap();
