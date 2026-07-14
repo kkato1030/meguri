@@ -46,6 +46,16 @@ pub fn run_git_sync(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Resolve the toplevel of the Git work tree containing `dir` (blocking, via
+/// `git rev-parse --show-toplevel`). Errors when `dir` is not inside a Git
+/// work tree — callers that want a fallback must handle it explicitly rather
+/// than silently getting `dir` back.
+pub fn repo_toplevel_sync(dir: &Path) -> Result<PathBuf> {
+    let top = run_git_sync(dir, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a Git repository", dir.display()))?;
+    Ok(PathBuf::from(top))
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -639,6 +649,28 @@ mod tests {
         ] {
             run_git(dir, &args).await.unwrap();
         }
+    }
+
+    #[test]
+    fn repo_toplevel_sync_walks_up_from_subdir_and_rejects_non_repos() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("docs").join("adr");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Canonicalize both sides: on macOS the tempdir sits behind the
+        // /var -> /private/var symlink and git reports the resolved path.
+        assert_eq!(
+            repo_toplevel_sync(&sub).unwrap().canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+
+        // Outside any work tree: a hard error, never a silent fallback.
+        let plain = tempfile::tempdir().unwrap();
+        let err = repo_toplevel_sync(plain.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not inside a Git repository"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]

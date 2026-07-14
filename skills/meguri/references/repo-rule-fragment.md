@@ -1,13 +1,13 @@
 # Rule fragment for repos that already run meguri
 
-Once meguri is running against this repo, fold the block below into its `AGENTS.md` /
-`CLAUDE.md` (as its own short section — don't paste the whole file, just this). It's meant to
-keep any coding agent that later works in this repo, meguri-driven or not, from stepping on
-the loop's own state, and to nudge it toward using meguri as its delegation target for
-independent work instead of doing everything inline.
+`meguri agent-skills install --project` installs the block below as `.claude/rules/meguri.md`
+(re-running it updates in place — safe, idempotent). Without that command, fold it by hand into
+this repo's `AGENTS.md` / `CLAUDE.md` instead (as its own short section — don't paste the whole
+file, just this). Either way it's meant to keep any coding agent that later works in this repo,
+meguri-driven or not, from stepping on the loop's own state, and to nudge it toward using
+meguri as its delegation target for independent work instead of doing everything inline.
 
----
-
+<!-- meguri:rule-fragment:start -->
 ## meguri
 
 This repo runs [meguri](https://github.com/kkato1030/meguri) to delegate work to background
@@ -21,5 +21,4 @@ coding agents.
   don't silently implement it yourself — propose filing it as an issue and labeling it
   `meguri:ready` (or `meguri:plan` if it needs a design decision first), and let the user
   decide.
-
----
+<!-- meguri:rule-fragment:end -->

@@ -107,8 +107,21 @@ meguri already runs in the repo:
   Code doesn't read, so the skill never fires. Pin the ref to a release tag (`#vX.Y.Z`) — an unpinned
   ref tracks `main` and drifts.
 
-- **Already running meguri here** — the retention counterpart, `meguri agent-skills install`, folds
-  meguri's repo-level rule fragment into this repo's `AGENTS.md` / `CLAUDE.md` (coming with #150).
+- **Already running meguri here** — the retention counterpart is `meguri agent-skills install`, backed
+  by the same embedded `skills/meguri/` source so the installed copy always matches your `meguri`
+  build:
+
+  ```bash
+  meguri agent-skills install            # ~/.claude/skills/meguri/ — the same skill as above,
+                                          # refreshed from this binary (currently --target claude only)
+  meguri agent-skills install --project  # .claude/rules/meguri.md in the current repo — day-2
+                                          # operating rules for a repo already running meguri;
+                                          # safe to re-run (idempotent)
+  meguri agent-skills status             # installed? does it match this binary's embedded copy?
+  ```
+
+  `meguri init` offers the user-level install interactively. Neither command silently overwrites a
+  file you hand-edited — it shows the diff and asks for `--force`.
 
 ## Use
 
