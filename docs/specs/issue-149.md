@@ -33,6 +33,8 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - **合成 = `all` → ロール別を連結、上書きはキー単位**。per-project の同キーが top-level を
   上書きし、無ければ top-level に落ちる(`language_for` の流儀を map に広げた形)。
 - **欠落 = warn + イベント発火で続行**。turn は落とさない。`doctor` は別途 strict に検出。
+- **パスは repo 相対に限定**。絶対パス・`..` を config 検証で弾く。中身は agent プロンプトに
+  埋め込まれるため、worktree 外の秘密ファイルを読ませない防御線。
 
 ## 変更箇所
 
@@ -54,6 +56,14 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
   `bail!`(routing の未知ロール拒否と同じメッセージ調)。同一マップ内で alias と canonical が
   同じロールに畳まれて衝突する場合(例: `pr-reviewer` と `spec-reviewer` を併記)も、
   どちらが勝つか曖昧なので `bail!` で弾く。
+- **パス値の安全検証(必須)**: 各値は「repo 相対パス」を契約とする。preamble の中身は
+  agent プロンプトにそのまま埋め込まれるため、絶対パスや `..` を含む値を許すと worktree の
+  外(例: `~/.ssh/id_rsa`)を読んで agent に漏らす入口になる。共通ヘルパ
+  `validate_repo_relative(rel) -> Result<()>` を足し、絶対パス(`Path::is_absolute`)と
+  親ディレクトリ参照(`Component::ParentDir` を含む)を `bail!` で拒否する。`Config::validate`
+  で `prompts` / `[projects.prompts]` の全値に適用する。解決も doctor も、読み込む直前に
+  同じヘルパを必ず通してから `join` する(検証を単一の関門に集約し、経路差で漏れないように
+  する)。
 - `INIT_TEMPLATE` にコメント例を追記(過剰採用を避ける一言 —「CLAUDE.md で足りるなら不要」)。
 
 ### 2. 配線: preamble の解決・読み込み・埋め込み — `src/engine/flow.rs` + `src/turn/`
@@ -61,7 +71,8 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - 解決と読み込みは flow 層に置く(`Deps` が config/project/store を持つため)。
   `run_turn`(author)は `routing::routing_role_for_loop(&run.loop_kind)`、`run_review_turn`
   は `"self-reviewer"` を routing ロールとして `run_turn_in` に渡す。
-- `run_turn_in` で `preambles_for` → 各パスを `worktree.join(rel)` から読む。読めたものを
+- `run_turn_in` で `preambles_for` → 各パスは `validate_repo_relative` を通してから
+  `worktree.join(rel)` で読む(config validate を通った値でも、防御的に解決関門で再確認する)。読めたものを
   「## プロジェクトの恒常規律(以下に従うこと。ただし meguri の完了契約・検証ルールが優先)」
   のラベル付きブロックに `all` → ロール順で連結する。
 - 位置の責務は `src/turn/prompts.rs` が持つ: `prepare_turn` / `write_prompt_file` に
@@ -79,8 +90,10 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 ### 4. `meguri doctor`: primary clone 上の存在検証 — `src/main.rs`
 
 - `doctor_schedules` の `body_file` 検査と同型の新セクション: 各 project の `prompts` /
-  top-level `prompts` を列挙し、`project.repo_path.join(rel)` の存在を確認。無ければ ❌ で
-  問題として報告(実行時は warn 続行だが、doctor は設定ミス = typo を捕まえる役)。
+  top-level `prompts` を列挙し、`validate_repo_relative` を通した上で
+  `project.repo_path.join(rel)` の存在を確認。無ければ ❌ で問題として報告(実行時は warn 続行
+  だが、doctor は設定ミス = typo を捕まえる役)。config validate が絶対パス/`..` を先に弾くので
+  doctor がそれらを見ることは通常ないが、解決は同じ関門を共有する。
 
 ## 受け入れ基準
 
@@ -95,6 +108,8 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - [ ] turn プロンプトで、該当 preamble が本文冒頭・完了契約より前に埋め込まれる。設定が空の
       プロジェクトは現状と同一のプロンプトになる(後方互換)。
 - [ ] preamble パスが欠落しても turn は続行し、`prompt.preamble_missing` イベントが出る。
+- [ ] 絶対パス(例: `/etc/passwd`)や `..` を含む値(例: `../../secret`)は config 読み込みで
+      拒否される。
 - [ ] `meguri doctor` が、設定済みだが primary clone に無いパスを ❌ で報告する。
 - [ ] README / config ドキュメントに新セクションと「CLAUDE.md との住み分け」を追記。
 - [ ] `cargo fmt --check` / `clippy -D warnings` / `nextest run` / `cargo test --doc` が通る。
@@ -103,7 +118,9 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 
 - **config**(`src/config.rs` unit): パース、未知キー拒否、alias+canonical 衝突拒否、
   旧名/`all` 受理、`preambles_for` の合成4ケース、および旧名キーが canonical ロールで解決される
-  こと・旧名(top)↔canonical(project)上書きの2ケース。
+  こと・旧名(top)↔canonical(project)上書きの2ケース。加えて `validate_repo_relative` の
+  単体テスト(絶対パス拒否・`..` 拒否・正常な相対パス受理)と、それらを含む config が
+  load で弾かれること。
 - **配置**(`src/turn/prompts.rs` unit): 非空 preamble が本文の前・契約の前に入ること、
   空 preamble で現行出力と一致すること(既存 `prompt_file_contains_contract_and_turn_id` を拡張)。
 - **欠落**(flow 層 / `FakeStore` で): 欠落時に `prompt.preamble_missing` が記録され turn 続行。
