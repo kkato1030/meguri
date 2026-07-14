@@ -37,7 +37,7 @@ async fn setup() -> Setup {
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let prepared = prepare_turn(dir.path(), "do the thing").unwrap();
+    let prepared = prepare_turn(dir.path(), "do the thing", "").unwrap();
     let engine = TurnEngine {
         mux: mux.clone(),
         cfg: TurnConfig {

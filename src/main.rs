@@ -196,6 +196,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
             ok &= doctor_schedules(cfg);
+            // Role preambles (issue #149): each configured path must resolve to
+            // a real file inside the project's clone (and not escape it via a
+            // symlink) — the same containment gate the turn uses.
+            ok &= doctor_prompts(cfg);
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -323,6 +327,40 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 s.kind.as_str(),
                 s.cron,
             );
+        }
+    }
+    ok
+}
+
+/// Doctor's preamble section (issue #149): for every project, every preamble
+/// path that could be injected for it — the top-level `[prompts]` overlaid by
+/// its own `[projects.prompts]` — must resolve to a real file inside the
+/// project's clone. Missing paths and symlink escapes are both reported as ❌
+/// (config validate already rejects absolute / `..` values, so those never
+/// reach here). Projects with no preambles configured print nothing.
+fn doctor_prompts(cfg: &Config) -> bool {
+    use meguri::config::{PreambleResolution, resolve_preamble_within};
+
+    let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
+    if !has_any {
+        return true;
+    }
+    let mut ok = true;
+    println!("\npreambles:");
+    for project in &cfg.projects {
+        for (key, rel) in cfg.effective_prompts(project) {
+            let (mark, detail) = match resolve_preamble_within(&project.repo_path, &rel) {
+                PreambleResolution::Content(_) => ("✅", rel.to_string()),
+                PreambleResolution::Missing => {
+                    ok = false;
+                    ("❌", format!("{rel} not found in clone"))
+                }
+                PreambleResolution::Escapes => {
+                    ok = false;
+                    ("❌", format!("{rel} escapes the clone (symlink)"))
+                }
+            };
+            println!("  {mark} {}/{key} — {detail}", project.id);
         }
     }
     ok
