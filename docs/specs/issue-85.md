@@ -43,6 +43,18 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
   新規 issue による再走査)、`triage-report.json` のパース、
   レポート本文レンダリング(推薦テーブル + マーカー + ignore 適用)、プロンプト内容、
   discover の対象フィルタ(ワークフローラベル付き / hold / blocker を除外)を FakeForge で検証。
+- e2e テスト(`tests/triage_test.rs`、cleaner_test と同じ FakeForge + FakeMux + ローカル origin 構成、
+  scripted agent が `.meguri/triage-report.json` を書く)で **read-only 境界を run 全体で検証**する:
+  - 既定 `mode = "off"` では discover が空(巡回が一切起動しない)。
+  - 初回巡回 → レポート issue が `meguri:triage-report` 付きで作成され、推薦テーブルとマーカーが
+    本文に載る。再巡回では同じ issue の本文が全上書きされ、前回の項目が消えている。
+  - **書き込み境界**: run 完了後、origin の refs が不変(push なし)、PR なし、レポート issue
+    **以外の** issue の本文・ラベル・コメントが不変(triage 対象 issue に何も書いていないこと)。
+  - レポート issue に `meguri:hold` → discover が空。
+  - agent が成果物を出さない / JSON が壊れている / checkout が pristine でない → run は静かに skip、
+    `meguri:needs-human` なし・コメントなし・新規 issue なし、マーカーの `scanned` のみ更新して
+    次回 interval まで律速される。
+  - settle 後に pane が閉じ worktree ディレクトリが消えている(reaper に残さない)。
 
 ## 判定の出力スキーマ(v0)
 
@@ -84,7 +96,13 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 - **`src/forge/fake.rs`**: `list_open_issues()` = closed を除いた全 issue を返す。
 - **`src/config.rs`**: `TriageConfig` + `TriageMode`(off/report/advise/auto)+ `triage_for()`。
   `Config` に `#[serde(default)] pub triage: TriageConfig`、`ProjectConfig` に per-project override。
-- **`README.md`**: ループ表 / config サンプルに triage を追記(実装時)。
+- **`tests/triage_test.rs`(新規)**: 上記 e2e(cleaner_test.rs をひな形に)。
+- **`README.md` / `README.ja.md`**: 両方を並行更新(実装時)。対象節:
+  (1) Labels / ラベル節 — 記録用ラベルの段落に `meguri:triage-report` を `meguri:clean-report` と
+  並記、(2) cleaner 節の直後に triage 節(read-only 推薦レポートの説明、既定 off のオプトイン)、
+  (3) ループ表 — triage 行を追加、(4) Configuration / 設定 — `[triage]` サンプル
+  (`mode` / `interval_hours` / `ignore` と既定値)、(5) Status / roadmap — ループ数
+  (9 → 10)の更新と triage の一文。
 
 ## 主要な設計判断
 
@@ -120,5 +138,5 @@ open issue を meguri が自分で巡回し「どう扱うか(ready / plan / nee
 
 ## テスト
 
-- `cargo test`(triage の新規単体テスト + 既存の回帰)。
+- `cargo test`(triage の新規単体テスト + `tests/triage_test.rs` の e2e + 既存の回帰)。
 - `cargo clippy` / `cargo fmt`。
