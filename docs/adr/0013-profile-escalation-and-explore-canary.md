@@ -1,4 +1,4 @@
-# ADR 0012: 詰まったら昇格 — シグナル駆動のプロファイルエスカレーションと explore canary
+# ADR 0013: 詰まったら昇格 — シグナル駆動のプロファイルエスカレーションと explore canary
 
 - Status: accepted
 - Date: 2026-07-14

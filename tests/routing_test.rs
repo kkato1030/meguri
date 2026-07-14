@@ -370,9 +370,10 @@ worker = ["worker-cheap", "worker-strong"]
     tune(toml::from_str(toml).unwrap())
 }
 
-/// Like [`escalation_config`] but a three-step chain, and a higher fix-turn
-/// budget so the run can reach the top rung. Used to prove no intermediate
-/// profile is skipped.
+/// Like [`escalation_config`] but a three-step chain. The default
+/// `validate_turns` (3) is exactly enough to reach the top rung: fix turns 2
+/// and 3 escalate cheap→mid then mid→strong, and turn 4 exhausts the budget —
+/// so both escalations happen while the test stays as light as the two-step one.
 fn escalation_config_3step() -> Config {
     let toml = r#"
 [agents.profiles.worker-cheap]
@@ -396,9 +397,7 @@ worker = "worker-cheap"
 [escalation]
 worker = ["worker-cheap", "worker-mid", "worker-strong"]
 "#;
-    let mut config = tune(toml::from_str(toml).unwrap());
-    config.limits.validate_turns = 5;
-    config
+    tune(toml::from_str(toml).unwrap())
 }
 
 /// Auto routing where the worker's mainline pick (`claude-sonnet`) is overridden
@@ -463,6 +462,7 @@ async fn drive_worker_scenario(
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
     let store = Store::open_in_memory().unwrap();
     let deps = Deps::with_label_source(store.clone(), mux.clone(), forge, config, project);
