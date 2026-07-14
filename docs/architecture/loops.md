@@ -26,7 +26,11 @@ spec_worker は新規 PR を作らず、self-review の後に**既存の spec PR
 spec 先行経路はさらに
 `plan_delivery` 設定(`separate` | `combined`)で二手に分かれる: **separate**(既定)は spec PR と
 実装 PR を別々に完結させ、`plan_handoff.sweep` が両者を橋渡しする。**combined** は
-`spec_worker` が spec PR の branch を引き継ぎ、spec + 実装を1本の PR にまとめる。両経路とも
+`spec_worker` が spec PR の branch を引き継ぎ、spec + 実装を1本の PR にまとめる。plan
+レビュー(`pr_reviewer`, kind=Plan)の findings は「次の push 待ち」で放置されない —
+`spec_fixer`(issue #188 / [ADR 0013](../adr/0013-spec-fixer-drives-plan-review-findings.md))が
+planner と同じ author lane で findings を spec/ADR に反映して push し、`pr_reviewer` が新しい
+head を再レビューする(head sha で収束判定、≤3 round、超過は `needs-human`)。両経路とも
 最終的に同じ fixer/ci_fixer/conflict_resolver → auto-merge → merge-watch の後工程に合流する。
 cleaner だけはこのパイプラインの外で独立に回る。
 
@@ -53,10 +57,22 @@ pr_reviewer, kind=Plan               │
 (pr-review lane、既定 on)             │
   clean → PRラベル:                   │
     spec-reviewing→spec-ready        │
-  findings → PR本文 <details> に追記、  │
-  次の push 待ち(同じ head は1回だけ)   │
+  findings → PR本文 <details> に追記   │
+  (同じ head は1回だけレビュー)         │
    │                                 │
-   ▼ plan_delivery で分岐             │
+   ▼ findings                        │
+spec_fixer(author lane、             │
+planner の pane/session を継続、       │
+issue #188 / ADR 0013)               │
+  findings を読み spec/ADR を修正      │
+  → push(≤3 round、超過は             │
+    needs-human)                    │
+   │                                 │
+   └─(新 head を pr_reviewer が       │
+      再レビュー、head sha で dedup、  │
+      clean になるまで ⇄ 繰り返し)     │
+   │                                 │
+   ▼ clean → plan_delivery で分岐     │
    ├──────────────┐                  │
    ▼ separate(既定) ▼ combined        │
 plan_handoff.sweep  spec_worker      │
@@ -156,10 +172,10 @@ cleaner (standalone) ── パイプラインの外を独立に回る
 現行の `default_loops()`(`src/engine/mod.rs`)の**登録順そのものが優先度**である。プリエンプションは無く、`Loop` trait に `priority()` のような機構も無い — 並び順そのものが仕様([ADR 0001-scheduler-priority-wip-first](../adr/0001-scheduler-priority-wip-first.md))。
 
 ```
-conflict_resolver → ci_fixer → fixer → spec_worker → pr_reviewer → worker → planner → cleaner
+conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → pr_reviewer → worker → planner → cleaner
 ```
 
-これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
+これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。`spec_fixer`(issue #188)は plan 側の fixer 系 — plan レビュー(pr_reviewer)の findings で parked した spec PR を進める仕掛かり完了ループなので、他の fixer 系と同じく新規着手ループ(spec_worker 以降)より上に置かれる。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
 
 ### 帯域外(out-of-band)sweep
 
@@ -183,6 +199,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 |---|---|---|---|---|---|---|
 | planner | author(+ self-review) | `meguri:plan` issue | issue | 新 branch | self-review(self-review lane、ADR 0008/0011)→ spec PR 作成、issue: `plan`→`speccing` | 維持(author pane) |
 | pr_reviewer | pr-review(独立) | Plan: `spec-reviewing` PR(既定 on)/ Impl: 実装 PR(opt-in)、head 未レビュー | issue + `pr-review` lane | read-only detached、`pr-reviewer-<issue>` 固定 | `meguri/pr-review` commit status + PR 本文 `<details>` 要約(Plan の clean は PR: `spec-ready`)、次の push 待ち | 維持(独立 pane) |
+| spec_fixer | author(継続) | `spec-reviewing` PR の head の `meguri/pr-review` が failure | issue(branch から復元) | PR head に attach | spec 修正 push(≤3 round)、超過は `needs-human`。pr_reviewer が新 head を再レビュー | 維持、author pane を継続 |
 | spec_worker | author(継続、+ self-review) | `spec-ready` PR(`plan_delivery = combined` 限定 — separate では discover が空) | issue(branch から復元) | 既存 branch を継ぐ | 実装 commit を同一 PR に統合 → validate/self-review(self-review lane、spec+実装の統合 diff、ADR 0011)、issue: `speccing`→`implementing` | 維持、author pane を継続 |
 | worker | author(+ self-review) | `meguri:ready` issue | issue | 新 branch | self-review(self-review lane、ADR 0006)→ PR `Closes #N`、issue: `ready`→`implementing` | 維持(author pane) |
 | fixer | author(継続) | PR の未解決スレッド(人間/外部bot) | issue(branch から復元) | PR head に attach | スレッドに返信、再レビュー待ち | 維持、author pane を継続 |
@@ -192,7 +209,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 
 補足:
 
-- **author lane** は同じ branch を編集する loop 全員(planner → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。**self-review lane** は self-review が必須の3 loop(planner / worker / spec_worker、表の「+ self-review」)だけが使う、同じ issue に紐づく別の実行体(プロファイル `self-reviewer`)——author が積んだ diff を独立した目でレビューし、fix 指示を author lane へ戻す内部往復専用([ADR 0006](../adr/0006-ai-implementation-review-is-an-internal-loop.md) / [ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) / [ADR 0011](../adr/0011-combined-impl-diff-self-review.md))。lane = pane とは限らない — launch mode は role 単位で pane/direct を選べ、self-reviewer の既定は `direct`(pane を張らない、[ADR 0012](../adr/0012-launch-mode-role-pane-or-direct-keep-pane-subordinate.md))。**pr-review lane** は pr_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
+- **author lane** は同じ branch を編集する loop 全員(planner → spec_fixer → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。spec_fixer は run を PR の canonical issue で鍵るため、spec を書いた planner と同じ author pane・同一 session で修正が走り、planning の文脈を保つ(issue #92 の lane モデルどおり)。**self-review lane** は self-review が必須の3 loop(planner / worker / spec_worker、表の「+ self-review」)だけが使う、同じ issue に紐づく別の実行体(プロファイル `self-reviewer`)——author が積んだ diff を独立した目でレビューし、fix 指示を author lane へ戻す内部往復専用([ADR 0006](../adr/0006-ai-implementation-review-is-an-internal-loop.md) / [ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) / [ADR 0011](../adr/0011-combined-impl-diff-self-review.md))。lane = pane とは限らない — launch mode は role 単位で pane/direct を選べ、self-reviewer の既定は `direct`(pane を張らない、[ADR 0012](../adr/0012-launch-mode-role-pane-or-direct-keep-pane-subordinate.md))。**pr-review lane** は pr_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
 - pane・worktree はいずれも issue が寿命の単位で、issue が close されると `reaper::sweep` が回収する(watch 実行中はポーリングのたびに、一発実行では `meguri prune`)。
 - 表に無い `auto_merger.sweep` / `merge_watch.sweep` / `plan_handoff.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
 
@@ -264,3 +281,4 @@ fixer 家族(`review-fixer` / `conflict-fixer` 等)の内部 rename、および
 | [0009-auto-merge-orchestrator-side-merge-on-free-private](../adr/0009-auto-merge-orchestrator-side-merge-on-free-private.md) | ネイティブ auto-merge が使えない private+Free リポジトリ向けに、meguri 自身がマージする orchestrator モードを追加(ADR 0003 を mode で二分)。 |
 | [0011-discovery-throttles-not-before-and-cadence](../adr/0011-discovery-throttles-not-before-and-cadence.md) | discovery に not-before(時刻ゲート)と cadence(ラベル別の窓あたり上限)の2つの調速ゲートを追加。 |
 | [0011-combined-impl-diff-self-review](../adr/0011-combined-impl-diff-self-review.md) | `plan_delivery = combined` では spec+実装の統合 diff に対して1回だけ self-review する。 |
+| [0013-spec-fixer-drives-plan-review-findings](../adr/0013-spec-fixer-drives-plan-review-findings.md) | plan レビューの findings は spec_fixer が planner の author lane で駆動する。収束は head sha、≤3 round で needs-human。 |

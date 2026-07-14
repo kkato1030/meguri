@@ -261,16 +261,13 @@ async fn process_pr(deps: &Deps, pr: &PullRequest, now: u64) -> Result<()> {
     Ok(())
 }
 
-/// Escalate a Stuck PR: `meguri:needs-human` + one explanatory comment. The
-/// label is the durable "escalated" record — subsequent sweeps skip it — so
-/// this is idempotent without any local state.
+/// Escalate a Stuck PR: `meguri:needs-human` + one explanatory comment, routed
+/// through the central escalation helper (issue #176) so the label/comment/event
+/// path is identical to every other escalation site. The label is the durable
+/// "escalated" record — subsequent sweeps skip it — so this is idempotent
+/// without any local state.
 async fn escalate(deps: &Deps, pr: &PullRequest, snap: &Snapshot) -> Result<()> {
-    deps.forge()
-        .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
-        .await?;
-    deps.forge()
-        .comment_pr(pr.number, &stuck_comment(snap))
-        .await?;
+    super::escalation::escalate_pr(deps, pr.number, &stuck_comment(snap)).await;
     let status = snap
         .merge
         .as_ref()

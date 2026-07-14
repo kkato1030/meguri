@@ -18,6 +18,8 @@ use meguri::forge::{
 fn deps_with(forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.pr.auto_merge.enabled = true;
+    // The auto-merger only arms under full autonomy (issue #176).
+    config.autonomy = meguri::config::Autonomy::Full;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: "/tmp/unused".into(),
@@ -34,6 +36,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
@@ -127,7 +130,7 @@ async fn pr_review_gate_escalates_a_failure_status_and_does_not_arm() {
     );
     assert!(
         forge
-            .pr_comments_of(pr)
+            .comments_of(pr)
             .iter()
             .any(|c| c.contains("PR review"))
     );
@@ -162,6 +165,62 @@ async fn pr_review_gate_is_skipped_when_impl_review_disabled() {
     assert_eq!(
         forge.armed_of(pr),
         Some((MergeStrategy::Squash, "sha-head".into()))
+    );
+}
+
+#[tokio::test]
+async fn attended_escalates_a_pr_review_failure_without_arming() {
+    // ADR 0012 §5: escalation is mode-independent — autonomy changes only the
+    // final arm. Under the default `attended`, a review-failed head still gets
+    // its `needs-human` backstop, but nothing is ever armed.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Failure);
+    let mut deps = deps_with_pr_review(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended never arms, pr-review failure or not"
+    );
+    let labels = forge.pr_labels_of(pr);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the review-failed backstop escalates even under attended: {labels:?}"
+    );
+    assert!(
+        forge
+            .comments_of(pr)
+            .iter()
+            .any(|c| c.contains("PR review"))
+    );
+}
+
+#[tokio::test]
+async fn attended_leaves_a_green_pr_unarmed_and_unescalated() {
+    // Attended stops only the final arm: a green pr-review status means
+    // nothing to escalate, and the PR is left for a human to merge.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Success);
+    let mut deps = deps_with_pr_review(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended: green PR left for a human to merge"
+    );
+    assert!(
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "a green head has nothing to escalate"
     );
 }
 

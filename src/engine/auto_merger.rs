@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::Deps;
 use super::pr_reviewer::PR_REVIEW_STATUS;
-use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn};
+use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn, Autonomy};
 use crate::forge::{
     self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, MergeableState, PullRequest,
 };
@@ -202,6 +202,18 @@ async fn process_pr(
             return Ok(());
         }
     }
+    // 6c: the autonomy gate (issue #176, ADR 0012). meguri only arms/merges
+    // when the project is `full` — under `attended` (the default) a human is
+    // the merge gate, so a green PR is left for a person to merge. Placed
+    // *after* the pr-review gate on purpose: escalation is mode-independent
+    // (ADR 0012 §5 — autonomy changes only the final arm), so a review-failed
+    // head
+    // still gets its `needs-human` backstop above even when arming is off.
+    // Orthogonal to `auto_merge.opt_in`, which selects *which* PRs are
+    // eligible.
+    if deps.config.autonomy_for(&deps.project) != Autonomy::Full {
+        return Ok(());
+    }
     // 7: repository merge settings (fetched once per sweep, reused across PRs).
     // A mismatch here means the config passed startup fail-fast but the repo
     // changed since — warn and skip rather than error. orchestrator mode also
@@ -282,21 +294,15 @@ async fn pr_review_gate(deps: &Deps, pr: &PullRequest) -> Result<PrReviewGate> {
 /// can merge). Reached only when the label is absent (condition 2 blocks it
 /// otherwise), so the escalation and its comment fire once.
 async fn escalate_pr_review_failed(deps: &Deps, pr: &PullRequest) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps
-        .forge()
-        .comment_pr(
-            pr.number,
-            &format!(
-                "🔁 **meguri** — auto-merge は `{}` の PR review が失敗しているため arm しません。\n\
-                 指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
-                short_sha(&pr.head_sha)
-            ),
-        )
-        .await;
+    let comment = super::escalation::pr_needs_human_comment(
+        &format!(
+            "は `{}` の PR review が失敗しているため auto-merge を arm できません。",
+            short_sha(&pr.head_sha)
+        ),
+        "指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
+        crate::tasks::DEFAULT_ATTACH_HINT,
+    );
+    super::escalation::escalate_pr(deps, pr.number, &comment).await;
     let _ = deps.store.emit(
         None,
         "automerge.pr_review_failed",

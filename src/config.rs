@@ -112,6 +112,12 @@ pub struct Config {
     /// regressions are still caught.
     #[serde(default)]
     pub drift: DriftConfig,
+    /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
+    /// #66). Top-level like `[drift]` so toggling it never materializes
+    /// `[routing]` and flips role routing on. Only fires when routing is
+    /// active (a common gate in the flow).
+    #[serde(default)]
+    pub escalation: EscalationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -126,6 +132,10 @@ pub struct Config {
     pub clean: CleanConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    /// How autonomous meguri may be (issue #176). Global default; a project may
+    /// override wholesale via its own `autonomy`. See [`Autonomy`].
+    #[serde(default)]
+    pub autonomy: Autonomy,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -221,6 +231,22 @@ impl Default for GuardConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
+/// The mode's single runtime effect is the auto-merge arm gate: `Full` lets the
+/// auto-merger arm a green PR (meguri may reach a merge with no human), `Attended`
+/// stops at green for a human to merge. Escalation is **mode-independent** — the
+/// "human-needed ⇒ needs-human" invariant holds in both modes. Orthogonal to
+/// `auto_merge.opt_in` (that selects *which* PRs; this permits arming *at all*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Autonomy {
+    /// A human is the merge gate: meguri never arms auto-merge (default).
+    #[default]
+    Attended,
+    /// meguri may arm auto-merge on a green, guard-clean PR.
+    Full,
 }
 
 /// Settings for the reconcile loop (issue #142): detecting that a once-shipped
@@ -546,6 +572,52 @@ pub struct RoutingConfig {
     /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+    /// Fraction (0.0–1.0) of runs assigned to a comparison ("explore")
+    /// profile instead of the mainline pick (routing 3/3, issue #66). Default
+    /// `0.0` = off: no run is diverted, so behavior matches routing 1/3. The
+    /// selection is deterministic by target number, and lives inside
+    /// `[routing]` because explore is part of how routing assigns profiles —
+    /// you only set it when routing is already wanted.
+    #[serde(default)]
+    pub explore_ratio: f64,
+}
+
+/// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
+/// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
+/// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
+/// switches role routing on (see [`crate::routing`]), so a `[routing.escalation]`
+/// table would silently activate routing for a user who only wanted to turn
+/// escalation off — the same reason ADR 0007 gave `[drift]` a top-level home.
+/// Escalation still only fires when routing is active (a common gate in the
+/// flow), so `[escalation]` alone changes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Kill switch. Default `true`, but escalation only fires for roles that
+    /// have an escalation chain AND when routing is active, so the default is
+    /// inert until both hold.
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    /// Per-role chain overrides. Keys are the 6 routing roles (see
+    /// `crate::routing::KNOWN_ROLES`); values are ordered profile-name chains
+    /// (weakest → strongest), e.g. `worker = ["claude-sonnet", "claude-opus"]`.
+    /// An empty chain (`worker = []`) turns escalation off for that role
+    /// without touching the others. Flattened so `enabled` and the role chains
+    /// share the one `[escalation]` table.
+    #[serde(flatten, default)]
+    pub roles: HashMap<String, Vec<String>>,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            roles: HashMap::new(),
+        }
+    }
+}
+
+fn default_escalation_enabled() -> bool {
+    true
 }
 
 /// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
@@ -953,6 +1025,10 @@ pub struct ProjectConfig {
     /// `[review]` section wholesale (like `pr` / `clean`).
     #[serde(default)]
     pub review: Option<ReviewConfig>,
+    /// Per-project autonomy mode; overrides the global `autonomy` wholesale
+    /// (issue #176). See [`Autonomy`].
+    #[serde(default)]
+    pub autonomy: Option<Autonomy>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -1329,6 +1405,12 @@ impl Config {
     /// wins wholesale, like `pr_for`).
     pub fn review_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a ReviewConfig {
         project.review.as_ref().unwrap_or(&self.review)
+    }
+
+    /// Effective autonomy mode for a project (project override wins wholesale,
+    /// issue #176).
+    pub fn autonomy_for(&self, project: &ProjectConfig) -> Autonomy {
+        project.autonomy.unwrap_or(self.autonomy)
     }
 
     /// Effective deliverable language for a project (project override wins).
@@ -1899,6 +1981,50 @@ draft = false
     }
 
     #[test]
+    fn autonomy_defaults_to_attended() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.autonomy, Autonomy::Attended);
+        let raw = r#"
+[[projects]]
+id = "demo"
+repo_path = "/tmp/demo"
+repo_slug = "me/demo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let p = cfg.project("demo").unwrap();
+        assert_eq!(cfg.autonomy_for(p), Autonomy::Attended);
+    }
+
+    #[test]
+    fn autonomy_project_override_wins() {
+        // Global full, one project pins itself back to attended (issue #176).
+        let raw = r#"
+autonomy = "full"
+
+[[projects]]
+id = "auto"
+repo_path = "/tmp/auto"
+repo_slug = "me/auto"
+
+[[projects]]
+id = "manual"
+repo_path = "/tmp/manual"
+repo_slug = "me/manual"
+autonomy = "attended"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.autonomy, Autonomy::Full);
+        assert_eq!(
+            cfg.autonomy_for(cfg.project("auto").unwrap()),
+            Autonomy::Full
+        );
+        assert_eq!(
+            cfg.autonomy_for(cfg.project("manual").unwrap()),
+            Autonomy::Attended
+        );
+    }
+
+    #[test]
     fn language_defaults_to_none() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.language, None);
@@ -2191,6 +2317,47 @@ window = 50
             cfg.routing.is_none(),
             "[drift] must stay legacy for routing"
         );
+    }
+
+    #[test]
+    fn escalation_defaults_and_does_not_activate_routing() {
+        // No `[escalation]` section: enabled by default, no role chains, and it
+        // certainly doesn't imply `[routing]`.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.escalation.enabled);
+        assert!(cfg.escalation.roles.is_empty());
+        assert!(cfg.routing.is_none());
+
+        // A top-level `[escalation]` table parses `enabled` + per-role chains
+        // from the one flattened section, and must NOT materialize `[routing]`
+        // (the whole point of keeping it out of `[routing.escalation]`).
+        let cfg: Config = toml::from_str(
+            r#"
+[escalation]
+enabled = false
+worker = ["claude-sonnet", "claude-opus"]
+fixer = []
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.escalation.enabled);
+        assert_eq!(
+            cfg.escalation.roles["worker"],
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert_eq!(cfg.escalation.roles["fixer"], Vec::<String>::new());
+        assert!(
+            cfg.routing.is_none(),
+            "[escalation] must stay legacy for routing"
+        );
+    }
+
+    #[test]
+    fn explore_ratio_defaults_off_and_lives_under_routing() {
+        let cfg: Config = toml::from_str("[routing]\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.0);
+        let cfg: Config = toml::from_str("[routing]\nexplore_ratio = 0.1\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.1);
     }
 
     #[test]

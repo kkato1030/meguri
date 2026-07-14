@@ -187,11 +187,7 @@ pub trait Flavor: Send + Sync {
     /// escalate (needs-human label + comment / `status='needs_human'` +
     /// reason), with a launch-mode-aware attach hint (issue #169).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let hint = attach_hint(deps, run);
-        let _ = deps
-            .task_source
-            .escalate(&run.task_key(), reason, &hint)
-            .await;
+        super::escalation::escalate_task(deps, run, reason).await;
     }
 
     /// The agent ended its execute turn with `needs_plan`: a design decision
@@ -287,16 +283,33 @@ pub struct Checkpoint {
     /// threads.
     #[serde(default)]
     pub self_review_pending: Vec<super::self_review::Finding>,
-    /// Set when the rounds cap was hit without a clean verdict: the PR is
-    /// published anyway (the human merge gate is the backstop), and this
-    /// drives the single footer line noting the non-convergence.
-    #[serde(default)]
-    pub self_review_unconverged: bool,
     /// One entry per self-review round (ADR 0008): what the folded PR-body
     /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
     /// the history it already built.
     #[serde(default)]
     pub self_review_log: Vec<super::self_review::RoundRecord>,
+    /// Set once self-review reached a clean verdict: the phase converged and the
+    /// PR may open. Persisted so a resume distinguishes a clean-at-cap checkpoint
+    /// (rounds == max but done) from a genuinely unconverged one — without it the
+    /// cap backstop would re-escalate an already-clean diff (issue #176).
+    #[serde(default)]
+    pub self_review_converged: bool,
+    /// How many times this run has escalated its launch profile (routing 3/3,
+    /// issue #66) — a counter for observability (it rides the `run.escalated`
+    /// event's `level`), not a chain index: the next target is derived from the
+    /// currently-pinned profile's position in the chain. Survives a resume so a
+    /// crash mid-escalation doesn't re-climb.
+    #[serde(default)]
+    pub escalation_level: u32,
+    /// Validation-fix turns run under the *current* pinned profile since it was
+    /// (re)pinned (routing 3/3, issue #66). Reset to 0 on each escalation, and
+    /// that reset is persisted *before* the pin advances — so escalation only
+    /// fires once the current profile has actually had a fix turn
+    /// (`>= 1`). This is what makes escalation crash-safe: a resume after the
+    /// pin advanced but before the fix turn ran sees `0` and lets the new pin
+    /// try, instead of skipping it to the next chain entry.
+    #[serde(default)]
+    pub pin_fix_turns: u32,
     /// The repo `meguri.toml` values pinned at claim time (issue #165): read
     /// once from the worktree at the first worktree-ready point, then reused
     /// unchanged for the run's life (a since-tampered worktree or ref cannot
@@ -645,19 +658,13 @@ pub(crate) fn attach_hint(deps: &Deps, run: &RunRecord) -> String {
 /// the run stopped lives on the issue, not in meguri's local state). Used by
 /// forge loops that escalate on the issue directly (the spec worker); the
 /// worker/planner default escalate goes through the task source instead.
-/// Uses the generic pane-attach hint — its callers (spec worker, and the
-/// fixer family's before-PR-claimed fallback) all default to `pane` launch
-/// mode (ADR 0012's recommendation table).
+/// Thin alias for [`super::escalation::escalate_issue`] — the central helper
+/// (issue #176) — kept so the many forge-loop call sites read unchanged. The
+/// helper posts the generic pane-attach hint; its callers (spec worker, and the
+/// fixer family's before-PR-claimed fallback) all default to `pane` launch mode
+/// (issue #169, ADR 0012's recommendation table).
 pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
-    let forge = deps.forge();
-    let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
-    let _ = forge
-        .comment(
-            issue,
-            &tasks::needs_human_comment(reason, tasks::DEFAULT_ATTACH_HINT),
-        )
-        .await;
+    super::escalation::escalate_issue(deps, issue, reason).await;
 }
 
 fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &Checkpoint) -> Result<String> {
@@ -1094,11 +1101,40 @@ fn resolve_run_profile(
     let name = match pinned {
         Some(name) => name,
         None => {
-            let name = crate::routing::resolve(
-                &deps.config,
-                crate::routing::routing_role_for_loop(&run.loop_kind),
-                &crate::routing::detect_command,
-            )?;
+            let role = crate::routing::routing_role_for_loop(&run.loop_kind);
+            let mainline =
+                crate::routing::resolve(&deps.config, role, &crate::routing::detect_command)?;
+            // Explore canary (routing 3/3, issue #66): opt-in, deterministic,
+            // routing-active only (a legacy config has no `[routing]`, so the
+            // ratio reads 0.0 and this never diverts). A selected run is pinned
+            // to the recommendation chain's next candidate instead of the
+            // mainline pick, and marked `explore` so stats keep it separate.
+            let ratio = deps
+                .config
+                .routing
+                .as_ref()
+                .map(|r| r.explore_ratio)
+                .unwrap_or(0.0);
+            let name = if ratio > 0.0
+                && crate::routing::is_explore(run.task_key().number(), ratio)
+                && let Some(alt) = crate::routing::explore_alternative(
+                    &deps.config,
+                    role,
+                    &crate::routing::detect_command,
+                )
+                && alt != mainline
+            {
+                deps.store
+                    .update_run_routing_arm(&run.id, Some("explore"))?;
+                deps.store.emit(
+                    Some(&run.id),
+                    "run.explore_assigned",
+                    json!({ "profile": alt, "alt_of": mainline }),
+                )?;
+                alt
+            } else {
+                mainline
+            };
             deps.store.update_run_agent_profile(&run.id, &name)?;
             deps.store.emit(
                 Some(&run.id),
@@ -1115,6 +1151,90 @@ fn resolve_run_profile(
         )
     })?;
     Ok((name, profile))
+}
+
+/// Signal-driven profile escalation (routing 3/3, issue #66). Called once the
+/// current pinned profile has had a failing fix turn (`cp.pin_fix_turns >= 1`):
+/// if routing is active, escalation is enabled, and the profile has a stronger
+/// entry in its role's escalation chain, re-pin one step up, retire the live
+/// author pane, and clear the session so the next turn spawns fresh (a model
+/// change can't `--resume`). Returns whether it escalated, so the caller can
+/// flag it in the fix prompt. A no-op (returns `false`) past the chain end — the
+/// run then rides the existing `validate_turns` → needs-human backstop, so
+/// escalation is finite.
+///
+/// Crash-safety: `pin_fix_turns` is reset to 0 and **persisted before** the pin
+/// advances. So a crash between the reset and the pin write (or between the pin
+/// write and the fix turn) resumes to `pin_fix_turns == 0`, which blocks a
+/// second escalation until the new pin has actually run a fix turn — no chain
+/// entry is ever skipped without a try.
+async fn maybe_escalate(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+    persist_step: &str,
+) -> Result<bool> {
+    // Common gate: escalation is a refinement of active routing and honors the
+    // top-level kill switch. Both conditions fail in legacy → never escalate.
+    if deps.config.routing.is_none() || !deps.config.escalation.enabled {
+        return Ok(false);
+    }
+    let role = crate::routing::routing_role_for_loop(&run.loop_kind);
+    let (current, _) = resolve_run_profile(deps, run)?;
+    let Some(next) = crate::routing::next_escalation(
+        &deps.config,
+        role,
+        &current,
+        &crate::routing::detect_command,
+    ) else {
+        return Ok(false);
+    };
+
+    // Mark the new pin as "not yet tried" and persist it BEFORE advancing the
+    // pin, so a crash in the window below can't let a resume escalate again off
+    // a profile that never ran (which would skip a chain entry, issue #66).
+    cp.escalation_level += 1;
+    cp.pin_fix_turns = 0;
+    save_step(deps, run, persist_step, cp)?;
+
+    // Re-pin one step stronger; the next author-lane spawn reads this back.
+    deps.store.update_run_agent_profile(&run.id, &next)?;
+
+    // Retire the live author pane and forbid a resume: the model changed, so
+    // `--resume <id>` under the new profile can't restore the old session.
+    // `release_pane` saves the session id first (its default reversibility) —
+    // clear it right after so the fresh spawn re-injects the full context
+    // (validation history) instead of resuming into the old model.
+    let lane = lane_for_loop(&run.loop_kind);
+    super::reaper::release_pane(deps, run.issue_number, lane, "profile escalation").await;
+    deps.store
+        .save_pane_session(&deps.project.id, run.issue_number, lane, None)?;
+    deps.store.update_run_agent_session(&run.id, None)?;
+
+    // Arm bookkeeping: explore takes priority (explore > escalated > main), so
+    // an explore run keeps its arm — the escalation still lands in the event.
+    let already_explore = deps
+        .store
+        .get_run(&run.id)?
+        .and_then(|r| r.routing_arm)
+        .as_deref()
+        == Some("explore");
+    if !already_explore {
+        deps.store
+            .update_run_routing_arm(&run.id, Some("escalated"))?;
+    }
+
+    deps.store.emit(
+        Some(&run.id),
+        "run.escalated",
+        json!({
+            "from": current,
+            "to": next,
+            "level": cp.escalation_level,
+            "reason": "validation failed",
+        }),
+    )?;
+    Ok(true)
 }
 
 /// Watch a freshly resume-spawned pane briefly; false means it died (the
@@ -1655,6 +1775,20 @@ pub(crate) async fn validate(
             .into());
         }
 
+        // Signal-driven escalation (issue #66): once the current profile has had
+        // a failing fix turn (`pin_fix_turns >= 1`), climb to a stronger profile
+        // if the run's role has an escalation chain. Keying on "did the current
+        // pin try?" instead of `fix_turns_used` keeps it crash-safe — a resume
+        // that re-runs the check can't skip a chain entry that never ran. A
+        // no-op past the chain end, so a genuinely stuck run still exhausts
+        // `validate_turns` and lands on needs-human above.
+        let escalated = if cp.pin_fix_turns >= 1 {
+            maybe_escalate(deps, run, cp, persist_step).await?
+        } else {
+            false
+        };
+        save_step(deps, run, persist_step, cp)?;
+
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail = |s: &str| -> String {
@@ -1673,11 +1807,22 @@ pub(crate) async fn validate(
             json!({ "fix_turn": cp.fix_turns_used }),
         )?;
 
+        // When we just escalated, this pane is a fresh session under a stronger
+        // model with none of the prior conversation — so the prompt carries the
+        // validation history (it always does) plus a note that it is a retry
+        // under a stronger model.
+        let escalation_note = if escalated {
+            "\n\nNote: this run was escalated to a stronger model for this \
+             attempt because validation kept failing. You are a fresh session — \
+             rely on the command output below, not on earlier conversation."
+        } else {
+            ""
+        };
         let prompt = format!(
             "The project's validation command failed. Fix the code so it passes, \
              then commit your fixes.\n\nCommand: `{check}`\nExit code: {}\n\n\
              Last stdout:\n```\n{}\n```\n\nLast stderr:\n```\n{}\n```\n\n\
-             Do not create a pull request; meguri handles that.",
+             Do not create a pull request; meguri handles that.{escalation_note}",
             out.status.code().unwrap_or(-1),
             tail(&stdout),
             tail(&stderr),
@@ -1685,7 +1830,14 @@ pub(crate) async fn validate(
         let (outcome, _) = run_turn(deps, run, worktree, "fix-validation", &prompt).await?;
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
-                TurnStatus::Success => continue,
+                TurnStatus::Success => {
+                    // The current pin just spent a fix turn; record it so the
+                    // next failure may escalate off it (and a resume knows this
+                    // pin has been tried).
+                    cp.pin_fix_turns += 1;
+                    save_step(deps, run, persist_step, cp)?;
+                    continue;
+                }
                 // needs_plan/decompose make no sense once work is committed
                 // and failing validation — escalate like the other two.
                 TurnStatus::Failure
@@ -1824,22 +1976,13 @@ pub(crate) fn compose_pr_body(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
-    // A single footer line when the rounds cap was hit without a clean verdict
-    // (ADR 0006): the human/pr-review is the backstop.
-    let self_review_note = if cp.self_review_unconverged {
-        format!(
-            "\n\n> 🔁 self-review: {} ラウンド回しても収束しませんでした（未解決の指摘が残ったまま公開しています。人間レビューで確認してください）。",
-            cp.self_review_rounds
-        )
-    } else {
-        String::new()
-    };
+    // A published PR always cleared self-review: a non-converging (or
+    // needs-human) review escalates and never reaches open-pr (ADR 0012).
     format!(
-        "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "{}.\n\n{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
         issue_reference(run.issue_number, close),
         description,
-        self_review_note,
         self_review_details(cp, lenses),
         run.id
     )
@@ -1878,11 +2021,8 @@ fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let outcome = if cp.self_review_unconverged {
-        format!("unconverged after {} rounds", cp.self_review_rounds)
-    } else {
-        format!("clean after {} rounds", cp.self_review_rounds)
-    };
+    // A published PR always converged (a non-clean review escalates, ADR 0012).
+    let outcome = format!("clean after {} rounds", cp.self_review_rounds);
     format!(
         "\n\n<details>\n<summary>🔁 self-review — {outcome}</summary>\n\n\
          lenses: {lenses}\n\n{rounds}\n</details>",
@@ -1901,17 +2041,12 @@ async fn post_self_review_status(deps: &Deps, run: &RunRecord, cp: &Checkpoint, 
         return;
     };
     let head = head.trim();
-    let (state, desc) = if cp.self_review_unconverged {
-        (
-            crate::forge::CommitStatusState::Failure,
-            format!("unconverged · {} rounds", cp.self_review_rounds),
-        )
-    } else {
-        (
-            crate::forge::CommitStatusState::Success,
-            format!("clean · {} rounds", cp.self_review_rounds),
-        )
-    };
+    // A published PR always cleared self-review (a non-clean review escalates
+    // and never reaches this point, ADR 0012).
+    let (state, desc) = (
+        crate::forge::CommitStatusState::Success,
+        format!("clean · {} rounds", cp.self_review_rounds),
+    );
     if let Err(e) = deps
         .forge()
         .set_commit_status(head, "meguri/self-review", state, &desc)
@@ -2185,6 +2320,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

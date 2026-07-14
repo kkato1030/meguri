@@ -204,6 +204,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
@@ -273,4 +274,370 @@ async fn every_loop_kind_spawns_from_its_role_resolved_profile() {
             "loop {loop_kind}: profile pinned on the run"
         );
     }
+}
+
+// --- routing 3/3 (issue #66): escalation + explore, end to end -------------
+
+/// Commit everything in the worktree under a fixed identity.
+async fn commit_all(wt: &Path, msg: &str) {
+    run_git(wt, &["add", "-A"]).await.unwrap();
+    run_git(
+        wt,
+        &[
+            "-c",
+            "user.email=a@example.com",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            msg,
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// A worktree-watching fake agent for the escalation/explore scenarios. It
+/// commits a unique file on the execute turn (so the tree is ahead of base),
+/// and — once it sees the escalation note in a fix prompt — drops the
+/// `pass.txt` marker the check command waits on. Pane-agnostic (it reacts to
+/// prompt files), so it keeps working after the pane is retired on escalation.
+/// Every file it writes is turn-unique, so no commit is ever empty.
+fn spawn_escalation_agent(worktree_root: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..600 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let Some(wt) = find_worktree(&worktree_root) else {
+                continue;
+            };
+            let Some(turn_id) = latest_prompt_turn(&wt) else {
+                continue;
+            };
+            if !seen.insert(turn_id.clone()) {
+                continue;
+            }
+            let prompt = std::fs::read_to_string(wt.join(format!(".meguri/prompt-{turn_id}.md")))
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                if prompt.contains("You are implementing") {
+                    std::fs::write(wt.join("greeting.txt"), format!("hello {turn_id}\n")).unwrap();
+                    commit_all(&wt, "implement").await;
+                }
+                if prompt.contains("escalated to a stronger model") {
+                    std::fs::write(wt.join("pass.txt"), format!("ok {turn_id}\n")).unwrap();
+                    commit_all(&wt, "add pass marker").await;
+                }
+                let result = serde_json::json!({
+                    "turn_id": turn_id, "status": "success", "summary": "scripted",
+                });
+                std::fs::write(wt.join(".meguri/result.json"), result.to_string()).unwrap();
+            });
+        }
+    })
+}
+
+/// Common limits for the scripted scenarios: no nudging, don't linger on the
+/// always-Working FakeMux, and skip the self-review phase (not under test).
+fn tune(mut config: Config) -> Config {
+    config.limits.idle_grace_secs = 3600;
+    config.limits.result_grace_secs = 1;
+    config.review.enabled = false;
+    config
+}
+
+/// Manual routing that pins the worker to a cheap profile with a two-step
+/// escalation chain to a strong one. Both profiles use `echo` as the command so
+/// the real `echo --version` detection (which `next_escalation` runs) passes on
+/// any host; the distinguishing first arg tags which one a pane spawned from.
+fn escalation_config() -> Config {
+    let toml = r#"
+[agents.profiles.worker-cheap]
+command = "echo"
+args = ["cheap"]
+
+[agents.profiles.worker-strong]
+command = "echo"
+args = ["strong"]
+
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "worker-cheap"
+
+[escalation]
+worker = ["worker-cheap", "worker-strong"]
+"#;
+    tune(toml::from_str(toml).unwrap())
+}
+
+/// Like [`escalation_config`] but a three-step chain. The default
+/// `validate_turns` (3) is exactly enough to reach the top rung: fix turns 2
+/// and 3 escalate cheap→mid then mid→strong, and turn 4 exhausts the budget —
+/// so both escalations happen while the test stays as light as the two-step one.
+fn escalation_config_3step() -> Config {
+    let toml = r#"
+[agents.profiles.worker-cheap]
+command = "echo"
+args = ["cheap"]
+
+[agents.profiles.worker-mid]
+command = "echo"
+args = ["mid"]
+
+[agents.profiles.worker-strong]
+command = "echo"
+args = ["strong"]
+
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "worker-cheap"
+
+[escalation]
+worker = ["worker-cheap", "worker-mid", "worker-strong"]
+"#;
+    tune(toml::from_str(toml).unwrap())
+}
+
+/// Auto routing where the worker's mainline pick (`claude-sonnet`) is overridden
+/// to a detectable `echo` command, so `resolve` lands on it and the explore
+/// alternative is the recommendation chain's next entry (`default`, wired to a
+/// second distinct `echo`). `ratio` sets `explore_ratio`.
+fn explore_config(ratio: &str) -> Config {
+    let toml = format!(
+        r#"
+[agent]
+command = "echo"
+args = ["default-agent"]
+
+[agents.profiles.claude-sonnet]
+command = "echo"
+args = ["sonnet"]
+
+[routing]
+mode = "auto"
+explore_ratio = {ratio}
+"#
+    );
+    tune(toml::from_str(&toml).unwrap())
+}
+
+/// Drive one worker run to completion under `config` and `check_command`,
+/// returning the pane commands FakeMux recorded, the store (for events/stats),
+/// the run id, and the run's terminal outcome.
+async fn drive_worker_scenario(
+    config: Config,
+    check_command: Option<&str>,
+) -> (
+    Vec<Vec<String>>,
+    Store,
+    String,
+    std::result::Result<WorkerOutcome, String>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let clone = init_origin_and_clone(root.path()).await;
+    let worktree_root = root.path().join("worktrees");
+
+    let forge = Arc::new(FakeForge::with_issue(
+        7,
+        "Add greeting file",
+        "Create `greeting.txt` containing hello.",
+        &[LABEL_READY],
+    ));
+    let mux = Arc::new(FakeMux::new(false));
+    let project = ProjectConfig {
+        id: "proj".into(),
+        repo_path: clone,
+        repo_slug: Some("me/proj".into()),
+        default_branch: "main".into(),
+        language: None,
+        check_command: check_command.map(str::to_string),
+        worktree_root: Some(worktree_root.clone()),
+        pr: None,
+        mode: Default::default(),
+        deliver: None,
+        clean: None,
+        plan_delivery: Default::default(),
+        review: None,
+        worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let deps = Deps::with_label_source(store.clone(), mux.clone(), forge, config, project);
+
+    let run = deps
+        .store
+        .create_run_for_loop("proj", "worker", 7, "Add greeting file")
+        .unwrap();
+    let agent = spawn_escalation_agent(worktree_root.clone());
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .map_err(|e| format!("{e:#}"));
+    agent.abort();
+    (mux.spawned_commands(), store, run.id, outcome)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validation_failure_escalates_to_the_next_profile() {
+    // The check waits on `pass.txt`, which the agent only drops once it has been
+    // escalated — so the run must climb cheap → strong to pass.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(escalation_config(), Some("test -f pass.txt")).await;
+    assert!(
+        matches!(outcome, Ok(WorkerOutcome::Succeeded { .. })),
+        "escalated run should succeed: {outcome:?}"
+    );
+
+    // Exactly two spawns: the cheap profile, then the escalated strong one.
+    assert_eq!(commands.len(), 2, "one spawn per profile: {commands:?}");
+    assert_eq!(
+        &commands[0][..2],
+        &["echo".to_string(), "cheap".to_string()]
+    );
+    assert_eq!(
+        &commands[1][..2],
+        &["echo".to_string(), "strong".to_string()]
+    );
+    // The escalated spawn is a fresh session, never a --resume (the model
+    // changed, so the old native session can't be restored).
+    assert!(
+        !commands[1].iter().any(|a| a == "--resume"),
+        "escalation must spawn fresh, not resume: {:?}",
+        commands[1]
+    );
+
+    // The run ends pinned to the strong profile and marked escalated.
+    let run = store.get_run(&run_id).unwrap().unwrap();
+    assert_eq!(run.agent_profile.as_deref(), Some("worker-strong"));
+    assert_eq!(run.routing_arm.as_deref(), Some("escalated"));
+    let events = store.events_for_run(&run_id, 200).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "run.escalated"),
+        "run.escalated is on the event log"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn escalation_stops_at_the_chain_end_and_hands_to_human() {
+    // Validation never passes: the run climbs the chain once, then — at the
+    // top with nowhere to go — exhausts its fix turns and fails to needs-human.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(escalation_config(), Some("false")).await;
+    assert!(
+        outcome.is_err(),
+        "a chain-exhausted run must fail to needs-human: {outcome:?}"
+    );
+
+    // Escalated exactly once (cheap → strong), never past the chain end.
+    assert_eq!(commands.len(), 2, "no infinite escalation: {commands:?}");
+    assert_eq!(
+        &commands[0][..2],
+        &["echo".to_string(), "cheap".to_string()]
+    );
+    assert_eq!(
+        &commands[1][..2],
+        &["echo".to_string(), "strong".to_string()]
+    );
+    let escalations = store
+        .events_for_run(&run_id, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.escalated")
+        .count();
+    assert_eq!(escalations, 1, "exactly one escalation, not a loop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn escalation_climbs_a_multi_step_chain_without_skipping() {
+    // A three-step chain with a never-passing check: the run must visit each
+    // rung in turn (cheap → mid → strong), spawning each exactly once. If a
+    // resume/replay ever escalated off a pin that hadn't run yet, `mid` would be
+    // skipped and the spawns would read cheap → strong — this pins that it can't.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(escalation_config_3step(), Some("false")).await;
+    assert!(
+        outcome.is_err(),
+        "a never-passing check ends in needs-human: {outcome:?}"
+    );
+
+    let tags: Vec<&str> = commands.iter().map(|c| c[1].as_str()).collect();
+    assert_eq!(
+        tags,
+        vec!["cheap", "mid", "strong"],
+        "every chain entry gets a turn, in order: {commands:?}"
+    );
+    let escalations = store
+        .events_for_run(&run_id, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.escalated")
+        .count();
+    assert_eq!(escalations, 2, "two escalations across a three-step chain");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explore_diverts_to_the_alternative_and_marks_the_arm() {
+    // explore_ratio = 1.0 forces this issue onto the explore arm: instead of the
+    // mainline `claude-sonnet`, it spawns the recommendation chain's next entry
+    // (`default`), and stats keep it on its own arm row.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(explore_config("1.0"), None).await;
+    assert!(
+        matches!(outcome, Ok(WorkerOutcome::Succeeded { .. })),
+        "explore run should still succeed: {outcome:?}"
+    );
+
+    assert_eq!(
+        &commands[0][..2],
+        &["echo".to_string(), "default-agent".to_string()],
+        "explore spawns the alternative, not the mainline: {commands:?}"
+    );
+    let run = store.get_run(&run_id).unwrap().unwrap();
+    assert_eq!(run.agent_profile.as_deref(), Some("default"));
+    assert_eq!(run.routing_arm.as_deref(), Some("explore"));
+    let events = store.events_for_run(&run_id, 200).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "run.explore_assigned"),
+        "run.explore_assigned is on the event log"
+    );
+    let rows = store.routing_stats(Some("proj"), 20).unwrap();
+    assert!(
+        rows.iter().any(|r| r.loop_kind == "worker"
+            && r.agent_profile == "default"
+            && r.routing_arm == "explore"),
+        "explore run gets its own arm row in stats: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explore_ratio_zero_keeps_the_mainline_pick() {
+    // The default (0.0) diverts nothing: the mainline `claude-sonnet` spawns and
+    // the arm stays unset — byte-for-byte the routing-1/3 assignment.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(explore_config("0.0"), None).await;
+    assert!(
+        matches!(outcome, Ok(WorkerOutcome::Succeeded { .. })),
+        "{outcome:?}"
+    );
+
+    assert_eq!(
+        &commands[0][..2],
+        &["echo".to_string(), "sonnet".to_string()],
+        "explore_ratio 0 leaves the mainline pick: {commands:?}"
+    );
+    let run = store.get_run(&run_id).unwrap().unwrap();
+    assert_eq!(run.agent_profile.as_deref(), Some("claude-sonnet"));
+    assert_eq!(run.routing_arm, None, "mainline arm stays unset");
+    let events = store.events_for_run(&run_id, 200).unwrap();
+    assert!(
+        !events.iter().any(|e| e.kind == "run.explore_assigned"),
+        "no explore assignment when the ratio is 0"
+    );
 }
