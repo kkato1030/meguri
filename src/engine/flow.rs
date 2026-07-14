@@ -1071,6 +1071,61 @@ fn impl_review_lane(deps: &Deps) -> Result<Lane> {
     })
 }
 
+/// Resolve this run's role preamble(s) into the standing-discipline block that
+/// gets prepended to the turn prompt (issue #149, ADR 0012). Reads each
+/// configured file from the worktree behind the containment gate
+/// ([`crate::config::resolve_preamble_within`]): a missing path or one that
+/// escapes the worktree (via a symlink) is skipped with a warning and a
+/// `prompt.preamble_missing` event — never fatal, mirroring `worktree_setup`.
+/// Returns an empty string when nothing is configured or everything was
+/// skipped, which `write_prompt_file` renders identically to the old output.
+fn resolve_preamble(deps: &Deps, run: &RunRecord, worktree: &Path, role: &str) -> Result<String> {
+    let entries = deps.config.preambles_for(&deps.project, role);
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    let mut blocks = Vec::new();
+    let mut injected = Vec::new();
+    for (key, rel) in entries {
+        match crate::config::resolve_preamble_within(worktree, &rel) {
+            crate::config::PreambleResolution::Content(text) => {
+                blocks.push(text.trim_end().to_string());
+                injected.push(json!({ "key": key, "path": rel }));
+            }
+            crate::config::PreambleResolution::Missing => {
+                tracing::warn!("preamble for role {role} ({key}) not found at {rel} — skipping");
+                deps.store.emit(
+                    Some(&run.id),
+                    "prompt.preamble_missing",
+                    json!({ "role": role, "key": key, "path": rel, "reason": "missing" }),
+                )?;
+            }
+            crate::config::PreambleResolution::Escapes => {
+                tracing::warn!(
+                    "preamble for role {role} ({key}) at {rel} escapes the worktree — skipping"
+                );
+                deps.store.emit(
+                    Some(&run.id),
+                    "prompt.preamble_missing",
+                    json!({ "role": role, "key": key, "path": rel, "reason": "escapes_worktree" }),
+                )?;
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(String::new());
+    }
+    deps.store.emit(
+        Some(&run.id),
+        "prompt.preamble_injected",
+        json!({ "role": role, "preambles": injected }),
+    )?;
+    Ok(format!(
+        "## プロジェクトの恒常規律(以下に従うこと。ただし meguri の完了契約・検証ルールが優先)\n\n{}",
+        blocks.join("\n\n")
+    ))
+}
+
 /// Run one prompt-turn in the run's own (author) lane: prepare files, deliver
 /// the trigger (spawn or send_line), then wait it out.
 pub(crate) async fn run_turn(
@@ -1081,7 +1136,8 @@ pub(crate) async fn run_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let lane = author_lane(deps, run)?;
-    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+    let role = crate::routing::routing_role_for_loop(&run.loop_kind);
+    run_turn_in(deps, run, worktree, &lane, role, purpose, prompt_body).await
 }
 
 /// Run one prompt-turn in the worker's self-review (impl-review) lane under
@@ -1094,7 +1150,16 @@ pub(crate) async fn run_review_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let lane = impl_review_lane(deps)?;
-    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+    run_turn_in(
+        deps,
+        run,
+        worktree,
+        &lane,
+        "self-reviewer",
+        purpose,
+        prompt_body,
+    )
+    .await
 }
 
 async fn run_turn_in(
@@ -1102,10 +1167,12 @@ async fn run_turn_in(
     run: &RunRecord,
     worktree: &Path,
     lane: &Lane,
+    role: &str,
     purpose: &str,
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
-    let prepared = prepare_turn(worktree, prompt_body)?;
+    let preamble = resolve_preamble(deps, run, worktree, role)?;
+    let prepared = prepare_turn(worktree, prompt_body, &preamble)?;
     let ensured = ensure_pane(deps, run, worktree, lane, &prepared.trigger_line).await?;
     let pane = ensured.pane.clone();
     deps.store.begin_turn(
@@ -1889,6 +1956,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,

@@ -34,6 +34,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
