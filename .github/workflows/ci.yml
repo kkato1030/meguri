@@ -75,9 +75,12 @@ jobs:
         run: cargo test --doc
 
   # 獲得スキル配布物のドリフト検知(issue #151 / ADR 0012 §4): 未導入ユーザー向けの
-  # `apm install kkato1030/meguri/skills/meguri` チャネルが、apm のバージョン更新で黙って
+  # `apm install kkato1030/meguri/skills/meguri#<tag>` チャネルが、apm のバージョン更新で黙って
   # 壊れていないかを最小コストで確認する。apm は SHA256 でピンして取得し(ADR 0007 の衛生)、
   # skills/meguri を各ターゲットへ install して SKILL.md が想定パスに展開されることを assert する。
+  # ローカルパス install(バンドルの構造)だけでなく、ユーザーに約束している owner/repo/subpath#ref
+  # の GitHub 参照解決も、テスト対象コミットにピンして1回検査する(apm がサブパス解決を壊しても
+  # ローカルパスだけでは通ってしまうため)。
   skills-package:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -105,9 +108,10 @@ jobs:
           tar xzf apm.tar.gz
           echo "${GITHUB_WORKSPACE}/apm-linux-x86_64" >> "${GITHUB_PATH}"
 
+      # (1) ローカルパス install: バンドルが構造的に install できるかをネットワーク非依存で確認。
       # 使い捨て cwd から絶対パスで install する。リポジトリルートで走らせると skills/meguri を
       # 本体の apm.yml(meguri 開発用)に足してしまうため、必ずルート外の cwd で回す。
-      - name: Verify skills/meguri installs across targets
+      - name: Verify skills/meguri bundle installs (local path)
         run: |
           set -euo pipefail
           apm --version
@@ -118,7 +122,27 @@ jobs:
           # codex/copilot/agent-skills は共有の .agents/skills/ に入る。
           test -f "${work}/.claude/skills/meguri/SKILL.md"
           test -f "${work}/.agents/skills/meguri/SKILL.md"
-          echo "acquisition channel intact: skills/meguri -> .claude/skills/ and .agents/skills/"
+          echo "bundle installs: skills/meguri -> .claude/skills/ and .agents/skills/"
+
+      # (2) GitHub 参照 install: ユーザーに約束している owner/repo/subpath#ref の解決を検査する。
+      # ref はテスト対象コミット(PR は head SHA、push は github.sha)にピンし、fork PR でも
+      # 解決できるよう head リポジトリの slug を使う。context は env 経由で渡す(式インジェクション回避)。
+      - name: Verify skills/meguri installs from the GitHub subpath reference
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_REPO: ${{ github.repository }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repo="${HEAD_REPO:-$PUSH_REPO}"
+          ref="${HEAD_SHA:-$PUSH_SHA}"
+          work="$(mktemp -d)"
+          cd "${work}"
+          apm install "${repo}/skills/meguri#${ref}" --target claude,codex,copilot,agent-skills
+          test -f "${work}/.claude/skills/meguri/SKILL.md"
+          test -f "${work}/.agents/skills/meguri/SKILL.md"
+          echo "acquisition channel intact: ${repo}/skills/meguri#${ref} -> .claude/skills/ and .agents/skills/"
 
   # ワークフロー静的解析(issue #78): 危険な権限 / pull_request_target / 式インジェクション /
   # 未ピン action 等を検出。指摘があれば job が fail し PR をブロックする。
