@@ -134,7 +134,17 @@ async fn reblock_inside_throttle_window_notifies_once() {
         Some("awaiting_human 通知")
     );
     assert_eq!(delivered[0].reason, "agent_blocked");
-    assert!(delivered[0].attach.contains("fake pane"));
+    assert!(
+        delivered[0]
+            .attach
+            .as_deref()
+            .is_some_and(|a| a.contains("fake pane")),
+        "turn escalation points at the live pane"
+    );
+    assert!(
+        delivered[0].url.is_none(),
+        "turn escalation has no PR url — it points at a pane"
+    );
 }
 
 /// 再 blocked が throttle 窓を過ぎてから(≥60 秒)起きると 2 回とも配送される。

@@ -108,6 +108,12 @@ pub struct FakeForge {
     /// Commit statuses meguri wrote: (head_sha, context) → latest state
     /// (ADR 0008 inspection history). Re-posting a context overwrites it.
     pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
+    /// Cross-repo blocker metadata: blocker number → (repo slug, body). A
+    /// cross-repo decomposition child lives in a sibling fake's store, so this
+    /// fake cannot read its body; seed it here (as GitHub's dependency endpoint
+    /// would return it) so `blocked_by` can surface a sibling child's repo/body
+    /// for the materializer's graph adoption (issue #134).
+    pub cross_blocker_meta: Mutex<HashMap<i64, (String, String)>>,
 }
 
 impl FakeForge {
@@ -152,14 +158,24 @@ impl FakeForge {
     }
 
     /// Record that `issue` is blocked by `blocker` (GitHub-native
-    /// dependency); the blocker's state comes from the closed map.
+    /// dependency); the blocker's state comes from the closed map. Idempotent:
+    /// an edge already present is not duplicated (mirrors the real forge's
+    /// idempotent add, issue #134).
     pub fn block_issue(&self, issue: i64, blocker: i64) {
-        self.blocked_by
+        let mut graph = self.blocked_by.lock().unwrap();
+        let edges = graph.entry(issue).or_default();
+        if !edges.contains(&blocker) {
+            edges.push(blocker);
+        }
+    }
+
+    /// Seed a cross-repo blocker's repo slug and body so `blocked_by` can
+    /// return them (the blocker lives in another fake's store; issue #134).
+    pub fn record_cross_blocker(&self, blocker: i64, repo: &str, body: &str) {
+        self.cross_blocker_meta
             .lock()
             .unwrap()
-            .entry(issue)
-            .or_default()
-            .push(blocker);
+            .insert(blocker, (repo.to_string(), body.to_string()));
     }
 
     /// Make blocked_by lookups for `issue` fail (unreadable blockers).
@@ -591,6 +607,9 @@ impl Forge for FakeForge {
             bail!("blocked_by of issue #{issue} is unreadable");
         }
         let closed = self.closed.lock().unwrap();
+        let issues = self.issues.lock().unwrap();
+        let cross = self.cross_blocker_meta.lock().unwrap();
+        let own_repo = self.slug.clone().unwrap_or_default();
         Ok(self
             .blocked_by
             .lock()
@@ -599,15 +618,26 @@ impl Forge for FakeForge {
             .map(|blockers| {
                 blockers
                     .iter()
-                    .map(|n| Blocker {
-                        number: *n,
-                        state: if closed.contains_key(n) {
-                            "closed"
-                        } else {
-                            "open"
+                    .map(|n| {
+                        // Same-repo blocker: read body from this store and tag
+                        // it with this fake's own repo. Cross-repo blocker
+                        // (another fake's store): read the seeded metadata.
+                        let (repo, body) = match issues.iter().find(|i| i.number == *n) {
+                            Some(i) => (own_repo.clone(), i.body.clone()),
+                            None => cross.get(n).cloned().unwrap_or_default(),
+                        };
+                        Blocker {
+                            number: *n,
+                            state: if closed.contains_key(n) {
+                                "closed"
+                            } else {
+                                "open"
+                            }
+                            .into(),
+                            state_reason: closed.get(n).cloned(),
+                            body,
+                            repo,
                         }
-                        .into(),
-                        state_reason: closed.get(n).cloned(),
                     })
                     .collect()
             })
@@ -624,6 +654,18 @@ impl Forge for FakeForge {
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
         Ok(number)
+    }
+
+    async fn find_issue_by_marker(&self, marker: &str) -> Result<Option<i64>> {
+        // All states: the fake keeps closed issues in `issues` (closure is a
+        // separate map), so this scan already covers open and closed.
+        Ok(self
+            .issues
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.body.contains(marker))
+            .map(|i| i.number))
     }
 
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
@@ -880,6 +922,10 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn issue_comments(&self, issue: i64) -> Result<Vec<String>> {
+        Ok(self.comments_of(issue))
+    }
+
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()> {
         self.comments.lock().unwrap().push((pr, body.into()));
         Ok(())
@@ -1008,6 +1054,15 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn close_pr(&self, pr: i64) -> Result<()> {
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        rec.state = "closed".into();
+        Ok(())
+    }
+
     async fn merge_policy(
         &self,
         _base_branch: &str,
@@ -1066,5 +1121,79 @@ impl Forge for FakeForge {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_by_carries_body_and_repo() {
+        // Same-repo child: body from this store, repo = this fake's slug.
+        let forge = FakeForge::with_slug("me/proj");
+        forge
+            .create_issue("child", "child body <!-- key -->", &[])
+            .await
+            .unwrap();
+        forge.block_issue(1, 1);
+        // Cross-repo child (another fake's store): seeded metadata.
+        forge.record_cross_blocker(99, "me/sib", "sibling body <!-- k2 -->");
+        forge.block_issue(1, 99);
+
+        let blockers = forge.blocked_by(1).await.unwrap();
+        let same = blockers.iter().find(|b| b.number == 1).unwrap();
+        assert!(same.body.contains("<!-- key -->"));
+        assert_eq!(same.repo, "me/proj");
+        let cross = blockers.iter().find(|b| b.number == 99).unwrap();
+        assert!(cross.body.contains("<!-- k2 -->"));
+        assert_eq!(cross.repo, "me/sib");
+    }
+
+    #[tokio::test]
+    async fn add_blocked_by_is_idempotent() {
+        let forge = FakeForge::default();
+        forge.create_issue("a", "", &[]).await.unwrap(); // #1
+        forge.create_issue("b", "", &[]).await.unwrap(); // #2
+        forge.add_blocked_by(1, 2).await.unwrap();
+        forge.add_blocked_by(1, 2).await.unwrap();
+        assert_eq!(forge.blockers_of(1), vec![2], "no duplicate edge");
+    }
+
+    #[tokio::test]
+    async fn close_pr_sets_state_closed() {
+        let forge = FakeForge::default();
+        forge.add_pr(7, "t", "b", &[], "meguri/1-x", "sha");
+        forge.close_pr(7).await.unwrap();
+        assert_eq!(forge.get_pr(7).await.unwrap().state, "closed");
+    }
+
+    #[tokio::test]
+    async fn find_issue_by_marker_is_all_state() {
+        let forge = FakeForge::default();
+        let n = forge
+            .create_issue("child", "prose <!-- meguri:decompose-child idx=0 -->", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            forge
+                .find_issue_by_marker("<!-- meguri:decompose-child idx=0 -->")
+                .await
+                .unwrap(),
+            Some(n)
+        );
+        // Still found once closed (all-state).
+        forge.close_issue(n);
+        assert_eq!(
+            forge
+                .find_issue_by_marker("<!-- meguri:decompose-child idx=0 -->")
+                .await
+                .unwrap(),
+            Some(n)
+        );
+        assert_eq!(
+            forge.find_issue_by_marker("<!-- absent -->").await.unwrap(),
+            None
+        );
     }
 }

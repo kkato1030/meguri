@@ -19,8 +19,9 @@ use crate::forge;
 use crate::gitops;
 use crate::launch;
 use crate::mux::{PaneId, PaneSpec};
+use crate::notify::Notification;
 use crate::routing;
-use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{InteractionState, LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
 
@@ -594,6 +595,57 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
         )
         .await;
     }
+}
+
+/// The `Notification::reason` (and `review.awaiting_human` marker) for a
+/// parked review — a finished review run waiting on a human. ADR 0009.
+pub(crate) const REASON_REVIEW_PARKED: &str = "spec_review_parked";
+
+/// Park a finished review run on a human (ADR 0009 / issue #153). The run has
+/// ended (or is about to end) `Succeeded`, but the PR now waits on a human —
+/// plan findings the author must fix, or a clean spec PR the human must merge.
+/// Raise an *active* signal off the conversation timeline:
+///
+/// 1. set the run's `interaction_state` to `AwaitingHuman` (survives the
+///    `Succeeded` status — `update_run_status` never clears it), so the
+///    dashboard's parked-review query surfaces it;
+/// 2. emit `review.awaiting_human` — the durable proof the park ran, and what
+///    the dashboard query keys off (not the state alone);
+/// 3. page a human via the throttled notifier, pointing at the PR (not a
+///    pane: the review pane is released as the run finishes).
+///
+/// Kind- and verdict-agnostic on purpose: both pr-reviewer(Plan) branches and
+/// a future spec_fixer round-limit escalation call this one seam. Notify is
+/// best-effort — a delivery failure never fails the run.
+pub(crate) async fn signal_review_parked(
+    deps: &Deps,
+    run: &RunRecord,
+    pr_number: i64,
+    pr_url: &str,
+    verdict: &str,
+    head_sha: &str,
+) {
+    if let Err(e) = deps
+        .store
+        .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+    {
+        tracing::warn!("cannot park run {} on a human: {e:#}", run.id);
+    }
+    let _ = deps.store.emit(
+        Some(&run.id),
+        "review.awaiting_human",
+        json!({ "pr": pr_number, "url": pr_url, "verdict": verdict, "head": head_sha }),
+    );
+    deps.notifier
+        .notify_awaiting_human(&Notification {
+            run_id: run.id.clone(),
+            issue_number: run.issue_number,
+            issue_title: run.issue_title.clone(),
+            reason: REASON_REVIEW_PARKED.to_string(),
+            attach: None,
+            url: Some(pr_url.to_string()),
+        })
+        .await;
 }
 
 /// The PR this run claimed, from its persisted checkpoint (release/escalate

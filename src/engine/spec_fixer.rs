@@ -132,10 +132,11 @@ pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> 
 }
 
 /// The retry-limit escalation: every budgeted round pushed a revision, the
-/// plan review is still red — park the PR on `meguri:needs-human`. Best-effort like
-/// the ci-fixer's; the label is what stops rediscovery. This does NOT page a
-/// human via the `turn.awaiting_human` notifier (no turn is running at
-/// discovery time); notifying the park is #153's job (ADR 0013).
+/// plan review is still red — park the PR on `meguri:needs-human`. Best-effort
+/// like the ci-fixer's; the label is what stops rediscovery. This is where the
+/// plan-side parked-review page lives (ADR 0009 / issue #153): the base
+/// pr-reviewer defers findings to spec_fixer, so the page moved here — the
+/// budget is spent, the review is still red, so a real human wait exists.
 async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
     // Runs are keyed by the PR's canonical *issue* (issue #92), which the spec
     // PR's own number usually differs from — so the re-run hint must name the
@@ -164,6 +165,22 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
         "spec_fixer.budget_exhausted",
         json!({ "pr": pr.number, "budget": MAX_SPEC_FIX_RUNS }),
     );
+    // Page a human at the round limit (ADR 0009 / issue #153). Run-less: no turn
+    // is running at discovery time, so this points at the PR (not a pane) and
+    // carries no interaction_state (the `needs-human` label above is the
+    // dashboard marker). The synthetic run_id keys the notifier's throttle so a
+    // re-fire before a human clears the label does not re-page. Best-effort like
+    // the rest of this escalation — a delivery failure never blocks the sweep.
+    deps.notifier
+        .notify_awaiting_human(&crate::notify::Notification {
+            run_id: format!("spec-fixer-budget-{}", pr.number),
+            issue_number: issue,
+            issue_title: Some(pr.title.clone()),
+            reason: flow::REASON_REVIEW_PARKED.to_string(),
+            attach: None,
+            url: Some(pr.url.clone()),
+        })
+        .await;
 }
 
 struct SpecFixerFlavor;
@@ -537,7 +554,9 @@ mod tests {
             pr_reviewer::PR_REVIEW_STATUS,
             CommitStatusState::Failure,
         );
-        let deps = fake_deps(forge.clone());
+        let mut deps = fake_deps(forge.clone());
+        let (notifier, gw) = crate::notify::fake::recording_notifier();
+        deps.notifier = notifier;
 
         // Record MAX succeeded spec-fixer runs for the canonical issue #7.
         for _ in 0..MAX_SPEC_FIX_RUNS {
@@ -584,6 +603,14 @@ mod tests {
                 .unwrap(),
             1
         );
+        // …and a human is paged at the round limit (ADR 0009 / issue #153),
+        // pointing at the PR (not a pane — no turn runs at discovery time).
+        let delivered = gw.delivered();
+        assert_eq!(delivered.len(), 1, "the round-limit park pages once");
+        assert_eq!(delivered[0].reason, "spec_review_parked");
+        assert_eq!(delivered[0].issue_number, 7, "keyed by the canonical issue");
+        assert!(delivered[0].url.is_some(), "the page points at the PR");
+        assert!(delivered[0].attach.is_none(), "no pane to attach to");
     }
 
     #[tokio::test]

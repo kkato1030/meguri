@@ -75,6 +75,9 @@ repo_slug = "owner/repo"
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
 # throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
+#
+# [decompose]
+# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -138,6 +141,8 @@ pub struct Config {
     /// override wholesale via its own `autonomy`. See [`Autonomy`].
     #[serde(default)]
     pub autonomy: Autonomy,
+    #[serde(default)]
+    pub decompose: DecomposeConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -235,6 +240,27 @@ fn default_true() -> bool {
     true
 }
 
+/// `[decompose]` — the reviewed-decomposition materializer (issue #134). The
+/// planner writes a decomposition proposal spec; once its PR is approved a
+/// lightweight sweep files the child issues + dependencies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DecomposeConfig {
+    /// Kill switch (default on): false makes the materialization sweep inert,
+    /// so an approved proposal is not materialized — it stays `spec-ready`
+    /// awaiting a human. The operational lever for rolling back the
+    /// irreversible child-creation step (ADR 0016).
+    #[serde(default = "default_true")]
+    pub materialize_enabled: bool,
+}
+
+impl Default for DecomposeConfig {
+    fn default() -> Self {
+        Self {
+            materialize_enabled: default_true(),
+        }
+    }
+}
+
 /// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
 /// The mode's single runtime effect is the auto-merge arm gate: `Full` lets the
 /// auto-merger arm a green PR (meguri may reach a merge with no human), `Attended`
@@ -329,7 +355,9 @@ pub enum TriageMode {
     Off,
     /// v0: read-only sweep into a single `meguri:triage-report` issue.
     Report,
-    /// v1 #87: proposal comments / `meguri:triage-*` labels (not yet built).
+    /// v1 #87: `report`, plus a proposal label (`meguri:triage-*`) and an
+    /// evidence comment on each recommended issue. A human promotes the
+    /// proposal to the real label; meguri never does.
     Advise,
     /// v2 #88: apply `meguri:ready`/`meguri:plan` directly (not yet built).
     Auto,
@@ -349,9 +377,16 @@ pub struct TriageConfig {
     pub interval_hours: u64,
     /// False-positive silencer: recommendations whose rendered row contains any
     /// of these substrings are dropped from the report at render time (same
-    /// idea as `clean.ignore`).
+    /// idea as `clean.ignore`); in `advise` mode it also suppresses the
+    /// per-issue label/comment for that recommendation.
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// `advise` mode only (issue #87): max issues proposed-to (label +
+    /// evidence comment) per sweep. Rate-limits the forge writes a single
+    /// tick can make; issues left over wait for the next sweep (their content
+    /// is unchanged, so they stay candidates).
+    #[serde(default = "default_triage_max_actions_per_tick")]
+    pub max_actions_per_tick: u64,
 }
 
 impl Default for TriageConfig {
@@ -360,12 +395,16 @@ impl Default for TriageConfig {
             mode: TriageMode::default(),
             interval_hours: default_triage_interval_hours(),
             ignore: Vec::new(),
+            max_actions_per_tick: default_triage_max_actions_per_tick(),
         }
     }
 }
 
 fn default_triage_interval_hours() -> u64 {
     6
+}
+fn default_triage_max_actions_per_tick() -> u64 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1824,6 +1863,7 @@ mod tests {
         assert_eq!(back.review.max_rounds, 3);
         assert_eq!(back.triage.mode, TriageMode::Off);
         assert_eq!(back.triage.interval_hours, 6);
+        assert_eq!(back.triage.max_actions_per_tick, 3);
     }
 
     #[test]
@@ -2358,6 +2398,7 @@ language = "English"
         assert_eq!(cfg.triage.mode, TriageMode::Off);
         assert_eq!(cfg.triage.interval_hours, 6);
         assert!(cfg.triage.ignore.is_empty());
+        assert_eq!(cfg.triage.max_actions_per_tick, 3);
     }
 
     #[test]
@@ -2398,6 +2439,7 @@ ignore = ["#42"]
         let demo = cfg.project("demo").unwrap();
         assert_eq!(cfg.triage_for(demo).mode, TriageMode::Report);
         assert_eq!(cfg.triage_for(demo).interval_hours, 6);
+        assert_eq!(cfg.triage_for(demo).max_actions_per_tick, 3);
 
         let quiet = cfg.project("quiet").unwrap();
         assert_eq!(cfg.triage_for(quiet).mode, TriageMode::Off);
@@ -2405,6 +2447,7 @@ ignore = ["#42"]
         // the built-in defaults, not the global section.
         assert_eq!(cfg.triage_for(quiet).interval_hours, 6);
         assert_eq!(cfg.triage_for(quiet).ignore, vec!["#42"]);
+        assert_eq!(cfg.triage_for(quiet).max_actions_per_tick, 3);
     }
 
     #[test]

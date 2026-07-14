@@ -77,6 +77,30 @@ pub fn is_decomposed_child(issue_body: &str) -> bool {
     issue_body.contains(DECOMPOSED_MARKER)
 }
 
+/// Marker the planner writes into a decomposition-proposal PR's body so the
+/// materializer sweep (and the spec-worker / handoff exclusions) recognize it
+/// from the already-fetched PR list without reading the branch (issue #134).
+pub const DECOMPOSE_PROPOSAL_MARKER: &str = "<!-- meguri:decompose-proposal -->";
+
+/// Is this PR a reviewed decomposition proposal (vs an ordinary spec PR)?
+pub fn is_decompose_proposal(pr_body: &str) -> bool {
+    pr_body.contains(DECOMPOSE_PROPOSAL_MARKER)
+}
+
+/// Info string that tags the one machine-readable `children` fenced block
+/// inside a decomposition-proposal spec (issue #134). Unique so it never
+/// collides with an ordinary ```json example.
+pub const CHILDREN_FENCE_INFO: &str = "json meguri-children";
+
+/// The stable per-child key embedded in each materialized child's body. Written
+/// atomically with `create_issue`, so "created" and "discoverable by key" are
+/// inseparable; the materializer matches it in the parent dependency graph to
+/// recognize an already-created child (issue #134). `parent_ref` is the
+/// slug-qualified parent (`owner/repo#N`) so the key is unique across repos.
+pub fn decompose_child_key(parent_ref: &str, idx: usize) -> String {
+    format!("<!-- meguri:decompose-child parent={parent_ref} idx={idx} -->")
+}
+
 /// The planner as a schedulable loop: `meguri:plan` issues in, spec PRs out.
 pub struct PlannerLoop;
 
@@ -398,7 +422,7 @@ impl Flavor for PlannerFlavor {
 /// `None` for a `human` node: it is filed with no trigger label, so discovery
 /// never drives it and a human closes it (issue #154).
 /// [`validate_children`] has already rejected any other kind.
-fn child_label(child: &ChildIssue) -> Option<&'static str> {
+pub(crate) fn child_label(child: &ChildIssue) -> Option<&'static str> {
     match child.kind.as_str() {
         "human" => None,
         "plan" => Some(forge::LABEL_PLAN),
@@ -411,7 +435,7 @@ fn child_label(child: &ChildIssue) -> Option<&'static str> {
 /// resolved through [`Deps::forge_factory`] (issue #154). `validate_children`
 /// has already confirmed the project is in scope; this additionally rejects a
 /// sibling with no GitHub repo to file into (local mode).
-fn resolve_child_target(
+pub(crate) fn resolve_child_target(
     deps: &Deps,
     parent_slug: &str,
     child: &ChildIssue,
@@ -440,7 +464,7 @@ fn resolve_child_target(
 /// reaches the human via the escalation comment. `allowed_projects` is the
 /// parent's own project id plus its workspace sibling ids — the only repos a
 /// child may target (issue #154 / ADR 0009).
-fn validate_children(
+pub(crate) fn validate_children(
     children: &[ChildIssue],
     allowed_projects: &[&str],
 ) -> std::result::Result<(), String> {
@@ -544,11 +568,14 @@ fn adaptive_depth_instruction(issue_body: &str) -> String {
     )
 }
 
-/// Prompt section inviting the decompose ending — except on issues that are
-/// themselves decomposition children, where only one level is allowed and
-/// the agent is told to hand a still-too-big issue to a human instead. When
-/// the project belongs to a workspace, the cross-repo scope (which sibling
-/// repos a child may target) is spelled out from config (issue #154).
+/// Prompt section inviting the decomposition-proposal spec — the reviewed path
+/// (issue #134). When the issue must be split, the planner writes a
+/// *proposal* spec (prose + a machine-readable `children` block) to the same
+/// spec file and marks the PR; after the spec-review gate approves it, meguri's
+/// materializer files the children. Decomposition children may not be split
+/// again (one level only). When the project belongs to a workspace, the
+/// cross-repo scope (which sibling repos a child may target) is spelled out
+/// from config (issue #154).
 fn decompose_instruction(deps: &Deps, issue_body: &str) -> String {
     if is_decomposed_child(issue_body) {
         return "# Too big for one spec?\n\
@@ -560,29 +587,43 @@ fn decompose_instruction(deps: &Deps, issue_body: &str) -> String {
             .to_string();
     }
     format!(
-        "# Too big for one spec?\n\
-     If your investigation shows the issue cannot converge on one spec and \
-     must be split into sub-issues, do NOT write a spec and do NOT create \
-     any issues yourself. Instead end the turn with `\"status\": \"decompose\"` \
-     in the result file (accepted here in addition to the completion \
-     contract's statuses), with:\n\
-     - `summary`: one paragraph on why you split it this way (it becomes a \
-       comment on the issue).\n\
-     - `children`: the sub-issues to file, in dependency order. Each entry is \
-       {{\"title\": \"...\", \"body\": \"<minimal body>\", \"kind\": \
-       \"ready\"|\"plan\"|\"human\", \"blocked_by\": [<zero-based indices of \
-       earlier entries it depends on>]{project_field}}}. \
-       Use kind \"ready\" for children small enough to implement directly, \
-       \"plan\" for children that still need their own design pass, and \
-       \"human\" for a step meguri cannot perform itself (creating a \
-       repository, changing visibility, rewriting history, and other \
-       irreversible operations) — a `human` child is filed with no trigger \
-       label, so meguri never runs it and a person closes it once done, \
-       unblocking its dependents.\n\
+        "# Too big for one spec? Write a decomposition proposal instead\n\
+     If your investigation shows the issue cannot converge on one implementation \
+     spec and must be split into several independent sub-issues (the test: would \
+     you want to review and roll these back as separate PRs?), do NOT write an \
+     implementation spec. Instead write a **decomposition proposal** into the \
+     same spec file `{spec}`, and do NOT create any issues yourself — meguri's \
+     materializer files them only after this proposal PR is approved.\n\
+     The proposal spec must contain, as human-readable prose reviewers can check:\n\
+     - the parent goal, and a **requirement-coverage** note (which child covers \
+       each parent requirement);\n\
+     - the dependency graph and the rollout order;\n\
+     - each child's done-criteria.\n\
+     It must also contain **exactly one** machine-readable fenced block whose \
+     info string is `{fence}` — a JSON array of children, in dependency order, \
+     that meguri parses verbatim (this reviewed block is what gets materialized):\n\
+     ```{fence}\n\
+     [\n\
+       {{\"title\": \"…\", \"body\": \"<minimal body>\", \"kind\": \"ready\", \"blocked_by\": []}},\n\
+       {{\"title\": \"…\", \"body\": \"…\", \"kind\": \"plan\", \"blocked_by\": [0]{project_field}}}\n\
+     ]\n\
+     ```\n\
+     Field schema: `title` (required) / `body` (optional) / `kind` (required: \
+     \"ready\" for a child small enough to implement directly, \"plan\" for one \
+     that needs its own design pass, \"human\" for a step meguri cannot perform \
+     — creating a repository, changing visibility, and other irreversible \
+     operations — filed with no trigger label so a person closes it) / \
+     `blocked_by` (optional: zero-based indices of *earlier* entries this one \
+     depends on).\n\
      {scope}\
-     meguri files the sub-issues, wires the `blocked_by` dependencies, and \
-     labels them. Decomposition is one level only: sub-issues cannot be \
-     decomposed again.\n\n",
+     Finally, put the marker `{marker}` on its own line in your `pr_body` so \
+     meguri routes this PR to materialization. The proposal spec is disposable \
+     scaffolding just like an implementation spec: after materialization the \
+     children + dependencies are the durable state and the spec is discarded. \
+     Decomposition is one level only — the children cannot be decomposed again.\n\n",
+        spec = spec_rel_path_from_body_hint(),
+        fence = CHILDREN_FENCE_INFO,
+        marker = DECOMPOSE_PROPOSAL_MARKER,
         project_field = if deps.config.workspace_of(&deps.project.id).is_some() {
             ", \"project\": \"<sibling project id, optional>\""
         } else {
@@ -590,6 +631,13 @@ fn decompose_instruction(deps: &Deps, issue_body: &str) -> String {
         },
         scope = decompose_scope_clause(deps),
     )
+}
+
+/// The proposal spec lives at the same per-issue path as an implementation
+/// spec; the prompt already told the agent that path, so refer to it generically
+/// here to keep the decompose section issue-number-agnostic.
+fn spec_rel_path_from_body_hint() -> &'static str {
+    "docs/specs/issue-<N>.md"
 }
 
 /// The cross-repo scope paragraph injected into the decompose instruction:
@@ -700,8 +748,13 @@ mod tests {
         };
         let prompt = PlannerFlavor.execute_prompt(&fake_deps(), &run, &cp, dir.path());
         assert!(prompt.contains("# Too big for one spec?"));
-        assert!(prompt.contains(r#""status": "decompose""#));
+        // The reviewed path (issue #134): a proposal spec, not an immediate
+        // `status: decompose`.
+        assert!(prompt.contains("decomposition proposal"));
+        assert!(prompt.contains("json meguri-children"));
+        assert!(prompt.contains(DECOMPOSE_PROPOSAL_MARKER));
         assert!(prompt.contains(r#""blocked_by""#));
+        assert!(!prompt.contains(r#""status": "decompose""#));
     }
 
     #[test]
@@ -773,6 +826,20 @@ mod tests {
             spec_depth_hint("spec_depth: normal and spec_depth: design"),
             Some("design")
         );
+    }
+
+    #[test]
+    fn proposal_marker_and_child_key_round_trip() {
+        assert!(is_decompose_proposal(&format!(
+            "desc\n{DECOMPOSE_PROPOSAL_MARKER}\n"
+        )));
+        assert!(!is_decompose_proposal("an ordinary spec PR body"));
+        // The per-child key is slug-qualified and idx-specific.
+        let k0 = decompose_child_key("me/proj#7", 0);
+        let k1 = decompose_child_key("me/proj#7", 1);
+        assert!(k0.contains("parent=me/proj#7"));
+        assert!(k0.contains("idx=0"));
+        assert_ne!(k0, k1);
     }
 
     #[test]
