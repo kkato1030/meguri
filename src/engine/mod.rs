@@ -2,6 +2,7 @@ pub mod auto_merger;
 pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
+pub mod escalation;
 pub mod fixer;
 pub mod flow;
 pub mod merge_watch;
@@ -14,7 +15,9 @@ pub mod routing_drift;
 pub mod scheduler;
 pub mod scheduler_fire;
 pub mod self_review;
+pub mod spec_fixer;
 pub mod spec_worker;
+pub mod triage;
 pub mod worker;
 
 use std::sync::Arc;
@@ -378,11 +381,16 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
+        // Plan-side fixer family (issue #188): unparks spec PRs the plan
+        // review flagged, so it sits with the other fixers, above new-work
+        // loops.
+        Arc::new(spec_fixer::SpecFixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(pr_reviewer::PrReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
+        Arc::new(triage::TriageLoop),
     ]
 }
 
@@ -486,13 +494,28 @@ mod tests {
             "worker",
             "planner",
             "spec-worker",
+            "spec-fixer",
             "fixer",
             "ci-fixer",
             "conflict-resolver",
             "cleaner",
+            "triage",
         ] {
             assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
+    }
+
+    #[test]
+    fn spec_fixer_sits_in_the_fixer_family_above_new_work() {
+        // Registration order is priority (issue #188): the spec-fixer must
+        // unpark a spec PR before the worker/planner start new work, and it
+        // belongs after the fixer, with the guard/worker/planner behind it.
+        let kinds: Vec<&str> = default_loops().iter().map(|l| l.kind()).collect();
+        let pos = |k: &str| kinds.iter().position(|x| *x == k).expect(k);
+        assert!(pos("fixer") < pos("spec-fixer"));
+        assert!(pos("spec-fixer") < pos("spec-worker"));
+        assert!(pos("spec-fixer") < pos("worker"));
+        assert!(pos("spec-fixer") < pos("planner"));
     }
 
     #[test]
@@ -578,10 +601,12 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

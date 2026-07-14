@@ -1,7 +1,10 @@
+use std::io::{IsTerminal, Write};
+
 use anyhow::{Result, bail};
 use clap::Parser;
+use meguri::agent_skills;
 use meguri::app;
-use meguri::cli::{Cli, Command, DaemonCommand, StatsCommand};
+use meguri::cli::{AgentSkillsCommand, Cli, Command, DaemonCommand, StatsCommand};
 use meguri::config::{self, Config};
 use meguri::daemon;
 use meguri::store::Store;
@@ -72,6 +75,19 @@ async fn main() -> Result<()> {
             dry_run,
             force,
         } => app::cmd_prune(project.as_deref(), dry_run, force).await,
+        Command::AgentSkills { command } => match command {
+            AgentSkillsCommand::Install {
+                target,
+                project,
+                repo,
+                force,
+            } => app::cmd_agent_skills_install(&target, project, repo.as_deref(), force),
+            AgentSkillsCommand::Status {
+                target,
+                project,
+                repo,
+            } => app::cmd_agent_skills_status(&target, project, repo.as_deref()),
+        },
     }
 }
 
@@ -94,7 +110,46 @@ fn cmd_init() -> Result<()> {
         "\nNext: edit {} — fill in the [[projects]] stub (repo_path, repo_slug).",
         cfg_path.display()
     );
+    offer_agent_skills_install();
     Ok(())
+}
+
+/// After `meguri init`, offer the user-level Claude Code skill (issue #150)
+/// so an agent working nearby can learn about and propose meguri on its
+/// own. Interactive only — a non-interactive run (CI, scripted setup) just
+/// gets the pointer, never a silent write to `~/.claude/`.
+fn offer_agent_skills_install() {
+    println!();
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "Tip: `meguri agent-skills install` sets up a Claude Code skill \
+             (~/.claude/skills/meguri/) so agents working nearby can learn about meguri."
+        );
+        return;
+    }
+    print!("Also install the meguri skill for Claude Code (~/.claude/skills/meguri/)? [y/N] ");
+    if std::io::stdout().flush().is_err() {
+        return;
+    }
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!("Skipped — run `meguri agent-skills install` any time.");
+        return;
+    }
+    let home = match agent_skills::resolve_home() {
+        Ok(home) => home,
+        Err(e) => {
+            println!("⚠️  could not install agent skill: {e:#}");
+            return;
+        }
+    };
+    match agent_skills::install_user_skill(agent_skills::Target::Claude, &home, false) {
+        Ok(report) => app::print_agent_skills_install_report(&report),
+        Err(e) => println!("⚠️  could not install agent skill: {e:#}"),
+    }
 }
 
 async fn cmd_doctor(probe: bool) -> Result<()> {
@@ -242,6 +297,15 @@ async fn check_auto_merge(cfg: &Config) -> bool {
         let am = &cfg.pr_for(project).auto_merge;
         if !am.enabled {
             continue;
+        }
+        // Inconsistency warn (issue #176): auto-merge is on, but the project is
+        // `attended`, so meguri will never arm it. Advisory only — not a failure.
+        if cfg.autonomy_for(project) != meguri::config::Autonomy::Full {
+            println!(
+                "⚠️  auto-merge ({}): enabled but autonomy=attended — meguri will not arm \
+                 auto-merge (set autonomy = \"full\" to arm; ADR 0012)",
+                project.id
+            );
         }
         // Auto-merge is a GitHub-PR concern; a local-mode project has no slug
         // and no PRs to arm, so there is nothing to check.

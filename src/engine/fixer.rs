@@ -292,27 +292,17 @@ impl Flavor for FixerFlavor {
     /// gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let Some(pr) = flow::claimed_pr(deps, &run.id) else {
-            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps
-            .forge()
-            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-            .await;
-        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-        // Launch-mode-aware closing sentence (issue #169): a direct-mode
-        // fixer has no pane to attach to.
-        let hint = flow::attach_hint(deps, run);
-        let _ = deps
-            .forge()
-            .pr_comment(
-                pr,
-                &format!(
-                    "🔁 **meguri** could not address the review comments on this \
-                     PR and needs a human.\n\n> {reason}\n\n{hint}"
-                ),
-            )
-            .await;
+        // The central helper posts the label/comment/event; the closing hint is
+        // launch-mode-aware (issue #169) — a direct-mode fixer has no pane.
+        let comment = super::escalation::pr_needs_human_comment(
+            "could not address the review comments on this PR and needs a human.",
+            reason,
+            &flow::attach_hint(deps, run),
+        );
+        super::escalation::escalate_pr(deps, pr, &comment).await;
     }
 }
 
@@ -405,10 +395,12 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

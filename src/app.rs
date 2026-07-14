@@ -1,11 +1,13 @@
 //! CLI command implementations.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::agent_skills::{self, FileOutcome, InstallReport, StatusEntry, StatusState, Target};
 use crate::config::{self, Config, ProjectConfig, ProjectMode};
 use crate::daemon;
 use crate::engine::reaper;
@@ -1392,10 +1394,184 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
     Ok(())
 }
 
+/// `meguri agent-skills install` (issue #150): write the embedded skill
+/// (user-level) or rule fragment (`--project`) to disk.
+pub fn cmd_agent_skills_install(
+    target: &str,
+    project: bool,
+    repo: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let target = Target::parse(target)?;
+    let report = if project {
+        let repo_root = agent_skills_repo_root(repo)?;
+        agent_skills::install_project_fragment(target, &repo_root, force)?
+    } else {
+        let home = agent_skills::resolve_home()?;
+        agent_skills::install_user_skill(target, &home, force)?
+    };
+    print_agent_skills_install_report(&report);
+    Ok(())
+}
+
+/// `meguri agent-skills status` (issue #150): report install state without
+/// touching disk.
+pub fn cmd_agent_skills_status(target: &str, project: bool, repo: Option<&str>) -> Result<()> {
+    let remedy = agent_skills_install_remedy(target, project, repo);
+    let parsed_target = Target::parse(target)?;
+    if project {
+        let repo_root = agent_skills_repo_root(repo)?;
+        let entry = agent_skills::status_project_fragment(parsed_target, &repo_root);
+        print_agent_skills_status(std::slice::from_ref(&entry), &remedy);
+    } else {
+        let home = agent_skills::resolve_home()?;
+        let entries = agent_skills::status_user_skill(parsed_target, &home);
+        print_agent_skills_status(&entries, &remedy);
+    }
+    Ok(())
+}
+
+/// Resolve which repository `--project` writes to / reads from. `--repo` is
+/// taken verbatim (explicit escape hatch); without it the current directory
+/// is resolved to its Git toplevel so running from `docs/` or `src/` still
+/// targets `<repo root>/.claude/rules/`. Both `install` and `status` go
+/// through here, so they always agree on the location.
+fn agent_skills_repo_root(repo: Option<&str>) -> Result<PathBuf> {
+    match repo {
+        Some(r) => Ok(PathBuf::from(r)),
+        None => {
+            let cwd = std::env::current_dir().context("resolving current directory")?;
+            agent_skills_repo_root_from(&cwd)
+        }
+    }
+}
+
+/// Cwd-independent core of [`agent_skills_repo_root`], split out so tests can
+/// exercise the resolution from an arbitrary directory without touching the
+/// process-wide current directory.
+fn agent_skills_repo_root_from(dir: &std::path::Path) -> Result<PathBuf> {
+    crate::gitops::repo_toplevel_sync(dir).context(
+        "`--project` targets the current Git repository; \
+         run this from inside a repository checkout or pass --repo <path>",
+    )
+}
+
+/// The exact `install` invocation that fixes drift reported by `status` for
+/// this same `--target`/`--project`/`--repo` combination.
+fn agent_skills_install_remedy(target: &str, project: bool, repo: Option<&str>) -> String {
+    let mut cmd = String::from("meguri agent-skills install");
+    if target != "claude" {
+        cmd.push_str(&format!(" --target {target}"));
+    }
+    if project {
+        cmd.push_str(" --project");
+        if let Some(r) = repo {
+            cmd.push_str(&format!(" --repo {r}"));
+        }
+    }
+    cmd.push_str(" --force");
+    cmd
+}
+
+pub fn print_agent_skills_install_report(report: &InstallReport) {
+    for f in &report.files {
+        let (mark, verb) = match f.outcome {
+            FileOutcome::Created => ("✅", "created"),
+            FileOutcome::Updated => ("✅", "updated"),
+            FileOutcome::Unchanged => ("✅", "already up to date"),
+            FileOutcome::Blocked => ("⚠️ ", "differs from the embedded source — not overwritten"),
+        };
+        println!("{mark} {} ({verb})", f.path.display());
+        if let Some(diff) = &f.diff {
+            for line in diff.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    if report.has_blocked() {
+        println!("Re-run with --force to overwrite the differing file(s) above.");
+    }
+}
+
+fn print_agent_skills_status(entries: &[StatusEntry], remedy: &str) {
+    for e in entries {
+        let (mark, label) = match e.state {
+            StatusState::Missing => ("❌", "not installed".to_string()),
+            StatusState::UpToDate => ("✅", "up to date".to_string()),
+            StatusState::Drifted => (
+                "⚠️ ",
+                format!(
+                    "installed but differs from this binary's embedded version — run \
+                     `{remedy}` to update"
+                ),
+            ),
+        };
+        println!("{mark} {} — {label}", e.path.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::now;
+
+    #[test]
+    fn agent_skills_repo_root_resolves_git_toplevel_from_subdirectory() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitops::run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("docs");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Canonicalize both sides: macOS tempdirs live behind /var ->
+        // /private/var and git reports the resolved path.
+        assert_eq!(
+            agent_skills_repo_root_from(&sub)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_skills_repo_root_errors_clearly_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = agent_skills_repo_root_from(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--repo"), "error should suggest --repo: {msg}");
+        assert!(msg.contains("Git repository"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn agent_skills_repo_root_takes_explicit_repo_verbatim() {
+        // `--repo` is the escape hatch: no git resolution — install/status
+        // surface their own errors against whatever path was given.
+        assert_eq!(
+            agent_skills_repo_root(Some("/no/such/checkout")).unwrap(),
+            PathBuf::from("/no/such/checkout")
+        );
+    }
+
+    #[test]
+    fn agent_skills_install_and_status_agree_on_root_from_subdirectory() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitops::run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Same resolution `install --project` performs when run from src/.
+        let install_root = agent_skills_repo_root_from(&sub).unwrap();
+        agent_skills::install_project_fragment(Target::Claude, &install_root, false).unwrap();
+
+        // The fragment lands at the repo root, never under the subdirectory.
+        assert!(repo.path().join(".claude/rules/meguri.md").is_file());
+        assert!(!sub.join(".claude").exists());
+
+        // `status --project` from the same subdirectory resolves to the same
+        // root and therefore sees the install as up to date.
+        let status_root = agent_skills_repo_root_from(&sub).unwrap();
+        let entry = agent_skills::status_project_fragment(Target::Claude, &status_root);
+        assert_eq!(entry.state, StatusState::UpToDate);
+    }
 
     #[test]
     fn heartbeat_freshness_window() {
@@ -1627,5 +1803,21 @@ mod tests {
         assert_eq!(groups[1].0, "no workspace");
         // No config → flat (None).
         assert!(group_by_workspace(None, &runs).is_none());
+    }
+
+    #[test]
+    fn agent_skills_install_remedy_matches_the_status_invocation() {
+        assert_eq!(
+            agent_skills_install_remedy("claude", false, None),
+            "meguri agent-skills install --force"
+        );
+        assert_eq!(
+            agent_skills_install_remedy("claude", true, None),
+            "meguri agent-skills install --project --force"
+        );
+        assert_eq!(
+            agent_skills_install_remedy("claude", true, Some("/tmp/some-repo")),
+            "meguri agent-skills install --project --repo /tmp/some-repo --force"
+        );
     }
 }

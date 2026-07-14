@@ -175,9 +175,15 @@ impl PrReviewerLoop {
     /// reviewed at this head, or — for impl — CI not green).
     async fn candidate_kind(&self, deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
         let review = deps.config.review_for(&deps.project);
+        // needs-human is a human stop signal on both sides: once the
+        // pr-reviewer (or anything else) escalated a PR, do not re-review it
+        // until a human clears the label (issue #176 — plan was previously
+        // reviewed unconditionally, so a findings escalation would re-fire
+        // forever; now symmetric with impl).
         if pr.state != "open"
             || pr.has_label(forge::LABEL_HOLD)
             || pr.has_label(forge::LABEL_WORKING)
+            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
         {
             return Ok(None);
         }
@@ -188,11 +194,10 @@ impl PrReviewerLoop {
         match kind {
             Kind::Plan => {} // spec-reviewing PRs are always reviewable
             Kind::Impl => {
-                // Same ownership guard as the fixer: meguri branch only, not
-                // needs-human, and no spec-phase label (spec-ready is the
-                // combined spec worker's territory).
+                // Same ownership guard as the fixer: meguri branch only, and no
+                // spec-phase label (spec-ready is the combined spec worker's
+                // territory). needs-human is handled in common above.
                 if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
-                    || pr.has_label(forge::LABEL_NEEDS_HUMAN)
                     || pr.has_label(forge::LABEL_SPEC_READY)
                 {
                     return Ok(None);
@@ -375,23 +380,14 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 }
 
 async fn escalate_on_pr(deps: &Deps, run: &RunRecord, pr: i64, reason: &str) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-    // The closing "how to look at this" sentence is launch-mode-aware
-    // (issue #169): a direct-mode pr-reviewer has no pane to attach to.
-    let hint = flow::attach_hint(deps, run);
-    let _ = deps
-        .forge()
-        .comment_pr(
-            pr,
-            &format!(
-                "🔁 **meguri** could not finish reviewing this PR and needs a human.\n\n> {reason}\n\n{hint}"
-            ),
-        )
-        .await;
+    // The central helper posts the label/comment/event; the closing hint is
+    // launch-mode-aware (issue #169) — a direct-mode pr-reviewer has no pane.
+    let comment = super::escalation::pr_needs_human_comment(
+        "could not finish reviewing this PR and needs a human.",
+        reason,
+        &flow::attach_hint(deps, run),
+    );
+    super::escalation::escalate_pr(deps, pr, &comment).await;
 }
 
 enum Prepared {
@@ -651,6 +647,17 @@ fn pr_review_details(cp: &PrReviewCheckpoint, verdict: ReviewVerdict) -> String 
     )
 }
 
+/// The pr-reviewer's folded `<details>` block within a PR body, if present:
+/// everything from [`PR_REVIEW_BODY_MARKER`] to the end (the block is always
+/// last — see [`upsert_pr_review_details`]). `spec_fixer` reads it to feed the
+/// plan findings back to the fixing agent (issue #188); returns `None` when the
+/// body carries no review block.
+pub fn extract_pr_review_details(body: &str) -> Option<String> {
+    let idx = body.find(PR_REVIEW_BODY_MARKER)?;
+    let block = body[idx..].trim();
+    (!block.is_empty()).then(|| block.to_string())
+}
+
 /// Replace (or append) the pr-review `<details>` in a PR body. The pr-review
 /// block is always last: everything from the marker to the end is the block,
 /// so a re-review truncates there and re-appends.
@@ -696,8 +703,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
 
     // Plan review drives the label state machine (ADR 0008 §3): a clean spec
     // review flips spec-reviewing → spec-ready (the combined spec worker keys
-    // off it); findings keep spec-reviewing for the next push. The impl
-    // review never touches spec labels.
+    // off it). The impl review never touches spec labels.
     if cp.kind == Kind::Plan && verdict == ReviewVerdict::Clean {
         deps.forge()
             .add_pr_label(pr, forge::LABEL_SPEC_READY)
@@ -707,38 +713,83 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
             .await
             .ok();
     }
-    deps.forge()
-        .remove_pr_label(pr, forge::LABEL_WORKING)
-        .await
-        .ok();
 
-    // Parked-review signal (ADR 0009 / issue #153): a plan review that leaves a
-    // human in charge raises an active signal (interaction_state + notify +
-    // event), off the conversation timeline. Two plan parks qualify:
-    //   - findings: the author must push a fix (the head stays spec-reviewing);
-    //   - clean under plan_delivery=separate: the human must merge the spec PR
-    //     (combined hands off to the spec worker automatically — not a park).
-    // The impl review never parks here.
-    if cp.kind == Kind::Plan && plan_review_parks(deps, verdict) {
-        flow::signal_review_parked(
-            deps,
-            run,
-            pr,
-            &cp.pr_url,
-            verdict_str(verdict),
-            &cp.head_sha,
-        )
-        .await;
+    match (cp.kind, verdict) {
+        (_, ReviewVerdict::Clean) => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+            // Parked-review signal (ADR 0009 / issue #153): a clean plan review
+            // under `plan_delivery=separate` leaves the human to merge the spec
+            // PR — nothing else picks this up (spec_fixer drives only
+            // *findings*). Raise the active signal (interaction_state + notify +
+            // event), off the conversation timeline. Combined hands the
+            // spec-ready PR to the spec worker (not a park); impl clean is never
+            // a park.
+            if cp.kind == Kind::Plan && plan_clean_parks(deps) {
+                flow::signal_review_parked(
+                    deps,
+                    run,
+                    pr,
+                    &cp.pr_url,
+                    verdict_str(verdict),
+                    &cp.head_sha,
+                )
+                .await;
+            }
+        }
+        // Plan findings: `spec_fixer` (ADR 0013) is the plan-side human gate —
+        // it discovers `spec-reviewing` PRs whose head `meguri/pr-review` is
+        // `Failure` and drives the fix itself, paging a human (ADR 0009 / issue
+        // #153) only once its round budget runs out. Adding `needs-human` here
+        // would starve that discover query (it skips escalated PRs) before
+        // spec_fixer ever runs — the same lockout ADR 0007 avoids by having
+        // merge_watch defer to fixer loops instead of escalating first. Drop the
+        // working claim (this settle's turn is done) but leave the label/status
+        // as-is; the parked-review page moves to spec_fixer's round limit.
+        (Kind::Plan, ReviewVerdict::Findings) => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+            deps.store.emit(
+                Some(&run.id),
+                "pr_review.deferred_to_spec_fixer",
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+            )?;
+        }
+        // Impl findings: no auto-fix loop drives impl PRs off pr-reviewer
+        // findings, so the pr-reviewer stays the human gate here (ADR 0012
+        // P1/P3). `escalate_pr` drops the working claim and adds
+        // needs-human (which also stops discover from re-reviewing until a
+        // human clears it).
+        (Kind::Impl, ReviewVerdict::Findings) => {
+            let lead = format!(
+                "PR review ({}) found issues that need a human before this PR can proceed.",
+                cp.kind.as_str()
+            );
+            let comment = super::escalation::pr_needs_human_comment(
+                &lead,
+                "See the folded 🛡️ PR review in the PR body for the findings.",
+                &flow::attach_hint(deps, run),
+            );
+            super::escalation::escalate_pr(deps, pr, &comment).await;
+            deps.store.emit(
+                Some(&run.id),
+                "pr_review.escalated",
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+            )?;
+        }
     }
     Ok(cp.pr_url.clone())
 }
 
-/// Whether a settled plan review leaves a human in charge (ADR 0009).
-fn plan_review_parks(deps: &Deps, verdict: ReviewVerdict) -> bool {
-    match verdict {
-        ReviewVerdict::Findings => true,
-        ReviewVerdict::Clean => deps.project.plan_delivery != crate::config::PlanDelivery::Combined,
-    }
+/// Whether a clean plan review leaves a human to merge the spec PR (ADR 0009).
+/// Only under `plan_delivery=separate`; combined hands the `spec-ready` PR to
+/// the spec worker automatically, so it is not a park.
+fn plan_clean_parks(deps: &Deps) -> bool {
+    deps.project.plan_delivery != crate::config::PlanDelivery::Combined
 }
 
 fn verdict_str(verdict: ReviewVerdict) -> &'static str {
@@ -838,6 +889,170 @@ mod tests {
     }
 
     #[test]
+    fn extract_pr_review_details_pulls_the_folded_block() {
+        // No block: nothing to feed a fixer.
+        assert_eq!(extract_pr_review_details("Refs #5.\n\nBody text."), None);
+
+        // With a block: everything from the marker to the end (issue #188).
+        let body = upsert_pr_review_details(
+            "Refs #5.",
+            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Findings),
+        );
+        let block = extract_pr_review_details(&body).unwrap();
+        assert!(block.starts_with(PR_REVIEW_BODY_MARKER));
+        assert!(block.contains("- missing acceptance criteria"));
+        assert!(
+            !block.contains("Refs #5."),
+            "only the review block: {block}"
+        );
+    }
+
+    /// The plan review's settle drives the spec label state machine (ADR 0008
+    /// §3): clean flips `spec-reviewing → spec-ready`, findings keep
+    /// `spec-reviewing` so the next push (spec_fixer, issue #188) triggers a
+    /// re-review.
+    #[tokio::test]
+    async fn plan_settle_drives_the_spec_label_state_machine() {
+        async fn settle_verdict(
+            verdict: ReviewVerdict,
+        ) -> std::sync::Arc<crate::forge::fake::FakeForge> {
+            let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+            forge.add_pr(
+                7,
+                "Spec: caching (#5)",
+                "Refs #5.",
+                &[forge::LABEL_SPEC_REVIEWING],
+                "meguri/5-add-caching-abc",
+                "deadbeef",
+            );
+            let project = crate::config::ProjectConfig {
+                id: "proj".into(),
+                repo_path: "/tmp/unused".into(),
+                repo_slug: Some("me/proj".into()),
+                mode: Default::default(),
+                deliver: None,
+                default_branch: "main".into(),
+                check_command: None,
+                worktree_root: None,
+                language: None,
+                pr: None,
+                clean: None,
+                triage: None,
+                plan_delivery: Default::default(),
+                review: None,
+                worktree_setup: Default::default(),
+                schedules: Vec::new(),
+                autonomy: None,
+                cadence: Vec::new(),
+                prompts: Default::default(),
+            };
+            let deps = Deps::with_label_source(
+                crate::store::Store::open_in_memory().unwrap(),
+                std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+                forge.clone(),
+                crate::config::Config::default(),
+                project,
+            );
+            let run = deps
+                .store
+                .create_run_for_loop("proj", KIND, 5, "Spec: caching (#5)")
+                .unwrap();
+            let mut c = cp(Kind::Plan, "deadbeef");
+            c.pr_number = Some(7);
+            c.pr_url = "https://fake.example/pr/7".into();
+            c.verdict = Some(verdict);
+            settle(&deps, &run, &c).await.unwrap();
+            forge
+        }
+
+        // Clean: spec-reviewing removed, spec-ready added.
+        let forge = settle_verdict(ReviewVerdict::Clean).await;
+        let labels = forge.pr_labels(7);
+        assert!(labels.contains(&forge::LABEL_SPEC_READY.to_string()));
+        assert!(!labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
+        assert_eq!(
+            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Success)
+        );
+
+        // Findings: spec-reviewing kept (spec_fixer's re-drive target), no
+        // spec-ready, status failure, and — issue #192 — no needs-human, or
+        // spec_fixer's discover (which skips escalated PRs) would never fire.
+        let forge = settle_verdict(ReviewVerdict::Findings).await;
+        let labels = forge.pr_labels(7);
+        assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
+        assert!(!labels.contains(&forge::LABEL_SPEC_READY.to_string()));
+        assert!(
+            !labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            "plan findings must not escalate — spec_fixer (ADR 0013) owns the fix loop: {labels:?}"
+        );
+        assert_eq!(
+            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Failure)
+        );
+    }
+
+    /// Impl findings are unchanged by issue #192: no auto-fix loop drives
+    /// impl PRs, so the pr-reviewer stays the human gate (ADR 0012).
+    #[tokio::test]
+    async fn impl_findings_still_escalate_to_needs_human() {
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+        forge.add_pr(
+            9,
+            "Add caching (#5)",
+            "Refs #5.",
+            &[forge::LABEL_IMPLEMENTING, forge::LABEL_WORKING],
+            "meguri/5-add-caching-def",
+            "cafef00d",
+        );
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+        };
+        let deps = Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+        let run = deps
+            .store
+            .create_run_for_loop("proj", KIND, 5, "Add caching (#5)")
+            .unwrap();
+        let mut c = cp(Kind::Impl, "cafef00d");
+        c.pr_number = Some(9);
+        c.pr_url = "https://fake.example/pr/9".into();
+        c.verdict = Some(ReviewVerdict::Findings);
+        settle(&deps, &run, &c).await.unwrap();
+
+        let labels = forge.pr_labels(9);
+        assert!(labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()));
+        assert!(!labels.contains(&forge::LABEL_WORKING.to_string()));
+        assert_eq!(
+            forge.commit_status_of("cafef00d", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Failure)
+        );
+    }
+
+    #[test]
     fn review_file_parses_and_validates() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".meguri")).unwrap();
@@ -906,6 +1121,7 @@ mod tests {
             worktree_root: Some(worktree_root.path().to_path_buf()),
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: crate::config::WorktreeSetupConfig {
@@ -913,6 +1129,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };
