@@ -821,7 +821,10 @@ mod tests {
         let block = extract_pr_review_details(&body).unwrap();
         assert!(block.starts_with(PR_REVIEW_BODY_MARKER));
         assert!(block.contains("- missing acceptance criteria"));
-        assert!(!block.contains("Refs #5."), "only the review block: {block}");
+        assert!(
+            !block.contains("Refs #5."),
+            "only the review block: {block}"
+        );
     }
 
     /// The plan review's settle drives the spec label state machine (ADR 0008

@@ -38,7 +38,9 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable, pr_reviewer};
+use super::{
+    Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable, pr_reviewer,
+};
 use crate::forge::{self, CommitStatusState, PullRequest};
 use crate::store::RunRecord;
 use crate::tasks::TaskKey;
@@ -478,18 +480,34 @@ mod tests {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
         // #1: spec-reviewing, plan review failure at its head → a target.
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct(
+            "h1",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Failure,
+        );
         // #2: spec-reviewing but the review is green → not a target.
         seed_spec_pr(&forge, 2, "h2");
-        forge.set_commit_status_direct("h2", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Success);
+        forge.set_commit_status_direct(
+            "h2",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Success,
+        );
         // #3: spec-reviewing, review pending → not a target (still settling).
         seed_spec_pr(&forge, 3, "h3");
-        forge.set_commit_status_direct("h3", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Pending);
+        forge.set_commit_status_direct(
+            "h3",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Pending,
+        );
         // #4: spec-reviewing but no review status yet (freshly pushed) → skip.
         seed_spec_pr(&forge, 4, "h4");
         // #5: review failure but not spec-reviewing → skip.
         forge.add_pr(5, "impl (#5)", "body", &[], "meguri/5-impl-abc", "h5");
-        forge.set_commit_status_direct("h5", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct(
+            "h5",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Failure,
+        );
 
         let deps = fake_deps(forge);
         let targets = SpecFixerLoop.discover(&deps).await.unwrap();
@@ -512,7 +530,11 @@ mod tests {
             "meguri/7-add-caching-abc",
             "h1",
         );
-        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct(
+            "h1",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Failure,
+        );
         let deps = fake_deps(forge.clone());
 
         // Record MAX succeeded spec-fixer runs for the canonical issue #7.
@@ -566,7 +588,11 @@ mod tests {
     async fn prepare_work_claims_and_loads_findings() {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct(
+            "h1",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Failure,
+        );
         let deps = fake_deps(forge.clone());
         let run = deps
             .store
@@ -623,7 +649,11 @@ mod tests {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
         // A spec PR the pr-reviewer already reviewed with findings at head h1.
         seed_spec_pr(&forge, 1, "h1");
-        forge.set_commit_status_direct("h1", pr_reviewer::PR_REVIEW_STATUS, CommitStatusState::Failure);
+        forge.set_commit_status_direct(
+            "h1",
+            pr_reviewer::PR_REVIEW_STATUS,
+            CommitStatusState::Failure,
+        );
         let deps = fake_deps(forge.clone());
 
         // 1. spec-fixer picks it up; the pr-reviewer does not (h1 is already
@@ -632,7 +662,10 @@ mod tests {
         assert_eq!(sf.len(), 1, "spec-fixer targets the parked PR");
         deps.open_prs.clear().await;
         let g = pr_reviewer::PrReviewerLoop.discover(&deps).await.unwrap();
-        assert!(g.is_empty(), "pr-reviewer skips the already-reviewed head h1");
+        assert!(
+            g.is_empty(),
+            "pr-reviewer skips the already-reviewed head h1"
+        );
 
         // 2. After the spec-fixer settles, working is gone and spec-reviewing
         //    stays (nothing flips the label until the pr-reviewer re-reviews).
