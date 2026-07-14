@@ -234,7 +234,23 @@ async fn add_github(
         repo_path: &project.repo_path,
         language: cfg.language_for(project),
     };
-    add_core(&forge, params, refiner_source).await?;
+    let number = add_core(&forge, params, refiner_source).await?;
+    // Watched-label notify for the issue meguri just filed (issue #205). Cheap
+    // no-op unless this project has `[projects.notify].labels`. `add_core` stays
+    // config-free; the hook lives here in the wrapper where cfg/project exist.
+    let watched = project
+        .notify
+        .as_ref()
+        .map(|n| n.labels.as_slice())
+        .unwrap_or(&[]);
+    crate::notify::Notifier::from_config(&cfg.notifications)
+        .notify_labels(
+            number,
+            text.lines().next().unwrap_or(text),
+            watched,
+            &labels,
+        )
+        .await;
     Ok(())
 }
 

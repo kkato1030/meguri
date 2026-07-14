@@ -149,6 +149,24 @@ impl Deps {
             .as_ref()
             .expect("forge is required for this loop (github mode)")
     }
+
+    /// Push a notification for each watched label an issue meguri just created
+    /// in *this project's* repo (per-project `[projects.notify]`, issue #205).
+    /// The shared hook every own-repo `create_issue` site calls right after
+    /// creation — scheduler fire, cleaner/triage reports, planner children.
+    /// Cross-repo sibling children are excluded: this project's watch does not
+    /// govern another repo's issues. Best-effort.
+    pub async fn notify_created_issue(&self, number: i64, title: &str, labels: &[&str]) {
+        let watched = self
+            .project
+            .notify
+            .as_ref()
+            .map(|n| n.labels.as_slice())
+            .unwrap_or(&[]);
+        self.notifier
+            .notify_labels(number, title, watched, labels)
+            .await;
+    }
 }
 
 /// Per-tick cache of `list_open_prs` (issue #170): lazily filled by whichever

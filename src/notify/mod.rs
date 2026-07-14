@@ -216,6 +216,28 @@ impl Notifier {
         self.gateway.deliver(n).await;
         true
     }
+
+    /// Page each watched label the newly-created issue carries — the shared
+    /// hook every meguri issue-creation site routes through (issue #205). A
+    /// `label` notification bypasses the global `events` allowlist (it is
+    /// authorized per-project). Best-effort and cheap when nothing is watched.
+    pub async fn notify_labels(
+        &self,
+        number: i64,
+        title: &str,
+        watched: &[String],
+        labels: &[&str],
+    ) {
+        if watched.is_empty() {
+            return;
+        }
+        for label in labels {
+            if watched.iter().any(|w| w == label) {
+                self.notify(&Notification::label(number, title, label, None))
+                    .await;
+            }
+        }
+    }
 }
 
 /// Production gateway: macOS notification via `osascript`, webhook via `curl`
@@ -253,10 +275,23 @@ impl NotifyGateway for SystemGateway {
         if let Some(url) = &self.cfg.webhook_url {
             let kind = resolve_kind(&self.cfg, url);
             if let Err(err) = post_webhook(url, kind, n).await {
-                tracing::warn!(url, %err, "webhook POST failed");
+                // Log the host, never the full URL: a Slack/ntfy webhook URL
+                // carries a secret token in its path (issue #205).
+                tracing::warn!(host = webhook_host(url), ?kind, %err, "webhook POST failed");
             }
         }
     }
+}
+
+/// The host portion of a webhook URL — the non-secret part safe to log. A
+/// webhook URL's *path* carries the token (Slack `.../services/T/B/XXXX`), so
+/// only the host is logged on failure.
+fn webhook_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
 }
 
 /// Resolve the webhook flavor: the explicit `kind`, else auto-detect from the
@@ -492,6 +527,17 @@ mod tests {
         let req = webhook_request(WebhookKind::Ntfy, &n);
         assert!(req.body.contains("エージェントが人の入力を待っています"));
         assert!(req.headers.iter().any(|(k, _)| *k == "Title"));
+    }
+
+    #[test]
+    fn webhook_host_is_the_non_secret_part() {
+        // The token lives in the path; only the host may be logged.
+        assert_eq!(
+            webhook_host("https://hooks.slack.com/services/T0/B0/secrettoken"),
+            "hooks.slack.com"
+        );
+        assert_eq!(webhook_host("https://ntfy.sh/mytopic?x=1"), "ntfy.sh");
+        assert_eq!(webhook_host("weird"), "weird");
     }
 
     #[test]

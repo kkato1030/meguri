@@ -30,29 +30,6 @@ pub fn schedule_marker(name: &str) -> String {
     format!("<!-- meguri:schedule name={name} -->")
 }
 
-/// Push a notification for each watched label the newly-created issue carries
-/// (per-project `[projects.notify]`, issue #205). Best-effort: the v1 label
-/// watch only sees issues meguri itself creates (this enqueue site); watching
-/// human-created issues needs a poll loop and is a separate issue.
-pub(crate) async fn notify_watched_labels(deps: &Deps, number: i64, title: &str, labels: &[&str]) {
-    let watched = deps
-        .project
-        .notify
-        .as_ref()
-        .map(|n| n.labels.as_slice())
-        .unwrap_or(&[]);
-    if watched.is_empty() {
-        return;
-    }
-    for label in labels {
-        if watched.iter().any(|w| w == label) {
-            deps.notifier
-                .notify(&Notification::label(number, title, label, None))
-                .await;
-        }
-    }
-}
-
 /// Epoch seconds now (the injected-clock seam: the scheduler passes this into
 /// [`sweep`], tests pass a fixed value).
 pub fn epoch_now() -> u64 {
@@ -198,7 +175,7 @@ async fn enqueue(deps: &Deps, sched: &ScheduleConfig, title: &str, body: &str) -
                 ScheduleKind::Plan => LABEL_PLAN,
             };
             let number = forge.create_issue(title, body, &[label]).await?;
-            notify_watched_labels(deps, number, title, &[label]).await;
+            deps.notify_created_issue(number, title, &[label]).await;
             Ok(number)
         }
         None => {
