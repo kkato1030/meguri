@@ -131,17 +131,20 @@ worker (author lane)      │           │
                   │
                   │  ここから先は run/pane を持たない「帯域外 sweep」(§2)
                   ▼
-     auto_merger.sweep (opt-in, ADR 0003)
-     条件が揃った PR に GitHub-native auto-merge を arm
+     auto_merger.sweep (opt-in, ADR 0003 / 0009)
+     native: 条件が揃った PR に GitHub-native auto-merge を arm
+     orchestrator: 同じ適格条件で meguri 自身が直接 merge
+     (private+Free 向けフォールバック、ADR 0009)
                   │
                   ▼
-     merge_watch.sweep (ADR 0007)
+     merge_watch.sweep (ADR 0007) — native の armed PR のみ監視
      conflict/red CI は fixer 系に委譲(no-op)。
      どのループも拾わない stall だけ meguri:needs-human で escalate
                   │
                   ▼
-        GitHub が branch protection + required checks で
-        マージを確定 → issue close(Closes #N)
+        native: GitHub が branch protection + required checks で
+        マージを確定 / orchestrator: meguri が MERGEABLE 報告時に
+        merge_pr → いずれも issue close(Closes #N)
 
 
 cleaner (standalone) ── パイプラインの外を独立に回る
@@ -185,8 +188,8 @@ conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → pr_r
 |---|---|---|
 | `scheduler_fire::sweep` | cron スケジュール(`[[projects.schedules]]`)を評価し、due なら issue/task を1件起票する(起票のみ、消化は既存ループ) | [0009-schedules-enqueue-only-not-a-cron-replacement](../adr/0009-schedules-enqueue-only-not-a-cron-replacement.md) |
 | `reaper::sweep` | close された issue の pane・worktree・マージ済みローカルブランチを回収 | [0004-issue-lane-pane-session-lifetime](../adr/0004-issue-lane-pane-session-lifetime.md) |
-| `auto_merger::sweep` | 条件が揃った PR に GitHub-native auto-merge を arm(opt-in) | [0003-auto-merge-github-native-arm-only](../adr/0003-auto-merge-github-native-arm-only.md) |
-| `merge_watch::sweep` | arm 済み PR のドリフト検出。conflict/red CI は fixer 系ループに委譲(no-op)、拾われない stall だけ escalate | [0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md) |
+| `auto_merger::sweep` | 適格な PR を `mode` で処理: `native` は GitHub-native auto-merge を arm、`orchestrator` は meguri 自身が `merge_pr` で直接マージ(opt-in、ADR 0009) | [0003-auto-merge-github-native-arm-only](../adr/0003-auto-merge-github-native-arm-only.md) |
+| `merge_watch::sweep` | native で arm 済みの PR のみドリフト検出(orchestrator の直接マージは監視対象外)。conflict/red CI は fixer 系ループに委譲(no-op)、拾われない stall だけ escalate | [0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md) |
 | `plan_handoff::sweep` | `plan_delivery = separate` 限定。spec PR が merge 済みの `speccing` issue を検知し `speccing`→`ready` に切替える(combined では no-op) | [0008-symmetric-plan-impl-review-loop](../adr/0008-symmetric-plan-impl-review-loop.md) |
 
 上表5つの実行順は固定(scheduler_fire → reaper → auto_merger → merge_watch → plan_handoff)。`scheduler_fire` が起票した issue/task はその tick の discovery を既に過ぎているため次 tick で拾われる(poll_interval 粒度なので実害なし)。auto_merger → merge_watch の順は、新しく arm した PR を同じ tick 内で merge_watch が一度観測できるようにするため。`scheduler_fire` の状態(最終発火時刻)は forge ではなく sqlite の `schedule_state` に置く — 定義は config 側(hot reload 対象)にあり、Authority 原則の「forge が唯一の永続状態」の例外として、これは純粋にローカルなスケジューラの進行管理だから(cleaner の interval と同種)。`plan_handoff` の後には `routing_drift` / `reconcile` という discovery 系の sweep がさらに続くが、いずれも loop パイプラインではなく discovery の鮮度・再着手検知が役割のため本 doc のスコープ外(表に含めない)。
