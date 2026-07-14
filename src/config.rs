@@ -42,15 +42,18 @@ pub fn repos_root() -> PathBuf {
 pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目だけ書けば、残りは既定値が使われます。
 # 既定値一覧は README を参照。
 
-[[projects]]
-id = "myproj"
-repo_slug = "owner/repo"
+# プロジェクトは `meguri add-project owner/repo` で追加します(1 コマンドで下の
+# [[projects]] を追記し、clone まで実体化する)。手書きしたいときは下の例のコメントを
+# 外して編集してください。init 直後はプロジェクト 0 件です。
+# [[projects]]
+# id = "myproj"
+# repo_slug = "owner/repo"
 # repo_path = "/abs/path/to/clone"  # 省略すると ~/.meguri/repos/<id> に bare clone を自動実体化。
-                                    # 手元の clone を使いたいときだけ絶対パスを明示(従来どおり)。
+#                                   # 手元の clone を使いたいときだけ絶対パスを明示(従来どおり)。
 # default_branch = "main"
 # check_command = "cargo test"
 # mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、repo_path は必須、
-                      # 成果物はローカルブランチ)。`meguri add "タスク"` で投入。詳細は README を参照。
+#                     # 成果物はローカルブランチ)。`meguri add "タスク"` で投入。詳細は README を参照。
 
 # [projects.worktree_setup]                  # worktree 準備のたびに(再利用時も)実行する汎用フック
 # commands = ["apm install --frozen"]        # 例: agent 指示ファイルの再生成。apm 専用ではなく任意コマンド列
@@ -1761,7 +1764,7 @@ fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
 /// `/`, `.`, `..`, or an empty string must fail loudly at load time rather than
 /// silently placing a clone outside `~/.meguri/repos`. Same "interpret as a
 /// path and reject dangerous components" stance as [`validate_repo_relative`].
-fn validate_project_id(id: &str) -> Result<()> {
+pub fn validate_project_id(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("project id must not be empty");
     }
@@ -1783,6 +1786,114 @@ fn validate_project_id(id: &str) -> Result<()> {
              (no `/`, `\\`, `.`, `..`, or leading `/`)"
         ),
     }
+}
+
+/// Reject an `owner/repo` slug that is not a safe, GitHub-shaped identifier
+/// (issue #196). Two gates: a conservative character set (`[A-Za-z0-9._-]`,
+/// exactly one `/`, both halves non-empty) and an explicit per-component check
+/// that rejects `.`/`..` — which the character set alone would let through — so
+/// a slug can never carry path traversal or, once written into config.toml,
+/// inject beyond its own `key = "..."`.
+pub fn validate_repo_slug(slug: &str) -> Result<()> {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!("repo slug {slug:?} must be exactly \"owner/repo\"");
+    };
+    for (label, part) in [("owner", owner), ("repo", repo)] {
+        if part.is_empty() {
+            anyhow::bail!("repo slug {slug:?} has an empty {label}");
+        }
+        if part == "." || part == ".." {
+            anyhow::bail!("repo slug {slug:?} {label} must not be `.` or `..`");
+        }
+        if !part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            anyhow::bail!(
+                "repo slug {slug:?} {label} has an invalid character \
+                 (allowed: letters, digits, `.`, `_`, `-`)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The default project id derived from an `owner/repo` slug: the repo half. The
+/// caller still runs it through [`validate_project_id`] (a repo name may hold
+/// characters an id may not) and asks for `--id` if it fails.
+pub fn default_id_from_slug(slug: &str) -> &str {
+    slug.rsplit('/').next().unwrap_or(slug)
+}
+
+/// The default project id derived from a local path: its final component.
+pub fn default_id_from_path(path: &Path) -> Option<&str> {
+    path.file_name().and_then(|s| s.to_str())
+}
+
+/// A new `[[projects]]` entry to append to config.toml (issue #196). Only the
+/// keys an add-project is allowed to set; every value is written through the
+/// TOML serializer (see [`render_project_block`]), so a string carrying quotes,
+/// newlines, or backslashes is escaped rather than injected.
+#[derive(Debug, Serialize)]
+pub struct ProjectDraft {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// Omitted for the default (github) mode; `Some("local")` for local mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProjectsDoc<'a> {
+    projects: &'a [ProjectDraft],
+}
+
+/// Render a single `[[projects]]` block for `draft` via the TOML serializer —
+/// the escape boundary that makes the append injection-safe.
+pub fn render_project_block(draft: &ProjectDraft) -> Result<String> {
+    let doc = ProjectsDoc {
+        projects: std::slice::from_ref(draft),
+    };
+    toml::to_string(&doc).context("serializing the new [[projects]] block")
+}
+
+/// Append a `[[projects]]` block to the config file, preserving every existing
+/// byte — comments, key order, hand edits (issue #196, ADR 0019). TOML's
+/// array-of-tables can always be extended at EOF, so a plain text append is the
+/// whole mechanism (no re-serialization of the existing file). Atomic: the new
+/// content is written to a sibling temp file and renamed over the original.
+pub fn append_project(cfg_path: &Path, draft: &ProjectDraft) -> Result<()> {
+    let block = render_project_block(draft)?;
+    let existing = std::fs::read_to_string(cfg_path)
+        .with_context(|| format!("cannot read config at {}", cfg_path.display()))?;
+    let mut out = existing;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&block);
+    write_atomic(cfg_path, &out)
+}
+
+/// Overwrite a file atomically (temp file in the same directory + rename). Used
+/// by [`append_project`] and by add-project's rollback path (restore the
+/// original bytes if the appended config fails to reparse).
+pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let base = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config.toml");
+    let tmp = dir.join(format!(".{base}.tmp-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("writing temp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 /// Reject a configured preamble path that could escape the repo lexically: an
@@ -2341,22 +2452,24 @@ language = "English"
 
     #[test]
     fn init_template_is_minimal_and_loads_with_defaults() {
-        // Only the projects stub is active; every other section stays commented.
+        // No table is active — the projects stub is commented too (issue #196):
+        // a fresh `meguri init` config has zero live projects, so `add-project`
+        // appends the first one without leaving a dummy `owner/repo` behind.
         let active_tables: Vec<&str> = INIT_TEMPLATE
             .lines()
             .filter(|l| l.trim_start().starts_with('['))
             .collect();
-        assert_eq!(active_tables, vec!["[[projects]]"]);
+        assert!(
+            active_tables.is_empty(),
+            "no live table expected, got {active_tables:?}"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, INIT_TEMPLATE).unwrap();
         let cfg = Config::load_from(&path).unwrap();
 
-        let p = cfg.project("myproj").unwrap();
-        assert_eq!(p.repo_slug.as_deref(), Some("owner/repo"));
-        assert_eq!(p.default_branch, "main");
-        assert_eq!(p.check_command, None);
+        assert!(cfg.projects.is_empty(), "fresh init has no live projects");
 
         // Omitted sections/keys fall back to the serde defaults.
         assert_eq!(cfg.language, None);
