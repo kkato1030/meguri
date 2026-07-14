@@ -106,6 +106,17 @@ materialization は skip して `spec-ready → spec-reviewing` に戻す — gu
 開くモード、ADR 0008 §3)では status を書く者がいないため条件も課さない — 承認ゲートのオプトアウトと
 head 一致条件は同じスイッチで外れる。
 
+per-head status は「**今の** head がレビュー済みか」しか証明しない。子の安定 key(§3)は
+`親 + index` のみなので、materialization が一部の子を作った後に head が更新・再承認されると、
+旧 head の子を新 head の同 index の子として graph 照合が採用しうる — 2つのレビュー済み spec の
+混成が実体化される。そこで **掃引横断の head pin** を足す: materialization は最初の子を作る前に
+親 body へ実行 head を記録し(`<!-- meguri:decompose-head sha=… -->`)、記録と異なる承認 head に
+出会ったら**停止して親 issue に `meguri:needs-human` を付け、人間判断へ回す**(子 issue は
+不可逆なので自動 reconcile はしない。旧 head へ戻して再承認するか、旧 head 起点の子とマーカーを
+整理するかは人間が選ぶ)。pin は guard の有無に依らず課す — 部分実体化の一貫性の問題であって、
+承認ゲートのオプトアウトでは外れない。issue ラベルがフェーズ/ボールの正本(ADR 0005)なので、
+親の `meguri:hold` / `meguri:needs-human` は(提案 PR 側のラベル同様)掃引全体の停止条件でもある。
+
 ### 6. planner の判断は in-context のまま(専用の判定ループを作らない)
 
 実装 spec を書くか分解提案 spec を書くかは planner の in-context 判断。基準は「複数の独立 PR として

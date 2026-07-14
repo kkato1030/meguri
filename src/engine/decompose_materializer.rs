@@ -15,7 +15,9 @@
 //! created?" (strongly consistent, includes closed children), joined by a stable
 //! per-child body key, with an all-state marker search covering the narrow
 //! create→link window (a reservation marker + defer keeps that window from ever
-//! double-creating).
+//! double-creating). A parent-body head pin ties a partially materialized
+//! proposal to the approved head it started under, so a re-pushed and
+//! re-approved head can never silently adopt the old head's children.
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -64,6 +66,33 @@ fn parse_reserve_attempt(body: &str, idx: usize) -> Option<u32> {
 /// `slug#number` (a fast path; the dependency graph is the real authority).
 fn ledger_marker(idx: usize, slug: &str, number: i64) -> String {
     format!("<!-- meguri:decompose-ledger idx={idx} issue={slug}#{number} -->")
+}
+
+/// The parent-body pin recording which head this parent's materialization ran
+/// (or is running) against. The per-child stable key is `parent + idx` only,
+/// so without this pin a partially materialized proposal whose head was
+/// re-pushed and re-approved would adopt the *old* head's children as the new
+/// head's same-index children — silently breaking "the reviewed children block
+/// is what gets materialized" (ADR 0012 §5). Written before the first child is
+/// created; a mismatch halts the sweep and escalates to a human.
+const HEAD_PIN_PREFIX: &str = "<!-- meguri:decompose-head sha=";
+
+/// The full head pin for `sha`.
+fn head_pin(sha: &str) -> String {
+    format!("{HEAD_PIN_PREFIX}{sha} -->")
+}
+
+/// The pinned materialization head recorded in the parent body, if any.
+fn parse_head_pin(body: &str) -> Option<String> {
+    body.lines().find_map(|l| {
+        Some(
+            l.trim()
+                .strip_prefix(HEAD_PIN_PREFIX)?
+                .strip_suffix("-->")?
+                .trim()
+                .to_string(),
+        )
+    })
 }
 
 /// Idempotent error-comment marker so a malformed proposal is flagged on the PR
@@ -116,6 +145,18 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
 /// safe this sweep; anything unfinished is retried next tick (the proposal PR
 /// stays open until the single commit point — closing it — succeeds).
 async fn process(deps: &Deps, pr: &forge::PullRequest, parent: i64) -> Result<()> {
+    // Stop / ball labels on the *parent issue* halt materialization too: the
+    // issue's labels are the canonical phase/ball record (2-axis model, ADR
+    // 0005), so a human pausing (`hold`) or escalating (`needs-human`) the
+    // parent must stop the irreversible child creation even when the proposal
+    // PR itself carries no such label. Checked before the head gate so a held
+    // parent is left completely untouched (no spec-ready/reviewing churn).
+    let parent_issue = deps.forge().get_issue(parent).await?;
+    if parent_issue.has_label(forge::LABEL_HOLD) || parent_issue.has_label(forge::LABEL_NEEDS_HUMAN)
+    {
+        return Ok(());
+    }
+
     // Head-motion gate: only materialize the head the guard actually reviewed
     // (ADR 0012 §5). The approval trail is the per-head guard-review status.
     let guard_on = deps.config.review_for(&deps.project).guard.plan;
@@ -189,6 +230,20 @@ async fn materialize(
     let allowed_refs: Vec<&str> = allowed.iter().map(String::as_str).collect();
     if let Err(problem) = planner::validate_children(&children, &allowed_refs) {
         return report_error(deps, pr, &format!("children block is invalid: {problem}")).await;
+    }
+
+    // Head pin (cross-sweep half of the head-motion gate, ADR 0012 §5): the
+    // per-sweep guard-status check proves the *current* head was reviewed, but
+    // a materialization that started under an earlier approved head may have
+    // already created children keyed only by `parent + idx`. Adopting those as
+    // this head's children would materialize a mix of two reviewed specs, so a
+    // pinned head that differs stops everything and hands the parent to a
+    // human (children are irreversible; no automatic reconciliation).
+    let parent_body = deps.forge().get_issue(parent).await?.body;
+    match parse_head_pin(&parent_body) {
+        None => append_parent_marker(deps, parent, &head_pin(&pr.head_sha)).await?,
+        Some(pinned) if pinned == pr.head_sha => {} // resuming the same head
+        Some(pinned) => return report_head_conflict(deps, pr, parent, &pinned).await,
     }
 
     // Adopt-or-create each child in dependency order, idempotently.
@@ -534,6 +589,63 @@ fn upsert_block(body: &str, block: &str) -> String {
     }
 }
 
+/// A materialization that began under a different (previously approved) head:
+/// halt before creating anything, put the ball on the parent issue
+/// (`meguri:needs-human` — the issue's labels are the canonical ball, so the
+/// parent-label stop gate keeps every later sweep away), and explain once per
+/// head on the proposal PR. A human resolves it by either restoring the pinned
+/// head (and re-approving it) or cleaning up the old head's children and the
+/// parent's `meguri:decompose-*` markers before removing the label.
+async fn report_head_conflict(
+    deps: &Deps,
+    pr: &forge::PullRequest,
+    parent: i64,
+    pinned: &str,
+) -> Result<()> {
+    deps.forge()
+        .add_label(parent, forge::LABEL_NEEDS_HUMAN)
+        .await?;
+    let marker = format!(
+        "<!-- meguri:decompose-head-conflict pinned={pinned} head={} -->",
+        pr.head_sha
+    );
+    let existing = deps
+        .forge()
+        .pr_comments(pr.number)
+        .await
+        .unwrap_or_default();
+    if !existing.iter().any(|c| c.contains(&marker)) {
+        deps.forge()
+            .comment_pr(
+                pr.number,
+                &format!(
+                    "⚠️ **meguri**: この分解提案は head `{pinned}` で materialize を開始済みですが、\
+                     承認された head が `{}` に変わっています。旧 head 起点の子 issue を新 head の\
+                     子として採用すると「レビューされた children = 実体化される children」が壊れる\
+                     ため、停止して親 issue に `meguri:needs-human` を付けました。\n\n\
+                     対処: (a) 旧 head の切り方で続行するなら head を `{pinned}` に戻して再承認する、\
+                     (b) 新 head で進めるなら旧 head 起点の子 issue と親 body の \
+                     `meguri:decompose-*` マーカーを整理する — その上で親の `meguri:needs-human` を\
+                     外してください。\n\n{marker}",
+                    pr.head_sha
+                ),
+            )
+            .await
+            .ok();
+    }
+    deps.store.emit(
+        None,
+        "issue.materialize_head_conflict",
+        json!({ "parent": parent, "pr": pr.number, "pinned": pinned, "head": pr.head_sha }),
+    )?;
+    tracing::warn!(
+        "decompose proposal PR #{} approved head {} conflicts with pinned materialization head {pinned}; escalated to human",
+        pr.number,
+        pr.head_sha
+    );
+    Ok(())
+}
+
 /// Post a one-shot error comment on a malformed proposal (no issue is created).
 async fn report_error(deps: &Deps, pr: &forge::PullRequest, problem: &str) -> Result<()> {
     let marker = error_marker(&pr.head_sha);
@@ -839,6 +951,102 @@ mod tests {
             "held proposal is not materialized"
         );
         assert_eq!(forge.get_pr(10).await.unwrap().state, "open");
+    }
+
+    #[tokio::test]
+    async fn process_skips_a_parent_with_stop_labels_untouched() {
+        // `hold` / `needs-human` on the *parent issue* (the canonical
+        // phase/ball record) halt materialization entirely — no children, and
+        // no spec-ready → spec-reviewing churn either (finding: parent stop
+        // labels). Without the skip, the guard gate would flip the labels
+        // because HEAD carries no guard-review status.
+        let (forge, deps) = setup();
+        for label in [crate::forge::LABEL_HOLD, crate::forge::LABEL_NEEDS_HUMAN] {
+            forge.add_label(1, label).await.unwrap();
+            let pr = pr_of(&forge).await;
+            process(&deps, &pr, 1).await.unwrap();
+            assert_eq!(forge.all_issues().len(), 1, "no children under {label}");
+            let labels = forge.pr_labels_of(10);
+            assert!(
+                labels.contains(&crate::forge::LABEL_SPEC_READY.to_string()),
+                "spec-ready kept under {label}"
+            );
+            assert!(
+                !labels.contains(&crate::forge::LABEL_SPEC_REVIEWING.to_string()),
+                "not flipped to spec-reviewing under {label}"
+            );
+            forge.remove_label(1, label).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_pins_the_approved_head_on_the_parent() {
+        let (forge, deps) = setup();
+        let pr = pr_of(&forge).await;
+        materialize(&deps, &pr, 1, "me/proj", &two_children())
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_head_pin(&forge.get_issue(1).await.unwrap().body).as_deref(),
+            Some(HEAD),
+            "the parent records which head was materialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_halts_and_escalates_when_pinned_to_a_different_head() {
+        // A previous sweep began materializing under another approved head:
+        // the pin and child A (idx 0, old spec) already exist. The head then
+        // moved and got re-approved. Adopting old-head children as the new
+        // head's same-index children would break "reviewed children block =
+        // what gets materialized", so the sweep must stop and hand the parent
+        // to a human (finding: stable key is parent+idx only).
+        let (forge, deps) = setup();
+        forge
+            .update_issue_body(1, &head_pin("sha-old"))
+            .await
+            .unwrap();
+        let key = decompose_child_key("me/proj#1", 0);
+        let child_a = forge
+            .create_issue(
+                "Old Child A",
+                &format!("do a\n{key}"),
+                &[crate::forge::LABEL_READY],
+            )
+            .await
+            .unwrap();
+        forge.block_issue(1, child_a);
+
+        let pr = pr_of(&forge).await; // approved head = HEAD != sha-old
+        materialize(&deps, &pr, 1, "me/proj", &two_children())
+            .await
+            .unwrap();
+
+        // Nothing created or adopted; the proposal PR stays open; the ball is
+        // on the parent issue, which also keeps later sweeps away.
+        assert_eq!(forge.all_issues().len(), 2, "no new children");
+        assert_eq!(forge.get_pr(10).await.unwrap().state, "open");
+        assert!(
+            forge
+                .labels_of(1)
+                .contains(&crate::forge::LABEL_NEEDS_HUMAN.to_string()),
+            "parent escalated to needs-human"
+        );
+        assert_eq!(forge.pr_comments_of(10).len(), 1, "one conflict comment");
+
+        // Idempotent per head: a re-run adds no second comment.
+        materialize(&deps, &pr, 1, "me/proj", &two_children())
+            .await
+            .unwrap();
+        assert_eq!(forge.pr_comments_of(10).len(), 1);
+        assert_eq!(forge.all_issues().len(), 2);
+    }
+
+    #[test]
+    fn head_pin_round_trips() {
+        let body = format!("intro\n{}\ntail", head_pin("abc123"));
+        assert_eq!(parse_head_pin(&body).as_deref(), Some("abc123"));
+        assert_eq!(parse_head_pin("no pin here"), None);
     }
 
     #[tokio::test]
