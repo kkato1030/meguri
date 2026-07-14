@@ -109,7 +109,7 @@ async fn setup_with_triage(triage: TriageConfig) -> TestEnv {
         .insert("triage".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone.clone(),
+        repo_path: Some(clone.clone()),
         repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,

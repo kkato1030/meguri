@@ -81,7 +81,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         .insert("self-reviewer".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -305,7 +305,7 @@ async fn worker_happy_path_issue_to_pr() {
     );
 
     // The branch actually landed on origin.
-    let clone = &env.deps.project.repo_path;
+    let clone = env.deps.project.repo_path.as_ref().unwrap();
     let branches = run_git(clone, &["ls-remote", "--heads", "origin"])
         .await
         .unwrap();
@@ -436,7 +436,7 @@ async fn worker_prompt_carries_repo_pr_template() {
 
     // Ship a PR template in the repo so the worktree (cut from origin/main)
     // contains it.
-    let clone = env.deps.project.repo_path.clone();
+    let clone = env.deps.project.repo_path.clone().unwrap();
     std::fs::create_dir_all(clone.join(".github")).unwrap();
     std::fs::write(
         clone.join(".github/pull_request_template.md"),
@@ -656,7 +656,7 @@ async fn worker_needs_plan_with_existing_spec_escalates_to_human() {
 
     // The issue already went through planning: its spec is merged on main,
     // so the worker's worktree contains it.
-    let clone = env.deps.project.repo_path.clone();
+    let clone = env.deps.project.repo_path.clone().unwrap();
     std::fs::create_dir_all(clone.join("docs/specs")).unwrap();
     std::fs::write(clone.join("docs/specs/issue-7.md"), "# Spec\n").unwrap();
     run_git(&clone, &["add", "docs/specs"]).await.unwrap();
@@ -1331,7 +1331,7 @@ async fn repo_check_command_from_meguri_toml_is_applied() {
     // Host project has no check_command; the repo declares one plus pr.draft.
     let env = setup(None).await;
     seed_repo_toml(
-        &env.deps.project.repo_path,
+        env.deps.project.repo_path.as_ref().unwrap(),
         "check_command = \"test -f greeting.txt\"\n\n[pr]\ndraft = false\n",
     )
     .await;
@@ -1383,7 +1383,7 @@ async fn run_pins_repo_check_command_against_mid_run_tamper() {
     // tampered command never runs.
     let env = setup(None).await;
     seed_repo_toml(
-        &env.deps.project.repo_path,
+        env.deps.project.repo_path.as_ref().unwrap(),
         "check_command = \"test -f greeting.txt\"\n",
     )
     .await;
@@ -1445,7 +1445,7 @@ async fn invalid_repo_config_warns_and_falls_back() {
     // warned about, an event is emitted, and the run continues on host config.
     let env = setup(None).await;
     seed_repo_toml(
-        &env.deps.project.repo_path,
+        env.deps.project.repo_path.as_ref().unwrap(),
         "check_command = \"x\"\nrepo_slug = \"me/x\"\n", // host-only key → parse error
     )
     .await;

@@ -455,7 +455,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint)
     let dir = format!("pr-reviewer-{}", run.issue_number);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
     gitops::create_review_worktree(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         &wt,
         &cp.head_branch,
         &cp.head_sha,
@@ -927,7 +927,7 @@ mod tests {
             );
             let project = crate::config::ProjectConfig {
                 id: "proj".into(),
-                repo_path: "/tmp/unused".into(),
+                repo_path: Some("/tmp/unused".into()),
                 repo_slug: Some("me/proj".into()),
                 mode: Default::default(),
                 deliver: None,
@@ -1007,7 +1007,7 @@ mod tests {
         );
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,
@@ -1111,7 +1111,7 @@ mod tests {
         ));
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path: repo.path().to_path_buf(),
+            repo_path: Some(repo.path().to_path_buf()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

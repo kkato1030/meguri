@@ -334,8 +334,7 @@ impl super::Loop for TriageLoop {
             return Ok(Vec::new());
         }
         let head =
-            gitops::default_branch_head(&deps.project.repo_path, &deps.project.default_branch)
-                .await?;
+            gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
         let max_open = max_open_issue(deps).await?;
         let marker = report.as_ref().and_then(|i| parse_triage_marker(&i.body));
         if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
@@ -530,7 +529,7 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &TriageCheckpoint) ->
 }
 
 async fn remove_worktree_best_effort(deps: &Deps, run: &RunRecord, worktree: &Path) {
-    if let Err(e) = gitops::remove_worktree(&deps.project.repo_path, worktree).await {
+    if let Err(e) = gitops::remove_worktree(&deps.repo_path(), worktree).await {
         tracing::warn!(
             "cannot remove triage worktree {}: {e:#}",
             worktree.display()
@@ -581,8 +580,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut TriageCheckpoint) -
         parse_triage_marker(&issue.body)
     };
 
-    let head =
-        gitops::default_branch_head(&deps.project.repo_path, &deps.project.default_branch).await?;
+    let head = gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
     let max_open = max_open_issue(deps).await?;
     if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
         return Ok(Prepared::Skip(format!(
@@ -614,7 +612,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -
     let dir = format!("triage-{}", run.id);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
     gitops::create_review_worktree(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         &wt,
         &deps.project.default_branch,
         &cp.head_sha,

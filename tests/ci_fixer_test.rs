@@ -87,7 +87,7 @@ async fn setup() -> TestEnv {
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         check_command: None,
@@ -236,7 +236,7 @@ async fn origin_tip(clone: &Path) -> String {
 async fn ci_fixer_happy_path_commits_the_fix_and_pushes() {
     let env = setup().await;
     let run = create_ci_fixer_run(&env);
-    let clone = env.deps.project.repo_path.clone();
+    let clone = env.deps.project.repo_path.clone().unwrap();
     let tip_before = origin_tip(&clone).await;
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
@@ -464,9 +464,12 @@ async fn ci_fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     );
 
     // Nothing was pushed.
-    let tip = origin_tip(&env.deps.project.repo_path).await;
-    let pr_commit = run_git(&env.deps.project.repo_path, &["rev-parse", PR_BRANCH])
-        .await
-        .unwrap();
+    let tip = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
+    let pr_commit = run_git(
+        env.deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", PR_BRANCH],
+    )
+    .await
+    .unwrap();
     assert_eq!(tip, pr_commit);
 }

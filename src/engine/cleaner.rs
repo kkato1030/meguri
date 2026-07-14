@@ -256,8 +256,7 @@ impl super::Loop for CleanerLoop {
             return Ok(Vec::new());
         }
         let head =
-            gitops::default_branch_head(&deps.project.repo_path, &deps.project.default_branch)
-                .await?;
+            gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
         let marker = report.as_ref().and_then(|i| parse_clean_marker(&i.body));
         let interval = deps.config.clean_for(&deps.project).interval_hours * 3600;
         if !needs_scan(marker.as_ref(), &head, epoch_now(), interval) {
@@ -442,7 +441,7 @@ fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &CleanCheckpoint) -> 
 }
 
 async fn remove_worktree_best_effort(deps: &Deps, run: &RunRecord, worktree: &Path) {
-    if let Err(e) = gitops::remove_worktree(&deps.project.repo_path, worktree).await {
+    if let Err(e) = gitops::remove_worktree(&deps.repo_path(), worktree).await {
         tracing::warn!(
             "cannot remove cleaner worktree {}: {e:#}",
             worktree.display()
@@ -493,8 +492,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord, cp: &mut CleanCheckpoint) ->
         parse_clean_marker(&issue.body)
     };
 
-    let head =
-        gitops::default_branch_head(&deps.project.repo_path, &deps.project.default_branch).await?;
+    let head = gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
     let interval = deps.config.clean_for(&deps.project).interval_hours * 3600;
     if !needs_scan(marker.as_ref(), &head, epoch_now(), interval) {
         return Ok(Prepared::Skip(format!(
@@ -524,7 +522,7 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) ->
     let dir = format!("clean-{}", run.id);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
     gitops::create_review_worktree(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         &wt,
         &deps.project.default_branch,
         &cp.head_sha,
@@ -878,14 +876,14 @@ async fn stale_branches(deps: &Deps, head_sha: &str, stale_days: u64) -> Result<
         .collect();
     let now = epoch_now() as i64;
     let mut stale = Vec::new();
-    for branch in gitops::list_remote_branches(&deps.project.repo_path).await? {
+    for branch in gitops::list_remote_branches(&deps.repo_path()).await? {
         if branch.name == deps.project.default_branch || pr_heads.contains(&branch.name) {
             continue;
         }
         let age_days = (now.saturating_sub(branch.committer_unix)).max(0) as u64 / 86_400;
         // Errors (unknown refs, shallow history) count as "not merged".
         let merged = gitops::is_ancestor(
-            &deps.project.repo_path,
+            &deps.repo_path(),
             &format!("refs/remotes/origin/{}", branch.name),
             head_sha,
         )

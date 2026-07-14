@@ -195,13 +195,13 @@ async fn process(deps: &Deps, pr: &forge::PullRequest, parent: i64) -> Result<()
     // Read the proposal spec from the exact approved head (not the working
     // tree). Fetch first; if the branch tip moved under us mid-sweep, skip and
     // let the next tick re-evaluate the new head.
-    let repo_path = std::path::Path::new(&deps.project.repo_path);
-    let tip = gitops::fetch_branch_tip(repo_path, &pr.head_branch).await?;
+    let repo_path = deps.repo_path();
+    let tip = gitops::fetch_branch_tip(&repo_path, &pr.head_branch).await?;
     if tip != pr.head_sha {
         return Ok(()); // head moved during the sweep; re-evaluate next tick
     }
     let spec_path = planner::spec_rel_path(parent);
-    let spec = gitops::show_file_at_ref(repo_path, &pr.head_sha, &spec_path).await?;
+    let spec = gitops::show_file_at_ref(&repo_path, &pr.head_sha, &spec_path).await?;
 
     materialize(deps, pr, parent, &parent_slug, &spec).await
 }
@@ -765,7 +765,7 @@ mod tests {
     fn project() -> crate::config::ProjectConfig {
         crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

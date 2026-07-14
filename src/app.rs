@@ -227,11 +227,12 @@ async fn add_github(
         }))
     };
 
+    let repo_path = cfg.repo_path_for(project);
     let params = AddParams {
         text,
         labels: &labels,
         repo_slug,
-        repo_path: &project.repo_path,
+        repo_path: &repo_path,
         language: cfg.language_for(project),
     };
     add_core(&forge, params, refiner_source).await?;
@@ -398,10 +399,11 @@ pub fn infer_project<'a>(
         .projects
         .iter()
         .filter(|p| {
-            let rp = p
-                .repo_path
-                .canonicalize()
-                .unwrap_or_else(|_| p.repo_path.clone());
+            // A managed clone is bare (no working tree the cwd could sit under),
+            // so this cwd-based match only ever hits explicit-`repo_path`
+            // projects — which is the intended pre-managed-clone behavior.
+            let effective = cfg.repo_path_for(p);
+            let rp = effective.canonicalize().unwrap_or(effective);
             // starts_with is component-wise, so `/repo` never matches `/repo2`.
             cwd_c.starts_with(&rp)
         })
@@ -477,6 +479,10 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
         );
     }
     let deps = build_deps(&cfg, project, mux_override)?;
+
+    // Materialize the managed bare clone before anything touches `repo_path`
+    // (ADR 0018) — the one-shot counterpart of the scheduler's tick-top hook.
+    engine::ensure_project_clone(&deps).await?;
 
     let gh_issue = deps.forge().get_issue(issue).await?;
     // Manual run bypasses the cadence gate (it is a human's explicit override —

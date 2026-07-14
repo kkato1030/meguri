@@ -2,7 +2,7 @@
 //! dispatch. Loops discover targets (e.g. labeled GitHub issues); sqlite
 //! only tracks runs, and `runs.loop_kind` routes each run to its loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,17 +95,31 @@ impl Scheduler {
                 }
             }
 
+            // Materialize any declared-but-missing managed clones BEFORE anything
+            // touches `repo_path` (ADR 0018). Must precede redispatch, discover,
+            // AND the sweeps: redispatch runs before discover, discover is
+            // skipped when slots are full, and the sweeps touch `repo_path`
+            // outside discover — so a hook placed in any one of them would leave
+            // a window where an un-cloned project is processed. A project whose
+            // clone can't be materialized is excluded from this whole tick and
+            // retried next tick.
+            let ready = self.ensure_projects_ready().await;
+
             // Re-dispatch interrupted/queued runs before discovering new
             // work, every tick rather than only at watch startup (#183): a
             // pane that died mid-execute resumes from its checkpoint within
             // one poll_interval instead of staying stuck until the next
             // `meguri daemon restart`.
-            if let Err(e) = self.redispatch_interrupted(&store, &mut running, &mut active_run_ids) {
+            if let Err(e) =
+                self.redispatch_interrupted(&store, &ready, &mut running, &mut active_run_ids)
+            {
                 tracing::warn!("redispatch failed: {e:#}");
             }
 
             if active_weight(&active_run_ids) < self.max_concurrent
-                && let Err(e) = self.discover(&mut running, &mut active_run_ids).await
+                && let Err(e) = self
+                    .discover(&ready, &mut running, &mut active_run_ids)
+                    .await
             {
                 tracing::warn!("discovery failed: {e:#}");
             }
@@ -121,6 +135,11 @@ impl Scheduler {
             // review pane per issue, kept until it closes; #13, #92).
             // Runs on the first tick too, i.e. as startup recovery.
             for deps in &self.projects {
+                // Skip a project whose managed clone isn't ready this tick (the
+                // sweeps below touch `repo_path`); it retries next tick.
+                if !ready.contains(&deps.project.id) {
+                    continue;
+                }
                 if let Err(e) = super::scheduler_fire::sweep(deps, now).await {
                     tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
                 }
@@ -184,6 +203,7 @@ impl Scheduler {
     /// targets go oldest-first (FIFO by issue/PR number).
     async fn discover(
         &self,
+        ready: &HashSet<String>,
         running: &mut JoinSet<String>,
         active: &mut HashMap<String, usize>,
     ) -> Result<()> {
@@ -197,6 +217,11 @@ impl Scheduler {
             for deps in &self.projects {
                 if active_weight(active) >= self.max_concurrent {
                     return Ok(());
+                }
+                // Skip a project whose managed clone isn't ready this tick
+                // (`lp.discover` touches `repo_path`); it retries next tick.
+                if !ready.contains(&deps.project.id) {
+                    continue;
                 }
                 let mut targets = lp.discover(deps).await?;
                 // Sort by the coordination key: issue_number is no longer the
@@ -255,9 +280,30 @@ impl Scheduler {
     /// also guards against double-dispatching a run this loop already
     /// spawned earlier in the same tick, or in a still-running previous
     /// tick, whose store status hasn't caught up to `running` yet.
+    /// Materialize declared-but-missing managed clones and return the set of
+    /// project ids ready to process this tick. A project whose clone can't be
+    /// materialized is excluded (a `tracing::warn!` per failing tick, matching
+    /// the sweep-failure idiom; the event is emitted inside
+    /// [`super::ensure_project_clone`]) and retried next tick.
+    async fn ensure_projects_ready(&self) -> HashSet<String> {
+        let mut ready = HashSet::with_capacity(self.projects.len());
+        for deps in &self.projects {
+            match super::ensure_project_clone(deps).await {
+                Ok(()) => {
+                    ready.insert(deps.project.id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!("clone prep failed for {}: {e:#}", deps.project.id);
+                }
+            }
+        }
+        ready
+    }
+
     fn redispatch_interrupted(
         &self,
         store: &Store,
+        ready: &HashSet<String>,
         running: &mut JoinSet<String>,
         active: &mut HashMap<String, usize>,
     ) -> Result<()> {
@@ -266,6 +312,10 @@ impl Scheduler {
                 break;
             }
             if active.contains_key(&run.id) {
+                continue;
+            }
+            // Don't resume a run whose managed clone isn't ready this tick.
+            if !ready.contains(&run.project_id) {
                 continue;
             }
             if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
@@ -398,7 +448,7 @@ mod tests {
         }
         let project = ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

@@ -56,6 +56,148 @@ pub fn repo_toplevel_sync(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(top))
 }
 
+/// The fetch refspec meguri sets on a managed bare clone. `git clone --bare`
+/// leaves `remote.origin.fetch` unset, so `refs/remotes/origin/*` would never
+/// update and every `origin/<default>` lookup would silently fall back to a
+/// stale local ref. Setting this (and doing an initial fetch) makes the managed
+/// clone behave like a normal `origin`-tracking repo. NOT `--mirror`'s
+/// `+refs/*:refs/*`, which would prune the in-flight `meguri/*` branches.
+const MANAGED_FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+
+/// Health of a candidate managed-clone directory (see [`ensure_bare_clone`]).
+/// `doctor` reads it too, to tell "declared but not cloned yet" (normal) from
+/// "clone failed / broken remnant".
+#[derive(Debug)]
+pub enum CloneHealth {
+    /// A well-formed managed bare clone — [`ensure_bare_clone`] is a no-op.
+    Healthy,
+    /// Nothing there yet (missing or empty dir) — clone into it.
+    Absent,
+    /// Something is there but it is not a healthy managed clone (a stray file,
+    /// a non-bare repo, a clone interrupted before the initial fetch). Carries a
+    /// human-readable reason; [`ensure_bare_clone`] refuses to touch it.
+    Broken(String),
+}
+
+/// Classify a managed-clone directory. Deliberately stricter than "does `HEAD`
+/// exist": a clone that died after `git clone --bare` wrote `HEAD` but before
+/// the refspec/fetch completed must be caught as `Broken`, not silently treated
+/// as healthy (which would make later `origin/<default>` lookups fail obscurely).
+pub async fn clone_health(dest: &Path) -> CloneHealth {
+    match std::fs::read_dir(dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CloneHealth::Absent,
+        Err(e) => return CloneHealth::Broken(format!("cannot read {}: {e}", dest.display())),
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                return CloneHealth::Absent; // exists but empty
+            }
+        }
+    }
+    match run_git(dest, &["rev-parse", "--is-bare-repository"]).await {
+        Ok(out) if out.trim() == "true" => {}
+        Ok(out) => return CloneHealth::Broken(format!("not a bare repository (is-bare={out:?})")),
+        Err(e) => return CloneHealth::Broken(format!("not a git repository ({e})")),
+    }
+    if run_git(dest, &["config", "--get", "remote.origin.url"])
+        .await
+        .is_err()
+    {
+        return CloneHealth::Broken("remote.origin.url is not set".into());
+    }
+    match run_git(dest, &["config", "--get-all", "remote.origin.fetch"]).await {
+        Ok(out) if out.lines().any(|l| l == MANAGED_FETCH_REFSPEC) => {}
+        _ => {
+            return CloneHealth::Broken(format!(
+                "remote.origin.fetch is not {MANAGED_FETCH_REFSPEC}"
+            ));
+        }
+    }
+    match run_git(
+        dest,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/remotes/origin",
+        ],
+    )
+    .await
+    {
+        Ok(out) if !out.trim().is_empty() => {}
+        _ => {
+            return CloneHealth::Broken(
+                "no refs/remotes/origin/* (initial fetch never completed)".into(),
+            );
+        }
+    }
+    CloneHealth::Healthy
+}
+
+/// Set the managed fetch refspec and run the initial fetch on a freshly-cloned
+/// bare repo, so `refs/remotes/origin/*` is populated. Split out from
+/// [`ensure_bare_clone`] so it can be exercised in tests against a plain
+/// `git clone --bare` of a local origin, without `gh` or the network.
+async fn configure_managed_remote(dest: &Path) -> Result<()> {
+    run_git(
+        dest,
+        &["config", "remote.origin.fetch", MANAGED_FETCH_REFSPEC],
+    )
+    .await
+    .context("setting remote.origin.fetch on the managed clone")?;
+    run_git(dest, &["fetch", "origin"])
+        .await
+        .context("initial fetch of the managed clone")?;
+    Ok(())
+}
+
+/// Materialize (idempotently) a meguri-managed **bare** clone of `repo_slug` at
+/// `dest` (`~/.meguri/repos/<id>`). Inherits `gh`'s credential helper via
+/// `gh repo clone`, consistent with the forge's gh dependence.
+///
+/// - Already a healthy managed clone → no-op (a cheap local health probe; no
+///   network, no `gh`).
+/// - Absent (missing/empty dir) → `gh repo clone … -- --bare`, then set the
+///   fetch refspec and do the initial fetch.
+/// - A broken remnant (stray file, non-bare repo, interrupted clone) → `bail!`
+///   loudly with a "remove it and re-run" hint. meguri never `rm -rf`s a
+///   directory it did not create.
+pub async fn ensure_bare_clone(dest: &Path, repo_slug: &str) -> Result<()> {
+    match clone_health(dest).await {
+        CloneHealth::Healthy => return Ok(()),
+        CloneHealth::Absent => {}
+        CloneHealth::Broken(why) => bail!(
+            "managed clone at {} is broken ({why}); remove it and re-run",
+            dest.display()
+        ),
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating managed-clone parent {}", parent.display()))?;
+    }
+    gh_clone_bare(repo_slug, dest).await?;
+    configure_managed_remote(dest).await?;
+    Ok(())
+}
+
+/// `gh repo clone <slug> <dest> -- --bare` — the one place meguri shells out to
+/// clone. The `-- --bare` passes `--bare` through to the underlying `git clone`.
+async fn gh_clone_bare(repo_slug: &str, dest: &Path) -> Result<()> {
+    let dest = dest.to_string_lossy().to_string();
+    let out = tokio::process::Command::new("gh")
+        .args(["repo", "clone", repo_slug, &dest, "--", "--bare"])
+        .output()
+        .await
+        .context("spawning gh (is the GitHub CLI installed?)")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "gh repo clone {repo_slug} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -797,6 +939,108 @@ mod tests {
         ] {
             run_git(dir, &args).await.unwrap();
         }
+    }
+
+    /// A bare origin with one commit on `main`, for the managed-clone tests.
+    async fn bare_origin(dir: &Path) {
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        init_repo(&work).await;
+        run_git(&work, &["commit", "--allow-empty", "-m", "seed"])
+            .await
+            .unwrap();
+        let bare = dir.join("origin.git");
+        run_git(
+            dir,
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn configure_managed_remote_sets_refspec_and_populates_origin_refs() {
+        // A plain `git clone --bare` (no gh, no network) reproduces what
+        // `ensure_bare_clone`'s clone step leaves behind, so we can test the
+        // refspec + fetch finalize against a local origin.
+        let root = tempfile::tempdir().unwrap();
+        bare_origin(root.path()).await;
+        let origin = root.path().join("origin.git");
+        let dest = root.path().join("managed.git");
+        run_git(
+            root.path(),
+            &[
+                "clone",
+                "--bare",
+                origin.to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // `git clone --bare` sets no fetch refspec and no remote-tracking refs.
+        assert!(matches!(clone_health(&dest).await, CloneHealth::Broken(_)));
+
+        configure_managed_remote(&dest).await.unwrap();
+
+        let refspec = run_git(&dest, &["config", "--get-all", "remote.origin.fetch"])
+            .await
+            .unwrap();
+        assert!(
+            refspec.lines().any(|l| l == MANAGED_FETCH_REFSPEC),
+            "refspec: {refspec:?}"
+        );
+        let origin_refs = run_git(
+            &dest,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
+        )
+        .await
+        .unwrap();
+        assert!(
+            origin_refs.contains("refs/remotes/origin/main"),
+            "origin refs: {origin_refs:?}"
+        );
+
+        // Now healthy — and `ensure_bare_clone` is a no-op (never touches gh).
+        assert!(matches!(clone_health(&dest).await, CloneHealth::Healthy));
+        ensure_bare_clone(&dest, "owner/repo").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clone_health_treats_missing_and_empty_as_absent() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            clone_health(&root.path().join("nope")).await,
+            CloneHealth::Absent
+        ));
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(clone_health(&empty).await, CloneHealth::Absent));
+    }
+
+    #[tokio::test]
+    async fn ensure_bare_clone_bails_on_broken_remnants() {
+        let root = tempfile::tempdir().unwrap();
+
+        // A stray `HEAD` file (a clone that died immediately) is not a repo.
+        let stray = root.path().join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let err = ensure_bare_clone(&stray, "owner/repo").await.unwrap_err();
+        assert!(format!("{err:#}").contains("broken"), "{err:#}");
+
+        // A non-bare repo at the managed path is also refused (never cloned over).
+        let nonbare = root.path().join("nonbare");
+        std::fs::create_dir_all(&nonbare).unwrap();
+        init_repo(&nonbare).await;
+        let err = ensure_bare_clone(&nonbare, "owner/repo").await.unwrap_err();
+        assert!(format!("{err:#}").contains("broken"), "{err:#}");
     }
 
     #[test]

@@ -65,7 +65,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     config.review.enabled = false; // self-review not under test in the scheduler suite
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,

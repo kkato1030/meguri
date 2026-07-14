@@ -83,7 +83,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         .insert("self-reviewer".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -341,7 +341,7 @@ async fn planner_happy_path_plan_issue_to_spec_pr() {
     assert!(execute_prompt.contains("# Spec depth"));
 
     // The spec branch actually landed on origin (the worker resumes there).
-    let clone = &env.deps.project.repo_path;
+    let clone = env.deps.project.repo_path.as_ref().unwrap();
     let branches = run_git(clone, &["ls-remote", "--heads", "origin"])
         .await
         .unwrap();
@@ -546,7 +546,7 @@ async fn planner_decompose_files_children_with_deps_labels_and_parent_comment() 
 
     // Nothing was pushed either — decompose ends the run before open-pr.
     let branches = run_git(
-        &env.deps.project.repo_path,
+        env.deps.project.repo_path.as_ref().unwrap(),
         &["ls-remote", "--heads", "origin"],
     )
     .await
@@ -608,7 +608,7 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
     config.limits.result_grace_secs = 1;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -629,7 +629,7 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
     };
     let sibling_project = ProjectConfig {
         id: "sib".into(),
-        repo_path: root.path().join("sib-unused"),
+        repo_path: Some(root.path().join("sib-unused")),
         repo_slug: Some("me/sib".into()),
         ..project.clone()
     };
