@@ -18,7 +18,7 @@ use meguri::forge::fake::FakeForge;
 use meguri::gitops::run_git;
 use meguri::mux::PaneId;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{ROLE_AUTHOR, Store};
+use meguri::store::{LANE_AUTHOR, Store};
 
 async fn init_origin_and_clone(root: &Path) -> (PathBuf, PathBuf) {
     let origin = root.join("origin.git");
@@ -84,7 +84,12 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -108,18 +113,18 @@ async fn setup() -> TestEnv {
 fn seed_pane_session(env: &TestEnv, session: &str) {
     let store = &env.deps.store;
     store
-        .upsert_pane("proj", 7, ROLE_AUTHOR, "fake", "meguri", "%gone", "/wt/old")
+        .upsert_pane("proj", 7, LANE_AUTHOR, "fake", "meguri", "%gone", "/wt/old")
         .unwrap();
     store
-        .save_pane_session("proj", 7, ROLE_AUTHOR, Some(session))
+        .save_pane_session("proj", 7, LANE_AUTHOR, Some(session))
         .unwrap();
-    store.mark_pane_reclaimed("proj", 7, ROLE_AUTHOR).unwrap();
+    store.mark_pane_reclaimed("proj", 7, LANE_AUTHOR).unwrap();
 }
 
 fn pane_session(env: &TestEnv) -> Option<String> {
     env.deps
         .store
-        .get_pane("proj", 7, ROLE_AUTHOR)
+        .get_pane("proj", 7, LANE_AUTHOR)
         .unwrap()
         .and_then(|p| p.agent_session_id)
 }

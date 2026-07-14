@@ -7,9 +7,9 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
-    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
+    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// The FakeForge's default merge policy: everything allowed and the base
@@ -42,6 +42,10 @@ pub struct RecordedPr {
 
 #[derive(Default)]
 pub struct FakeForge {
+    /// This fake's own repo slug, if it stands in for a specific repo (issue
+    /// #154 cross-repo tests). `None` = the single-repo default: every
+    /// `add_blocked_by_in` is treated as same-repo.
+    pub slug: Option<String>,
     pub issues: Mutex<Vec<Issue>>,
     /// Closed issues: number → state_reason ("completed", "not_planned", ...).
     pub closed: Mutex<HashMap<i64, String>>,
@@ -94,20 +98,40 @@ pub struct FakeForge {
     /// (the inline comments land in `threads`).
     pub pr_reviews: Mutex<Vec<(i64, String)>>,
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
-    /// scenarios; the impl-reviewer falls back to a summary comment).
+    /// scenarios; exercised even though no current loop calls it).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
+    /// Commit statuses meguri wrote: (head_sha, context) → latest state
+    /// (ADR 0008 inspection history). Re-posting a context overwrites it.
+    pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
 }
 
 impl FakeForge {
     pub fn with_issue(number: i64, title: &str, body: &str, labels: &[&str]) -> Self {
         let forge = Self::default();
-        forge.issues.lock().unwrap().push(Issue {
+        forge.add_issue(number, title, body, labels);
+        forge
+    }
+
+    /// Seed an additional issue on the fake forge (multi-issue discovery /
+    /// cadence tests).
+    pub fn add_issue(&self, number: i64, title: &str, body: &str, labels: &[&str]) {
+        self.issues.lock().unwrap().push(Issue {
             number,
             title: title.into(),
             body: body.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
-        forge
+    }
+
+    /// A fake standing in for a specific repo slug (issue #154 cross-repo
+    /// decomposition tests): `add_blocked_by_in` then distinguishes
+    /// same-repo blockers (existence-checked) from cross-repo ones (recorded
+    /// as-is, since the blocker lives in another fake's store).
+    pub fn with_slug(slug: &str) -> Self {
+        Self {
+            slug: Some(slug.to_string()),
+            ..Self::default()
+        }
     }
 
     pub fn close_issue(&self, number: i64) {
@@ -417,6 +441,29 @@ impl FakeForge {
         self.clean_prs.lock().unwrap().insert(pr);
     }
 
+    /// The latest commit-status state meguri wrote for (sha, context), if any.
+    pub fn commit_status_of(&self, head_sha: &str, context: &str) -> Option<CommitStatusState> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .get(&(head_sha.to_string(), context.to_string()))
+            .copied()
+    }
+
+    /// Seed a commit status directly (e.g. a guard verdict a prior run left on
+    /// the PR head), so the auto-merger's guard gate can be exercised.
+    pub fn set_commit_status_direct(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+    ) {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
+    }
+
     /// Override the repository's merge policy (default: everything allowed +
     /// base protected).
     pub fn set_merge_policy(&self, policy: MergePolicy) {
@@ -569,6 +616,25 @@ impl Forge for FakeForge {
                 if !issues.iter().any(|i| i.number == number) {
                     bail!("issue #{number} not found");
                 }
+            }
+        }
+        self.block_issue(issue, blocker);
+        Ok(())
+    }
+
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()> {
+        // Same-repo (this fake owns blocker_repo, or is the single-repo
+        // default): existence-checked exactly like add_blocked_by. Cross-repo:
+        // the blocker lives in another fake's store, so only the dependent
+        // issue is checked and the edge is recorded as-is.
+        let same_repo = self.slug.as_deref().is_none_or(|s| s == blocker_repo);
+        if same_repo {
+            return self.add_blocked_by(issue, blocker).await;
+        }
+        {
+            let issues = self.issues.lock().unwrap();
+            if !issues.iter().any(|i| i.number == issue) {
+                bail!("issue #{issue} not found");
             }
         }
         self.block_issue(issue, blocker);
@@ -877,6 +943,28 @@ impl Forge for FakeForge {
         rec.state = "merged".into();
         self.merged.lock().unwrap().insert(pr, head_sha.to_string());
         Ok(())
+    }
+
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        _description: &str,
+    ) -> Result<()> {
+        self.commit_statuses
+            .lock()
+            .unwrap()
+            .insert((head_sha.to_string(), context.to_string()), state);
+        Ok(())
+    }
+
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>> {
+        Ok(self.commit_status_of(head_sha, context))
     }
 
     async fn mark_pr_ready(&self, pr: i64) -> Result<()> {

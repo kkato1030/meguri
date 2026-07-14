@@ -30,7 +30,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, open_pr_for_issue};
+use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, CheckRollup, CheckState, PullRequest};
 use crate::store::RunRecord;
 use crate::tasks::TaskKey;
@@ -44,33 +44,23 @@ pub const KIND: &str = "ci-fixer";
 /// docs on convergence).
 pub const MAX_CI_FIX_RUNS: i64 = 3;
 
-/// Head-branch prefix identifying meguri's own PRs (the ci-fixer only amends
-/// work meguri opened).
-const MEGURI_BRANCH_PREFIX: &str = "meguri/";
+/// Prefix of meguri's own commit-status contexts (`meguri/self-review`,
+/// `meguri/pr-review`). The ci-fixer must not treat these as fixable CI:
+/// they carry no failed-job log to diagnose, and an advisory-red guard status
+/// (ADR 0008) is deliberately not a merge blocker — picking it up would spin
+/// the ci-fixer on nothing and could wrongly escalate it (criterion 6).
+const MEGURI_STATUS_PREFIX: &str = "meguri/";
 
-/// Whether the ci-fixer may touch this PR at all (independent of its CI
-/// state).
-fn pr_is_ci_fixable(pr: &PullRequest) -> Option<String> {
-    if pr.state != "open" {
-        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
+/// The rollup with meguri's own status contexts stripped, so the ci-fixer's
+/// fixable verdict and prompt only ever consider real CI.
+fn without_meguri_statuses(rollup: CheckRollup) -> CheckRollup {
+    CheckRollup {
+        checks: rollup
+            .checks
+            .into_iter()
+            .filter(|c| !c.name.starts_with(MEGURI_STATUS_PREFIX))
+            .collect(),
     }
-    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
-        return Some(format!(
-            "PR #{} head `{}` was not opened by meguri",
-            pr.number, pr.head_branch
-        ));
-    }
-    if pr.has_label(forge::LABEL_SPEC_READY) {
-        return Some(format!(
-            "PR #{} is {} (the worker owns the branch)",
-            pr.number,
-            forge::LABEL_SPEC_READY
-        ));
-    }
-    if pr.has_label(forge::LABEL_HOLD) {
-        return Some(format!("PR #{} is on hold", pr.number));
-    }
-    None
 }
 
 /// The ci-fixer as a schedulable loop: red meguri PRs in, fix pushes out.
@@ -93,15 +83,14 @@ impl super::Loop for CiFixerLoop {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // PR loops are inert in local mode
         }
+        let combined = is_combined(deps);
         let mut targets = Vec::new();
-        for pr in deps.forge().list_open_prs().await? {
-            if pr_is_ci_fixable(&pr).is_some()
-                || pr.has_label(forge::LABEL_WORKING)
-                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-            {
+        for pr in deps.open_prs.get(deps).await? {
+            if pr_is_touchable(&pr, combined).is_some() {
                 continue;
             }
-            if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Failure {
+            let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
+            if rollup.state() != CheckState::Failure {
                 continue;
             }
             let issue = canonical_key(&pr);
@@ -116,6 +105,7 @@ impl super::Loop for CiFixerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -209,24 +199,10 @@ impl Flavor for CiFixerFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_ci_fixable(&pr) {
+        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
             return Ok(PreparedWork::Skip(reason));
         }
-        if pr.has_label(forge::LABEL_WORKING) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is already claimed ({})",
-                pr.number,
-                forge::LABEL_WORKING
-            )));
-        }
-        if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
-            return Ok(PreparedWork::Skip(format!(
-                "PR #{} is escalated ({})",
-                pr.number,
-                forge::LABEL_NEEDS_HUMAN
-            )));
-        }
-        let rollup = deps.forge().pr_check_rollup(pr.number).await?;
+        let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
         if rollup.state() != CheckState::Failure {
             return Ok(PreparedWork::Skip(format!(
                 "PR #{}'s CI is no longer failing",
@@ -386,15 +362,16 @@ impl Flavor for CiFixerFlavor {
             .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
             .await;
         let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        // Launch-mode-aware closing sentence (issue #169): a direct-mode
+        // fixer has no pane to attach to.
+        let hint = flow::attach_hint(deps, run);
         let _ = deps
             .forge()
             .pr_comment(
                 pr,
                 &format!(
                     "🔁 **meguri** could not fix the failing CI checks on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
+                     PR and needs a human.\n\n> {reason}\n\n{hint}"
                 ),
             )
             .await;
@@ -411,53 +388,9 @@ mod tests {
         assert!(!CiFixerFlavor.sets_subject());
     }
 
-    #[test]
-    fn fixable_guards_state_ownership_and_labels() {
-        let pr = PullRequest {
-            number: 3,
-            title: "Add feature (#9)".into(),
-            body: String::new(),
-            url: "https://fake.example/pr/3".into(),
-            head_branch: "meguri/9-add-feature-abc123".into(),
-            head_sha: String::new(),
-            state: "open".into(),
-            is_draft: false,
-            labels: vec![],
-        };
-        assert!(pr_is_ci_fixable(&pr).is_none());
-
-        let merged = PullRequest {
-            state: "merged".into(),
-            ..pr.clone()
-        };
-        assert!(pr_is_ci_fixable(&merged).unwrap().contains("merged"));
-
-        let human = PullRequest {
-            head_branch: "feature/manual".into(),
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_ci_fixable(&human)
-                .unwrap()
-                .contains("not opened by meguri")
-        );
-
-        let spec_ready = PullRequest {
-            labels: vec![forge::LABEL_SPEC_READY.to_string()],
-            ..pr.clone()
-        };
-        assert!(
-            pr_is_ci_fixable(&spec_ready)
-                .unwrap()
-                .contains(forge::LABEL_SPEC_READY)
-        );
-
-        let held = PullRequest {
-            labels: vec![forge::LABEL_HOLD.to_string()],
-            ..pr
-        };
-        assert!(pr_is_ci_fixable(&held).unwrap().contains("hold"));
-    }
+    // Touchability (open / meguri branch / spec-ready / hold / working /
+    // needs-human) is the shared `pr_is_touchable` guard's job — see its
+    // tests in `engine::mod`.
 
     fn red_rollup() -> CheckRollup {
         CheckRollup {
@@ -474,6 +407,48 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn meguri_status_contexts_are_stripped_from_the_rollup() {
+        // A red `meguri/pr-review` advisory status (ADR 0008) must not make
+        // the ci-fixer think there is CI to fix (criterion 6).
+        let rollup = CheckRollup {
+            checks: vec![
+                CheckRun {
+                    name: "meguri/pr-review".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+                CheckRun {
+                    name: "test".into(),
+                    state: CheckState::Success,
+                    url: String::new(),
+                },
+            ],
+        };
+        let stripped = without_meguri_statuses(rollup);
+        assert_eq!(stripped.checks.len(), 1);
+        assert_eq!(stripped.checks[0].name, "test");
+        // Only real CI remains, so the verdict is green (nothing to fix).
+        assert_eq!(stripped.state(), CheckState::Success);
+
+        // A real red check still drives the ci-fixer even next to a meguri one.
+        let mixed = CheckRollup {
+            checks: vec![
+                CheckRun {
+                    name: "meguri/pr-review".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+                CheckRun {
+                    name: "test".into(),
+                    state: CheckState::Failure,
+                    url: String::new(),
+                },
+            ],
+        };
+        assert_eq!(without_meguri_statuses(mixed).state(), CheckState::Failure);
     }
 
     #[test]
@@ -543,7 +518,12 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

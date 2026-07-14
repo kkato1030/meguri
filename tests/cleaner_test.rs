@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{CleanConfig, Config, ProjectConfig};
+use meguri::config::{CleanConfig, Config, LaunchMode, ProjectConfig};
 use meguri::engine::cleaner::{
     self, CleanerLoop, MARKER_HEAD_NONE, REPORT_FILE, clean_marker, parse_clean_marker, run_cleaner,
 };
@@ -104,6 +104,14 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     config.clean = clean;
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin cleaner to pane so it doesn't fall through to its recommended
+    // `direct` mode, which would spawn a *real* `claude` subprocess instead
+    // of going through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("cleaner".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone.clone(),
@@ -116,7 +124,12 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         mode: Default::default(),
         deliver: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(

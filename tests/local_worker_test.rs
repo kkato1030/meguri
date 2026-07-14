@@ -64,7 +64,12 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        plan_delivery: Default::default(),
+        review: None,
         worktree_setup: Default::default(),
+        schedules: Vec::new(),
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let store = Store::open_in_memory().unwrap();
@@ -76,8 +81,10 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         forge: None,
         task_source,
         notifier: meguri::notify::fake::recording_notifier().0,
+        forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config,
         project,
+        open_prs: Default::default(),
     };
     TestEnv {
         deps,

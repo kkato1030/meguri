@@ -1,18 +1,32 @@
-//! The spec-reviewer loop: open PR labeled `meguri:spec-reviewing` →
-//! detached worktree at the PR head → an agent turn reads the diff and writes a
-//! summary review. A clean review flips the PR to `meguri:spec-ready`; a
-//! review with findings is posted as a PR comment and the loop waits for the
-//! next push. Every review comment embeds a head-sha marker, so the same
-//! head is never reviewed twice ("Authority": what was reviewed is recorded
-//! on the PR, not in local state). Inline review threads are future work —
-//! a summary comment is the deliverable for now.
+//! The pr-reviewer loop: the optional external GitHub review, symmetric
+//! across plan and impl (ADR 0008). One kind-parameterized component
+//! supersedes the old `spec_reviewer` (review for the plan/spec PR) and gives
+//! the impl PR the same optional review. Its output stays **off the
+//! review-thread timeline**:
+//!
+//! - a `meguri/pr-review` **commit status** on the reviewed head (success =
+//!   clean, failure = findings) — the dedup key, the human-visible advisory
+//!   check, and the auto-merger's arm gate (ADR 0008 §5);
+//! - a folded `<details>` block appended to the PR **body** (idempotent by a
+//!   marker) — the round summary.
+//!
+//! It never posts inline review threads (`create_pr_review`): the fixer only
+//! reacts to threads, so a pr-reviewer that opened one would re-ignite the
+//! AI↔AI ping-pong ADR 0006 removed. The pr-reviewer is summary-only.
+//!
+//! Kind-specific behavior lives only in discovery and settle:
+//! - **Plan** (spec/ADR PR, `meguri:spec-reviewing`): additionally drives the
+//!   label state machine — a clean review flips `spec-reviewing → spec-ready`
+//!   (which the combined-mode spec worker keys off), findings keep
+//!   `spec-reviewing` so the next push is re-reviewed. The plan review is on
+//!   by default (it is the old mandatory spec review).
+//! - **Impl** (implementation PR): no label transition; off by default
+//!   (opt-in; external-bot compatible).
 //!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*; the
-//! pane lives in the issue's independent `review` lane (separate session
-//! from the author lane, so the reviewing perspective stays untainted) and
-//! the worktree is a read-only detached checkout fixed at `review-<issue>`,
-//! re-pointed to each new head — pane, session, and worktree all survive
-//! review rounds and are reclaimed when the issue closes.
+//! pane lives in the issue's independent `pr-review` lane; the worktree is a
+//! read-only detached checkout fixed at `pr-reviewer-<issue>`, re-pointed to
+//! each new head — all reclaimed when the issue closes.
 
 use std::path::{Path, PathBuf};
 
@@ -22,39 +36,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use super::WorkerOutcome;
-use super::flow::{self, NeedsHuman, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
+use super::flow::{self, Kind, NeedsHuman, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
 use super::{Deps, Target, canonical_issue, canonical_key};
-use crate::forge::{self, PullRequest};
+use crate::forge::{self, CheckState, CommitStatusState, PullRequest};
 use crate::gitops;
-use crate::store::{ROLE_REVIEW, RunRecord, RunStatus};
+use crate::store::{LANE_PR_REVIEW, RunRecord, RunStatus};
 use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
-/// `runs.loop_kind` value for spec-reviewer runs. Renamed from `reviewer`
-/// (ADR 0006) to sit symmetrically opposite the internal `impl_reviewer`.
-pub const KIND: &str = "spec-reviewer";
+/// `runs.loop_kind` value for pr-reviewer runs.
+pub const KIND: &str = "pr-reviewer";
 
-/// Terminal reviewer step: post the review, settle the PR labels.
+/// The commit-status context the pr-reviewer writes on the reviewed head.
+pub const PR_REVIEW_STATUS: &str = "meguri/pr-review";
+
+/// Terminal pr-reviewer step: post the status/body, settle the PR labels.
 pub const STEP_SETTLE: &str = "settle";
 
-/// Where the orchestrator drops the PR diff for the agent to read
-/// (worktree-relative; `.meguri/` is git-excluded, so it never dirties the
-/// tree).
+/// Where the orchestrator drops the PR diff for the agent to read.
 pub const DIFF_FILE: &str = ".meguri/pr-diff.patch";
-/// Where the agent writes its verdict + review body (worktree-relative).
+/// Where the agent writes its verdict + review body.
 pub const REVIEW_FILE: &str = ".meguri/review.json";
 
-/// Hidden marker embedded in every review comment. Its presence for a head
-/// sha means that head was already reviewed — the idempotency key across
-/// restarts, re-discoveries, and hosts.
-pub fn review_marker(head_sha: &str) -> String {
-    format!("<!-- meguri:review head={head_sha} -->")
-}
+/// Marker beginning the pr-reviewer's folded `<details>` in the PR body.
+/// Everything from this marker to the end of the body is the pr-review
+/// block, so re-reviewing truncates at it and re-appends (idempotent).
+const PR_REVIEW_BODY_MARKER: &str = "<!-- meguri:pr-review -->";
 
-pub fn head_already_reviewed(comments: &[String], head_sha: &str) -> bool {
-    let marker = review_marker(head_sha);
-    comments.iter().any(|c| c.contains(&marker))
-}
+/// Head-branch prefix identifying meguri's own PRs — the impl pr-reviewer
+/// only reviews work meguri opened (same guard as the fixer).
+const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,8 +83,7 @@ pub struct ReviewFile {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct ReviewCheckpoint {
-    /// The PR under review; the run itself is keyed by the canonical issue.
+pub struct PrReviewCheckpoint {
     #[serde(default)]
     pub pr_number: Option<i64>,
     #[serde(default)]
@@ -86,46 +96,58 @@ pub struct ReviewCheckpoint {
     pub head_sha: String,
     #[serde(default)]
     pub pr_url: String,
+    /// Which side of the loop this PR is (plan/impl), decided at claim time
+    /// from the PR's labels.
+    #[serde(default = "default_kind")]
+    pub kind: Kind,
     #[serde(default)]
     pub verdict: Option<ReviewVerdict>,
     #[serde(default)]
     pub review: String,
 }
 
-/// The spec reviewer as a schedulable loop: `meguri:spec-reviewing` PRs in,
-/// review comments (and `meguri:spec-ready` transitions) out.
-pub struct SpecReviewerLoop;
+fn default_kind() -> Kind {
+    Kind::Impl
+}
+
+/// Whether `pr` is a plan (spec/ADR) target: it carries `meguri:spec-reviewing`.
+fn is_plan_pr(pr: &PullRequest) -> bool {
+    pr.has_label(forge::LABEL_SPEC_REVIEWING)
+}
+
+/// The pr-reviewer's kind for a PR (plan iff it is a spec-reviewing PR).
+fn kind_of(pr: &PullRequest) -> Kind {
+    if is_plan_pr(pr) {
+        Kind::Plan
+    } else {
+        Kind::Impl
+    }
+}
+
+/// The pr-reviewer as a schedulable loop: reviewable meguri PRs (spec or
+/// impl) in, a `meguri/pr-review` status + folded body summary out.
+pub struct PrReviewerLoop;
 
 #[async_trait]
-impl super::Loop for SpecReviewerLoop {
+impl super::Loop for PrReviewerLoop {
     fn kind(&self) -> &'static str {
         KIND
     }
 
-    /// Open PRs carrying the review label whose *current head* has no review
-    /// comment yet, keyed by their canonical issue. Deliberately not
-    /// `issue_has_succeeded_run`-guarded: a succeeded findings-review must
-    /// not block re-reviewing the next push — the head-sha marker is the
-    /// dedup.
+    /// Candidate PRs whose *current head* has no pr-review status yet, keyed
+    /// by their canonical issue. Plan candidates are `spec-reviewing` PRs
+    /// (when the plan review is on); impl candidates are green,
+    /// unlabeled-by-spec meguri PRs (when the impl review is on).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
         if deps.forge.is_none() {
             return Ok(Vec::new()); // PR loops are inert in local mode
         }
-        let prs = deps
-            .forge()
-            .list_prs_with_label(forge::LABEL_SPEC_REVIEWING)
-            .await?;
         let mut targets = Vec::new();
-        for pr in prs {
-            if pr.has_label(forge::LABEL_HOLD) || pr.has_label(forge::LABEL_WORKING) {
+        for pr in deps.forge().list_open_prs().await? {
+            if self.candidate_kind(deps, &pr).await?.is_none() {
                 continue;
             }
-            let comments = deps.forge().pr_comments(pr.number).await?;
-            if head_already_reviewed(&comments, &pr.head_sha) {
-                continue;
-            }
-            // Degraded mode: no branch encoding, no closing keyword — the
-            // PR number itself becomes the key (observable, not fatal).
+            // Degraded mode: unresolved canonical issue is observable, not fatal.
             if canonical_issue(&pr).is_none() {
                 deps.store.emit(
                     None,
@@ -136,17 +158,66 @@ impl super::Loop for SpecReviewerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(canonical_key(&pr)),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_spec_reviewer(deps, run_id).await
+        run_pr_reviewer(deps, run_id).await
     }
 }
 
-pub async fn run_spec_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
+impl PrReviewerLoop {
+    /// The kind this PR is a pr-review candidate for, or `None` if it is not
+    /// actionable (review disabled for its kind, held/claimed, already
+    /// reviewed at this head, or — for impl — CI not green).
+    async fn candidate_kind(&self, deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
+        let review = deps.config.review_for(&deps.project);
+        if pr.state != "open"
+            || pr.has_label(forge::LABEL_HOLD)
+            || pr.has_label(forge::LABEL_WORKING)
+        {
+            return Ok(None);
+        }
+        let kind = kind_of(pr);
+        if !kind.guard_enabled(review) {
+            return Ok(None);
+        }
+        match kind {
+            Kind::Plan => {} // spec-reviewing PRs are always reviewable
+            Kind::Impl => {
+                // Same ownership guard as the fixer: meguri branch only, not
+                // needs-human, and no spec-phase label (spec-ready is the
+                // combined spec worker's territory).
+                if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
+                    || pr.has_label(forge::LABEL_NEEDS_HUMAN)
+                    || pr.has_label(forge::LABEL_SPEC_READY)
+                {
+                    return Ok(None);
+                }
+                // Only review a settled-green head: Failure is the ci-fixer's,
+                // Pending may still change under us.
+                if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Success {
+                    return Ok(None);
+                }
+            }
+        }
+        // Head already reviewed (the status is the dedup key).
+        if deps
+            .forge()
+            .commit_status(&pr.head_sha, PR_REVIEW_STATUS)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        Ok(Some(kind))
+    }
+}
+
+pub async fn run_pr_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     let run = deps
         .store
         .get_run(run_id)?
@@ -187,19 +258,10 @@ pub async fn run_spec_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcom
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
                 }
-                WorkerOutcome::NeedsPlan(reason) => {
-                    // Unreachable: review turns escalate needs_plan instead.
+                WorkerOutcome::NeedsPlan(reason) | WorkerOutcome::Decomposed(reason) => {
+                    // Unreachable: review turns escalate these instead.
                     deps.store
-                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
-                    deps.store
-                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
-                }
-                WorkerOutcome::Decomposed(reason) => {
-                    // Unreachable: review turns escalate decompose instead.
-                    deps.store
-                        .update_run_status(run_id, RunStatus::Decomposed, Some(reason))?;
-                    deps.store
-                        .emit(Some(run_id), "run.decomposed", json!({ "reason": reason }))?;
+                        .update_run_status(run_id, RunStatus::Failed, Some(reason))?;
                 }
             }
             Ok(outcome)
@@ -210,12 +272,8 @@ pub async fn run_spec_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcom
                 .update_run_status(run_id, RunStatus::Failed, Some(&msg))?;
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
-            // Escalate on the claimed PR when the checkpoint knows it;
-            // before prepare-work filled it, fall back to the canonical
-            // issue via the issue API (which reaches PRs too, so even the
-            // degraded PR-number key gets the notice).
             match claimed_pr(deps, run_id) {
-                Some(pr) => escalate_on_pr(deps, pr, &msg).await,
+                Some(pr) => escalate_on_pr(deps, &run, pr, &msg).await,
                 None => flow::escalate_on_forge(deps, run.issue_number, &msg).await,
             }
             Err(e)
@@ -223,17 +281,15 @@ pub async fn run_spec_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcom
     }
 }
 
-/// The PR this run claimed, from its persisted checkpoint (the error path
-/// gets the run record as of drive start, so re-read the store).
 fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
     let run = deps.store.get_run(run_id).ok().flatten()?;
-    serde_json::from_str::<ReviewCheckpoint>(&run.checkpoint_json)
+    serde_json::from_str::<PrReviewCheckpoint>(&run.checkpoint_json)
         .ok()
         .and_then(|cp| cp.pr_number)
 }
 
 async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
-    let mut cp: ReviewCheckpoint = serde_json::from_str(&run.checkpoint_json).unwrap_or_default();
+    let mut cp: PrReviewCheckpoint = serde_json::from_str(&run.checkpoint_json).unwrap_or_default();
     let mut step = run.step.clone();
 
     if step == STEP_PREPARE_WORK {
@@ -241,6 +297,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
             Prepared::Claimed(pr) => pr,
             Prepared::Skip(reason) => return Ok(WorkerOutcome::Skipped(reason)),
         };
+        cp.kind = kind_of(&pr);
         cp.pr_number = Some(pr.number);
         cp.pr_title = pr.title;
         cp.pr_body = pr.body;
@@ -255,7 +312,6 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         step = save_step(deps, run, STEP_EXECUTE, &cp)?;
     }
 
-    // Re-read: prepare_worktree persisted branch/worktree_path.
     let run = deps
         .store
         .get_run(&run.id)?
@@ -272,7 +328,6 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
             flow::StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             flow::StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
             flow::StepFlow::NeedsPlan(reason) => {
-                // Unreachable: the review turn escalates needs_plan below.
                 return Err(NeedsHuman(format!(
                     "agent asked for a plan reviewing issue #{}: {reason}",
                     run.issue_number
@@ -280,7 +335,6 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 .into());
             }
             flow::StepFlow::Decompose(result) => {
-                // Unreachable: the review turn escalates decompose below.
                 return Err(NeedsHuman(format!(
                     "agent asked to decompose reviewing issue #{}: {}",
                     run.issue_number, result.summary
@@ -300,14 +354,12 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
     bail!("unknown step {step:?}");
 }
 
-fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &ReviewCheckpoint) -> Result<String> {
+fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &PrReviewCheckpoint) -> Result<String> {
     deps.store
         .update_run_step(&run.id, step, &serde_json::to_string(cp)?)?;
     Ok(step.to_string())
 }
 
-/// `meguri stop`: cancel the run, release the PR claim, release the review
-/// pane (its session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     deps.store
         .update_run_status(&run.id, RunStatus::Cancelled, None)?;
@@ -317,26 +369,26 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
             .await
             .ok();
     }
-    super::reaper::release_pane(deps, run.issue_number, ROLE_REVIEW, "stopped by user").await;
+    super::reaper::release_pane(deps, run.issue_number, LANE_PR_REVIEW, "stopped by user").await;
     deps.store.emit(Some(&run.id), "run.cancelled", json!({}))?;
     Ok(())
 }
 
-/// Failure escalation on the PR (mirrors the worker's issue escalation).
-async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
+async fn escalate_on_pr(deps: &Deps, run: &RunRecord, pr: i64, reason: &str) {
     let _ = deps
         .forge()
         .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
         .await;
     let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+    // The closing "how to look at this" sentence is launch-mode-aware
+    // (issue #169): a direct-mode pr-reviewer has no pane to attach to.
+    let hint = flow::attach_hint(deps, run);
     let _ = deps
         .forge()
         .comment_pr(
             pr,
             &format!(
-                "🔁 **meguri** could not finish reviewing this PR and needs a human.\n\n> {reason}\n\n\
-                 The agent's pane (if still open) has the full context — \
-                 see `meguri ps` / `meguri attach` on the host running meguri."
+                "🔁 **meguri** could not finish reviewing this PR and needs a human.\n\n> {reason}\n\n{hint}"
             ),
         )
         .await;
@@ -347,15 +399,13 @@ enum Prepared {
     Skip(String),
 }
 
-/// prepare-work: re-resolve the PR from the run's canonical issue (the run
-/// no longer carries the PR number) with the same `canonical_key` match
-/// discovery used, then claim it with `meguri:working`. A hold, a missing
-/// review label, a head that got its review while we queued, or an
-/// ambiguous key are benign races — skip, don't escalate.
+/// prepare-work: re-resolve the PR for the run's canonical issue and claim it
+/// with `meguri:working`. Any change that makes it un-reviewable is a benign
+/// race — skip, don't escalate.
 async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
     let mut matches: Vec<PullRequest> = deps
         .forge()
-        .list_prs_with_label(forge::LABEL_SPEC_REVIEWING)
+        .list_open_prs()
         .await?
         .into_iter()
         .filter(|pr| canonical_key(pr) == run.issue_number)
@@ -364,38 +414,21 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
         1 => matches.remove(0),
         0 => {
             return Ok(Prepared::Skip(format!(
-                "no open {} PR for issue #{} (label removed since discovery?)",
-                forge::LABEL_SPEC_REVIEWING,
+                "no open reviewable PR for issue #{} (label removed since discovery?)",
                 run.issue_number
             )));
         }
         n => {
             return Ok(Prepared::Skip(format!(
-                "{n} open {} PRs resolve to issue #{} — not picking one",
-                forge::LABEL_SPEC_REVIEWING,
+                "{n} open PRs resolve to issue #{} — not picking one",
                 run.issue_number
             )));
         }
     };
-    if pr.has_label(forge::LABEL_HOLD) {
+    if PrReviewerLoop.candidate_kind(deps, &pr).await?.is_none() {
         return Ok(Prepared::Skip(format!(
-            "PR #{} is on hold ({})",
-            pr.number,
-            forge::LABEL_HOLD
-        )));
-    }
-    if pr.has_label(forge::LABEL_WORKING) {
-        return Ok(Prepared::Skip(format!(
-            "PR #{} is already claimed ({})",
-            pr.number,
-            forge::LABEL_WORKING
-        )));
-    }
-    let comments = deps.forge().pr_comments(pr.number).await?;
-    if head_already_reviewed(&comments, &pr.head_sha) {
-        return Ok(Prepared::Skip(format!(
-            "PR #{} head {} already carries a review",
-            pr.number, pr.head_sha
+            "PR #{} is no longer a pr-review candidate (claimed, held, reviewed, or CI moved)",
+            pr.number
         )));
     }
     deps.forge()
@@ -404,23 +437,20 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
     deps.store.emit(
         Some(&run.id),
         "pr.claimed",
-        json!({ "pr": pr.number, "head": pr.head_sha }),
+        json!({ "pr": pr.number, "head": pr.head_sha, "kind": kind_of(&pr).as_str() }),
     )?;
     Ok(Prepared::Claimed(pr))
 }
 
 /// prepare-worktree: detached checkout of the PR head, fixed at
-/// `review-<issue>` so pane and session survive review rounds — a later
-/// round re-points the same checkout to the new head instead of moving the
-/// lane to a fresh directory (which would retire the pane). Concurrent
-/// reviews of the same issue are prevented by the active-run unique index.
-async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<()> {
+/// `pr-reviewer-<issue>` so pane and session survive review rounds.
+async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result<()> {
     let root = deps
         .project
         .worktree_root
         .clone()
         .unwrap_or_else(crate::config::worktrees_root);
-    let dir = format!("review-{}", run.issue_number);
+    let dir = format!("pr-reviewer-{}", run.issue_number);
     let wt = gitops::worktree_path(&root, &deps.project.id, &dir);
     gitops::create_review_worktree(
         &deps.project.repo_path,
@@ -441,26 +471,29 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -
     flow::run_worktree_setup(deps, run, &wt).await
 }
 
-fn execute_prompt(cp: &ReviewCheckpoint, language: Option<&str>) -> String {
+fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
+    let (subject, artifact) = match cp.kind {
+        Kind::Plan => ("spec/ADR pull request", "spec"),
+        Kind::Impl => ("implementation pull request", "change"),
+    };
     format!(
-        "You are reviewing pull request #{number} in this repository. The \
-         worktree is checked out read-only at the PR head (commit \
+        "You are the independent pr-reviewer for {subject} #{number} in this \
+         repository. The worktree is checked out read-only at the PR head (commit \
          `{sha}`, branch `{branch}`).\n\n\
          # PR: {title}\n\n{body}\n\n\
          # Instructions\n\
-         - Read the PR's full diff at `{diff}`; browse the checked-out code \
-           for context as needed.\n\
-         - Review the change for correctness, completeness, and fit with the \
-           repository's conventions. A summary-style review is enough — no \
-           inline threads.\n\
-         - Do NOT modify, commit, or push anything; the review file below is \
-           your only deliverable.\n\
+         - Read the PR's full diff at `{diff}`; browse the checked-out code for \
+           context as needed.\n\
+         - Review the {artifact} for correctness, completeness, and fit with the \
+           repository's conventions. A summary-style review is enough — no inline \
+           threads.\n\
+         - Do NOT modify, commit, or push anything; the review file below is your \
+           only deliverable.\n\
          - Write your review to `{review}` as JSON:\n\
-           `{{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown review comment>\"}}`\n\
-           - \"clean\": nothing must change before this PR can proceed \
-             (pure nitpicks do not block; mention them in `review`).\n\
-           - \"findings\": something must change; list every finding in \
-             `review` so the author can fix and push.\n\
+           `{{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown review>\"}}`\n\
+           - \"clean\": nothing must change before this PR can proceed (pure nitpicks \
+             do not block; mention them in `review`).\n\
+           - \"findings\": something must change; list every finding in `review`.\n\
          - A completed review is a success regardless of verdict; report \
            \"failure\"/\"needs_human\" only when you cannot review at all.\
          {lang_section}",
@@ -476,8 +509,8 @@ fn execute_prompt(cp: &ReviewCheckpoint, language: Option<&str>) -> String {
     // The completion contract is appended by prepare_turn.
 }
 
-/// The reviewer's deliverable, verified after each turn: a parseable review
-/// file and an untouched checkout. The Err text feeds a corrective prompt.
+/// The pr-reviewer's deliverable, verified after each turn: a parseable
+/// review file and an untouched checkout.
 fn read_review(worktree: &Path) -> std::result::Result<ReviewFile, String> {
     let raw = std::fs::read_to_string(worktree.join(REVIEW_FILE)).map_err(|_| {
         format!("- review file `{REVIEW_FILE}` does not exist (write it as instructed)")
@@ -498,17 +531,14 @@ fn read_review(worktree: &Path) -> std::result::Result<ReviewFile, String> {
 }
 
 /// execute: one review turn (plus at most one corrective turn), then the
-/// verdict lands in the checkpoint. Verification is the orchestrator's, not
-/// the agent's: the review file must parse and the checkout must be exactly
-/// the head we claimed.
+/// verdict lands in the checkpoint.
 async fn execute(
     deps: &Deps,
     run: &RunRecord,
-    cp: &mut ReviewCheckpoint,
+    cp: &mut PrReviewCheckpoint,
     worktree: &Path,
 ) -> Result<flow::StepFlow> {
     let pr = cp.pr_number.context("checkpoint has no PR number")?;
-    // Drop the diff where the prompt says it is (idempotent on resume).
     let diff = deps.forge().pr_diff(pr).await?;
     std::fs::create_dir_all(worktree.join(crate::turn::prompts::MEGURI_DIR))?;
     std::fs::write(worktree.join(DIFF_FILE), &diff)?;
@@ -517,13 +547,16 @@ async fn execute(
     let mut corrective_turns = 0u32;
 
     loop {
-        let (outcome, _) = flow::run_turn(deps, run, worktree, "review", &prompt).await?;
+        // The pr-reviewer runs in its own `pr-review` lane (lane_for_loop maps
+        // the `pr-reviewer` loop_kind → LANE_PR_REVIEW), under the
+        // `pr-reviewer` routing role.
+        let (outcome, _) = flow::run_turn(deps, run, worktree, "pr-reviewer", &prompt).await?;
         let result = match outcome {
             TurnOutcome::Completed(r) => r,
             TurnOutcome::Stopped => return Ok(flow::StepFlow::Stopped),
             TurnOutcome::PaneDied => {
                 return Ok(flow::StepFlow::Interrupted(
-                    "pane died during review".into(),
+                    "pane died during pr review".into(),
                 ));
             }
         };
@@ -537,8 +570,6 @@ async fn execute(
                 ))
                 .into());
             }
-            // needs_plan is a worker signal and decompose a planner one; on
-            // a review turn a human looks.
             TurnStatus::NeedsHuman | TurnStatus::NeedsPlan | TurnStatus::Decompose => {
                 return Err(NeedsHuman(format!(
                     "agent needs a human reviewing PR #{pr}: {}",
@@ -548,17 +579,13 @@ async fn execute(
             }
         }
 
-        // Trust but verify: the checkout must be pristine and still at the
-        // claimed head, and the review file must parse.
         let clean = gitops::status_clean(worktree).await?;
         let head_now = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
         let problem = if !clean || head_now != cp.head_sha {
             Some(format!(
                 "- the review checkout must stay untouched: working tree clean: \
                  {clean} (must be true), HEAD: {head_now} (must be {expected}) — \
-                 discard all changes (`git checkout -- . && git clean -fd && \
-                 git reset --hard {expected}`), the review file under .meguri/ \
-                 is exempt",
+                 discard all changes, the review file under .meguri/ is exempt",
                 expected = cp.head_sha,
             ))
         } else {
@@ -570,7 +597,7 @@ async fn execute(
             cp.review = review.review;
             deps.store.emit(
                 Some(&run.id),
-                "review.verified",
+                "pr_review.verified",
                 json!({ "verdict": review.verdict, "head": cp.head_sha }),
             )?;
             return Ok(flow::StepFlow::Continue);
@@ -579,7 +606,7 @@ async fn execute(
         corrective_turns += 1;
         if corrective_turns > 1 {
             return Err(NeedsHuman(format!(
-                "agent claimed success but the review doesn't verify after a \
+                "agent claimed success but the pr review doesn't verify after a \
                  corrective turn:\n{problem}"
             ))
             .into());
@@ -597,50 +624,75 @@ async fn execute(
     }
 }
 
-/// The PR comment carrying the review (and the idempotency marker).
-fn review_comment(cp: &ReviewCheckpoint, verdict: ReviewVerdict) -> String {
-    let marker = review_marker(&cp.head_sha);
+/// The folded `<details>` the pr-reviewer appends to the PR body. Idempotent
+/// by [`PR_REVIEW_BODY_MARKER`]: [`upsert_pr_review_details`] truncates any
+/// prior block before appending this one.
+fn pr_review_details(cp: &PrReviewCheckpoint, verdict: ReviewVerdict) -> String {
     let short = cp.head_sha.get(..12).unwrap_or(&cp.head_sha);
+    let outcome = match verdict {
+        ReviewVerdict::Clean => "clean",
+        ReviewVerdict::Findings => "findings",
+    };
     let review = cp.review.trim();
-    match verdict {
-        ReviewVerdict::Clean => {
-            let mut body = format!(
-                "{marker}\n🔁 **meguri review** — clean at `{short}`; moving to `{}`.",
-                forge::LABEL_SPEC_READY
-            );
-            if !review.is_empty() {
-                body.push_str(&format!("\n\n{review}"));
-            }
-            body
-        }
-        ReviewVerdict::Findings => format!(
-            "{marker}\n🔁 **meguri review** — findings at `{short}`:\n\n{review}\n\n\
-             Push fixes to this branch and meguri will re-review the new head."
-        ),
+    let review = if review.is_empty() {
+        "(no notes)"
+    } else {
+        review
+    };
+    format!(
+        "{PR_REVIEW_BODY_MARKER}\n<details>\n<summary>🛡️ pr review ({kind}) — {outcome} at `{short}`</summary>\n\n{review}\n</details>",
+        kind = cp.kind.as_str(),
+    )
+}
+
+/// Replace (or append) the pr-review `<details>` in a PR body. The pr-review
+/// block is always last: everything from the marker to the end is the block,
+/// so a re-review truncates there and re-appends.
+fn upsert_pr_review_details(body: &str, block: &str) -> String {
+    let base = match body.find(PR_REVIEW_BODY_MARKER) {
+        Some(idx) => body[..idx].trim_end(),
+        None => body.trim_end(),
+    };
+    if base.is_empty() {
+        block.to_string()
+    } else {
+        format!("{base}\n\n{block}")
     }
 }
 
-/// settle: post the review comment (once per head — the marker makes re-runs
-/// after an interruption idempotent) and settle the labels. The spec-ready
-/// label is load-bearing (the worker's continuation keys off it), so failing
-/// to apply it fails the run instead of passing silently.
-async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<String> {
+/// settle: write the `meguri/pr-review` commit status, fold the summary into
+/// the PR body, and (plan only) settle the spec labels. Idempotent on resume.
+async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result<String> {
     let pr = cp.pr_number.context("checkpoint has no PR number")?;
     let verdict = cp.verdict.context("checkpoint has no review verdict")?;
 
-    let comments = deps.forge().pr_comments(pr).await?;
-    if !head_already_reviewed(&comments, &cp.head_sha) {
-        deps.forge()
-            .comment_pr(pr, &review_comment(cp, verdict))
-            .await?;
-        deps.store.emit(
-            Some(&run.id),
-            "review.posted",
-            json!({ "verdict": verdict, "head": cp.head_sha }),
-        )?;
-    }
+    let (state, desc) = match verdict {
+        ReviewVerdict::Clean => (CommitStatusState::Success, "clean".to_string()),
+        ReviewVerdict::Findings => (
+            CommitStatusState::Failure,
+            "findings — see the PR body".to_string(),
+        ),
+    };
+    // The status is the dedup key + advisory check + auto-merge gate (ADR 0008).
+    deps.forge()
+        .set_commit_status(&cp.head_sha, PR_REVIEW_STATUS, state, &desc)
+        .await?;
 
-    if verdict == ReviewVerdict::Clean {
+    // Fold the round summary into the PR body (no conversation comment, no
+    // inline thread — the fixer never reacts).
+    let new_body = upsert_pr_review_details(&cp.pr_body, &pr_review_details(cp, verdict));
+    deps.forge().update_pr_body(pr, &new_body).await?;
+    deps.store.emit(
+        Some(&run.id),
+        "pr_review.posted",
+        json!({ "pr": pr, "verdict": verdict, "head": cp.head_sha, "kind": cp.kind.as_str() }),
+    )?;
+
+    // Plan review drives the label state machine (ADR 0008 §3): a clean spec
+    // review flips spec-reviewing → spec-ready (the combined spec worker keys
+    // off it); findings keep spec-reviewing for the next push. The impl
+    // review never touches spec labels.
+    if cp.kind == Kind::Plan && verdict == ReviewVerdict::Clean {
         deps.forge()
             .add_pr_label(pr, forge::LABEL_SPEC_READY)
             .await?;
@@ -649,8 +701,6 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
             .await
             .ok();
     }
-    // Findings: keep `meguri:spec-reviewing` — the next push moves the head
-    // past the marker and discovery re-reviews it.
     deps.forge()
         .remove_pr_label(pr, forge::LABEL_WORKING)
         .await
@@ -662,15 +712,89 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &ReviewCheckpoint) -> Result<S
 mod tests {
     use super::*;
 
+    fn cp(kind: Kind, head: &str) -> PrReviewCheckpoint {
+        PrReviewCheckpoint {
+            pr_number: Some(12),
+            pr_title: "Spec: Add caching (#5)".into(),
+            pr_body: "Refs #5.".into(),
+            head_branch: "meguri/5-add-caching-abc".into(),
+            head_sha: head.into(),
+            kind,
+            review: "- missing acceptance criteria".into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn marker_matches_only_its_own_head() {
-        let comments = vec![
-            "unrelated chatter".to_string(),
-            format!("{}\nreview body", review_marker("abc123")),
-        ];
-        assert!(head_already_reviewed(&comments, "abc123"));
-        assert!(!head_already_reviewed(&comments, "def456"));
-        assert!(!head_already_reviewed(&[], "abc123"));
+    fn kind_of_keys_off_spec_reviewing() {
+        let base = PullRequest {
+            number: 1,
+            title: String::new(),
+            body: String::new(),
+            url: String::new(),
+            head_branch: "meguri/1-x".into(),
+            head_sha: "sha".into(),
+            state: "open".into(),
+            is_draft: false,
+            labels: vec![forge::LABEL_SPEC_REVIEWING.to_string()],
+        };
+        assert_eq!(kind_of(&base), Kind::Plan);
+        let impl_pr = PullRequest {
+            labels: vec![forge::LABEL_IMPLEMENTING.to_string()],
+            ..base.clone()
+        };
+        assert_eq!(kind_of(&impl_pr), Kind::Impl);
+    }
+
+    #[test]
+    fn prompt_demands_review_not_changes() {
+        let prompt = execute_prompt(&cp(Kind::Plan, "deadbeef"), None);
+        assert!(prompt.contains("pull request #12"));
+        assert!(prompt.contains("# PR: Spec: Add caching (#5)"));
+        assert!(prompt.contains(DIFF_FILE));
+        assert!(prompt.contains(REVIEW_FILE));
+        assert!(prompt.contains("Do NOT modify"));
+        assert!(prompt.contains("deadbeef"));
+        assert!(prompt.contains("no inline threads"));
+        assert!(!prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn impl_prompt_frames_a_change_not_a_spec() {
+        let prompt = execute_prompt(&cp(Kind::Impl, "abc"), Some("日本語"));
+        assert!(prompt.contains("implementation pull request"));
+        assert!(prompt.contains("# Output language"));
+    }
+
+    #[test]
+    fn pr_review_details_folds_verdict_and_head() {
+        let block = pr_review_details(&cp(Kind::Impl, "0123456789abcdef"), ReviewVerdict::Findings);
+        assert!(block.contains(PR_REVIEW_BODY_MARKER));
+        assert!(block.contains("<details>"));
+        assert!(block.contains("pr review (impl) — findings at `0123456789ab`"));
+        assert!(block.contains("- missing acceptance criteria"));
+    }
+
+    #[test]
+    fn upsert_replaces_a_prior_pr_review_block() {
+        let body = "Refs #5.\n\nBody text.";
+        let first = upsert_pr_review_details(
+            body,
+            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Findings),
+        );
+        assert!(first.starts_with("Refs #5."));
+        assert!(first.contains("Body text."));
+        assert_eq!(first.matches(PR_REVIEW_BODY_MARKER).count(), 1);
+
+        // Re-reviewing the new head replaces the block, never stacks it.
+        let second = upsert_pr_review_details(
+            &first,
+            &pr_review_details(&cp(Kind::Plan, "bbb"), ReviewVerdict::Clean),
+        );
+        assert_eq!(second.matches(PR_REVIEW_BODY_MARKER).count(), 1);
+        assert!(second.contains("clean at `bbb`"));
+        assert!(!second.contains("findings at `aaa`"));
+        assert!(second.starts_with("Refs #5."));
     }
 
     #[test]
@@ -679,22 +803,19 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".meguri")).unwrap();
         let path = dir.path().join(REVIEW_FILE);
 
-        let err = read_review(dir.path()).unwrap_err();
-        assert!(err.contains("does not exist"), "{err}");
-
+        assert!(
+            read_review(dir.path())
+                .unwrap_err()
+                .contains("does not exist")
+        );
         std::fs::write(&path, "not json").unwrap();
-        let err = read_review(dir.path()).unwrap_err();
-        assert!(err.contains("not valid JSON"), "{err}");
-
+        assert!(
+            read_review(dir.path())
+                .unwrap_err()
+                .contains("not valid JSON")
+        );
         std::fs::write(&path, r#"{"verdict":"findings","review":"  "}"#).unwrap();
-        let err = read_review(dir.path()).unwrap_err();
-        assert!(err.contains("empty"), "{err}");
-
-        std::fs::write(&path, r#"{"verdict":"findings","review":"- bug"}"#).unwrap();
-        let review = read_review(dir.path()).unwrap();
-        assert_eq!(review.verdict, ReviewVerdict::Findings);
-        assert_eq!(review.review, "- bug");
-
+        assert!(read_review(dir.path()).unwrap_err().contains("empty"));
         std::fs::write(&path, r#"{"verdict":"clean"}"#).unwrap();
         assert_eq!(
             read_review(dir.path()).unwrap().verdict,
@@ -702,66 +823,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_demands_review_not_changes() {
-        let cp = ReviewCheckpoint {
-            pr_number: Some(12),
-            pr_title: "Spec: Add caching (#5)".into(),
-            pr_body: "Closes #5.".into(),
-            head_branch: "meguri/5-add-caching-abc".into(),
-            head_sha: "deadbeef".into(),
-            ..Default::default()
-        };
-        let prompt = execute_prompt(&cp, None);
-        assert!(prompt.contains("pull request #12"));
-        assert!(prompt.contains("# PR: Spec: Add caching (#5)"));
-        assert!(prompt.contains(DIFF_FILE));
-        assert!(prompt.contains(REVIEW_FILE));
-        assert!(prompt.contains("Do NOT modify"));
-        assert!(prompt.contains("deadbeef"));
-        assert!(!prompt.contains("# Output language"));
-    }
-
-    #[test]
-    fn prompt_pins_output_language_when_configured() {
-        let cp = ReviewCheckpoint::default();
-        let prompt = execute_prompt(&cp, Some("日本語"));
-        assert!(prompt.contains("# Output language"));
-        assert!(prompt.contains("日本語"));
-    }
-
-    #[test]
-    fn review_comment_carries_marker_and_verdict() {
-        let cp = ReviewCheckpoint {
-            head_sha: "0123456789abcdef".into(),
-            review: "- missing acceptance criteria".into(),
-            ..Default::default()
-        };
-        let dirty = review_comment(&cp, ReviewVerdict::Findings);
-        assert!(dirty.contains(&review_marker("0123456789abcdef")));
-        assert!(dirty.contains("`0123456789ab`"), "{dirty}");
-        assert!(dirty.contains("- missing acceptance criteria"));
-        assert!(dirty.contains("re-review"));
-
-        let clean = review_comment(
-            &ReviewCheckpoint {
-                head_sha: "abc".into(), // shorter than the display width
-                ..Default::default()
-            },
-            ReviewVerdict::Clean,
-        );
-        assert!(clean.contains(&review_marker("abc")));
-        assert!(clean.contains(forge::LABEL_SPEC_READY));
-    }
-
     /// `prepare_worktree` re-points the same detached checkout onto each new
     /// review round's head via `reset --hard` + `clean -fd` (see
     /// `gitops::create_review_worktree`), which wipes untracked files. The
-    /// `worktree_setup` hook must run again on that re-point — not just the
-    /// first time the checkout is created — since its output is exactly the
-    /// kind of untracked artifact `clean -fd` removes (issue #138).
+    /// `worktree_setup` hook (issue #138) must run again on that re-point — not
+    /// just the first time the checkout is created — since its output is
+    /// exactly the kind of untracked artifact `clean -fd` removes.
     #[tokio::test]
-    async fn worktree_setup_reruns_when_the_review_worktree_is_repointed() {
+    async fn worktree_setup_reruns_when_the_pr_reviewer_worktree_is_repointed() {
         let repo = tempfile::tempdir().unwrap();
         for args in [
             vec!["init", "-b", "main"],
@@ -797,10 +866,15 @@ mod tests {
             worktree_root: Some(worktree_root.path().to_path_buf()),
             pr: None,
             clean: None,
+            plan_delivery: Default::default(),
+            review: None,
             worktree_setup: crate::config::WorktreeSetupConfig {
                 commands: vec!["echo ran > marker.txt".into()],
                 ..Default::default()
             },
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,
@@ -813,7 +887,7 @@ mod tests {
         let head1 = gitops::run_git(repo.path(), &["rev-parse", "HEAD"])
             .await
             .unwrap();
-        let mut cp = ReviewCheckpoint {
+        let mut cp = PrReviewCheckpoint {
             head_branch: "pr-branch".into(),
             head_sha: head1,
             ..Default::default()
@@ -841,7 +915,7 @@ mod tests {
         prepare_worktree(&deps, &run, &cp).await.unwrap();
         assert!(
             wt.join("marker.txt").exists(),
-            "worktree_setup must rerun after the review worktree re-points"
+            "worktree_setup must rerun after the pr-reviewer worktree re-points"
         );
     }
 }

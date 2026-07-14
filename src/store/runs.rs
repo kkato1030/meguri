@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Row, params};
+use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Store, now};
@@ -155,10 +155,26 @@ pub struct RunRecord {
     /// NULL until something resolves it; once set, every later spawn,
     /// resume, or hook run of this run reuses it.
     pub agent_profile: Option<String>,
+    /// Which routing arm the run took (routing 3/3, issue #66): `None` =
+    /// mainline, `"explore"` = diverted to a comparison profile, `"escalated"`
+    /// = climbed to a stronger profile mid-run. Keeps `meguri stats routing`
+    /// able to separate the three even though escalation overwrites
+    /// `agent_profile` in place.
+    pub routing_arm: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// Normalized-body SHA-256 the run acted on (issue #142), set once the
+    /// checkpoint's `issue_body` is settled. NULL for pre-#142 runs — treated
+    /// as "matches any body" by [`Store::issue_processed_current_body`] so the
+    /// old permanent-suppression behavior survives an upgrade.
+    pub body_digest: Option<String>,
+    /// The cadence bucket (issue label) this run consumed (issue #148), stamped
+    /// in the creating INSERT and never changed. NULL for runs outside any
+    /// cadence rule. [`Store::cadence_consumed`] counts non-skipped runs by
+    /// this column within the window.
+    pub cadence_label: Option<String>,
 }
 
 impl RunRecord {
@@ -200,10 +216,13 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         current_turn_id: row.get("current_turn_id")?,
         agent_session_id: row.get("agent_session_id")?,
         agent_profile: row.get("agent_profile")?,
+        routing_arm: row.get("routing_arm")?,
         error: row.get("error")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
+        body_digest: row.get("body_digest")?,
+        cadence_label: row.get("cadence_label")?,
     })
 }
 
@@ -239,19 +258,71 @@ impl Store {
         issue_number: i64,
         issue_title: &str,
     ) -> Result<RunRecord> {
+        self.create_run_for_loop_cadence(project_id, loop_kind, issue_number, issue_title, None)
+    }
+
+    /// Like [`Store::create_run_for_loop`] but stamps the cadence bucket
+    /// (issue #148) in the *same* INSERT that creates the run — never a
+    /// follow-up UPDATE. If the process died between run creation and a
+    /// separate stamp, a NULL-labelled `sns` run would slip past the window
+    /// COUNT and the next tick would consume the bucket a second time; folding
+    /// the stamp into the INSERT removes that crash window entirely. Only the
+    /// scheduler's issue branch and manual `meguri run` pass a non-None bucket.
+    pub fn create_run_for_loop_cadence(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+        issue_title: &str,
+        cadence_label: Option<&str>,
+    ) -> Result<RunRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         // Short ids are friendlier CLI handles; keep full uuid uniqueness.
         let id = format!("run-{}", &id[..8]);
         self.with_conn(|c| {
             c.execute(
                 "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
-                                   status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-                params![id, project_id, loop_kind, issue_number, issue_title, now()],
+                                   status, created_at, cadence_label)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                params![
+                    id,
+                    project_id,
+                    loop_kind,
+                    issue_number,
+                    issue_title,
+                    now(),
+                    cadence_label
+                ],
             )?;
             Ok(())
         })?;
         Ok(self.get_run(&id)?.expect("run just inserted"))
+    }
+
+    /// Count consumption of a cadence bucket within its window (issue #148):
+    /// non-`skipped` runs for `(project, label)` created at or after
+    /// `window_start`. `skipped` runs are benign races that touched nothing, so
+    /// they do not consume the quota; every other status counts as one attempt
+    /// (success or failure alike — ADR 0011). `window_start` is epoch seconds;
+    /// `runs.created_at` is our RFC3339 UTC shape, whose lexicographic order is
+    /// chronological, so the bound is formatted the same way before comparison.
+    pub fn cadence_consumed(
+        &self,
+        project_id: &str,
+        label: &str,
+        window_start: u64,
+    ) -> Result<i64> {
+        let bound = super::format_epoch(window_start);
+        self.with_conn(|c| {
+            let count = c.query_row(
+                "SELECT COUNT(*) FROM runs
+                   WHERE project_id = ?1 AND cadence_label = ?2
+                     AND created_at >= ?3 AND status != 'skipped'",
+                params![project_id, label, bound],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
     }
 
     /// Create a run targeting a local task (local/silent mode). `issue_number`
@@ -342,6 +413,71 @@ impl Store {
         })
     }
 
+    /// Whether a succeeded run of `loop_kind` already covers the issue's
+    /// *current* body (issue #142): either a succeeded run whose `body_digest`
+    /// matches `digest`, or a legacy NULL-digest succeeded run (pre-#142 —
+    /// treated as "matches any body" so the old permanent suppression survives
+    /// an upgrade). The body-aware replacement for [`Store::issue_has_succeeded_run`]
+    /// in discovery: when this returns false while `issue_has_succeeded_run` is
+    /// true, the body changed since it was last processed — the suppression
+    /// lifts and the reconcile loop signals the edit.
+    pub fn issue_processed_current_body(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+        digest: &str,
+    ) -> Result<bool> {
+        self.with_conn(|c| {
+            let exists = c
+                .prepare(
+                    "SELECT 1 FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'succeeded'
+                       AND (body_digest IS NULL OR body_digest = ?4) LIMIT 1",
+                )?
+                .exists(params![project_id, loop_kind, issue_number, digest])?;
+            Ok(exists)
+        })
+    }
+
+    /// The most recent succeeded run of `loop_kind` for an issue (issue #142):
+    /// the run whose work a later body edit invalidates. `issue.body_changed`
+    /// is emitted against it so the signal shows up under `meguri logs` on that
+    /// run, not orphaned with a NULL run id.
+    pub fn latest_succeeded_run_id(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let id = c
+                .query_row(
+                    "SELECT id FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND status = 'succeeded'
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![project_id, loop_kind, issue_number],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(id)
+        })
+    }
+
+    /// Record the normalized-body digest a run acted on (issue #142). Written
+    /// once the checkpoint's `issue_body` is settled, in the flow step shared
+    /// by every flavor, so a loop with a custom claim path (the spec worker)
+    /// still stamps its succeeded runs.
+    pub fn set_run_body_digest(&self, id: &str, digest: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET body_digest = ?2 WHERE id = ?1",
+                params![id, digest],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Number of succeeded runs of a loop for one issue/PR — the conflict
     /// resolver's resolve budget: a PR that keeps re-conflicting after this
     /// many successful resolves stops being rediscovered instead of looping
@@ -361,6 +497,30 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(count)
+        })
+    }
+
+    /// The branch of the most recent run of `loop_kind` for an issue, if one
+    /// recorded a branch. The separate-mode handoff sweep (ADR 0008) uses it to
+    /// find the planner's spec PR branch and check whether it merged.
+    pub fn branch_for_issue(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let branch = c
+                .query_row(
+                    "SELECT branch FROM runs WHERE project_id = ?1 AND loop_kind = ?2
+                       AND issue_number = ?3 AND branch IS NOT NULL
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![project_id, loop_kind, issue_number],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            Ok(branch)
         })
     }
 
@@ -492,6 +652,20 @@ impl Store {
             c.execute(
                 "UPDATE runs SET agent_profile = ?2 WHERE id = ?1",
                 params![id, profile],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record the run's routing arm (routing 3/3, issue #66): `Some("explore")`
+    /// or `Some("escalated")`, or `None` to leave it on the mainline. Written
+    /// when a run is diverted to an explore profile, or when it escalates
+    /// (unless it is already an explore run — explore takes priority).
+    pub fn update_run_routing_arm(&self, id: &str, arm: Option<&str>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET routing_arm = ?2 WHERE id = ?1",
+                params![id, arm],
             )?;
             Ok(())
         })
@@ -697,6 +871,95 @@ mod tests {
         assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
+    }
+
+    #[test]
+    fn issue_processed_current_body_is_digest_aware_with_null_legacy() {
+        let store = Store::open_in_memory().unwrap();
+
+        // A legacy succeeded run with a NULL digest suppresses any body
+        // (preserves the old permanent-suppression behavior on upgrade).
+        let legacy = store.create_run("demo", 9, "t").unwrap();
+        store
+            .update_run_status(&legacy.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert!(
+            store
+                .issue_processed_current_body("demo", "worker", 9, "any")
+                .unwrap()
+        );
+
+        // A run that recorded a digest covers only that exact body.
+        let run = store.create_run("demo", 10, "t").unwrap();
+        store.set_run_body_digest(&run.id, "aaa").unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert!(
+            store
+                .issue_processed_current_body("demo", "worker", 10, "aaa")
+                .unwrap()
+        );
+        // A different body is no longer covered → suppression lifts.
+        assert!(
+            !store
+                .issue_processed_current_body("demo", "worker", 10, "bbb")
+                .unwrap()
+        );
+        // No succeeded run at all: never suppressed.
+        assert!(
+            !store
+                .issue_processed_current_body("demo", "worker", 11, "aaa")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cadence_consumed_counts_non_skipped_stamped_runs_in_window() {
+        let store = Store::open_in_memory().unwrap();
+        // Window start well before now; every fresh run's created_at is inside.
+        let start = 0;
+
+        // Unstamped run: not counted.
+        store.create_run_for_loop("demo", "worker", 1, "t").unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 0);
+
+        // Two stamped runs, one succeeded one failed: both count (attempt, not
+        // outcome).
+        let a = store
+            .create_run_for_loop_cadence("demo", "worker", 2, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&a.id, RunStatus::Succeeded, None)
+            .unwrap();
+        let b = store
+            .create_run_for_loop_cadence("demo", "worker", 3, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&b.id, RunStatus::Failed, None)
+            .unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 2);
+
+        // A skipped stamped run does not count.
+        let c = store
+            .create_run_for_loop_cadence("demo", "worker", 4, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&c.id, RunStatus::Skipped, None)
+            .unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 2);
+
+        // Scoped by project and label.
+        assert_eq!(store.cadence_consumed("other", "sns", start).unwrap(), 0);
+        assert_eq!(store.cadence_consumed("demo", "nl", start).unwrap(), 0);
+
+        // A window start in the far future excludes everything.
+        assert_eq!(
+            store
+                .cadence_consumed("demo", "sns", 32_000_000_000)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

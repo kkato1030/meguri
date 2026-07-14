@@ -1,0 +1,87 @@
+# ADR 0007: routing の継続検査は 2 層 — 静的鮮度は doctor、成果ドリフトは scheduler がイベント化し sqlite 直読みで集計する
+
+- Status: accepted
+- Date: 2026-07-12
+- Issue: #65
+- 関連: docs/specs/issue-65.md(routing 2/3)、ADR 0003(役割ベース振り分け・`GENERATED_AT`)、ADR 0002(serve は撤去済み・sqlite 直読みの原則は継承)
+
+## 文脈
+
+ADR 0003 で「auto の推奨表はバイナリに焼き込み、生成日(`GENERATED_AT`)を持たせて鮮度を機械検査する」と決めた。その検査(routing 2/3)をどう実装するかが本 ADR の論点。推奨表は「相場観」であって、モデルの世代交代・エイリアスの廃止・CLI の破壊的更新で必ず古びる。しかも古び方は 2 種類ある:
+
+- **表そのものの賞味期限**が切れている(新モデルが出た/エイリアスが消えた)。実 run を待たずに、安く決定的に検出できる。
+- 表は表として、**実際の成績が推奨を裏切っている**(worker/claude-sonnet の成功率が落ちた)。これは実 run 履歴を集計しないと分からない。
+
+この 2 つは検出コスト・データ源・打ち手がすべて異なるので、一つの仕組みに畳もうとすると両方が中途半端になる。
+
+## 決定
+
+### 1. 検査を 2 層に分ける
+
+| 層 | 何を見るか | データ源 | いつ走るか | 出力 |
+|---|---|---|---|---|
+| 静的鮮度 | 表の `generated_at`・モデルエイリアスの生死・CLI メジャーバージョン | 定数 + 実起動プローブ + sqlite(前回バージョン) | `meguri doctor` 実行時 | doctor の ⚠️/❌ |
+| 成果ドリフト | (役割, プロファイル) 別の成功率・平均ターン数の悪化 | `runs`(実履歴)→ `routing_drift`(現在状態)+ `events`(遷移履歴) | watch の poll(scheduler の sweep) | `routing_drift` を project 別に読む → doctor / top / stats |
+
+層をまたぐ唯一の接点は「どちらも routing の陳腐化を疑わせる」ことだけで、実装は独立している。
+
+### 2. 集計軸は `runs.loop_kind`(= 役割)× `runs.agent_profile`
+
+役割は run が生まれた時点で確定している決定的な軸(ADR 0003)であり、`runs.loop_kind` そのもの。プロファイルは #64 が `runs.agent_profile` に固定済み。両カラムの GROUP BY で「(役割, プロファイル) 単位」がそのまま出る。新しい次元表は要らない。
+
+**v1 の既知の限界**: `impl-reviewer` は独立した run ではなく worker run 内の 1 ターン(ADR 0006)なので、run ベースの集計には (役割=impl-reviewer) の行が立たない。プローブ側(層 1)は profile 名で回るので impl-reviewer が使うプロファイルも検証されるが、成果ドリフト(層 2)の対象外であることを明記する。ターン単位の成果集計は将来拡張。
+
+### 3. コスト代理指標は「ターン数 × 所要時間」。トークン会計はしない
+
+ペイン越しに全 CLI 統一でトークン数は取れない(issue の言う通り)。成功率・平均ターン数・平均所要時間の 3 指標で v1 は足りる。Claude Code のセッション jsonl から usage を拾うのはスコープ外。
+
+成功率の分母は **terminal かつ「成績」と呼べる run** に限る: `succeeded` を成功、`failed` / `cancelled` を失敗とし、`skipped` / `needs_plan` / `decomposed`(良性・非失敗の終了)は分母から除く。この定義をテストで固定する。
+
+### 4. 集計は sqlite 直読み。ドリフト検知だけは scheduler が担う
+
+読み取り(`meguri stats routing`・doctor・top)は `Config::load` + `Store::open` だけで完結させ、watch が止まっていても過去 run を集計できる(ADR 0002 で撤去した serve の read path 原則をそのまま継承)。
+
+一方**ドリフトの「検知」は watch の poll に乗せる**。reaper / auto-merger と同じ per-project sweep で、直近ウィンドウ(既定 20 run)と前ウィンドウを比較し、閾値超えを判定する。理由:
+
+- 検知はループを持つ主体(scheduler)だけがやればよく、read-only な stats/doctor に毎回計算させない。
+- 閾値は決定的(config)なので、テストで固定して同じ入力から同じ結果を再現できる。
+
+**現在状態は状態テーブル、履歴はイベント** に分ける。当初は `events` だけに書く案だったが、`events` は `run_id`/`data_json` しか持たず `project_id` を持たない一方、drift は run 非依存の (役割×プロファイル) 集計なので `run_id` では紐づかない。よって read 側(doctor/top/stats)が「この project の未解消 drift だけ」を絞れず、また「解消したら消える」判定の拠り所も無かった。これを解消するため、現在状態を専用テーブル `routing_drift`(PK = `project_id`×`loop_kind`×`agent_profile`、`active` 0/1 + before/after 指標)に UPSERT し、read 側はこのテーブルを `project_id` で絞って `active=1` を読む。`routing.drift` / `routing.drift_cleared` イベントは**閾値を跨いだ瞬間の履歴**として `events` に残す(監査・後追い用)が、read 側の真の現在状態はテーブルが担う。
+
+同じドリフトを毎 tick 書かないための dedup は、この状態テーブルに自然な置き場を得る: sweep は判定結果をテーブルの現在値と突き合わせ、`active` が遷移したときだけイベントを追記する(0→1 で `routing.drift`、1→0 で `routing.drift_cleared`)。テストで「同一状態の連続 sweep でイベントが 1 度だけ / 回復で cleared が 1 度だけ / 複数 project が混ざらない」を固定する。
+
+### 5. 閾値はトップレベル `[drift]` で調整可能。既定は成功率 -20pt / 平均ターン数 +50%
+
+「相場観の陳腐化」は環境で速さが違うのでユーザーが締められるべき。既定値はテストの期待値として固定する。
+
+閾値セクションは **`RoutingConfig` の中(`[routing.drift]`)には置かず、トップレベル `[drift]` に置く**。ADR 0003 で `[routing]` は「書けば role routing の推奨解決が発動する switch」と決めており、実装も `Config.routing: Option<RoutingConfig>` で `[routing]` の存在そのものを active 判定に使う(`src/routing.rs::resolve` は `cfg.routing` が `Some` かどうかで legacy と分岐)。TOML では `[routing.drift]` を書くと `[routing]` テーブルが暗黙生成され `routing` が `Some` になるため、**legacy のまま drift 閾値だけ締めたいユーザーが意図せず `mode = auto` の推奨プロファイル解決を発動させてしまう**。drift 検知は routing の active/legacy に依存しない(legacy でも全 run は `default` プロファイルで走るので (役割, default) 単位の成績悪化は検出できる)ので、設定も routing から切り離してトップレベルに置くのが筋。これで `[drift]` の有無は routing の active 判定に一切影響しない。
+
+### 6. project スコープは「現在 project」を導入せず、既存の各コマンドの流儀に合わせる
+
+`routing_drift` を `project_id` で持つと決めた以上、読む 3 コマンドが「どの project を出すか」を確定しないと実装者が受け入れ条件を満たせない。ここで**新たに「現在 project」という概念を導入しない** — 現行コードにそんな状態はどこにも無く(doctor は `cfg.projects` を全件ループ、top は明示的に cross-project)、導入すれば別問題(どこに保存する/どう切り替える)を新設することになる。代わりに各コマンドの**既存の性格に合わせて**スコープを決める:
+
+| コマンド | 現状 | drift のスコープ |
+|---|---|---|
+| `meguri stats routing` | 新設 | 既定は全 project(project 列付き)。`--project <id>`(`cmd_run`/`cmd_prune` と同じ optional 引数)で単一 project に絞る |
+| `meguri doctor` | `cfg.projects` を全件ループ | 全 project の未解消行を project id 前置で列挙(選択フラグ無し) |
+| `meguri top` | 明示的に cross-project view | 全 project の active drift を横断集計してヘッダに 1 行 |
+
+判定基準: **単一 project を狙う操作性が要るコマンドだけ `--project` を持つ**(stats は表を絞りたい需要がある)。doctor と top は元々 all-project／cross-project の道具なので、そのまま全 project を出し、drift 行に project ラベルを付けて分離する。どのビューでも読みは `routing_drift` を `project_id` で絞る(単一)か project 列付きで全件出す(横断)かのどちらかで、`WHERE project_id=?` を基本に据えるので「ある project の drift が別 project のものとして混ざる」ことは無い。受け入れ条件の「project で正しく分離」は、単一表示では絞り込みで、横断表示では project ラベルの付与で、それぞれ満たす。
+
+### 7. 実起動プローブはネットワーク/認証失敗と「モデル不正」を区別する
+
+doctor 実行時のみ、各プロファイルで超短命の 1 ターン(claude なら `claude -p "reply: ok" --model sonnet` 相当)を打ち、モデルエイリアスの生死を実地確認する(quota を数百トークン消費する opt-in コスト)。ここで失敗の**原因を切り分ける**のが肝:
+
+- **モデル不正**(エイリアス廃止・リネーム)→ **❌**。routing 表が古い、というアクション可能な兆候。
+- **ネットワーク/認証失敗** → **⚠️**。routing のせいではないので doctor を fail させない。
+
+プローブは注入可能なクロージャにして(`routing::detect_command` と同じ流儀)、テストは fake agent で「無効モデル → ❌」を再現する。実 CLI を叩かない。
+
+## 帰結
+
+- routing の陳腐化に対して「表の日付が古い」「モデルが消えた」「CLI が更新された」「実成績が落ちた」の 4 兆候が、それぞれ独立した安い検査で出るようになる。
+- serve 撤去(ADR 0002)を受け、issue が想定した「serve ダッシュボードの 1 ページ」は **`meguri stats routing`(CLI)+ `meguri top` ヘッダの drift 行**に置き換わる。Web ページは作らない。
+- CLI バージョンは doctor 実行ごとに sqlite に UPSERT し、メジャー番号の変化で「再評価推奨」を出す。バージョン履歴の最小の永続化(1 CLI = 1 行)を新設する。
+- drift の現在状態は `routing_drift` テーブル(project×役割×プロファイル = 1 行、`active` フラグ)に持ち、read 側の project スコープと「解消したら消える」を保証する。`events` は project を持たず run 非依存の drift を絞れないため、read の真実源にはしない(履歴としては残す)。
+- 表示側は「現在 project」を新設せず、既存の性格を踏襲する: `stats routing` だけが `--project` で単一 project に絞れ(既定は全 project の project 列付き)、doctor と top は従来通り all-project／cross-project のまま drift を project ラベル付きで出す。これで実装者は 3 コマンドそれぞれのスコープを迷わず決められる。
+- 成果ドリフトの精度はターン単位集計・トークン会計を足せば上げられるが、いずれも本 ADR の軸(役割×プロファイル / ターン数×所要時間)の**下**に足す拡張であり、この決定を覆さない。

@@ -46,13 +46,6 @@ impl Scheduler {
         let mut running: JoinSet<String> = JoinSet::new();
         let mut active_run_ids: HashSet<String> = HashSet::new();
 
-        // Re-dispatch interrupted runs before discovering new work.
-        for run in store.list_runs(true)? {
-            if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
-                self.dispatch(&run, &mut running, &mut active_run_ids);
-            }
-        }
-
         loop {
             // Pick up config edits before this tick's discovery, so a change
             // applies to every run spawned from here on.
@@ -83,17 +76,35 @@ impl Scheduler {
                 }
             }
 
+            // Re-dispatch interrupted/queued runs before discovering new
+            // work, every tick rather than only at watch startup (#183): a
+            // pane that died mid-execute resumes from its checkpoint within
+            // one poll_interval instead of staying stuck until the next
+            // `meguri daemon restart`.
+            if let Err(e) = self.redispatch_interrupted(&store, &mut running, &mut active_run_ids) {
+                tracing::warn!("redispatch failed: {e:#}");
+            }
+
             if active_run_ids.len() < self.max_concurrent
                 && let Err(e) = self.discover(&mut running, &mut active_run_ids).await
             {
                 tracing::warn!("discovery failed: {e:#}");
             }
 
+            // Ride the poll: fire due cron schedules (issue #146). An
+            // out-of-band enqueue like the sweeps below — it creates an
+            // issue/task that the loops above discover next tick. `now` is
+            // sampled once so every project's schedules see the same instant.
+            let now = super::scheduler_fire::epoch_now();
+
             // Ride the poll: reclaim panes and worktrees whose issue closed
             // (the issue is the unit of lifetime — one author pane plus one
             // review pane per issue, kept until it closes; #13, #92).
             // Runs on the first tick too, i.e. as startup recovery.
             for deps in &self.projects {
+                if let Err(e) = super::scheduler_fire::sweep(deps, now).await {
+                    tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
+                }
                 if let Err(e) = super::reaper::sweep(deps).await {
                     tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
                 }
@@ -108,6 +119,23 @@ impl Scheduler {
                 // PR is seen once in the same tick.
                 if let Err(e) = super::merge_watch::sweep(deps).await {
                     tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
+                }
+                // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
+                // flips its issue speccing → ready so the worker implements it.
+                if let Err(e) = super::plan_handoff::sweep(deps).await {
+                    tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
+                }
+                // Ride the poll: recompute routing outcome drift from run
+                // history and record any threshold crossing (routing 2/3,
+                // #65). Pure sqlite, no pane, no API.
+                if let Err(e) = super::routing_drift::sweep(deps) {
+                    tracing::warn!("routing drift sweep failed for {}: {e:#}", deps.project.id);
+                }
+                // Notice body edits on already-shipped issues the label-filtered
+                // discovery can no longer see (issue #142, half B) and leave a
+                // re-attention signal. Light API sweep, no run record.
+                if let Err(e) = super::reconcile::sweep(deps).await {
+                    tracing::warn!("reconcile sweep failed for {}: {e:#}", deps.project.id);
                 }
             }
 
@@ -131,6 +159,12 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashSet<String>,
     ) -> Result<()> {
+        // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
+        // conflict_resolver) below share one `list_open_prs` call per
+        // project this tick instead of one each (issue #170).
+        for deps in &self.projects {
+            deps.open_prs.clear().await;
+        }
         for lp in &self.loops {
             for deps in &self.projects {
                 if active.len() >= self.max_concurrent {
@@ -150,11 +184,12 @@ impl Scheduler {
                     // someone raced us. Run creation branches on the key so
                     // the target travels from discovery through claim.
                     let created = match target.key {
-                        TaskKey::Issue(n) => deps.store.create_run_for_loop(
+                        TaskKey::Issue(n) => deps.store.create_run_for_loop_cadence(
                             &deps.project.id,
                             lp.kind(),
                             n,
                             &target.title,
+                            target.cadence_label.as_deref(),
                         ),
                         TaskKey::Local(id) => deps.store.create_run_for_task(
                             &deps.project.id,
@@ -175,6 +210,31 @@ impl Scheduler {
                     )?;
                     self.dispatch(&run, running, active);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Redispatch runs left `interrupted` (pane died mid-execute) or
+    /// `queued` (never got a slot), respecting the slot budget. `active`
+    /// also guards against double-dispatching a run this loop already
+    /// spawned earlier in the same tick, or in a still-running previous
+    /// tick, whose store status hasn't caught up to `running` yet.
+    fn redispatch_interrupted(
+        &self,
+        store: &Store,
+        running: &mut JoinSet<String>,
+        active: &mut HashSet<String>,
+    ) -> Result<()> {
+        for run in store.list_runs(true)? {
+            if active.len() >= self.max_concurrent {
+                break;
+            }
+            if active.contains(&run.id) {
+                continue;
+            }
+            if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
+                self.dispatch(&run, running, active);
             }
         }
         Ok(())

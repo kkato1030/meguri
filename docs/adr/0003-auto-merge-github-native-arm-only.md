@@ -1,6 +1,6 @@
 # ADR 0003: 自動マージは GitHub ネイティブ auto-merge への arm が基本 — meguri は「マージして安全か」を判定せず、GitHub が承認済み(clean)のマージのみ確定する
 
-- Status: accepted
+- Status: accepted(orchestrator モードによる補完あり — 下記追補 / ADR 0009 参照)
 - Date: 2026-07-12
 - Issue: #41
 
@@ -23,3 +23,9 @@ looper は同じ問題を ADR-0005 で (b) と決めており、meguri も同じ
 - meguri 側の実装は「条件が揃ったら arm、あとは待つ」だけになり、CI ポーリングやマージリトライのループを持たない。実装・テストの表面積が小さい。
 - arm 後に条件が崩れた場合(新しい review thread 等)の解除は GitHub は自動でやらない。ドリフト検出・解除は後段の merge-watch(別 issue)で扱う — この ADR は「meguri がマージ実行者にならない」ことだけを固定する。
 - classic branch protection API で判定するため rulesets 運用は検出できない。加えて protection の存在確認(`branches/{base}/protection/required_status_checks`)は **admin 権限のトークンを要する** — write のみのトークンでは protection 実在下でも 403 になり判定できない。どちらの場合も `require_branch_protection = false` が逃げ道だが、その場合 protection の存在確認は人間の責任になる。403 を「protection なし」に倒すと保証の薄いリポジトリと区別できず fail-fast の意味が失われるため、403 はエラーとして人間に返す。
+
+## 追補(issue #157、2026-07-13 — orchestrator モード)
+
+本 ADR の基本形(arm-only、判定を GitHub に委ねる)は **サーバ側にゲートが実在すること** を暗黙の前提にしている。**private + Free プランのリポジトリでは "Allow auto-merge" 設定自体が有効化できず**(API で PATCH しても黙って false のまま)、branch protection も無い(403)ため、この前提が崩れ、`enabled = true` は fail-fast で必ず落ちる。
+
+この環境向けのフォールバックとして **orchestrator モード**(`[pr.auto_merge].mode = "orchestrator"`)を追加した。適格判定は本 ADR の sweep と共通のまま、GitHub が `MERGEABLE` を返す PR を meguri 自身が直接マージする(arm しない)。本 ADR の「arm しに行った時点で既に mergeable なら `merge_pr` で確定する」唯一の例外を常態化したものであり、**「meguri 自身の PR 前検証(`check_command` + self-review, ADR 0006)が唯一のゲートになる」ことを明示的に受容するモード**である。native モード(既定)は本 ADR のまま。決定の詳細と帰結は **ADR 0009** を参照。

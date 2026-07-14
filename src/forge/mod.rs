@@ -2,6 +2,8 @@
 //! principle: labels and comments on the forge are the durable source of
 //! truth for workflow state, never in-memory agent output.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -203,6 +205,39 @@ pub enum CheckState {
     Pending,
 }
 
+/// The subset of GitHub's commit-status states meguri writes for its inspection
+/// history (`meguri/self-review`, `meguri/pr-review`, ADR 0008). Advisory by
+/// default: a `Failure` status is a red check that does not block a human merge
+/// (GitHub reports the PR `UNSTABLE`) unless the user makes the context a
+/// required check; the auto-merger reads it as its arm gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStatusState {
+    Success,
+    Failure,
+    Pending,
+}
+
+impl CommitStatusState {
+    /// The GitHub `state` string for the statuses API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Pending => "pending",
+        }
+    }
+
+    /// Parse GitHub's lowercase status state; `error` folds into `Failure`.
+    pub fn from_gh(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "success" => Some(Self::Success),
+            "failure" | "error" => Some(Self::Failure),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+}
+
 /// One CI check on the PR's head commit (a GitHub Actions check run or a
 /// classic commit status).
 #[derive(Debug, Clone)]
@@ -368,9 +403,16 @@ pub trait Forge: Send + Sync {
     /// File a new issue; returns its number (planner decomposition,
     /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
-    /// Record `issue` as blocked by `blocker` in the forge-native dependency
-    /// graph (the same graph [`Forge::blocked_by`] reads).
+    /// Record `issue` (in this forge's repo) as blocked by `blocker` in the
+    /// forge-native dependency graph (the same graph [`Forge::blocked_by`]
+    /// reads).
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
+    /// Like [`Forge::add_blocked_by`] but the blocker lives in `blocker_repo`
+    /// (`owner/repo`), which may differ from this forge's own repo — the
+    /// cross-repo decomposition case (issue #154). The dependent `issue` is
+    /// still in this forge's repo; only the blocker's home repo changes. When
+    /// `blocker_repo` equals this forge's repo the two are equivalent.
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()>;
     /// Overwrite an issue's body wholesale (snapshot-style report updates).
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
@@ -459,6 +501,29 @@ pub trait Forge: Send + Sync {
     async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
+
+    /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
+    /// — meguri's inspection history for a review (ADR 0008). `context` is the
+    /// status name (`meguri/self-review` / `meguri/pr-review`), `description`
+    /// the one-line verdict. Idempotent from the caller's view: re-posting the
+    /// same context replaces the visible status.
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        description: &str,
+    ) -> Result<()>;
+
+    /// The latest state of `context` on `head_sha`, or `None` if meguri never
+    /// wrote that context on that commit — the auto-merger's guard gate reads
+    /// it (ADR 0008 §5). `None` means "not decided yet": the caller waits
+    /// rather than escalating.
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>>;
     /// The repository's merge configuration for `base_branch` (ADR 0003
     /// fail-fast + arm gate). When `require_branch_protection` is false the
     /// branch-protection probe is skipped and `protected_with_required_checks`
@@ -470,6 +535,15 @@ pub trait Forge: Send + Sync {
         base_branch: &str,
         require_branch_protection: bool,
     ) -> Result<MergePolicy>;
+}
+
+/// Builds a [`Forge`] for a given repo slug (`owner/repo`). Cross-repo
+/// decomposition needs a forge for a workspace sibling's repository, which the
+/// per-project `Deps::forge` cannot provide (issue #154). Production returns a
+/// `GhForge`; tests inject fakes so the sibling-repo path is exercised without
+/// hitting GitHub. See ADR 0009.
+pub trait ForgeFactory: Send + Sync {
+    fn for_slug(&self, slug: &str) -> Arc<dyn Forge>;
 }
 
 #[cfg(test)]

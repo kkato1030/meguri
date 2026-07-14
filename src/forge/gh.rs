@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
-    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState, PrComment,
-    PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
+    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
 };
 
 /// How much of each failed job log survives into the fix prompt (logs can be
@@ -49,6 +49,17 @@ fn label_scheme(label: &str) -> (&'static str, &'static str) {
 pub struct GhForge {
     /// "owner/repo"
     repo: String,
+}
+
+/// Production [`ForgeFactory`](super::ForgeFactory): builds a [`GhForge`] per
+/// repo slug. Used by cross-repo decomposition to reach workspace siblings
+/// (issue #154).
+pub struct GhForgeFactory;
+
+impl super::ForgeFactory for GhForgeFactory {
+    fn for_slug(&self, slug: &str) -> std::sync::Arc<dyn Forge> {
+        std::sync::Arc::new(GhForge::new(slug))
+    }
 }
 
 impl GhForge {
@@ -488,17 +499,24 @@ impl Forge for GhForge {
             .with_context(|| format!("no issue number in gh issue create output: {out}"))
     }
 
-    /// The dependencies endpoint wants the blocking issue's database id, not
-    /// its number — resolve it first.
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
+        let repo = self.repo.clone();
+        self.add_blocked_by_in(issue, &repo, blocker).await
+    }
+
+    /// The dependencies endpoint wants the blocking issue's database id, not
+    /// its number — resolve it from the blocker's own repo (which may be a
+    /// workspace sibling, issue #154). The `issue_id` is unique across GitHub,
+    /// so once resolved the POST targets this forge's repo unchanged.
+    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()> {
         let raw = self
-            .gh(&["api", &format!("repos/{}/issues/{blocker}", self.repo)])
+            .gh(&["api", &format!("repos/{blocker_repo}/issues/{blocker}")])
             .await?;
         let v: Value = serde_json::from_str(&raw).context("parsing gh issue output")?;
         let id = v
             .get("id")
             .and_then(Value::as_i64)
-            .with_context(|| format!("issue #{blocker} has no id: {raw}"))?;
+            .with_context(|| format!("issue {blocker_repo}#{blocker} has no id: {raw}"))?;
         self.gh(&[
             "api",
             "-X",
@@ -1120,6 +1138,55 @@ impl Forge for GhForge {
         self.gh(&["pr", "ready", &pr.to_string(), "--repo", &self.repo])
             .await?;
         Ok(())
+    }
+
+    async fn set_commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+        state: CommitStatusState,
+        description: &str,
+    ) -> Result<()> {
+        // GitHub truncates the description at 140 chars; keep it short.
+        let description: String = description.chars().take(140).collect();
+        self.gh(&[
+            "api",
+            "-X",
+            "POST",
+            &format!("repos/{}/statuses/{head_sha}", self.repo),
+            "-f",
+            &format!("state={}", state.as_str()),
+            "-f",
+            &format!("context={context}"),
+            "-f",
+            &format!("description={description}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn commit_status(
+        &self,
+        head_sha: &str,
+        context: &str,
+    ) -> Result<Option<CommitStatusState>> {
+        // `.../commits/{sha}/statuses` lists statuses newest-first; take the
+        // most recent entry for the requested context.
+        let raw = self
+            .gh(&[
+                "api",
+                &format!("repos/{}/commits/{head_sha}/statuses", self.repo),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing commit statuses output")?;
+        let state = v.as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|s| s.get("context").and_then(Value::as_str) == Some(context))
+                .and_then(|s| s.get("state").and_then(Value::as_str))
+                .and_then(CommitStatusState::from_gh)
+        });
+        Ok(state)
     }
 
     async fn merge_policy(
