@@ -64,5 +64,9 @@ meguri は「run が不可逆操作(repo 作成・可視性変更・履歴改変
 - 最小の onboarding が `meguri add-project owner/repo` の 1 行になる。手動 clone も手編集も消える。
 - config は「追記のみ・コメント保持」を守るため `toml_edit` 等の再シリアライズは使わず、
   末尾テキスト追記で済ませる(新規依存を増やさない)。
+- 追記が唯一の書き込み経路になるので、**`meguri init` はもう live な `[[projects]]` stub を
+  書かない**。テンプレートの stub はコメント化し、init 直後の config は有効プロジェクト 0 件に
+  する。さもないと `init` → `add-project` でダミーの `owner/repo` が残り、doctor/watch が実
+  project 扱いして赤くする。追記される最初の実プロジェクトが唯一の live entry になる。
 - 本コマンドは**永続状態(`config.toml`)+ 公開契約(新 CLI)**に触れ、`--create` は**不可逆**なので、
   紐づく spec 側で migration / rollback を必須とする。
