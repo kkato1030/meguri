@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, LaunchMode, PrConfig, ProjectConfig, RepoConfig, RepoPrConfig};
 use meguri::engine::Deps;
 use meguri::engine::worker::{WorkerOutcome, run_worker};
 use meguri::forge::fake::FakeForge;
@@ -71,6 +71,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     // These happy-path tests don't exercise the self-review phase; the
     // dedicated self-review tests enable it explicitly.
     config.review.enabled = false;
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so the self-review tests below don't fall
+    // through to its recommended `direct` mode, which would spawn a *real*
+    // `claude` subprocess instead of going through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -83,10 +91,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -856,7 +868,7 @@ fn write_review(wt: &Path, verdict: &str, findings: serde_json::Value) {
         "verdict": verdict, "review": "self-review note", "findings": findings,
     });
     std::fs::write(
-        wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        wt.join(meguri::engine::self_review::REVIEW_FILE),
         body.to_string(),
     )
     .unwrap();
@@ -1039,7 +1051,7 @@ async fn self_review_findings_then_fix_converge_in_one_run() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn self_review_publishes_with_footer_when_rounds_run_out() {
+async fn self_review_escalates_when_rounds_run_out() {
     let mut env = setup(None).await;
     env.deps.config.review.enabled = true;
     env.deps.config.review.max_rounds = 2;
@@ -1058,7 +1070,7 @@ async fn self_review_publishes_with_footer_when_rounds_run_out() {
             if prompt.contains(REVIEW_MARK) {
                 write_review(
                     &wt,
-                    "findings",
+                    "fixable",
                     serde_json::json!([
                         {"path": "greeting.txt", "line": 1, "body": "still not right"}
                     ]),
@@ -1072,14 +1084,15 @@ async fn self_review_publishes_with_footer_when_rounds_run_out() {
         });
     });
 
-    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+    let result = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
         .await
-        .expect("worker timed out")
-        .unwrap();
+        .expect("worker timed out");
     agent.abort();
 
-    // The cap does not block: the PR is published anyway.
-    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    // Non-convergence is a human gate now (issue #176, ADR 0012): the run fails
+    // and the issue is parked on needs-human — the PR is never opened (was
+    // "publish with a footer" before #176).
+    assert!(result.is_err(), "unconverged self-review must fail the run");
     let kinds: Vec<String> = env
         .deps
         .store
@@ -1092,24 +1105,81 @@ async fn self_review_publishes_with_footer_when_rounds_run_out() {
         kinds.contains(&"self_review.unconverged".to_string()),
         "{kinds:?}"
     );
-
-    // The only trace on the PR is the single footer line — no threads, no
-    // conversation.
-    let prs = env.forge.prs();
-    let pr = prs[0].number;
-    assert!(env.forge.threads_of(pr).is_empty());
-    assert!(env.forge.pr_comments_of(pr).is_empty());
     assert!(
-        prs[0].body.contains("self-review"),
-        "unconverged PR needs a footer line: {}",
-        prs[0].body
+        env.forge.prs().is_empty(),
+        "no PR is published when self-review does not converge"
+    );
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn self_review_turn_uses_the_impl_reviewer_profile() {
+async fn self_review_needs_human_escalates_immediately() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    env.deps.config.review.max_rounds = 3;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // The very first review classifies the diff as needs_human: a fix round is
+    // never spent (issue #176), the run escalates at once.
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                write_review(&wt, "needs_human", serde_json::json!([]));
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix(&wt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+    agent.abort();
+
+    assert!(result.is_err(), "needs_human self-review must fail the run");
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.needs_human".to_string()),
+        "{kinds:?}"
+    );
+    // No fix round was spent, and no PR was published.
+    assert!(
+        !kinds.contains(&"self_review.fixed".to_string()),
+        "needs_human must not spend a fix round: {kinds:?}"
+    );
+    assert!(env.forge.prs().is_empty());
+    assert!(
+        env.forge
+            .labels_of(7)
+            .contains(&LABEL_NEEDS_HUMAN.to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_turn_uses_the_self_reviewer_profile() {
     // Model separation survives the internal loop: the review turn spawns
-    // under the `impl-reviewer` profile, the author's turns under `worker`.
+    // under the `self-reviewer` profile, the author's turns under `worker`.
     let mut env = setup(None).await;
     let mut config: Config = toml::from_str(
         r#"
@@ -1126,7 +1196,10 @@ mode = "manual"
 
 [routing.roles]
 worker = "p-worker"
-impl-reviewer = "p-review"
+self-reviewer = "p-review"
+
+[launch.roles]
+self-reviewer = "pane"
 "#,
     )
     .unwrap();
@@ -1166,12 +1239,249 @@ impl-reviewer = "p-review"
         commands
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("review-cli")),
-        "the review turn must spawn under the impl-reviewer profile: {commands:?}"
+        "the review turn must spawn under the self-reviewer profile: {commands:?}"
     );
     assert!(
         commands
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("worker-cli")),
         "the author turns must spawn under the worker profile: {commands:?}"
+    );
+}
+
+// ---- repo config: meguri.toml pinned at run start (issue #165) ------------
+
+/// Commit a repo-root `meguri.toml` on the clone's default branch and push it,
+/// so a run's worktree (branched off `origin/main`) checks it out.
+async fn seed_repo_toml(clone: &Path, contents: &str) {
+    std::fs::write(clone.join("meguri.toml"), contents).unwrap();
+    run_git(clone, &["add", "meguri.toml"]).await.unwrap();
+    run_git(
+        clone,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=meguri-test",
+            "commit",
+            "-m",
+            "add meguri.toml",
+        ],
+    )
+    .await
+    .unwrap();
+    run_git(clone, &["push", "origin", "main"]).await.unwrap();
+}
+
+/// The command each `validate.running` event recorded, in order — how a test
+/// observes which `check_command` the run actually executed.
+fn validate_commands(env: &TestEnv, run_id: &str) -> Vec<String> {
+    env.deps
+        .store
+        .events_for_run(run_id, 200)
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "validate.running")
+        .filter_map(|e| {
+            e.data
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn with_repo_config_folds_under_host_precedence() {
+    // Baseline project: host sets none of the repo-eligible keys.
+    let env = setup(None).await;
+    let repo = RepoConfig {
+        language: Some("日本語".into()),
+        check_command: Some("cargo test".into()),
+        pr: Some(RepoPrConfig { draft: Some(false) }),
+    };
+
+    // Host left them unset → repo fills them in.
+    let folded = env.deps.with_repo_config(&repo);
+    assert_eq!(folded.project.check_command.as_deref(), Some("cargo test"));
+    assert_eq!(folded.config.language_for(&folded.project), Some("日本語"));
+    assert!(!folded.config.pr_for(&folded.project).draft);
+    // auto_merge is never contributed by the repo — it stays host-global.
+    assert!(!folded.config.pr_for(&folded.project).auto_merge.enabled);
+
+    // Host [projects.*] override wins wholesale over the repo layer.
+    let mut deps = env.deps;
+    deps.project.check_command = Some("host-check".into());
+    deps.project.language = Some("English".into());
+    deps.project.pr = Some(PrConfig {
+        draft: true,
+        auto_merge: Default::default(),
+    });
+    let folded = deps.with_repo_config(&repo);
+    assert_eq!(folded.project.check_command.as_deref(), Some("host-check"));
+    assert_eq!(folded.config.language_for(&folded.project), Some("English"));
+    assert!(
+        folded.config.pr_for(&folded.project).draft,
+        "host [projects.pr] wins wholesale over repo pr.draft"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repo_check_command_from_meguri_toml_is_applied() {
+    // Host project has no check_command; the repo declares one plus pr.draft.
+    let env = setup(None).await;
+    seed_repo_toml(
+        &env.deps.project.repo_path,
+        "check_command = \"test -f greeting.txt\"\n\n[pr]\ndraft = false\n",
+    )
+    .await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    // The repo's check_command actually ran (not skipped as it would be with a
+    // None host command) — proof the repo layer reached validation.
+    let cmds = validate_commands(&env, &run.id);
+    assert!(
+        cmds.iter().any(|c| c == "test -f greeting.txt"),
+        "repo check_command must be the one validate ran: {cmds:?}"
+    );
+
+    // The repo's pr.draft = false took effect (host default is draft = true).
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1);
+    assert!(
+        !prs[0].draft,
+        "repo pr.draft = false must open a non-draft PR"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_pins_repo_check_command_against_mid_run_tamper() {
+    // Acceptance criterion 2: a run's completion contract is fixed at claim.
+    // The repo's check_command needs greeting.txt; the agent commits it, then
+    // rewrites (and commits) meguri.toml to a check that would fail — the run
+    // must still validate against the PINNED command, so it succeeds and the
+    // tampered command never runs.
+    let env = setup(None).await;
+    seed_repo_toml(
+        &env.deps.project.repo_path,
+        "check_command = \"test -f greeting.txt\"\n",
+    )
+    .await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            // Tamper: weaken the contract in this branch and commit it (so the
+            // worktree stays clean for git verification).
+            std::fs::write(wt.join("meguri.toml"), "check_command = \"false\"\n").unwrap();
+            run_git(&wt, &["add", "meguri.toml"]).await.unwrap();
+            run_git(
+                &wt,
+                &[
+                    "-c",
+                    "user.email=a@example.com",
+                    "-c",
+                    "user.name=agent",
+                    "commit",
+                    "-m",
+                    "weaken check",
+                ],
+            )
+            .await
+            .unwrap();
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    // Pinned command ran (greeting.txt exists) → success; the tampered "false"
+    // was never executed.
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "run must validate against the pinned command, not the tampered one: {outcome:?}"
+    );
+    let cmds = validate_commands(&env, &run.id);
+    assert!(
+        cmds.iter().all(|c| c == "test -f greeting.txt"),
+        "only the claim-time pinned command may run, never the tampered `false`: {cmds:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_repo_config_warns_and_falls_back() {
+    // Acceptance criterion 4: a broken meguri.toml doesn't kill the run — it is
+    // warned about, an event is emitted, and the run continues on host config.
+    let env = setup(None).await;
+    seed_repo_toml(
+        &env.deps.project.repo_path,
+        "check_command = \"x\"\nrepo_slug = \"me/x\"\n", // host-only key → parse error
+    )
+    .await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    // Run still succeeds (host has no check_command → validation is skipped).
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"repo_config.invalid".to_string()),
+        "an invalid meguri.toml must emit repo_config.invalid: {kinds:?}"
     );
 }

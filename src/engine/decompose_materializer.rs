@@ -2,7 +2,7 @@
 //!
 //! The planner writes a *decomposition proposal* spec (prose + a machine-readable
 //! `children` block) and marks its PR body. Once the spec-review gate approves
-//! the PR (`spec-ready` + a per-head `meguri/guard-review` success status), this
+//! the PR (`spec-ready` + a per-head `meguri/pr-review` success status), this
 //! sweep files the proposed children, wires GitHub-native `blocked_by`, labels
 //! each child, and turns the parent into an unlabeled tracking issue — then
 //! closes the disposable proposal PR (its single commit point).
@@ -23,8 +23,8 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use super::Deps;
-use super::guard::GUARD_STATUS;
 use super::planner::{self, CHILDREN_FENCE_INFO, decompose_child_footer_ref, decompose_child_key};
+use super::pr_reviewer::PR_REVIEW_STATUS;
 use crate::forge::{self, CommitStatusState};
 use crate::gitops;
 use crate::turn::ChildIssue;
@@ -157,13 +157,13 @@ async fn process(deps: &Deps, pr: &forge::PullRequest, parent: i64) -> Result<()
         return Ok(());
     }
 
-    // Head-motion gate: only materialize the head the guard actually reviewed
-    // (ADR 0012 §5). The approval trail is the per-head guard-review status.
+    // Head-motion gate: only materialize the head the pr-reviewer actually reviewed
+    // (ADR 0012 §5). The approval trail is the per-head pr-review status.
     let guard_on = deps.config.review_for(&deps.project).guard.plan;
     if guard_on {
         let approved = deps
             .forge()
-            .commit_status(&pr.head_sha, GUARD_STATUS)
+            .commit_status(&pr.head_sha, PR_REVIEW_STATUS)
             .await?
             == Some(CommitStatusState::Success);
         if !approved {
@@ -775,10 +775,14 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
         }
     }
 
@@ -942,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_stale_flips_back_to_reviewing_and_creates_nothing() {
-        // guard.plan on (default) but no guard-review success on the head:
+        // guard.plan on (default) but no pr-review success on the head:
         // the proposal is not materialized and goes back to spec-reviewing.
         let (forge, deps) = setup();
         let pr = pr_of(&forge).await;
@@ -956,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn guard_off_does_not_apply_the_head_gate() {
         // AC 9: with `guard.plan = false` (approval gate opted out) the sweep
-        // does not require a guard-review status and does not flip the PR back
+        // does not require a pr-review status and does not flip the PR back
         // to spec-reviewing — the head gate is off with the same switch. (This
         // unit has no git repo, so `process` errors when it goes on to read the
         // spec; the point is only that the gate did not fire.)
@@ -1008,7 +1012,7 @@ mod tests {
         // phase/ball record) halt materialization entirely — no children, and
         // no spec-ready → spec-reviewing churn either (finding: parent stop
         // labels). Without the skip, the guard gate would flip the labels
-        // because HEAD carries no guard-review status.
+        // because HEAD carries no pr-review status.
         let (forge, deps) = setup();
         for label in [crate::forge::LABEL_HOLD, crate::forge::LABEL_NEEDS_HUMAN] {
             forge.add_label(1, label).await.unwrap();

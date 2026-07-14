@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{Config, LaunchMode, ProjectConfig};
 use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
@@ -107,6 +107,15 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     );
 
     let mut config = Config::default();
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so a self-review turn (if a test enables
+    // review.enabled) doesn't fall through to its recommended `direct` mode,
+    // which would spawn a *real* `claude` subprocess instead of going
+    // through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     // These takeover tests don't script the self-review turn; the dedicated
@@ -124,12 +133,16 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         // The spec worker (branch-takeover morph) is the combined delivery
         // (ADR 0008); in separate delivery it is inert.
         plan_delivery: meguri::config::PlanDelivery::Combined,
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -225,7 +238,7 @@ fn write_review(worktree: &Path, verdict: &str) {
         "verdict": verdict, "review": "self-review note", "findings": [],
     });
     std::fs::write(
-        worktree.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+        worktree.join(meguri::engine::self_review::REVIEW_FILE),
         body.to_string(),
     )
     .unwrap();
@@ -577,9 +590,31 @@ async fn spec_worker_needs_human_escalates_like_the_worker() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
 
+    // The combined PR is parked on needs-human too (issue #176): spec-ready
+    // survives the failed run, so the PR-side label is what stops the next
+    // poll from picking the same PR up again.
     let pr_labels = env.forge.pr_labels_of(1);
     assert!(!pr_labels.contains(&LABEL_WORKING.to_string()));
     assert!(pr_labels.contains(&LABEL_SPEC_READY.to_string()));
+    assert!(
+        pr_labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the escalation must park the PR itself: {pr_labels:?}"
+    );
+    assert!(
+        SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "an escalated spec-ready PR must not be rediscovered until a human clears it"
+    );
+    // A human clearing the PR label re-arms the takeover (the failed run never
+    // counted as shipped).
+    env.forge
+        .remove_pr_label(1, LABEL_NEEDS_HUMAN)
+        .await
+        .unwrap();
+    let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
+    assert_eq!(
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        vec![5]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -624,8 +659,9 @@ async fn spec_worker_skips_quietly_when_label_removed_after_discovery() {
 async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
     let env = setup(None).await;
 
-    // Alongside the actionable spec PR: held, claimed, non-meguri-branch,
-    // and closed ones (each on its own issue-numbered branch).
+    // Alongside the actionable spec PR: held, claimed, escalated,
+    // non-meguri-branch, and closed ones (each on its own issue-numbered
+    // branch).
     for (number, branch, labels, state) in [
         (
             2,
@@ -637,6 +673,12 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
             3,
             "meguri/7-claimed-abc",
             vec![LABEL_SPEC_READY, LABEL_WORKING],
+            "open",
+        ),
+        (
+            6,
+            "meguri/9-escalated-abc",
+            vec![LABEL_SPEC_READY, LABEL_NEEDS_HUMAN],
             "open",
         ),
         (4, "feature/manual", vec![LABEL_SPEC_READY], "open"),

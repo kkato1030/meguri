@@ -1,7 +1,10 @@
+use std::io::{IsTerminal, Write};
+
 use anyhow::{Result, bail};
 use clap::Parser;
+use meguri::agent_skills;
 use meguri::app;
-use meguri::cli::{Cli, Command, DaemonCommand, StatsCommand};
+use meguri::cli::{AgentSkillsCommand, Cli, Command, DaemonCommand, StatsCommand};
 use meguri::config::{self, Config};
 use meguri::daemon;
 use meguri::store::Store;
@@ -39,9 +42,16 @@ async fn main() -> Result<()> {
             project,
             plan,
             file,
+            not_before,
             title,
-        } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
-        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
+        } => app::cmd_add(
+            project.as_deref(),
+            plan,
+            file.as_deref(),
+            title.as_deref(),
+            not_before.as_deref(),
+        ),
+        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
         Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
@@ -65,6 +75,19 @@ async fn main() -> Result<()> {
             dry_run,
             force,
         } => app::cmd_prune(project.as_deref(), dry_run, force).await,
+        Command::AgentSkills { command } => match command {
+            AgentSkillsCommand::Install {
+                target,
+                project,
+                repo,
+                force,
+            } => app::cmd_agent_skills_install(&target, project, repo.as_deref(), force),
+            AgentSkillsCommand::Status {
+                target,
+                project,
+                repo,
+            } => app::cmd_agent_skills_status(&target, project, repo.as_deref()),
+        },
     }
 }
 
@@ -87,7 +110,46 @@ fn cmd_init() -> Result<()> {
         "\nNext: edit {} — fill in the [[projects]] stub (repo_path, repo_slug).",
         cfg_path.display()
     );
+    offer_agent_skills_install();
     Ok(())
+}
+
+/// After `meguri init`, offer the user-level Claude Code skill (issue #150)
+/// so an agent working nearby can learn about and propose meguri on its
+/// own. Interactive only — a non-interactive run (CI, scripted setup) just
+/// gets the pointer, never a silent write to `~/.claude/`.
+fn offer_agent_skills_install() {
+    println!();
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "Tip: `meguri agent-skills install` sets up a Claude Code skill \
+             (~/.claude/skills/meguri/) so agents working nearby can learn about meguri."
+        );
+        return;
+    }
+    print!("Also install the meguri skill for Claude Code (~/.claude/skills/meguri/)? [y/N] ");
+    if std::io::stdout().flush().is_err() {
+        return;
+    }
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!("Skipped — run `meguri agent-skills install` any time.");
+        return;
+    }
+    let home = match agent_skills::resolve_home() {
+        Ok(home) => home,
+        Err(e) => {
+            println!("⚠️  could not install agent skill: {e:#}");
+            return;
+        }
+    };
+    match agent_skills::install_user_skill(agent_skills::Target::Claude, &home, false) {
+        Ok(report) => app::print_agent_skills_install_report(&report),
+        Err(e) => println!("⚠️  could not install agent skill: {e:#}"),
+    }
 }
 
 async fn cmd_doctor(probe: bool) -> Result<()> {
@@ -195,7 +257,16 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // Cron schedules (issue #146): cron/name/body validity already
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
-            ok &= doctor_schedules(cfg);
+            ok &= doctor_schedules(cfg).await;
+            // Cadence rules (issue #148): shape is already validated at load;
+            // here we show each rule's current window consumption.
+            doctor_cadence(cfg, store.as_ref());
+            // Repo config (issue #165): lint each project's `meguri.toml` on the
+            // default branch, failing on a host-only key or TOML error.
+            ok &= doctor_repo_configs(cfg).await;
+            // Role preambles (issue #149): each configured path must resolve to
+            // a regular file on the default branch (ADR 0015).
+            ok &= doctor_prompts(cfg).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -215,6 +286,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// ADR 0003). Returns false if any enabled project fails; projects that did
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
+    use meguri::config::AutoMergeMode;
     use meguri::engine::auto_merger::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
@@ -224,6 +296,15 @@ async fn check_auto_merge(cfg: &Config) -> bool {
         let am = &cfg.pr_for(project).auto_merge;
         if !am.enabled {
             continue;
+        }
+        // Inconsistency warn (issue #176): auto-merge is on, but the project is
+        // `attended`, so meguri will never arm it. Advisory only — not a failure.
+        if cfg.autonomy_for(project) != meguri::config::Autonomy::Full {
+            println!(
+                "⚠️  auto-merge ({}): enabled but autonomy=attended — meguri will not arm \
+                 auto-merge (set autonomy = \"full\" to arm; ADR 0012)",
+                project.id
+            );
         }
         // Auto-merge is a GitHub-PR concern; a local-mode project has no slug
         // and no PRs to arm, so there is nothing to check.
@@ -237,15 +318,29 @@ async fn check_auto_merge(cfg: &Config) -> bool {
             .await
         {
             Ok(policy) => match validate_policy(am, &policy) {
-                Ok(()) => println!(
-                    "✅ {label}: repo settings OK (strategy={}, protection {})",
-                    am.strategy.as_str(),
-                    if policy.protected_with_required_checks {
-                        "present"
-                    } else {
-                        "not required"
-                    },
-                ),
+                Ok(()) => match am.mode {
+                    AutoMergeMode::Native => println!(
+                        "✅ {label}: repo settings OK (mode=native, strategy={}, protection {})",
+                        am.strategy.as_str(),
+                        if policy.protected_with_required_checks {
+                            "present"
+                        } else {
+                            "not required"
+                        },
+                    ),
+                    AutoMergeMode::Orchestrator => {
+                        // No server-side gate exists in this mode — remind the
+                        // operator that meguri's own verification is the gate.
+                        println!(
+                            "✅ {label}: repo settings OK (mode=orchestrator, strategy={})",
+                            am.strategy.as_str(),
+                        );
+                        println!(
+                            "   ⚠️  orchestrator mode: no server-side merge gate — \
+                             meguri's own check_command + self-review is the only gate"
+                        );
+                    }
+                },
                 Err(problems) => {
                     println!("❌ {label}: {}", problems.join("; "));
                     ok = false;
@@ -263,11 +358,13 @@ async fn check_auto_merge(cfg: &Config) -> bool {
 /// Doctor's schedules section (issue #146): the cron expression, name
 /// uniqueness, body exclusivity, and local-mode `plan` rejection are already
 /// enforced at config load (so a loaded `cfg` has passed them). What load does
-/// *not* check is that each `body_file` actually exists on disk — do that here,
-/// and print each schedule's next fire. Returns false if any `body_file` is
-/// missing; projects without schedules print nothing.
-fn doctor_schedules(cfg: &Config) -> bool {
+/// *not* check is that each `body_file` is a regular file on the default branch
+/// — do that here (ADR 0015), and print each schedule's next fire. Returns false
+/// if any `body_file` is missing/unreadable; projects without schedules print
+/// nothing.
+async fn doctor_schedules(cfg: &Config) -> bool {
     use meguri::cron::Cron;
+    use meguri::gitops::{self, DefaultBranchFile};
     use meguri::store::format_epoch;
 
     let has_any = cfg.projects.iter().any(|p| !p.schedules.is_empty());
@@ -284,19 +381,26 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 .and_then(|c| c.next_after(now))
                 .map(format_epoch)
                 .unwrap_or_else(|| "never".into());
-            // body_file must exist (repo-relative); inline body is always fine.
+            // body_file must be a regular file on the default branch (ADR
+            // 0015); inline body is always fine.
             let (line_ok, body_detail) = match &s.body_file {
-                Some(rel) => {
-                    let path = project.repo_path.join(rel);
-                    if path.exists() {
-                        (true, format!("body_file {rel}"))
-                    } else {
-                        (
-                            false,
-                            format!("body_file {rel} not found at {}", path.display()),
-                        )
+                Some(rel) => match gitops::read_file_at_default_branch(
+                    &project.repo_path,
+                    &project.default_branch,
+                    rel,
+                )
+                .await
+                {
+                    Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
+                    Ok(DefaultBranchFile::Absent) => {
+                        (false, format!("body_file {rel} not on default branch"))
                     }
-                }
+                    Ok(DefaultBranchFile::NotRegularFile) => (
+                        false,
+                        format!("body_file {rel} is not a regular file on default branch"),
+                    ),
+                    Err(e) => (false, format!("body_file {rel}: {e:#}")),
+                },
                 None => (true, "inline body".to_string()),
             };
             ok &= line_ok;
@@ -308,6 +412,154 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 s.kind.as_str(),
                 s.cron,
             );
+        }
+    }
+    ok
+}
+
+/// Doctor's cadence section (issue #148): the config shape (label uniqueness,
+/// period mode, positive values) already fail-fasts at load, so here we simply
+/// show each rule's current window consumption — "N/M used, K left" — so an
+/// operator can see why a labelled issue is being held back. Projects without
+/// cadence rules print nothing; a missing store just omits the counts.
+fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
+    use meguri::cadence;
+
+    let has_any = cfg.projects.iter().any(|p| !p.cadence.is_empty());
+    if !has_any {
+        return;
+    }
+    let now = meguri::engine::scheduler_fire::epoch_now();
+    println!("\ncadence:");
+    for project in &cfg.projects {
+        for rule in &project.cadence {
+            let mode = match rule.per_hours {
+                Some(h) => format!("per {h}h"),
+                None => "per day (UTC)".to_string(),
+            };
+            let max = cadence::limit(rule);
+            let usage = match store {
+                Some(store) => {
+                    let start = cadence::window_start(rule, now);
+                    match store.cadence_consumed(&project.id, &rule.label, start) {
+                        Ok(consumed) => {
+                            let left = (max as i64 - consumed).max(0);
+                            format!("{consumed}/{max} used, {left} left")
+                        }
+                        Err(_) => format!("max {max} (count unavailable)"),
+                    }
+                }
+                None => format!("max {max}"),
+            };
+            println!("  ✅ {}/{} ({mode}) — {usage}", project.id, rule.label);
+        }
+    }
+}
+
+/// Doctor's repo-config section (issue #165): lint each project's repo root
+/// `meguri.toml`. Doctor holds no run, so it reads the default branch's
+/// `meguri.toml` (ADR 0015), not the working tree — advisory, not the run's
+/// pinned value. A host-only key or malformed TOML fails (deny_unknown_fields);
+/// an absent file is the silent, valid opt-out. Follows routing/schedules' "never silently
+/// fall back" principle so a boundary violation surfaces here, not as a no-op.
+async fn doctor_repo_configs(cfg: &Config) -> bool {
+    use meguri::config::RepoConfig;
+    use meguri::gitops::{self, DefaultBranchFile};
+
+    let mut printed_header = false;
+    let mut ok = true;
+    let mut header = || {
+        if !printed_header {
+            println!("\nrepo config:");
+            printed_header = true;
+        }
+    };
+    for project in &cfg.projects {
+        // Lint the default branch's `meguri.toml` (ADR 0015), not the working
+        // tree. An absent file is the silent, valid opt-out.
+        let read = gitops::read_file_at_default_branch(
+            &project.repo_path,
+            &project.default_branch,
+            "meguri.toml",
+        )
+        .await;
+        match read {
+            Ok(DefaultBranchFile::Absent) => {}
+            Ok(DefaultBranchFile::Content(raw)) => {
+                header();
+                match RepoConfig::parse_str(&raw) {
+                    Ok(_) => println!("  ✅ {}: meguri.toml OK", project.id),
+                    Err(e) => {
+                        println!("  ❌ {}: {e:#}", project.id);
+                        ok = false;
+                    }
+                }
+            }
+            Ok(DefaultBranchFile::NotRegularFile) => {
+                header();
+                println!(
+                    "  ❌ {}: meguri.toml is not a regular file on default branch",
+                    project.id
+                );
+                ok = false;
+            }
+            Err(e) => {
+                header();
+                println!("  ❌ {}: {e:#}", project.id);
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// Doctor's preamble section (issue #149): for every project, every preamble
+/// path that could be injected for it — the top-level `[prompts]` overlaid by
+/// its own `[projects.prompts]` — must be a regular file on the default branch
+/// (ADR 0015). Missing paths and non-regular files (a symlink, which can't be
+/// followed in a blob read) are both reported as ❌ (config validate already
+/// rejects absolute / `..` / trailing-slash values, so those never reach here).
+/// Projects with no preambles configured print nothing.
+async fn doctor_prompts(cfg: &Config) -> bool {
+    use meguri::gitops::{self, DefaultBranchFile};
+
+    let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
+    if !has_any {
+        return true;
+    }
+    let mut ok = true;
+    println!("\npreambles:");
+    for project in &cfg.projects {
+        for (key, rel) in cfg.effective_prompts(project) {
+            // Verify against the default branch (ADR 0015), reading the blob
+            // directly. A symlink can't be followed here, so it is reported as
+            // unverifiable rather than silently passing (its target string
+            // would otherwise read as content).
+            let (mark, detail) = match gitops::read_file_at_default_branch(
+                &project.repo_path,
+                &project.default_branch,
+                &rel,
+            )
+            .await
+            {
+                Ok(DefaultBranchFile::Content(_)) => ("✅", rel.to_string()),
+                Ok(DefaultBranchFile::Absent) => {
+                    ok = false;
+                    ("❌", format!("{rel} not on default branch"))
+                }
+                Ok(DefaultBranchFile::NotRegularFile) => {
+                    ok = false;
+                    (
+                        "❌",
+                        format!("{rel} is not a regular file on default branch (symlink/dir)"),
+                    )
+                }
+                Err(e) => {
+                    ok = false;
+                    ("❌", format!("{rel}: {e:#}"))
+                }
+            };
+            println!("  {mark} {}/{key} — {detail}", project.id);
         }
     }
     ok
@@ -436,6 +688,25 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+    ok &= doctor_launch(cfg);
+    ok
+}
+
+/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
+/// resolved (no legacy/off state, unlike routing). Explicit launch config
+/// errors (an unknown role key) are startup errors, surfaced here like
+/// routing's.
+fn doctor_launch(cfg: &Config) -> bool {
+    use meguri::{launch, routing};
+    let mut ok = true;
+    if let Err(e) = launch::validate(cfg) {
+        println!("  ❌ launch config: {e:#}");
+        ok = false;
+    }
+    println!("launch mode:");
+    for role in routing::KNOWN_ROLES {
+        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    }
     ok
 }
 
@@ -556,6 +827,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
         }

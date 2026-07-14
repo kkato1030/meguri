@@ -3,19 +3,22 @@ pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
 pub mod decompose_materializer;
+pub mod escalation;
 pub mod fixer;
 pub mod flow;
-pub mod guard;
-pub mod handoff;
-pub mod impl_reviewer;
 pub mod merge_watch;
+pub mod plan_handoff;
 pub mod planner;
+pub mod pr_reviewer;
 pub mod reaper;
 pub mod reconcile;
 pub mod routing_drift;
 pub mod scheduler;
 pub mod scheduler_fire;
+pub mod self_review;
+pub mod spec_fixer;
 pub mod spec_worker;
+pub mod triage;
 pub mod worker;
 
 use std::sync::Arc;
@@ -29,7 +32,7 @@ use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
 use crate::notify::{Notification, Notifier};
-use crate::store::{DesiredState, InteractionState, ROLE_AUTHOR, ROLE_REVIEW, Store};
+use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, LANE_PR_REVIEW, Store};
 use crate::tasks::{TaskKey, TaskSource};
 use crate::turn::TurnControl;
 
@@ -39,8 +42,8 @@ pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
     /// The GitHub forge — issue reading, PR/label/review operations. `None`
-    /// in local mode; the forge-dependent loops (fixer, reviewer, spec-worker,
-    /// conflict-resolver, ci-fixer, impl-reviewer, cleaner) then discover
+    /// in local mode; the forge-dependent loops (fixer, pr-reviewer,
+    /// spec-worker, conflict-resolver, ci-fixer, cleaner) then discover
     /// nothing. Task coordination goes through [`Deps::task_source`], not here.
     pub forge: Option<Arc<dyn Forge>>,
     /// The task coordination layer (discover / claim / release / escalate /
@@ -83,6 +86,7 @@ impl Deps {
             store.clone(),
             project.id.clone(),
             config.reconcile,
+            project.cadence.clone(),
         ));
         let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {
@@ -104,6 +108,37 @@ impl Deps {
     pub fn with_forge_factory(mut self, factory: Arc<dyn crate::forge::ForgeFactory>) -> Self {
         self.forge_factory = factory;
         self
+    }
+
+    /// A run-scoped clone whose `project` folds in the run's pinned repo
+    /// `meguri.toml` (issue #165). The precedence is
+    /// `builtin < host global < repo < host [projects.*] override`: a field the
+    /// host project already set wins wholesale; otherwise the repo value fills
+    /// it in. Cheap — `Deps` shares its store/mux/forge via `Arc`.
+    ///
+    /// `[pr]` is the one section with a key-level boundary (ADR 0011): the
+    /// host's `[projects.pr]` still wins wholesale (draft *and* auto_merge), but
+    /// when the host set no project `[pr]`, the repo's `draft` applies while
+    /// `auto_merge` stays host-global — the repo can never arm auto-merge.
+    pub fn with_repo_config(&self, repo: &crate::config::RepoConfig) -> Self {
+        let mut project = self.project.clone();
+        if project.language.is_none() {
+            project.language = repo.language.clone();
+        }
+        if project.check_command.is_none() {
+            project.check_command = repo.check_command.clone();
+        }
+        if project.pr.is_none()
+            && let Some(draft) = repo.pr.as_ref().and_then(|p| p.draft)
+        {
+            project.pr = Some(crate::config::PrConfig {
+                draft,
+                auto_merge: self.config.pr.auto_merge.clone(),
+            });
+        }
+        let mut deps = self.clone();
+        deps.project = project;
+        deps
     }
 
     /// The forge for github-mode loops. Panics if absent — only the
@@ -217,6 +252,10 @@ pub struct Target {
     /// task row). Also the run-creation and dispatch-sort key.
     pub key: TaskKey,
     pub title: String,
+    /// The cadence bucket (issue #148) discovery matched, if any. The scheduler
+    /// stamps it onto the created run so consumption can be counted. `None`
+    /// outside any cadence rule and for all non-task-source loops.
+    pub cadence_label: Option<String>,
 }
 
 /// The GitHub issue a PR belongs to: the branch encoding first
@@ -283,17 +322,17 @@ pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullReq
     }
 }
 
-/// The pane lane a loop's runs live in: the guard keeps its independent
-/// `review` lane; every other loop shares the issue's `author` lane (the
+/// The pane lane a loop's runs live in: the pr-reviewer keeps its independent
+/// `pr-review` lane; every other loop shares the issue's `author` lane (the
 /// cleaner's report issue is only ever touched by the cleaner, so the default
 /// lane cannot collide). The internal self-review turn runs in its own
-/// `impl-review` lane, but that lane is entered explicitly by the flow, not
+/// `self-review` lane, but that lane is entered explicitly by the flow, not
 /// via a loop_kind, so it is not resolved here.
-pub fn role_for_loop(loop_kind: &str) -> &'static str {
-    if loop_kind == guard::KIND {
-        ROLE_REVIEW
+pub fn lane_for_loop(loop_kind: &str) -> &'static str {
+    if loop_kind == pr_reviewer::KIND {
+        LANE_PR_REVIEW
     } else {
-        ROLE_AUTHOR
+        LANE_AUTHOR
     }
 }
 
@@ -343,11 +382,16 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
+        // Plan-side fixer family (issue #188): unparks spec PRs the plan
+        // review flagged, so it sits with the other fixers, above new-work
+        // loops.
+        Arc::new(spec_fixer::SpecFixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(guard::GuardLoop),
+        Arc::new(pr_reviewer::PrReviewerLoop),
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
+        Arc::new(triage::TriageLoop),
     ]
 }
 
@@ -443,19 +487,34 @@ mod tests {
     }
 
     #[test]
-    fn lane_is_review_only_for_the_guard() {
-        assert_eq!(role_for_loop(guard::KIND), ROLE_REVIEW);
+    fn lane_is_pr_review_only_for_the_pr_reviewer() {
+        assert_eq!(lane_for_loop(pr_reviewer::KIND), LANE_PR_REVIEW);
         for kind in [
             "worker",
             "planner",
             "spec-worker",
+            "spec-fixer",
             "fixer",
             "ci-fixer",
             "conflict-resolver",
             "cleaner",
+            "triage",
         ] {
-            assert_eq!(role_for_loop(kind), ROLE_AUTHOR, "loop: {kind}");
+            assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
+    }
+
+    #[test]
+    fn spec_fixer_sits_in_the_fixer_family_above_new_work() {
+        // Registration order is priority (issue #188): the spec-fixer must
+        // unpark a spec PR before the worker/planner start new work, and it
+        // belongs after the fixer, with the guard/worker/planner behind it.
+        let kinds: Vec<&str> = default_loops().iter().map(|l| l.kind()).collect();
+        let pos = |k: &str| kinds.iter().position(|x| *x == k).expect(k);
+        assert!(pos("fixer") < pos("spec-fixer"));
+        assert!(pos("spec-fixer") < pos("spec-worker"));
+        assert!(pos("spec-fixer") < pos("worker"));
+        assert!(pos("spec-fixer") < pos("planner"));
     }
 
     #[test]
@@ -541,10 +600,14 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             Store::open_in_memory().unwrap(),

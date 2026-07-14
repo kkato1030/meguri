@@ -51,6 +51,10 @@ pub const LABEL_AUTOMERGE: &str = "meguri:automerge";
 /// The cleaner loop's per-project report issue (one per project; its body is
 /// a snapshot of the current divergence, rewritten on every sweep).
 pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
+/// The triage loop's per-project report issue (issue #85). Read-only, like
+/// the cleaner's: its body is a snapshot of the current triage
+/// recommendations for untriaged open issues, rewritten on every sweep.
+pub const LABEL_TRIAGE_REPORT: &str = "meguri:triage-report";
 
 /// GitHub's three merge strategies. This is the forge's vocabulary and config
 /// deserializes straight into it (`serde(lowercase)`); ADR 0003 forbids
@@ -206,7 +210,7 @@ pub enum CheckState {
 }
 
 /// The subset of GitHub's commit-status states meguri writes for its inspection
-/// history (`meguri/self-review`, `meguri/guard-review`, ADR 0008). Advisory by
+/// history (`meguri/self-review`, `meguri/pr-review`, ADR 0008). Advisory by
 /// default: a `Failure` status is a red check that does not block a human merge
 /// (GitHub reports the PR `UNSTABLE`) unless the user makes the context a
 /// required check; the auto-merger reads it as its arm gate.
@@ -408,6 +412,10 @@ pub trait Forge: Send + Sync {
     async fn issue_state(&self, number: i64) -> Result<IssueState>;
     /// Open issues carrying `label` (candidates for discovery).
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
+    /// Every open issue, label-agnostic (triage discovery, issue #85). The
+    /// caller filters by label/hold/blocker — no forge-side search is used, so
+    /// "untriaged = no workflow label" stays a single client-side rule.
+    async fn list_open_issues(&self) -> Result<Vec<Issue>>;
     /// Issues blocking `issue` via the forge-native dependency graph
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
@@ -533,7 +541,7 @@ pub trait Forge: Send + Sync {
 
     /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
     /// — meguri's inspection history for a review (ADR 0008). `context` is the
-    /// status name (`meguri/self-review` / `meguri/guard-review`), `description`
+    /// status name (`meguri/self-review` / `meguri/pr-review`), `description`
     /// the one-line verdict. Idempotent from the caller's view: re-posting the
     /// same context replaces the visible status.
     async fn set_commit_status(

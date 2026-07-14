@@ -98,7 +98,7 @@ pub struct FakeForge {
     /// (the inline comments land in `threads`).
     pub pr_reviews: Mutex<Vec<(i64, String)>>,
     /// PRs whose create_pr_review call fails (inline-anchor-rejected
-    /// scenarios; the impl-reviewer falls back to a summary comment).
+    /// scenarios; exercised even though no current loop calls it).
     pub create_pr_review_errors: Mutex<HashSet<i64>>,
     /// Commit statuses meguri wrote: (head_sha, context) → latest state
     /// (ADR 0008 inspection history). Re-posting a context overwrites it.
@@ -114,13 +114,19 @@ pub struct FakeForge {
 impl FakeForge {
     pub fn with_issue(number: i64, title: &str, body: &str, labels: &[&str]) -> Self {
         let forge = Self::default();
-        forge.issues.lock().unwrap().push(Issue {
+        forge.add_issue(number, title, body, labels);
+        forge
+    }
+
+    /// Seed an additional issue on the fake forge (multi-issue discovery /
+    /// cadence tests).
+    pub fn add_issue(&self, number: i64, title: &str, body: &str, labels: &[&str]) {
+        self.issues.lock().unwrap().push(Issue {
             number,
             title: title.into(),
             body: body.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
-        forge
     }
 
     /// A fake standing in for a specific repo slug (issue #154 cross-repo
@@ -575,6 +581,18 @@ impl Forge for FakeForge {
             .unwrap()
             .iter()
             .filter(|i| i.has_label(label) && !closed.contains_key(&i.number))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_open_issues(&self) -> Result<Vec<Issue>> {
+        let closed = self.closed.lock().unwrap();
+        Ok(self
+            .issues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| !closed.contains_key(&i.number))
             .cloned()
             .collect())
     }

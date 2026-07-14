@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig, WorkspaceConfig};
+use meguri::config::{Config, LaunchMode, ProjectConfig, WorkspaceConfig};
 use meguri::engine::planner::{
     self, DECOMPOSED_MARKER, PlannerLoop, decompose_child_footer, run_planner, spec_rel_path,
 };
@@ -73,6 +73,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     // These planner tests don't exercise the self-review phase (ADR 0008); the
     // dedicated self-review test enables it explicitly.
     config.review.enabled = false;
+    // This suite plays the scripted agent through FakeMux (pane protocol);
+    // pin self-reviewer to pane so the self-review test below doesn't fall
+    // through to its recommended `direct` mode, which would spawn a *real*
+    // `claude` subprocess instead of going through the fake (issue #169).
+    config
+        .launch
+        .roles
+        .insert("self-reviewer".into(), LaunchMode::Pane);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -85,10 +93,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -360,7 +372,7 @@ async fn planner_self_reviews_the_spec_before_opening_the_pr() {
                     "verdict": "clean", "review": "spec looks sound", "findings": [],
                 });
                 std::fs::write(
-                    wt.join(meguri::engine::impl_reviewer::REVIEW_FILE),
+                    wt.join(meguri::engine::self_review::REVIEW_FILE),
                     body.to_string(),
                 )
                 .unwrap();
@@ -606,10 +618,14 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
     let sibling_project = ProjectConfig {
         id: "sib".into(),

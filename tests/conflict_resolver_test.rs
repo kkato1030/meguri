@@ -112,10 +112,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         language: None,
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -399,7 +403,7 @@ async fn resolver_discovery_skips_spec_ready_prs_under_combined_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resolver_stops_rediscovering_after_the_resolve_budget() {
+async fn resolver_escalates_and_stops_rediscovering_after_the_resolve_budget() {
     let env = setup(None).await;
     assert_eq!(
         ConflictResolverLoop
@@ -430,6 +434,52 @@ async fn resolver_stops_rediscovering_after_the_resolve_budget() {
             .is_empty(),
         "a PR that keeps re-conflicting must stop being rediscovered"
     );
+    // #176: exhaustion is a human gate now (P4) — the still-conflicting PR is
+    // parked on needs-human with one comment, and the needs-human filter makes
+    // the escalation fire exactly once across sweeps.
+    let labels = env.forge.pr_labels(1);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert_eq!(env.forge.comments_of(1).len(), 1);
+    // Next tick: the scheduler clears the shared open-PR cache (issue #170), so
+    // discover re-reads the now-needs-human PR and `pr_is_touchable` skips it —
+    // the escalation fires exactly once, not every sweep.
+    env.deps.open_prs.clear().await;
+    ConflictResolverLoop.discover(&env.deps).await.unwrap();
+    assert_eq!(
+        env.forge.comments_of(1).len(),
+        1,
+        "escalation fires once, not every sweep"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolver_does_not_escalate_an_exhausted_but_resolved_pr() {
+    let env = setup(None).await;
+    // Spend the budget, then the conflict resolves on its own (a human merged
+    // the base, or the base moved). The PR is no longer CONFLICTING.
+    for _ in 0..MAX_RESOLVE_RUNS {
+        let run = create_resolver_run(&env);
+        env.deps
+            .store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+    }
+    env.forge.set_pr_mergeable(1, MergeableState::Mergeable);
+
+    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
+    assert!(targets.is_empty(), "a resolved PR is not a resolver target");
+    // The budget-exhaustion escalation must be gated on "still conflicting":
+    // a PR that resolved itself must NOT be parked on needs-human (issue #176).
+    let labels = env.forge.pr_labels(1);
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "a resolved PR must not be escalated: {labels:?}"
+    );
+    assert!(env.forge.comments_of(1).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

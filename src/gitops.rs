@@ -46,6 +46,16 @@ pub fn run_git_sync(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Resolve the toplevel of the Git work tree containing `dir` (blocking, via
+/// `git rev-parse --show-toplevel`). Errors when `dir` is not inside a Git
+/// work tree — callers that want a fallback must handle it explicitly rather
+/// than silently getting `dir` back.
+pub fn repo_toplevel_sync(dir: &Path) -> Result<PathBuf> {
+    let top = run_git_sync(dir, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a Git repository", dir.display()))?;
+    Ok(PathBuf::from(top))
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -410,6 +420,124 @@ pub async fn default_branch_head(repo_path: &Path, default_branch: &str) -> Resu
     run_git(repo_path, &["rev-parse", default_branch]).await
 }
 
+/// Like [`run_git`] but returns raw stdout bytes with no trimming, so a blob's
+/// trailing newline/whitespace survives. Callers needing text convert with
+/// strict UTF-8 (unlike `run_git`'s lossy `trim_end`).
+async fn run_git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .context("spawning git")?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        bail!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
+/// A repo-relative path as it exists on the default branch, read via git
+/// plumbing (blob-direct, not the working tree). See ADR 0015.
+#[derive(Debug)]
+pub enum DefaultBranchFile {
+    /// A regular file (mode 100644 / 100755): its exact contents.
+    Content(String),
+    /// No entry at `rel` in the default branch tree.
+    Absent,
+    /// `rel` exists but is not a regular file (symlink 120000, tree 040000, or
+    /// submodule gitlink 160000) — its contents can't be returned as a blob.
+    NotRegularFile,
+}
+
+/// Read a repo-relative path's contents as they exist on the default branch,
+/// without touching the working tree (ADR 0015: advisory/discovery reads see
+/// the merged declaration, not a working-tree approximation).
+///
+/// Prefers `origin/<default_branch>`, falling back to the local branch when no
+/// remote exists — the same base resolution as [`default_branch_head`]. Unlike
+/// that helper this does *not* fetch: callers are hot (the doctor loops, the
+/// scheduler tick) and the run flow already keeps the ref fetched.
+///
+/// The entry type is settled from a single `ls-tree` record so a directory or
+/// symlink can never be mistaken for file contents; the blob is then read by
+/// its object id, not by re-resolving the pathspec.
+pub async fn read_file_at_default_branch(
+    repo_path: &Path,
+    default_branch: &str,
+    rel: &str,
+) -> Result<DefaultBranchFile> {
+    let base = if run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("origin/{default_branch}")],
+    )
+    .await
+    .is_ok()
+    {
+        format!("origin/{default_branch}")
+    } else {
+        default_branch.to_string()
+    };
+
+    // One entry, exact-path match. `--full-tree` makes the pathspec
+    // root-relative; `:(literal)` disables pathspec magic/globbing; the absence
+    // of `-r` means a directory returns its own tree entry, not its children.
+    let literal = format!(":(literal){rel}");
+    let out = run_git(
+        repo_path,
+        &[
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            "--format=%(objectmode) %(objecttype) %(objectname) %(path)",
+            &base,
+            "--",
+            &literal,
+        ],
+    )
+    .await
+    .with_context(|| format!("ls-tree {base} for {rel}"))?;
+
+    let mut entries = out.split('\0').filter(|s| !s.is_empty());
+    let Some(entry) = entries.next() else {
+        return Ok(DefaultBranchFile::Absent);
+    };
+    if entries.next().is_some() {
+        // More than one entry means `rel` matched several paths (e.g. a
+        // trailing slash listing a directory's children) — never content.
+        return Ok(DefaultBranchFile::Absent);
+    }
+
+    // `mode type oid path`: mode/type/oid are space-free tokens, so split on
+    // the first three spaces and take the remainder as the (possibly
+    // space-bearing) path.
+    let mut parts = entry.splitn(4, ' ');
+    let (Some(mode), Some(_type), Some(oid), Some(path)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        bail!("unparseable ls-tree entry: {entry:?}");
+    };
+    if path != rel {
+        return Ok(DefaultBranchFile::Absent);
+    }
+
+    match mode {
+        "100644" | "100755" => {
+            let bytes = run_git_bytes(repo_path, &["cat-file", "blob", oid]).await?;
+            let text = String::from_utf8(bytes)
+                .with_context(|| format!("{rel} on {base} is not valid UTF-8"))?;
+            Ok(DefaultBranchFile::Content(text))
+        }
+        _ => Ok(DefaultBranchFile::NotRegularFile),
+    }
+}
+
 /// A branch on origin as the cleaner's stale-branch check sees it.
 #[derive(Debug, Clone)]
 pub struct RemoteBranch {
@@ -669,6 +797,28 @@ mod tests {
         ] {
             run_git(dir, &args).await.unwrap();
         }
+    }
+
+    #[test]
+    fn repo_toplevel_sync_walks_up_from_subdir_and_rejects_non_repos() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
+        let sub = repo.path().join("docs").join("adr");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Canonicalize both sides: on macOS the tempdir sits behind the
+        // /var -> /private/var symlink and git reports the resolved path.
+        assert_eq!(
+            repo_toplevel_sync(&sub).unwrap().canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+
+        // Outside any work tree: a hard error, never a silent fallback.
+        let plain = tempfile::tempdir().unwrap();
+        let err = repo_toplevel_sync(plain.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not inside a Git repository"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1082,6 +1232,143 @@ mod tests {
         assert!(
             contents.contains("late-generated/"),
             "re-point path must still apply new excludes: {contents:?}"
+        );
+    }
+
+    /// Commit `content` at `rel` (creating parents) on the current branch.
+    async fn commit_file(repo: &Path, rel: &str, content: &str) {
+        let full = repo.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+        run_git(repo, &["add", rel]).await.unwrap();
+        run_git(repo, &["commit", "-m", &format!("add {rel}")])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_at_default_branch_returns_committed_content() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        // Trailing newline + trailing spaces must survive verbatim.
+        commit_file(repo.path(), "ops/plan.md", "line1\nline2  \n").await;
+
+        // Working-tree-only edit must NOT be reflected: default branch wins.
+        std::fs::write(repo.path().join("ops/plan.md"), "tampered\n").unwrap();
+
+        match read_file_at_default_branch(repo.path(), "main", "ops/plan.md")
+            .await
+            .unwrap()
+        {
+            DefaultBranchFile::Content(c) => assert_eq!(c, "line1\nline2  \n"),
+            other => panic!("expected Content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_at_default_branch_prefers_origin() {
+        // Remote-less: reads the local branch.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        commit_file(repo.path(), "meguri.toml", "language = \"local\"\n").await;
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "meguri.toml")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Content(c) if c == "language = \"local\"\n"
+        ));
+
+        // With a remote, `origin/main` wins over a diverged local tip.
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-b", "main"])
+            .await
+            .unwrap();
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        run_git(repo.path(), &["push", "origin", "main"])
+            .await
+            .unwrap();
+        // Advance local main past origin with a different value.
+        commit_file(repo.path(), "meguri.toml", "language = \"ahead\"\n").await;
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "meguri.toml")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Content(c) if c == "language = \"local\"\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_at_default_branch_classifies_non_files() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        commit_file(repo.path(), "dir/inside.md", "hi\n").await;
+
+        // Absent path.
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "nope.md")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Absent
+        ));
+
+        // A directory is not a regular file...
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "dir")
+                .await
+                .unwrap(),
+            DefaultBranchFile::NotRegularFile
+        ));
+        // ...and a trailing slash (which would make ls-tree list children)
+        // must not surface the first child as content.
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "dir/")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Absent
+        ));
+
+        // A symlink's target string must not be read as blob content.
+        std::os::unix::fs::symlink("dir/inside.md", repo.path().join("link.md")).unwrap();
+        run_git(repo.path(), &["add", "link.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "add symlink"])
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "link.md")
+                .await
+                .unwrap(),
+            DefaultBranchFile::NotRegularFile
+        ));
+
+        // Missing base ref is an error, not a silent Absent.
+        assert!(
+            read_file_at_default_branch(repo.path(), "no-such-branch", "dir/inside.md")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_at_default_branch_rejects_invalid_utf8() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        run_git(repo.path(), &["add", "bin.dat"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "binary"])
+            .await
+            .unwrap();
+        // Strict UTF-8: lossy replacement would silently corrupt the body.
+        assert!(
+            read_file_at_default_branch(repo.path(), "main", "bin.dat")
+                .await
+                .is_err()
         );
     }
 }

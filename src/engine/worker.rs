@@ -44,6 +44,7 @@ impl super::Loop for WorkerLoop {
             .map(|t| Target {
                 key: t.key,
                 title: t.title,
+                cadence_label: t.cadence_label,
             })
             .collect())
     }
@@ -485,10 +486,14 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,

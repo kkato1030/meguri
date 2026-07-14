@@ -233,6 +233,28 @@ impl GhForge {
         })
     }
 
+    /// Parses `gh api --paginate --slurp` output for the REST issues
+    /// endpoint: an outer array whose elements are the per-page arrays.
+    /// The endpoint returns PRs too (a PR is an issue there), so drop
+    /// anything carrying a `pull_request` object; the remaining JSON shape
+    /// (number/title/body, `labels[].name`) is exactly what
+    /// `issue_from_json` already reads.
+    fn open_issues_from_slurped_pages(raw: &str) -> Result<Vec<Issue>> {
+        let pages: Value = serde_json::from_str(raw).context("parsing gh api issues output")?;
+        Ok(pages
+            .as_array()
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .filter(|it| it.get("pull_request").is_none())
+                    .filter_map(Self::issue_from_json)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     fn labels_from_json(v: &Value) -> Vec<String> {
         v.get("labels")
             .and_then(Value::as_array)
@@ -452,6 +474,26 @@ impl Forge for GhForge {
         Ok(v.as_array()
             .map(|items| items.iter().filter_map(Self::issue_from_json).collect())
             .unwrap_or_default())
+    }
+
+    async fn list_open_issues(&self) -> Result<Vec<Issue>> {
+        // Triage's contract is to see *every* untriaged open issue, so this
+        // must not truncate the way `gh issue list --limit N` does — an old,
+        // low-numbered unlabeled issue past the cap would never be triaged, and
+        // `max_open_issue` would read a subset. `gh api --paginate` follows the
+        // Link headers, but it prints each page's JSON back to back — past 100
+        // open issues that concatenation is no longer one valid JSON document.
+        // `--slurp` wraps the pages into a single outer array instead, which
+        // `open_issues_from_slurped_pages` flattens.
+        let raw = self
+            .gh(&[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!("repos/{}/issues?state=open&per_page=100", self.repo),
+            ])
+            .await?;
+        Self::open_issues_from_slurped_pages(&raw)
     }
 
     /// GitHub-native issue dependencies. Missing fields degrade to an
@@ -1554,6 +1596,36 @@ mod tests {
         );
         assert_eq!(GhForge::actions_run_id("https://ci.example/build/42"), None);
         assert_eq!(GhForge::actions_run_id(""), None);
+    }
+
+    #[test]
+    fn open_issues_flatten_slurped_pages_and_drop_prs() {
+        // `gh api --paginate --slurp` yields one outer array with one inner
+        // array per page; issues past page one must survive the flatten, and
+        // PR entries (marked by `pull_request`) must be dropped on any page.
+        let raw = r#"[
+          [{"number":1,"title":"first","body":"b1","labels":[{"name":"bug"}]},
+           {"number":2,"title":"a PR","body":"", "pull_request":{"url":"x"}}],
+          [{"number":150,"title":"second page","body":null,"labels":[]}]
+        ]"#;
+        let issues = GhForge::open_issues_from_slurped_pages(raw).unwrap();
+        assert_eq!(
+            issues.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![1, 150]
+        );
+        assert_eq!(issues[0].labels, vec!["bug".to_string()]);
+        // Null body degrades to empty, same as issue_from_json elsewhere.
+        assert_eq!(issues[1].body, "");
+    }
+
+    #[test]
+    fn open_issues_reject_unslurped_page_concatenation() {
+        // Without --slurp, two pages arrive as two JSON arrays back to back —
+        // the very input that used to blow up mid-triage. It must be a parse
+        // error (so a regression is loud), never a silent partial read.
+        let raw = r#"[{"number":1,"title":"a","body":""}]
+[{"number":2,"title":"b","body":""}]"#;
+        assert!(GhForge::open_issues_from_slurped_pages(raw).is_err());
     }
 
     #[test]

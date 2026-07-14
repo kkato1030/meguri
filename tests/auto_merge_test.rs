@@ -4,20 +4,22 @@
 
 use std::sync::Arc;
 
-use meguri::config::{AutoMergeOptIn, Config, ProjectConfig};
+use meguri::config::{AutoMergeMode, AutoMergeOptIn, Config, ProjectConfig};
 use meguri::engine::Deps;
-use meguri::engine::auto_merger::{armed_marker, sweep};
-use meguri::engine::guard::GUARD_STATUS;
+use meguri::engine::auto_merger::{ARMED_MARKER_PREFIX, armed_marker, sweep};
+use meguri::engine::pr_reviewer::PR_REVIEW_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_REVIEWING,
-    MergePolicy, MergeStrategy,
+    MergePolicy, MergeStrategy, MergeableState,
 };
 
 /// A Deps over the given forge with auto-merge enabled (label opt-in, squash).
 fn deps_with(forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.pr.auto_merge.enabled = true;
+    // The auto-merger only arms under full autonomy (issue #176).
+    config.autonomy = meguri::config::Autonomy::Full;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: "/tmp/unused".into(),
@@ -30,10 +32,14 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         worktree_root: None,
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
+        cadence: Vec::new(),
+        prompts: Default::default(),
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
@@ -82,37 +88,42 @@ async fn arms_when_all_conditions_met() {
     assert!(comments.iter().any(|c| c.contains("arm しました")));
 }
 
-/// Deps with the impl guard enabled (so the auto-merger applies the guard gate).
-fn deps_with_guard(forge: Arc<FakeForge>) -> Deps {
+/// Deps with the impl review enabled (so the auto-merger applies the
+/// pr-review gate).
+fn deps_with_pr_review(forge: Arc<FakeForge>) -> Deps {
     let mut deps = deps_with(forge);
     deps.config.review.guard.impl_enabled = true;
     deps
 }
 
 #[tokio::test]
-async fn guard_gate_arms_on_a_success_status() {
+async fn pr_review_gate_arms_on_a_success_status() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Success);
-    let deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Success);
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
     assert_eq!(
         forge.armed_of(pr),
         Some((MergeStrategy::Squash, "sha-head".into())),
-        "a green guard status lets the arm proceed"
+        "a green pr-review status lets the arm proceed"
     );
 }
 
 #[tokio::test]
-async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
+async fn pr_review_gate_escalates_a_failure_status_and_does_not_arm() {
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    forge.set_commit_status_direct("sha-head", GUARD_STATUS, CommitStatusState::Failure);
-    let deps = deps_with_guard(forge.clone());
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Failure);
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
-    assert_eq!(forge.armed_of(pr), None, "a red guard status blocks arming");
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "a red pr-review status blocks arming"
+    );
     let labels = forge.pr_labels_of(pr);
     assert!(
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
@@ -120,21 +131,21 @@ async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
     );
     assert!(
         forge
-            .pr_comments_of(pr)
+            .comments_of(pr)
             .iter()
-            .any(|c| c.contains("guard review"))
+            .any(|c| c.contains("PR review"))
     );
 }
 
 #[tokio::test]
-async fn guard_gate_waits_when_status_absent() {
+async fn pr_review_gate_waits_when_status_absent() {
     let forge = Arc::new(FakeForge::default());
-    let pr = seed_armable(&forge, 10, "sha-head"); // no guard status posted yet
-    let deps = deps_with_guard(forge.clone());
+    let pr = seed_armable(&forge, 10, "sha-head"); // no pr-review status posted yet
+    let deps = deps_with_pr_review(forge.clone());
 
     sweep(&deps).await.unwrap();
     assert_eq!(forge.armed_of(pr), None, "no status yet: wait, don't arm");
-    // Waiting is silent — no escalation while the guard has not run.
+    // Waiting is silent — no escalation while the pr-reviewer has not run.
     assert!(
         !forge
             .pr_labels_of(pr)
@@ -144,17 +155,73 @@ async fn guard_gate_waits_when_status_absent() {
 }
 
 #[tokio::test]
-async fn guard_gate_is_skipped_when_impl_guard_disabled() {
-    // The default (impl guard off): the auto-merger arms without any status,
+async fn pr_review_gate_is_skipped_when_impl_review_disabled() {
+    // The default (impl review off): the auto-merger arms without any status,
     // never demanding one that nothing produces (no ADR-0007 deadlock).
     let forge = Arc::new(FakeForge::default());
     let pr = seed_armable(&forge, 10, "sha-head");
-    let deps = deps_with(forge.clone()); // impl guard stays off
+    let deps = deps_with(forge.clone()); // impl review stays off
 
     sweep(&deps).await.unwrap();
     assert_eq!(
         forge.armed_of(pr),
         Some((MergeStrategy::Squash, "sha-head".into()))
+    );
+}
+
+#[tokio::test]
+async fn attended_escalates_a_pr_review_failure_without_arming() {
+    // ADR 0012 §5: escalation is mode-independent — autonomy changes only the
+    // final arm. Under the default `attended`, a review-failed head still gets
+    // its `needs-human` backstop, but nothing is ever armed.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Failure);
+    let mut deps = deps_with_pr_review(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended never arms, pr-review failure or not"
+    );
+    let labels = forge.pr_labels_of(pr);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the review-failed backstop escalates even under attended: {labels:?}"
+    );
+    assert!(
+        forge
+            .comments_of(pr)
+            .iter()
+            .any(|c| c.contains("PR review"))
+    );
+}
+
+#[tokio::test]
+async fn attended_leaves_a_green_pr_unarmed_and_unescalated() {
+    // Attended stops only the final arm: a green pr-review status means
+    // nothing to escalate, and the PR is left for a human to merge.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_commit_status_direct("sha-head", PR_REVIEW_STATUS, CommitStatusState::Success);
+    let mut deps = deps_with_pr_review(forge.clone());
+    deps.config.autonomy = meguri::config::Autonomy::Attended;
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.armed_of(pr),
+        None,
+        "attended: green PR left for a human to merge"
+    );
+    assert!(
+        !forge
+            .pr_labels_of(pr)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "a green head has nothing to escalate"
     );
 }
 
@@ -493,4 +560,139 @@ async fn merge_pr_refuses_a_moved_head() {
         None,
         "nothing merged on a stale head"
     );
+}
+
+// --- orchestrator mode (auto-merge orchestrator-side merge, #157) -----------
+
+/// A Deps in orchestrator mode: meguri merges eligible PRs itself instead of
+/// arming. `require_branch_protection` is false (mandatory in this mode).
+fn deps_orchestrator(forge: Arc<FakeForge>) -> Deps {
+    let mut deps = deps_with(forge);
+    deps.config.pr.auto_merge.mode = AutoMergeMode::Orchestrator;
+    deps.config.pr.auto_merge.require_branch_protection = false;
+    deps
+}
+
+#[tokio::test]
+async fn orchestrator_merges_a_mergeable_pr() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha-head");
+    forge.set_pr_mergeable(pr, MergeableState::Mergeable);
+    let deps = deps_orchestrator(forge.clone());
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.merged_head(pr),
+        Some("sha-head".into()),
+        "eligible + MERGEABLE PR merged at its confirmed head"
+    );
+    assert_eq!(forge.armed_of(pr), None, "orchestrator never arms");
+    // The audit comment carries no arm marker (merge-watch invariant).
+    let comments = forge.pr_comments_of(pr);
+    assert!(
+        comments.iter().all(|c| !c.contains(ARMED_MARKER_PREFIX)),
+        "no arm marker in orchestrator comments: {comments:?}"
+    );
+    assert!(
+        comments.iter().any(|c| c.contains("orchestrator")),
+        "audit comment posted: {comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_skips_conflicting_pr() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha");
+    forge.set_pr_mergeable(pr, MergeableState::Conflicting);
+    let deps = deps_orchestrator(forge.clone());
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.merged_head(pr),
+        None,
+        "CONFLICTING is the conflict-resolver's, not merged here"
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_skips_unknown_mergeability() {
+    let forge = Arc::new(FakeForge::default());
+    // Default mergeability is Unknown (GitHub still computing).
+    let pr = seed_armable(&forge, 10, "sha");
+    let deps = deps_orchestrator(forge.clone());
+
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(
+        forge.merged_head(pr),
+        None,
+        "UNKNOWN is carried over to the next sweep, not merged"
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_does_not_merge_blocked_or_threaded_prs() {
+    let forge = Arc::new(FakeForge::default());
+
+    // On hold, but otherwise mergeable.
+    forge.add_pr(
+        1,
+        "Held",
+        "Closes #1.\n",
+        &[LABEL_AUTOMERGE, LABEL_HOLD],
+        "meguri/1-x",
+        "s1",
+    );
+    forge.set_pr_mergeable(1, MergeableState::Mergeable);
+    // Unresolved review thread (self-review not accepted), otherwise mergeable.
+    forge.add_pr(
+        2,
+        "Threaded",
+        "Closes #2.\n",
+        &[LABEL_AUTOMERGE],
+        "meguri/2-x",
+        "s2",
+    );
+    forge.set_pr_mergeable(2, MergeableState::Mergeable);
+    forge.add_review_thread(2, "t1", "src/lib.rs", "reviewer", "please fix");
+
+    let deps = deps_orchestrator(forge.clone());
+    sweep(&deps).await.unwrap();
+
+    assert_eq!(forge.merged_head(1), None, "blocked label: not merged");
+    assert_eq!(forge.merged_head(2), None, "unresolved thread: not merged");
+}
+
+#[tokio::test]
+async fn orchestrator_readies_draft_before_merging() {
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha");
+    forge.set_pr_draft(pr, true);
+    forge.set_pr_mergeable(pr, MergeableState::Mergeable);
+    let deps = deps_orchestrator(forge.clone());
+
+    sweep(&deps).await.unwrap();
+
+    assert!(!forge.is_draft(pr), "draft readied before merge");
+    assert_eq!(forge.merged_head(pr), Some("sha".into()));
+}
+
+#[tokio::test]
+async fn orchestrator_merges_even_without_native_auto_merge_allowed() {
+    // The whole point (#157): a repo that cannot enable "Allow auto-merge"
+    // (private + Free) still merges under orchestrator mode.
+    let forge = Arc::new(FakeForge::default());
+    let pr = seed_armable(&forge, 10, "sha");
+    forge.set_pr_mergeable(pr, MergeableState::Mergeable);
+    forge.set_merge_policy(MergePolicy {
+        auto_merge_allowed: false,
+        allowed_strategies: vec![MergeStrategy::Squash],
+        protected_with_required_checks: false,
+    });
+    let deps = deps_orchestrator(forge.clone());
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(forge.merged_head(pr), Some("sha".into()));
 }

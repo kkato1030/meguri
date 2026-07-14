@@ -30,7 +30,7 @@ use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
-use crate::store::{ROLE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
@@ -266,6 +266,7 @@ impl super::Loop for CleanerLoop {
         Ok(vec![Target {
             key: TaskKey::Issue(report.map(|i| i.number).unwrap_or(0)),
             title: REPORT_TITLE.to_string(),
+            cadence_label: None,
         }])
     }
 
@@ -300,12 +301,19 @@ pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                 WorkerOutcome::Stopped => {
                     deps.store
                         .update_run_status(run_id, RunStatus::Cancelled, None)?;
-                    if let Some(pane_id) = &run.mux_pane_id {
-                        let _ = deps
-                            .mux
-                            .kill_pane(&crate::mux::PaneId(pane_id.clone()))
-                            .await;
-                    }
+                    // Go through the shared release path (session save +
+                    // mark_pane_reclaimed), like flow::finalize_cancelled —
+                    // not a raw kill_pane off run.mux_pane_id, which used to
+                    // leave the pane row dangling until the next dead-pane
+                    // sweep (issue #169; under the recommended `direct`
+                    // launch mode for cleaner this is a no-op, no live pane).
+                    super::reaper::release_pane(
+                        deps,
+                        run.issue_number,
+                        LANE_AUTHOR,
+                        "stopped by user",
+                    )
+                    .await;
                     deps.store.emit(Some(run_id), "run.cancelled", json!({}))?;
                 }
                 WorkerOutcome::Interrupted(reason) => {
@@ -395,7 +403,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
                 super::reaper::release_pane(
                     deps,
                     run.issue_number,
-                    ROLE_AUTHOR,
+                    LANE_AUTHOR,
                     "cleaner sweep gave up",
                 )
                 .await;
@@ -414,7 +422,7 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
         super::reaper::release_pane(
             deps,
             run.issue_number,
-            ROLE_AUTHOR,
+            LANE_AUTHOR,
             "cleaner sweep finished",
         )
         .await;
