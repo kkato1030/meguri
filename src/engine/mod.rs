@@ -105,6 +105,37 @@ impl Deps {
         self
     }
 
+    /// A run-scoped clone whose `project` folds in the run's pinned repo
+    /// `meguri.toml` (issue #165). The precedence is
+    /// `builtin < host global < repo < host [projects.*] override`: a field the
+    /// host project already set wins wholesale; otherwise the repo value fills
+    /// it in. Cheap — `Deps` shares its store/mux/forge via `Arc`.
+    ///
+    /// `[pr]` is the one section with a key-level boundary (ADR 0011): the
+    /// host's `[projects.pr]` still wins wholesale (draft *and* auto_merge), but
+    /// when the host set no project `[pr]`, the repo's `draft` applies while
+    /// `auto_merge` stays host-global — the repo can never arm auto-merge.
+    pub fn with_repo_config(&self, repo: &crate::config::RepoConfig) -> Self {
+        let mut project = self.project.clone();
+        if project.language.is_none() {
+            project.language = repo.language.clone();
+        }
+        if project.check_command.is_none() {
+            project.check_command = repo.check_command.clone();
+        }
+        if project.pr.is_none()
+            && let Some(draft) = repo.pr.as_ref().and_then(|p| p.draft)
+        {
+            project.pr = Some(crate::config::PrConfig {
+                draft,
+                auto_merge: self.config.pr.auto_merge.clone(),
+            });
+        }
+        let mut deps = self.clone();
+        deps.project = project;
+        deps
+    }
+
     /// The forge for github-mode loops. Panics if absent — only the
     /// forge-dependent loops run without a forge, and they short-circuit their
     /// discovery before ever reaching here.
