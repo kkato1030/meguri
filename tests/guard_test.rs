@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{Config, ProjectConfig};
+use meguri::config::{AgentProfile, Config, LaunchMode, ProjectConfig};
 use meguri::engine::guard::{self, DIFF_FILE, GUARD_STATUS, GuardLoop, REVIEW_FILE, run_guard};
 use meguri::engine::{Deps, Loop, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
@@ -75,6 +75,8 @@ async fn push_pr_branch(clone: &Path) -> String {
 struct TestEnv {
     deps: Deps,
     forge: Arc<FakeForge>,
+    #[allow(dead_code)]
+    mux: Arc<FakeMux>,
     head_sha: String,
     #[allow(dead_code)]
     root: tempfile::TempDir,
@@ -84,6 +86,12 @@ struct TestEnv {
 /// `labels` seed the PR (a plan PR carries `spec-reviewing`; an impl PR does
 /// not). `impl_guard` enables the impl-kind guard.
 async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
+    setup_with(labels, impl_guard, |_| {}).await
+}
+
+/// [`setup`] plus a config tweak applied before `Deps` is built (e.g. the
+/// direct launch-mode tests below).
+async fn setup_with(labels: &[&str], impl_guard: bool, tweak: impl FnOnce(&mut Config)) -> TestEnv {
     let root = tempfile::tempdir().unwrap();
     let (_origin, clone) = init_origin_and_clone(root.path()).await;
     let head_sha = push_pr_branch(&clone).await;
@@ -107,6 +115,7 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     config.review.guard.impl_enabled = impl_guard;
+    tweak(&mut config);
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: clone,
@@ -125,9 +134,10 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
         schedules: Vec::new(),
     };
 
+    let mux = Arc::new(FakeMux::new(false));
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
-        Arc::new(FakeMux::new(false)),
+        mux.clone(),
         forge.clone(),
         config,
         project,
@@ -135,6 +145,7 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
     TestEnv {
         deps,
         forge,
+        mux,
         head_sha,
         root,
         worktree_root,
@@ -548,4 +559,135 @@ async fn second_round_reuses_pane_and_worktree() {
         Some(wt.to_string_lossy().as_ref())
     );
     assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(), head2);
+}
+
+/// Write a fake *headless* agent CLI for direct launch mode (issue #169): a
+/// shell script standing in for `claude -p`, invoked as `{command} <trigger>`
+/// with the worktree as cwd. It extracts the turn id from the trigger line
+/// and writes a `needs_human` result — the guard then escalates on the PR.
+fn fake_headless_agent(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-direct-agent.sh");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+trigger="$1"
+turn="${trigger#*prompt-}"
+turn="${turn%%.md*}"
+mkdir -p .meguri
+printf '{"turn_id":"%s","status":"needs_human","summary":"scripted direct review: stuck"}' "$turn" > .meguri/result.json
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// A `[launch.roles] pr-reviewer = "direct"` guard test env: the default
+/// profile is the fake headless script above (nothing spawns a real
+/// `claude`), and every guard turn runs as a plain subprocess.
+async fn setup_direct(script_dir: &Path) -> TestEnv {
+    let agent = fake_headless_agent(script_dir);
+    setup_with(&[LABEL_SPEC_REVIEWING], false, move |cfg| {
+        cfg.launch
+            .roles
+            .insert("pr-reviewer".into(), LaunchMode::Direct);
+        cfg.agent = AgentProfile {
+            command: agent.to_string_lossy().into_owned(),
+            args: vec![],
+            resume_args: vec![],
+            direct_args: vec![],
+            herdr_agent_hint: None,
+            session_dir: None,
+        };
+    })
+    .await
+}
+
+/// Issue #169 guard finding 2: with `[launch.roles] pr-reviewer = "direct"`
+/// there is no pane, so the escalation comment must not advertise
+/// `meguri attach` — it points at the headless session instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_guard_escalation_comment_does_not_advertise_attach() {
+    let script_dir = tempfile::tempdir().unwrap();
+    let env = setup_direct(script_dir.path()).await;
+    let run = create_guard_run(&env);
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
+        .await
+        .expect("guard timed out");
+    assert!(result.is_err());
+
+    let labels = env.forge.pr_labels_of(PR);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
+    let comments = env.forge.pr_comments_of(PR);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("needs a human"), "{}", comments[0]);
+    assert!(
+        !comments[0].contains("meguri attach"),
+        "a direct-mode role has no pane to attach to: {}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("headless"),
+        "the comment should explain the headless mode instead: {}",
+        comments[0]
+    );
+}
+
+/// Issue #169 guard finding 1: a lane that ran in pane mode before the role
+/// was switched to `direct` still has a live pane — the next direct turn
+/// must release it (kill on the mux + detach in the store) instead of
+/// leaving it alive forever, keeping ADR 0012's "a direct lane has no live
+/// pane" invariant.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_guard_releases_the_lanes_leftover_pane_mode_pane() {
+    use meguri::mux::Multiplexer;
+
+    let script_dir = tempfile::tempdir().unwrap();
+    let env = setup_direct(script_dir.path()).await;
+
+    // Simulate the lane's pane-mode past: a live pane on the mux, mapped on
+    // the panes table (as `ensure_pane` would have left it).
+    let pane = env.mux.register_live_pane("%leftover");
+    env.deps
+        .store
+        .upsert_pane(
+            "proj",
+            ISSUE,
+            ROLE_REVIEW,
+            "tmux",
+            "meguri",
+            "%leftover",
+            "/nonexistent/worktree",
+        )
+        .unwrap();
+
+    let run = create_guard_run(&env);
+    let _ = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run.id))
+        .await
+        .expect("guard timed out");
+
+    // The direct turn released the stale pane through the shared reaper
+    // path: killed on the mux, detached (reclaimed) in the store.
+    assert!(
+        !env.mux.pane_alive(&pane).await.unwrap(),
+        "the leftover pane must be killed before a direct turn"
+    );
+    let record = env
+        .deps
+        .store
+        .get_pane("proj", ISSUE, ROLE_REVIEW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.mux_pane_id, None,
+        "the pane mapping must be detached"
+    );
+    assert!(record.reclaimed_at.is_some());
 }

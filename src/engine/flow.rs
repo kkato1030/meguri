@@ -1188,6 +1188,22 @@ async fn run_turn_in(
             (outcome, Some(pane), ensured.resumed)
         }
         LaunchMode::Direct => {
+            // A lane that ran in pane mode before its role was switched to
+            // `direct` may still have a live pane. ADR 0012's invariant is
+            // that a direct lane has no live pane, so release it through the
+            // shared reaper path (session save + kill + mark_pane_reclaimed)
+            // rather than merely clearing the row's mux columns — a cleared
+            // row would orphan the still-running pane process, invisible to
+            // the reaper's sweeps. Releasing first also refreshes the saved
+            // session id, which the resume lookup below then picks up. No-op
+            // for a lane with no live pane (the steady direct-mode state).
+            super::reaper::release_pane(
+                deps,
+                run.issue_number,
+                lane.role,
+                "lane switched to direct launch mode",
+            )
+            .await;
             let (child, resumed) = spawn_direct_process(
                 deps,
                 run,

@@ -414,15 +414,16 @@ impl Flavor for CiFixerFlavor {
             .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
             .await;
         let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        // Launch-mode-aware closing sentence (issue #169): a direct-mode
+        // fixer has no pane to attach to.
+        let hint = flow::attach_hint(deps, run);
         let _ = deps
             .forge()
             .pr_comment(
                 pr,
                 &format!(
                     "🔁 **meguri** could not fix the failing CI checks on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
+                     PR and needs a human.\n\n> {reason}\n\n{hint}"
                 ),
             )
             .await;
