@@ -744,7 +744,13 @@ async fn spawn_advisor_pane(
     }
     // Register on the advisor lane only. Unlike spawn_agent_pane we do NOT
     // update_run_mux — the run's own pane is the worker's, not this one.
-    deps.store.upsert_pane(
+    //
+    // Failures past this point must not leak the live pane: without the
+    // LANE_ADVISOR row neither release_advisor nor the reaper can see it, so
+    // erring out would strand an untracked agent forever. Kill the pane before
+    // the row exists; once it does, funnel through release_pane so the row is
+    // reclaimed together with the pane.
+    if let Err(e) = deps.store.upsert_pane(
         &deps.project.id,
         issue,
         crate::store::LANE_ADVISOR,
@@ -752,13 +758,25 @@ async fn spawn_advisor_pane(
         &deps.config.mux.session,
         &pane.0,
         &advisor_dir.to_string_lossy(),
-    )?;
-    deps.store.emit(
+    ) {
+        let _ = deps.mux.kill_pane(&pane).await;
+        return Err(e).with_context(|| format!("cannot register advisor pane {}", pane.0));
+    }
+    if let Err(e) = deps.store.emit(
         Some(&run.id),
         "collab.advisor_spawned",
         json!({ "issue": issue, "pane": pane.0, "profile": profile_name,
                 "team": team, "mux": deps.mux.kind().as_str() }),
-    )?;
+    ) {
+        super::reaper::release_pane(
+            deps,
+            issue,
+            crate::store::LANE_ADVISOR,
+            "advisor spawn failed after registration",
+        )
+        .await;
+        return Err(e).context("cannot emit collab.advisor_spawned");
+    }
     Ok(())
 }
 
@@ -2376,6 +2394,7 @@ pub fn pr_body_instruction(worktree: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mux::Multiplexer as _;
 
     fn fake_run(issue: i64) -> RunRecord {
         use crate::store::Store;
@@ -2604,6 +2623,99 @@ mod tests {
                 .is_none()
         );
         assert!(advisor_consult_section(&deps, &run).is_empty());
+    }
+
+    /// If registering the `LANE_ADVISOR` row fails after the pane was spawned,
+    /// the pane must be killed before erring: without the row neither
+    /// `release_advisor` nor the reaper can see it, so surviving here would
+    /// mean an untracked agent running forever.
+    #[tokio::test]
+    async fn advisor_pane_registration_failure_kills_the_pane() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run, mux) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // Inject a store failure: any insert into the panes table aborts, so
+        // upsert_pane fails after spawn_pane already handed back a live pane.
+        deps.store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER fail_pane_insert BEFORE INSERT ON panes
+                     BEGIN SELECT RAISE(ABORT, 'injected panes failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        // Exactly one pane was spawned — and it did not survive the failure.
+        assert_eq!(mux.pane_count(), 1);
+        assert!(
+            !mux.pane_alive(&PaneId("fake:1".into())).await.unwrap(),
+            "the pane must be killed when its LANE_ADVISOR row cannot be written"
+        );
+        // No row, no consult block, and the ephemeral cwd was swept.
+        assert!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .is_none()
+        );
+        assert!(advisor_consult_section(&deps, &run).is_empty());
+        assert!(!root.path().join("proj").join("advisor-7").exists());
+    }
+
+    /// If the `collab.advisor_spawned` emit fails after the row was written,
+    /// the pane must still be torn down — via `release_pane`, so the row stops
+    /// advertising a live pane to `advisor_consult_section`.
+    #[tokio::test]
+    async fn advisor_spawned_emit_failure_releases_the_pane() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run, mux) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // Inject a store failure past registration: event inserts abort, so
+        // upsert_pane succeeds but the collab.advisor_spawned emit fails.
+        deps.store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER fail_event_insert BEFORE INSERT ON events
+                     BEGIN SELECT RAISE(ABORT, 'injected events failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        // Exactly one pane was spawned — and it did not survive the failure.
+        assert_eq!(mux.pane_count(), 1);
+        assert!(
+            !mux.pane_alive(&PaneId("fake:1".into())).await.unwrap(),
+            "the pane must be killed when the spawn cannot be journalled"
+        );
+        // The registered row was reclaimed: it no longer claims a live pane,
+        // so the worker prompt does not advertise the dead advisor.
+        assert_eq!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .and_then(|p| p.mux_pane_id),
+            None
+        );
+        assert!(advisor_consult_section(&deps, &run).is_empty());
+        assert!(!root.path().join("proj").join("advisor-7").exists());
     }
 
     #[tokio::test]
