@@ -860,6 +860,10 @@ impl Forge for FakeForge {
         Ok(())
     }
 
+    async fn issue_comments(&self, issue: i64) -> Result<Vec<String>> {
+        Ok(self.comments_of(issue))
+    }
+
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()> {
         self.comments.lock().unwrap().push((pr, body.into()));
         Ok(())
