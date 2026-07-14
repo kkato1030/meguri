@@ -35,11 +35,13 @@ advisor_role = "planner"  # advisor が借りる routing role(既定 "planner")
 
 ### 2. 起動時の agmsg 検出 — `src/collab.rs`(新規)+ 起動時 validate
 
-routing の CLI 検出(`routing::detect_command` = `command --version` が exit 0)を**流用**する。検出対象は PATH の `agmsg` ではなく **skill の実体 `~/.agents/skills/agmsg/scripts/version.sh`** にする:agmsg のランタイムは `~/.agents/skills/agmsg/scripts/` の bash script 群であり(PATH に入る npm の `agmsg` はインストーラの bootstrapper に過ぎない)、プロンプトが agent に叩かせるのもこの scripts なので(下記 4)、存在検出は実際に使うものを見る。`version.sh` は引数を無視して exit 0 で version を印字するので、`detect_command` に script のフルパスを渡すだけで流用できる。
+routing の CLI 検出(`routing::detect_command` = `command --version` が exit 0)を**流用**する。検出対象は PATH の `agmsg` ではなく **skill の実体 `~/.agents/skills/agmsg/scripts/version.sh`** にする:agmsg のランタイムは `~/.agents/skills/agmsg/scripts/` の bash script 群であり(PATH に入る npm の `agmsg` はインストーラの bootstrapper に過ぎない)、プロンプトが agent に叩かせるのもこの scripts なので(下記 4)、存在検出は実際に使うものを見る。`version.sh` は引数を無視して exit 0 で version を印字するので、`detect_command` が付ける `--version` 引数は無害だ(検出対象として script を素直に扱える)。
+
+**ただしパスは絶対で組み立ててから渡す**(plan review 指摘)。`detect_command` は `std::process::Command::new(command)` で shell を通さず起動するため `~` を展開しない(`routing.rs:579-580`)。`~/…/version.sh` をそのまま渡すと、agmsg が入っていても検出が常に失敗する。だから `collab::validate` 側で `dirs::home_dir()`(既に `config.rs` の `meguri_home()` で使用)から `<home>/.agents/skills/agmsg/scripts/version.sh` を組み立て、その**絶対パス文字列**を `detect` に渡す。detector は routing と同じく closure 注入(本番 `detect_command` / テスト fake)のままで、絶対パスの組み立てだけ `validate` が持てば testability は保たれる(path-aware な別 helper を置く案もあるが、既存 `detect_command` 再利用 + 絶対パス化の方が差分が小さい)。
 
 routing の logic が `src/routing.rs` に、config 型が `src/config.rs` にあるのと同じ分業で、collab の runtime logic を **`src/collab.rs`** に置く:
 
-- `pub fn validate(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Result<()>`:`mode = "advisor"` のとき上記 script が検出できなければ `bail!`(routing::validate と同じ「起動時に大きな音を立てて落ちる」流儀)。`advisor_role` が未知 routing role なら同様に startup error。`mode = "off"` / セクション無しは no-op。
+- `pub fn validate(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Result<()>`:`mode = "advisor"` のとき上記の**絶対パス化した** `version.sh` を `detect` に渡し、通らなければ `bail!`(routing::validate と同じ「起動時に大きな音を立てて落ちる」流儀)。`advisor_role` が未知 routing role なら同様に startup error。`mode = "off"` / セクション無しは no-op。
 - `routing::validate` を呼んでいる起動経路(`meguri watch` / `meguri run` の入口)から `collab::validate` も呼ぶ。**silent fallback しない**。
 - `pub fn team_name(project_id, issue) -> String`:agmsg の共有 SQLite floor は複数 project を横断しうるので、team は `meguri-<project_id>-<issue>` で衝突を避ける(issue の「team = issue 単位」を project でスコープ)。
 - prompt 断片ビルダ 2 つ(下記 4)。
@@ -120,7 +122,7 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 
 ## テスト計画
 
-- `src/collab.rs` の単体テスト:`validate`(off / advisor×検出あり / advisor×未検出→bail / 未知 advisor_role→bail)、`team_name`、プロンプト断片ビルダ(`send.sh` / `inbox.sh` の呼び出し形と team・id が入ること)。routing のテストが detector を closure 注入するパターン(`routing.rs:247` `only(...)`)をそのまま流用しサブプロセスを起こさない。
+- `src/collab.rs` の単体テスト:`validate`(off / advisor×検出あり / advisor×未検出→bail / 未知 advisor_role→bail)、`team_name`、プロンプト断片ビルダ(`send.sh` / `inbox.sh` の呼び出し形と team・id が入ること)。routing のテストが detector を closure 注入するパターン(`routing.rs:247` `only(...)`)をそのまま流用しサブプロセスを起こさない。`validate` に渡る検出パスが `~` 未展開でなく絶対パスであること(fake detector が受け取る引数を assert)も見る。
 - `src/config.rs`:`[collab]` の parse(既定 off / mode / advisor_role)、セクション無しで `collab.is_none()`。`ConfigReloader` が `[collab]` の変更を pin して warn すること(既存 `reloader_pins_process_bound_settings` に collab ケースを追加、基準 10)。
 - profile 解決:直近成功 planner run の pin あり→継ぐ / pin 無し→現在解決にフォールバック / pin 失効(config から消えた)→フォールバック + `collab.advisor_profile_fallback` emit(基準 2)。
 - `worker.rs` / `spec_worker.rs`:execute プロンプトが collab off で不変(基準 1)、spawn 成功時のみ相談ブロックを含む(基準 2)、spawn 失敗時は off と文字列一致(基準 4)。既存の `prompt_invites_needs_plan` パターン(`worker.rs:196`)に倣う。
@@ -131,7 +133,8 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 ## 触るファイル
 
 - `src/config.rs` — `[collab]` セクション(`CollabConfig` / `CollabMode`、`Config.collab: Option<_>`、pin 比較のため `PartialEq` derive)+ `ConfigReloader::poll` の process-bound pin に `collab` を追加(`mux` / `daemon` の隣、restart-required warn)
-- `src/collab.rs` — 新規。`validate`(agmsg script 検出 = routing 流用)、`supports_advisor_loop_kind`(flow と scheduler が共有する対象判定)、`team_name`、seed / 相談ブロックのプロンプトビルダ
+- `src/collab.rs` — 新規。`validate`(agmsg script を絶対パス化して routing の `detect_command` に渡す)、`supports_advisor_loop_kind`(flow と scheduler が共有する対象判定)、`team_name`、seed / 相談ブロックのプロンプトビルダ
+- `src/lib.rs` — 新モジュール宣言 `pub mod collab;`(`pub mod routing;` の隣。これが無いと crate から見えない)
 - `src/store/panes.rs` — `ROLE_ADVISOR = "advisor"` 定数
 - `src/store/runs.rs` — 読み取りクエリ 1 本(issue × loop_kind の直近成功 run の `agent_profile`)
 - `src/engine/flow.rs` — `ensure_advisor`(execute 前 spawn、捨てて張り直し、best-effort、成否を execute へ。対象判定は `collab::supports_advisor_loop_kind(&run.loop_kind)`)、`release_advisor`(run 終端 reap + ディレクトリ削除)
