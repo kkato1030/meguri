@@ -979,6 +979,33 @@ async fn top_refresh(
     // and a later reuse of the id must tile again.
     tiled.retain(|id| live_panes.contains(id));
 
+    // Parked reviews (ADR 0009 / issue #153): review runs that ended Succeeded
+    // but still wait on a human (a plan review's findings, or a clean spec PR
+    // awaiting a human merge). `list_runs(true)` can't see them (not active),
+    // so surface them here as awaiting-human rows. They may have no live pane —
+    // the actionable target is the PR, not a pane — so show them regardless,
+    // and skip any whose pane an active row already listed.
+    for run in store.list_parked_reviews()? {
+        let pane_info = run_pane(store, &run)?;
+        if let Some((rk, pid)) = &pane_info
+            && *rk == kind
+            && live_panes.contains(pid)
+        {
+            continue;
+        }
+        rows.push(TopRow {
+            run_id: run.id.clone(),
+            project: run.project_id.clone(),
+            issue: run.issue_number,
+            interaction: run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
+            agent: mux::AgentState::Unknown.as_str(),
+            pane: pane_info
+                .map(|(_, id)| id)
+                .unwrap_or_else(|| "-".to_string()),
+            awaiting_human: true,
+        });
+    }
+
     let watch_alive = store
         .latest_heartbeat("watch")?
         .map(|ts| heartbeat_alive(&ts, poll_interval_secs))

@@ -22,10 +22,17 @@ pub struct Notification {
     pub run_id: String,
     pub issue_number: i64,
     pub issue_title: Option<String>,
-    /// "agent_blocked" | "agent_quiet" | "runtime_budget_exceeded"
+    /// "agent_blocked" | "agent_quiet" | "runtime_budget_exceeded" |
+    /// "spec_review_parked"
     pub reason: String,
-    /// Shell command a human runs to attach to the pane.
-    pub attach: String,
+    /// Shell command a human runs to attach to the live pane, or `None` when
+    /// the wait has no pane (a parked review — the run already finished, so
+    /// the pointer is the PR, not a pane). ADR 0009 / issue #153.
+    pub attach: Option<String>,
+    /// Web page a human should open instead of attaching — the PR for a
+    /// parked review. `None` for the turn-scoped escalations (they point at a
+    /// pane via `attach`).
+    pub url: Option<String>,
 }
 
 /// Delivery-only gateway; policy (throttling) lives in `Notifier`.
@@ -141,7 +148,12 @@ fn osascript_notification(n: &Notification) -> String {
         n.issue_number,
         n.issue_title.as_deref().unwrap_or("")
     );
-    let body = format!("{} — meguri attach {}", reason_label(&n.reason), n.run_id);
+    // Point at the PR when there is one (parked review), else the pane.
+    let target = match &n.url {
+        Some(url) => url.clone(),
+        None => format!("meguri attach {}", n.run_id),
+    };
+    let body = format!("{} — {target}", reason_label(&n.reason));
     format!(
         "display notification {} with title {}",
         applescript_str(body.trim()),
@@ -155,6 +167,7 @@ fn reason_label(reason: &str) -> &str {
         "agent_blocked" => "エージェントが人の入力を待っています",
         "agent_quiet" => "エージェントが沈黙しています",
         "runtime_budget_exceeded" => "turn の実行時間が上限を超えました",
+        "spec_review_parked" => "spec レビューが人間の判断待ちです",
         other => other,
     }
 }
@@ -166,15 +179,21 @@ fn applescript_str(s: &str) -> String {
 
 /// JSON body POSTed to the webhook.
 fn webhook_payload(n: &Notification) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "event": "turn.awaiting_human",
         "run_id": n.run_id,
         "issue_number": n.issue_number,
         "issue_title": n.issue_title,
         "reason": n.reason,
         "attach": n.attach,
-        "attach_cli": format!("meguri attach {}", n.run_id),
-    })
+        "url": n.url,
+    });
+    // Only advertise `meguri attach` when there is a live pane to attach to —
+    // a finished (parked) run has none, so the CLI hint would be a dead end.
+    if n.attach.is_some() {
+        payload["attach_cli"] = json!(format!("meguri attach {}", n.run_id));
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -188,7 +207,20 @@ mod tests {
             issue_number: 7,
             issue_title: Some("awaiting_human 通知".into()),
             reason: "agent_blocked".into(),
-            attach: "tmux attach -t meguri".into(),
+            attach: Some("tmux attach -t meguri".into()),
+            url: None,
+        }
+    }
+
+    /// A parked-review notification: no pane, points at the PR (ADR 0009).
+    fn parked(run: &str) -> Notification {
+        Notification {
+            run_id: run.into(),
+            issue_number: 7,
+            issue_title: Some("Spec: caching (#7)".into()),
+            reason: "spec_review_parked".into(),
+            attach: None,
+            url: Some("https://example.test/pr/12".into()),
         }
     }
 
@@ -235,6 +267,28 @@ mod tests {
         assert_eq!(p["reason"], "agent_blocked");
         assert_eq!(p["attach"], "tmux attach -t meguri");
         assert_eq!(p["attach_cli"], "meguri attach run-1");
+        assert!(p["url"].is_null());
+    }
+
+    #[test]
+    fn parked_payload_points_at_pr_not_pane() {
+        // A parked review has no pane: the webhook carries `url` and omits the
+        // `meguri attach` dead end (ADR 0009 / issue #153).
+        let p = webhook_payload(&parked("run-9"));
+        assert_eq!(p["reason"], "spec_review_parked");
+        assert_eq!(p["url"], "https://example.test/pr/12");
+        assert!(p["attach"].is_null());
+        assert!(p.get("attach_cli").is_none());
+    }
+
+    #[test]
+    fn parked_osascript_body_shows_the_pr_url() {
+        let script = osascript_notification(&parked("run-9"));
+        assert!(
+            script.contains("https://example.test/pr/12"),
+            "got: {script}"
+        );
+        assert!(!script.contains("meguri attach"), "got: {script}");
     }
 
     #[test]
