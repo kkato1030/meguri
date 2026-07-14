@@ -85,6 +85,23 @@ repo_slug = "owner/repo"
 
 それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
 
+### エージェント向け skill — 近くで働くエージェントに meguri を自分で見つけてもらう
+
+`meguri init` の完了時に対話で案内されます。いつでも単独で実行できます:
+
+```bash
+meguri agent-skills install            # ~/.claude/skills/meguri/ — 症状トリガー式の
+                                        # Claude Code skill(現状 --target はこれのみ)
+meguri agent-skills install --project  # カレントリポジトリの .claude/rules/meguri.md —
+                                        # meguri 導入済みリポジトリの日常運用ルール。
+                                        # 再実行しても安全(冪等)
+meguri agent-skills status             # 導入済みか・このバイナリ内蔵版と一致するか
+```
+
+skill のソースはバイナリに埋め込まれている(`skills/meguri/` 参照)ので、導入される内容は
+使っている `meguri` のビルドと必ず一致します。`install` は手で編集したファイルを黙って
+上書きしません — 差分を提示し `--force` を求めます。
+
 ## 使い方
 
 ```bash

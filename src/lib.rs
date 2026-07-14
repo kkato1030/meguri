@@ -1,4 +1,5 @@
 pub mod agent_session;
+pub mod agent_skills;
 pub mod app;
 pub mod cli;
 pub mod config;

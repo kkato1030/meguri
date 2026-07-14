@@ -85,6 +85,23 @@ repo_slug = "owner/repo"
 
 Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
 
+### Agent skills — let a nearby agent learn about meguri on its own
+
+`meguri init` offers this interactively; run it any time:
+
+```bash
+meguri agent-skills install            # ~/.claude/skills/meguri/ — a symptom-triggered
+                                        # Claude Code skill (currently the only --target)
+meguri agent-skills install --project  # .claude/rules/meguri.md in the current repo —
+                                        # the day-2 operating rules for a repo already
+                                        # running meguri; safe to re-run (idempotent)
+meguri agent-skills status             # installed? matches this binary's embedded copy?
+```
+
+The skill source is embedded in the binary (see `skills/meguri/`), so the installed version
+always matches your `meguri` build. `install` never silently overwrites a file you hand-edited
+— it shows the diff and asks for `--force`.
+
 ## Use
 
 ```bash

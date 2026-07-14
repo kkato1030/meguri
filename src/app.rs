@@ -1,11 +1,13 @@
 //! CLI command implementations.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::agent_skills::{self, FileOutcome, InstallReport, StatusEntry, StatusState, Target};
 use crate::config::{self, Config, ProjectConfig, ProjectMode};
 use crate::daemon;
 use crate::engine::reaper;
@@ -1191,6 +1193,85 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
     store.emit(Some(&run.id), "run.cancelled", serde_json::json!({}))?;
     println!("run {} cancelled", run.id);
     Ok(())
+}
+
+/// `meguri agent-skills install` (issue #150): write the embedded skill
+/// (user-level) or rule fragment (`--project`) to disk.
+pub fn cmd_agent_skills_install(
+    target: &str,
+    project: bool,
+    repo: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let target = Target::parse(target)?;
+    let report = if project {
+        let repo_root = agent_skills_repo_root(repo)?;
+        agent_skills::install_project_fragment(target, &repo_root, force)?
+    } else {
+        let home = agent_skills::resolve_home()?;
+        agent_skills::install_user_skill(target, &home, force)?
+    };
+    print_agent_skills_install_report(&report);
+    Ok(())
+}
+
+/// `meguri agent-skills status` (issue #150): report install state without
+/// touching disk.
+pub fn cmd_agent_skills_status(target: &str, project: bool, repo: Option<&str>) -> Result<()> {
+    let target = Target::parse(target)?;
+    if project {
+        let repo_root = agent_skills_repo_root(repo)?;
+        let entry = agent_skills::status_project_fragment(target, &repo_root);
+        print_agent_skills_status(std::slice::from_ref(&entry));
+    } else {
+        let home = agent_skills::resolve_home()?;
+        let entries = agent_skills::status_user_skill(target, &home);
+        print_agent_skills_status(&entries);
+    }
+    Ok(())
+}
+
+fn agent_skills_repo_root(repo: Option<&str>) -> Result<PathBuf> {
+    match repo {
+        Some(r) => Ok(PathBuf::from(r)),
+        None => std::env::current_dir().context("resolving current directory"),
+    }
+}
+
+pub fn print_agent_skills_install_report(report: &InstallReport) {
+    for f in &report.files {
+        let (mark, verb) = match f.outcome {
+            FileOutcome::Created => ("✅", "created"),
+            FileOutcome::Updated => ("✅", "updated"),
+            FileOutcome::Unchanged => ("✅", "already up to date"),
+            FileOutcome::Blocked => ("⚠️ ", "differs from the embedded source — not overwritten"),
+        };
+        println!("{mark} {} ({verb})", f.path.display());
+        if let Some(diff) = &f.diff {
+            for line in diff.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    if report.has_blocked() {
+        println!("Re-run with --force to overwrite the differing file(s) above.");
+    }
+}
+
+fn print_agent_skills_status(entries: &[StatusEntry]) {
+    for e in entries {
+        let (mark, label) = match e.state {
+            StatusState::Missing => ("❌", "not installed".to_string()),
+            StatusState::UpToDate => ("✅", "up to date".to_string()),
+            StatusState::Drifted => (
+                "⚠️ ",
+                "installed but differs from this binary's embedded version — run \
+                 `meguri agent-skills install --force` to update"
+                    .to_string(),
+            ),
+        };
+        println!("{mark} {} — {label}", e.path.display());
+    }
 }
 
 #[cfg(test)]
