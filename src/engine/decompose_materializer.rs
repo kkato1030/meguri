@@ -931,6 +931,33 @@ mod tests {
         assert!(!labels.contains(&crate::forge::LABEL_SPEC_READY.to_string()));
     }
 
+    #[tokio::test]
+    async fn guard_off_does_not_apply_the_head_gate() {
+        // AC 9: with `guard.plan = false` (approval gate opted out) the sweep
+        // does not require a guard-review status and does not flip the PR back
+        // to spec-reviewing — the head gate is off with the same switch. (This
+        // unit has no git repo, so `process` errors when it goes on to read the
+        // spec; the point is only that the gate did not fire.)
+        let (forge, _deps) = setup();
+        let mut config = crate::config::Config::default();
+        config.review.guard.plan = false;
+        let deps = Deps::with_label_source(
+            crate::store::Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            config,
+            project(),
+        );
+        let pr = pr_of(&forge).await;
+        let _ = process(&deps, &pr, 1).await; // errors on the (absent) git read
+        let labels = forge.pr_labels_of(10);
+        assert!(
+            labels.contains(&crate::forge::LABEL_SPEC_READY.to_string()),
+            "guard off: head gate did not flip the label"
+        );
+        assert!(!labels.contains(&crate::forge::LABEL_SPEC_REVIEWING.to_string()));
+    }
+
     fn one_child() -> String {
         spec_with(r#"[{"title":"Only","body":"x","kind":"ready","blocked_by":[]}]"#)
     }

@@ -65,6 +65,9 @@ repo_slug = "owner/repo"
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
 # throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
+#
+# [decompose]
+# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0012)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
