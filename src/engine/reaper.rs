@@ -577,7 +577,39 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
             },
         );
     }
+    clear_parked_reviews_of_closed(deps, &mut states).await;
     Ok(())
+}
+
+/// Drop the parked-review signal (ADR 0009 / issue #153) of any closed issue.
+/// A parked run keeps `interaction_state=AwaitingHuman` until something clears
+/// it, but a clean spec PR can be merged and its issue closed with no next
+/// head — the pane sweep above never touches a run that already released its
+/// pane, so without this the dashboard would keep showing the closed issue.
+/// Reuses the sweep's issue-state cache; only parked runs cost a forge call.
+async fn clear_parked_reviews_of_closed(deps: &Deps, states: &mut IssueStates) {
+    let parked = match deps.store.list_parked_reviews() {
+        Ok(parked) => parked,
+        Err(e) => {
+            tracing::warn!("cannot list parked reviews to clear closed ones: {e:#}");
+            return;
+        }
+    };
+    for run in parked {
+        if run.project_id != deps.project.id {
+            continue;
+        }
+        if let Some(IssueState::Closed) = states.get(deps, run.issue_number).await
+            && let Err(e) = deps
+                .store
+                .clear_parked_reviews_for_issue(&deps.project.id, run.issue_number)
+        {
+            tracing::warn!(
+                "cannot clear parked review of closed issue #{}: {e:#}",
+                run.issue_number
+            );
+        }
+    }
 }
 
 /// Recursive on-disk size of a directory (symlinks not followed).

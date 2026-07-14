@@ -723,6 +723,52 @@ impl Store {
         })
     }
 
+    /// Parked reviews for the dashboard (ADR 0009 / issue #153): review runs
+    /// that ended `Succeeded`, still carry `AwaitingHuman`, and actually
+    /// emitted `review.awaiting_human`. The event is the discriminator: a
+    /// turn-scoped `AwaitingHuman` that merely lingered onto a `Succeeded`
+    /// pr-reviewer run (Impl, or combined Plan) never emits it, so it must not
+    /// show as a parked review. `interaction_state='awaiting_human'` keeps
+    /// cleared parks out; `status='succeeded'` guards against aborted runs.
+    pub fn list_parked_reviews(&self) -> Result<Vec<RunRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM runs
+                 WHERE status = 'succeeded'
+                   AND interaction_state = 'awaiting_human'
+                   AND EXISTS (SELECT 1 FROM events e
+                               WHERE e.run_id = runs.id
+                                 AND e.kind = 'review.awaiting_human')
+                 ORDER BY created_at DESC",
+            )?;
+            let runs = stmt
+                .query_map([], run_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(runs)
+        })
+    }
+
+    /// Clear the parked-review signal on every `Succeeded` run of an issue
+    /// (ADR 0009). Called when a fresh review round supersedes the prior head,
+    /// when the separate-delivery handoff receives the merged spec PR, and
+    /// when the issue closes — so a stale park leaves the dashboard.
+    /// Returns how many runs were cleared.
+    pub fn clear_parked_reviews_for_issue(
+        &self,
+        project_id: &str,
+        issue_number: i64,
+    ) -> Result<usize> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE runs SET interaction_state = NULL
+                 WHERE project_id = ?1 AND issue_number = ?2
+                   AND status = 'succeeded' AND interaction_state = 'awaiting_human'",
+                params![project_id, issue_number],
+            )?;
+            Ok(n)
+        })
+    }
+
     pub fn set_desired_state(&self, id: &str, state: Option<DesiredState>) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
@@ -1157,5 +1203,86 @@ mod tests {
         assert_eq!(v["desired_state"], "paused");
         assert!(v["started_at"].is_string());
         assert!(v["finished_at"].is_null());
+    }
+
+    /// Make a run parked: succeeded, awaiting a human, park event emitted.
+    fn park(store: &Store, issue: i64) -> String {
+        let run = store
+            .create_run_for_loop("demo", "pr-reviewer", issue, "t")
+            .unwrap();
+        store
+            .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+            .unwrap();
+        store
+            .emit(
+                Some(&run.id),
+                "review.awaiting_human",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        run.id
+    }
+
+    #[test]
+    fn list_parked_reviews_needs_succeeded_awaiting_and_the_event() {
+        let store = Store::open_in_memory().unwrap();
+        let parked = park(&store, 7);
+
+        // Turn-linger: succeeded + awaiting_human but no park event (an Impl or
+        // combined-Plan pr-reviewer whose own turn raised awaiting_human). Must
+        // not show.
+        let linger = store
+            .create_run_for_loop("demo", "pr-reviewer", 8, "t")
+            .unwrap();
+        store
+            .update_interaction_state(&linger.id, Some(InteractionState::AwaitingHuman))
+            .unwrap();
+        store
+            .update_run_status(&linger.id, RunStatus::Succeeded, None)
+            .unwrap();
+
+        // Aborted while awaiting a human: the park event is present but the run
+        // did not end succeeded. Must not show.
+        for (issue, status) in [
+            (9, RunStatus::Cancelled),
+            (10, RunStatus::Failed),
+            (11, RunStatus::Skipped),
+        ] {
+            let r = store
+                .create_run_for_loop("demo", "pr-reviewer", issue, "t")
+                .unwrap();
+            store
+                .update_interaction_state(&r.id, Some(InteractionState::AwaitingHuman))
+                .unwrap();
+            store
+                .emit(Some(&r.id), "review.awaiting_human", serde_json::json!({}))
+                .unwrap();
+            store.update_run_status(&r.id, status, None).unwrap();
+        }
+
+        let list = store.list_parked_reviews().unwrap();
+        assert_eq!(list.len(), 1, "only the genuine park shows");
+        assert_eq!(list[0].id, parked);
+    }
+
+    #[test]
+    fn clear_parked_reviews_for_issue_drops_it_from_the_list() {
+        let store = Store::open_in_memory().unwrap();
+        park(&store, 7);
+        park(&store, 8);
+        assert_eq!(store.list_parked_reviews().unwrap().len(), 2);
+
+        let cleared = store.clear_parked_reviews_for_issue("demo", 7).unwrap();
+        assert_eq!(cleared, 1);
+        let list = store.list_parked_reviews().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].issue_number, 8);
+
+        // A different project's issue #8 is untouched by another project's clear.
+        assert_eq!(store.clear_parked_reviews_for_issue("other", 8).unwrap(), 0);
+        assert_eq!(store.list_parked_reviews().unwrap().len(), 1);
     }
 }

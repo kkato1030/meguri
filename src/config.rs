@@ -75,6 +75,9 @@ repo_slug = "owner/repo"
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
 # throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
+#
+# [decompose]
+# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -143,6 +146,8 @@ pub struct Config {
     /// override wholesale via its own `autonomy`. See [`Autonomy`].
     #[serde(default)]
     pub autonomy: Autonomy,
+    #[serde(default)]
+    pub decompose: DecomposeConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -238,6 +243,27 @@ impl Default for GuardConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// `[decompose]` — the reviewed-decomposition materializer (issue #134). The
+/// planner writes a decomposition proposal spec; once its PR is approved a
+/// lightweight sweep files the child issues + dependencies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DecomposeConfig {
+    /// Kill switch (default on): false makes the materialization sweep inert,
+    /// so an approved proposal is not materialized — it stays `spec-ready`
+    /// awaiting a human. The operational lever for rolling back the
+    /// irreversible child-creation step (ADR 0016).
+    #[serde(default = "default_true")]
+    pub materialize_enabled: bool,
+}
+
+impl Default for DecomposeConfig {
+    fn default() -> Self {
+        Self {
+            materialize_enabled: default_true(),
+        }
+    }
 }
 
 /// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).

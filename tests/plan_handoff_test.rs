@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use meguri::config::{Config, PlanDelivery, ProjectConfig};
 use meguri::engine::plan_handoff;
+use meguri::engine::pr_reviewer;
 use meguri::engine::{Deps, planner};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Issue, LABEL_READY, LABEL_SPECCING};
+use meguri::store::{InteractionState, RunStatus};
 
 fn deps_with(forge: Arc<FakeForge>, delivery: PlanDelivery) -> Deps {
     let project = ProjectConfig {
@@ -85,6 +87,71 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     // Idempotent: a second sweep (issue no longer speccing) is a no-op.
     plan_handoff::sweep(&deps).await.unwrap();
     assert_eq!(forge.comments_of(5).len(), 1);
+}
+
+/// Park a clean plan review of `issue` the way the pr-reviewer does (ADR
+/// 0009): a `Succeeded` run carrying `AwaitingHuman` plus the
+/// `review.awaiting_human` event, so it shows in `list_parked_reviews()`.
+fn park_review(deps: &Deps, issue: i64) -> String {
+    let run = deps
+        .store
+        .create_run_for_loop("proj", pr_reviewer::KIND, issue, "t")
+        .unwrap();
+    deps.store
+        .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
+        .unwrap();
+    deps.store
+        .emit(
+            Some(&run.id),
+            "review.awaiting_human",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Succeeded, None)
+        .unwrap();
+    run.id
+}
+
+/// The handoff clears the parked plan review (ADR 0009): the park waited
+/// exactly for this merge, and `Refs #N` keeps the issue open, so without the
+/// clear the resolved awaiting row would linger on the dashboard.
+#[tokio::test]
+async fn handoff_clears_the_parked_plan_review() {
+    let forge = Arc::new(FakeForge::default());
+    let deps = deps_with(forge.clone(), PlanDelivery::Separate);
+    seed(&forge, &deps, 5, "meguri/5-thing-abc", "merged");
+    let parked = park_review(&deps, 5);
+    assert_eq!(deps.store.list_parked_reviews().unwrap().len(), 1);
+
+    plan_handoff::sweep(&deps).await.unwrap();
+
+    // Handed off…
+    assert!(forge.labels_of(5).contains(&LABEL_READY.to_string()));
+    // …and the park is gone with it.
+    assert!(deps.store.list_parked_reviews().unwrap().is_empty());
+    assert_eq!(
+        deps.store
+            .get_run(&parked)
+            .unwrap()
+            .unwrap()
+            .interaction_state,
+        None
+    );
+}
+
+/// A spec PR that has not merged yet keeps its park: the human is still the
+/// one who has to act, so the awaiting row must stay on the dashboard.
+#[tokio::test]
+async fn no_handoff_keeps_the_park() {
+    let forge = Arc::new(FakeForge::default());
+    let deps = deps_with(forge.clone(), PlanDelivery::Separate);
+    seed(&forge, &deps, 5, "meguri/5-thing-abc", "open");
+    park_review(&deps, 5);
+
+    plan_handoff::sweep(&deps).await.unwrap();
+
+    assert_eq!(deps.store.list_parked_reviews().unwrap().len(), 1);
 }
 
 #[tokio::test]

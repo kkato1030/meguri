@@ -435,6 +435,12 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
         "pr.claimed",
         json!({ "pr": pr.number, "head": pr.head_sha, "kind": kind_of(&pr).as_str() }),
     )?;
+    // A fresh review round supersedes any prior parked review of this issue
+    // (ADR 0009): drop the previous head's AwaitingHuman so it leaves the
+    // dashboard. The just-claimed run is still Running, so this never touches it.
+    deps.store
+        .clear_parked_reviews_for_issue(&deps.project.id, run.issue_number)
+        .ok();
     Ok(Prepared::Claimed(pr))
 }
 
@@ -714,15 +720,34 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
+            // Parked-review signal (ADR 0009 / issue #153): a clean plan review
+            // under `plan_delivery=separate` leaves the human to merge the spec
+            // PR — nothing else picks this up (spec_fixer drives only
+            // *findings*). Raise the active signal (interaction_state + notify +
+            // event), off the conversation timeline. Combined hands the
+            // spec-ready PR to the spec worker (not a park); impl clean is never
+            // a park.
+            if cp.kind == Kind::Plan && plan_clean_parks(deps) {
+                flow::signal_review_parked(
+                    deps,
+                    run,
+                    pr,
+                    &cp.pr_url,
+                    verdict_str(verdict),
+                    &cp.head_sha,
+                )
+                .await;
+            }
         }
         // Plan findings: `spec_fixer` (ADR 0013) is the plan-side human gate —
         // it discovers `spec-reviewing` PRs whose head `meguri/pr-review` is
-        // `Failure` and drives the fix itself, escalating on its own if its
-        // round budget runs out. Adding `needs-human` here would starve that
-        // discover query (it skips escalated PRs) before spec_fixer ever
-        // runs — the same lockout ADR 0007 avoids by having merge_watch defer
-        // to fixer loops instead of escalating first. Drop the working claim
-        // (this settle's turn is done) but leave the label/status as-is.
+        // `Failure` and drives the fix itself, paging a human (ADR 0009 / issue
+        // #153) only once its round budget runs out. Adding `needs-human` here
+        // would starve that discover query (it skips escalated PRs) before
+        // spec_fixer ever runs — the same lockout ADR 0007 avoids by having
+        // merge_watch defer to fixer loops instead of escalating first. Drop the
+        // working claim (this settle's turn is done) but leave the label/status
+        // as-is; the parked-review page moves to spec_fixer's round limit.
         (Kind::Plan, ReviewVerdict::Findings) => {
             deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
@@ -758,6 +783,20 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
         }
     }
     Ok(cp.pr_url.clone())
+}
+
+/// Whether a clean plan review leaves a human to merge the spec PR (ADR 0009).
+/// Only under `plan_delivery=separate`; combined hands the `spec-ready` PR to
+/// the spec worker automatically, so it is not a park.
+fn plan_clean_parks(deps: &Deps) -> bool {
+    deps.project.plan_delivery != crate::config::PlanDelivery::Combined
+}
+
+fn verdict_str(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::Clean => "clean",
+        ReviewVerdict::Findings => "findings",
+    }
 }
 
 #[cfg(test)]

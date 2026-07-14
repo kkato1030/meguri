@@ -58,6 +58,12 @@ async fn process_issue(deps: &Deps, issue: i64, labels: &[String]) -> Result<()>
     let Some(pr) = deps.forge().pr_for_branch(&branch).await? else {
         return Ok(());
     };
+    // A reviewed decomposition proposal never hands off to the worker: its
+    // parent becomes a tracking issue, not a `ready` implementation issue. The
+    // materializer sweep owns it (issue #134).
+    if super::planner::is_decompose_proposal(&pr.body) {
+        return Ok(());
+    }
     // Only a *merged* spec PR advances the issue. An open one is still under
     // review / awaiting merge; a closed-unmerged one was abandoned (a human
     // re-triages — meguri must not silently implement against a rejected spec).
@@ -84,6 +90,15 @@ async fn process_issue(deps: &Deps, issue: i64, labels: &[String]) -> Result<()>
             ),
         )
         .await
+        .ok();
+    // The merge this handoff receives is exactly what a clean plan review
+    // parked on (ADR 0009): the pr-reviewer left `AwaitingHuman` +
+    // `review.awaiting_human` on its run until a human merged the spec PR.
+    // That wait is now over, so drop the park here — otherwise, with the
+    // issue still open (`Refs #N` does not close it) and no next review head
+    // to supersede it, the resolved row would linger on the dashboard.
+    deps.store
+        .clear_parked_reviews_for_issue(&deps.project.id, issue)
         .ok();
     deps.store.emit(
         None,

@@ -144,6 +144,15 @@ impl Scheduler {
                 if let Err(e) = super::plan_handoff::sweep(deps).await {
                     tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
                 }
+                // Materialize approved decomposition proposals into child issues
+                // + dependencies (issue #134). Forge-only, like handoff — the
+                // adjacent spec-flow sweep that consumes spec-ready proposal PRs.
+                if let Err(e) = super::decompose_materializer::sweep(deps).await {
+                    tracing::warn!(
+                        "decompose materialize sweep failed for {}: {e:#}",
+                        deps.project.id
+                    );
+                }
                 // Ride the poll: recompute routing outcome drift from run
                 // history and record any threshold crossing (routing 2/3,
                 // #65). Pure sqlite, no pane, no API.
