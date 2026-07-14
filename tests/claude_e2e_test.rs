@@ -158,6 +158,7 @@ async fn real_claude_implements_issue_in_tmux() {
         worktree_root: Some(root.path().join("worktrees")),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),

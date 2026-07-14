@@ -898,6 +898,7 @@ mod tests {
                 language: None,
                 pr: None,
                 clean: None,
+                triage: None,
                 plan_delivery: Default::default(),
                 review: None,
                 worktree_setup: Default::default(),
@@ -977,6 +978,7 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
@@ -1080,6 +1082,7 @@ mod tests {
             worktree_root: Some(worktree_root.path().to_path_buf()),
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: crate::config::WorktreeSetupConfig {

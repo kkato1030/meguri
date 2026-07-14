@@ -135,6 +135,7 @@ async fn setup_with(
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
