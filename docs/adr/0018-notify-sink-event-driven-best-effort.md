@@ -7,8 +7,8 @@
 
 ## 文脈
 
-meguri が人間の注意を要する状態(needs-human エスカレーション、スケジュール発火失敗、ready 滞留)に
-なっても、人間へ push で届く経路が無かった。人間は GitHub をポーリングして気づくしかない。
+meguri が人間の注意を要する状態(needs-human エスカレーション、スケジュール発火失敗、監視ラベル付き
+issue 起票)になっても、人間へ push で届く経路が無かった。人間は GitHub をポーリングして気づくしかない。
 
 一方、通知の下地は既にあった。issue #7 の `src/notify/`(NotifyGateway / throttle する Notifier /
 macOS + `curl` webhook の SystemGateway)。ただし配線は `turn.awaiting_human` 1 イベント・payload 1 形状に
