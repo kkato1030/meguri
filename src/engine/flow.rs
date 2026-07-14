@@ -185,7 +185,7 @@ pub trait Flavor: Send + Sync {
     /// escalate (needs-human label + comment / `status='needs_human'` +
     /// reason).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let _ = deps.task_source.escalate(&run.task_key(), reason).await;
+        super::escalation::escalate_task(deps, &run.task_key(), reason).await;
     }
 
     /// The agent ended its execute turn with `needs_plan`: a design decision
@@ -281,11 +281,6 @@ pub struct Checkpoint {
     /// threads.
     #[serde(default)]
     pub self_review_pending: Vec<super::impl_reviewer::Finding>,
-    /// Set when the rounds cap was hit without a clean verdict: the PR is
-    /// published anyway (the human merge gate is the backstop), and this
-    /// drives the single footer line noting the non-convergence.
-    #[serde(default)]
-    pub self_review_unconverged: bool,
     /// One entry per self-review round (ADR 0008): what the folded PR-body
     /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
     /// the history it already built.
@@ -555,13 +550,10 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
 /// the run stopped lives on the issue, not in meguri's local state). Used by
 /// forge loops that escalate on the issue directly (the spec worker); the
 /// worker/planner default escalate goes through the task source instead.
+/// Thin alias for [`super::escalation::escalate_issue`] — the central helper
+/// (issue #176) — kept so the many forge-loop call sites read unchanged.
 pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
-    let forge = deps.forge();
-    let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
-    let _ = forge
-        .comment(issue, &tasks::needs_human_comment(reason))
-        .await;
+    super::escalation::escalate_issue(deps, issue, reason).await;
 }
 
 fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &Checkpoint) -> Result<String> {
@@ -1528,22 +1520,13 @@ pub(crate) fn compose_pr_body(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
-    // A single footer line when the rounds cap was hit without a clean verdict
-    // (ADR 0006): the human/guard review is the backstop.
-    let self_review_note = if cp.self_review_unconverged {
-        format!(
-            "\n\n> 🔁 self-review: {} ラウンド回しても収束しませんでした（未解決の指摘が残ったまま公開しています。人間レビューで確認してください）。",
-            cp.self_review_rounds
-        )
-    } else {
-        String::new()
-    };
+    // A published PR always cleared self-review: a non-converging (or
+    // needs-human) review escalates and never reaches open-pr (ADR 0012).
     format!(
-        "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "{}.\n\n{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
         issue_reference(run.issue_number, close),
         description,
-        self_review_note,
         self_review_details(cp, lenses),
         run.id
     )
@@ -1582,11 +1565,8 @@ fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let outcome = if cp.self_review_unconverged {
-        format!("unconverged after {} rounds", cp.self_review_rounds)
-    } else {
-        format!("clean after {} rounds", cp.self_review_rounds)
-    };
+    // A published PR always converged (a non-clean review escalates, ADR 0012).
+    let outcome = format!("clean after {} rounds", cp.self_review_rounds);
     format!(
         "\n\n<details>\n<summary>🔁 self-review — {outcome}</summary>\n\n\
          lenses: {lenses}\n\n{rounds}\n</details>",
@@ -1605,17 +1585,12 @@ async fn post_self_review_status(deps: &Deps, run: &RunRecord, cp: &Checkpoint, 
         return;
     };
     let head = head.trim();
-    let (state, desc) = if cp.self_review_unconverged {
-        (
-            crate::forge::CommitStatusState::Failure,
-            format!("unconverged · {} rounds", cp.self_review_rounds),
-        )
-    } else {
-        (
-            crate::forge::CommitStatusState::Success,
-            format!("clean · {} rounds", cp.self_review_rounds),
-        )
-    };
+    // A published PR always cleared self-review (a non-clean review escalates
+    // and never reaches this point, ADR 0012).
+    let (state, desc) = (
+        crate::forge::CommitStatusState::Success,
+        format!("clean · {} rounds", cp.self_review_rounds),
+    );
     if let Err(e) = deps
         .forge()
         .set_commit_status(head, "meguri/self-review", state, &desc)
@@ -1889,6 +1864,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            autonomy: None,
         };
         let deps = Deps::with_label_source(
             store,

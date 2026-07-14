@@ -39,11 +39,21 @@ pub const DIFF_FILE: &str = ".meguri/self-review-diff.patch";
 /// Where the review turn writes its verdict + findings (worktree-relative).
 pub const REVIEW_FILE: &str = ".meguri/self-review.json";
 
+/// The self-review disposition (issue #176, ADR 0012). Three-valued so the
+/// reviewer itself classifies whether the diff can be repaired automatically
+/// (`Fixable`, drives another fix round) or needs a person (`NeedsHuman`,
+/// escalates at once). `Clean` publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewVerdict {
+    /// Nothing must change — publish.
     Clean,
-    Findings,
+    /// Something must change, and the agent can fix it — run another fix round.
+    /// `findings` is accepted as a legacy alias (pre-#176 two-valued reviews).
+    #[serde(alias = "findings")]
+    Fixable,
+    /// Something must change that needs a human judgment — escalate now.
+    NeedsHuman,
 }
 
 /// One finding from a review turn, anchored to a line on the NEW side of the
@@ -97,9 +107,10 @@ pub(crate) async fn self_review(
 
     loop {
         // Backstop / resume guard: the cap is spent and the last verdict was
-        // not clean — publish as-is (ADR 0006).
+        // not clean — the diff did not converge, so a human decides (ADR 0012;
+        // was "publish as-is" before #176).
         if cp.self_review_rounds >= max_rounds {
-            return mark_unconverged(deps, run, cp);
+            return escalate_unconverged(deps, run, cp);
         }
 
         // ---- review turn (in the self-review lane) ----
@@ -108,6 +119,25 @@ pub(crate) async fn self_review(
             ReviewTurn::Stopped => return Ok(flow::StepFlow::Stopped),
             ReviewTurn::Interrupted(r) => return Ok(flow::StepFlow::Interrupted(r)),
         };
+
+        // `needs_human`: the reviewer judged the diff needs a person — escalate
+        // at once, without spending a fix round on something a fix cannot solve
+        // (ADR 0012). The run fails; `Flavor::escalate` routes to the central
+        // escalation helper (needs-human on the issue).
+        if review.verdict == ReviewVerdict::NeedsHuman {
+            deps.store.emit(
+                Some(&run.id),
+                "self_review.needs_human",
+                json!({ "round": cp.self_review_rounds + 1 }),
+            )?;
+            return Err(NeedsHuman(format!(
+                "self-review flagged issue #{} for a human: {}",
+                run.issue_number,
+                review.review.trim()
+            ))
+            .into());
+        }
+
         cp.self_review_rounds += 1;
         cp.self_review_pending = review.findings.clone();
         cp.self_review_log.push(RoundRecord {
@@ -123,7 +153,6 @@ pub(crate) async fn self_review(
         )?;
 
         if review.verdict == ReviewVerdict::Clean {
-            cp.self_review_unconverged = false;
             cp.self_review_pending.clear();
             persist(deps, run, cp)?;
             deps.store.emit(
@@ -134,9 +163,10 @@ pub(crate) async fn self_review(
             return Ok(flow::StepFlow::Continue);
         }
 
-        // Findings remain but no rounds left to re-review a fix — publish.
+        // Fixable findings remain but no rounds left to re-review a fix — the
+        // diff did not converge, so a human decides (ADR 0012).
         if cp.self_review_rounds >= max_rounds {
-            return mark_unconverged(deps, run, cp);
+            return escalate_unconverged(deps, run, cp);
         }
 
         // ---- fix turn (in the author lane) ----
@@ -162,10 +192,14 @@ fn persist(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -> Result<()> {
     Ok(())
 }
 
-/// The rounds cap was hit without a clean verdict: flag the non-convergence
-/// (footer + event) and let the PR open.
-fn mark_unconverged(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result<flow::StepFlow> {
-    cp.self_review_unconverged = true;
+/// The rounds cap was hit without a clean verdict: the self-review could not
+/// converge, so a human decides (ADR 0012 — before #176 this published the PR
+/// with a footer). Fails the run; `Flavor::escalate` labels needs-human.
+fn escalate_unconverged(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+) -> Result<flow::StepFlow> {
     persist(deps, run, cp)?;
     deps.store.emit(
         Some(&run.id),
@@ -173,7 +207,13 @@ fn mark_unconverged(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result
         json!({ "rounds": cp.self_review_rounds,
                 "pending": cp.self_review_pending.len() }),
     )?;
-    Ok(flow::StepFlow::Continue)
+    Err(NeedsHuman(format!(
+        "self-review did not converge on issue #{} after {} rounds ({} finding(s) still open)",
+        run.issue_number,
+        cp.self_review_rounds,
+        cp.self_review_pending.len()
+    ))
+    .into())
 }
 
 enum ReviewTurn {
@@ -400,16 +440,22 @@ fn review_prompt(
          - Do NOT modify, commit, or push anything; the review file below is your only \
            deliverable.\n\
          - Write your review to `{review}` as JSON:\n\
-           `{{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown summary>\", \
+           `{{\"verdict\": \"clean\" | \"fixable\" | \"needs_human\", \"review\": \"<Markdown summary>\", \
            \"findings\": [{{\"path\": \"src/x.rs\", \"line\": 42, \"lens\": \"correctness\", \
            \"body\": \"<what must change>\"}}]}}`\n\
            - \"clean\": nothing must change before this can be published (pure nitpicks do not \
              block; mention them in `review` and leave `findings` empty).\n\
-           - \"findings\": something must change. Each entry must anchor to a line that appears \
-             on the NEW side of the diff and may name the `lens` it came from; put cross-cutting \
-             remarks that fit no single line in `review` only.\n\
+           - \"fixable\": something must change, and you (the author) can fix it in code on the \
+             next round — a wrong branch, a missing test, an unhandled case. Each finding must \
+             anchor to a line on the NEW side of the diff and may name the `lens` it came from; \
+             put cross-cutting remarks that fit no single line in `review` only.\n\
+           - \"needs_human\": something is wrong that a person must decide — an ambiguous \
+             requirement, a risky trade-off, a product/design call you cannot make from the code. \
+             Explain it in `review`; this stops the run and asks a human (do not spend a fix round \
+             on it).\n\
          - A completed review is a success regardless of verdict; report \"failure\"/\"needs_human\" \
-           only when you cannot review at all.\
+           as the turn status only when you cannot review at all (the verdict above is the review's \
+           conclusion, not the turn's).\
          {lang_section}",
         number = run.issue_number,
         round = round,
@@ -458,14 +504,15 @@ fn read_review(worktree: &Path) -> std::result::Result<ImplReviewFile, String> {
     let review: ImplReviewFile = serde_json::from_str(raw.trim()).map_err(|e| {
         format!(
             "- review file `{REVIEW_FILE}` is not valid JSON ({e}); expected \
-             {{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown>\", \
+             {{\"verdict\": \"clean\" | \"fixable\" | \"needs_human\", \"review\": \"<Markdown>\", \
              \"findings\": [{{\"path\": ..., \"line\": ..., \"body\": ...}}]}}"
         )
     })?;
-    if review.verdict == ReviewVerdict::Findings && review.review.trim().is_empty() {
+    if review.verdict != ReviewVerdict::Clean && review.review.trim().is_empty() {
         return Err(format!(
-            "- verdict is \"findings\" but `review` in `{REVIEW_FILE}` is empty; \
-             summarize every finding"
+            "- verdict is \"{:?}\" but `review` in `{REVIEW_FILE}` is empty; \
+             a non-clean verdict must explain what must change",
+            review.verdict
         ));
     }
     if review.verdict == ReviewVerdict::Clean && !review.findings.is_empty() {
@@ -550,15 +597,40 @@ mod tests {
         .unwrap();
         assert!(read_review(dir.path()).is_err());
 
+        // The legacy "findings" verdict still parses, as the `fixable` alias
+        // (backward compat, issue #176).
         std::fs::write(
             &path,
             r#"{"verdict":"findings","review":"- bug","findings":[{"path":"src/a.rs","line":42,"body":"off by one"}]}"#,
         )
         .unwrap();
         let review = read_review(dir.path()).unwrap();
-        assert_eq!(review.verdict, ReviewVerdict::Findings);
+        assert_eq!(review.verdict, ReviewVerdict::Fixable);
         assert_eq!(review.findings.len(), 1);
         assert_eq!(review.findings[0].line, 42);
+
+        // The three-valued verdict: fixable and needs_human both parse.
+        std::fs::write(
+            &path,
+            r#"{"verdict":"fixable","review":"- bug","findings":[{"path":"src/a.rs","line":7,"body":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_review(dir.path()).unwrap().verdict,
+            ReviewVerdict::Fixable
+        );
+        std::fs::write(
+            &path,
+            r#"{"verdict":"needs_human","review":"needs a product decision"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_review(dir.path()).unwrap().verdict,
+            ReviewVerdict::NeedsHuman
+        );
+        // A non-clean verdict with an empty review is rejected.
+        std::fs::write(&path, r#"{"verdict":"needs_human","review":"  "}"#).unwrap();
+        assert!(read_review(dir.path()).unwrap_err().contains("empty"));
 
         std::fs::write(&path, r#"{"verdict":"clean"}"#).unwrap();
         assert_eq!(

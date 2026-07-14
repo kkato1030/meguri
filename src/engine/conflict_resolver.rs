@@ -94,14 +94,37 @@ impl super::Loop for ConflictResolverLoop {
                 continue;
             }
             let issue = canonical_key(&pr);
-            if deps
+            let exhausted = deps
                 .store
                 .succeeded_run_count(&deps.project.id, KIND, issue)?
-                >= MAX_RESOLVE_RUNS
-            {
+                >= MAX_RESOLVE_RUNS;
+            // Only conflicting PRs are actionable. Check this BEFORE acting on
+            // the budget: a PR that already stopped conflicting (resolved by a
+            // human, or a base that moved) must not be escalated just because it
+            // spent its resolve budget (issue #176).
+            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
                 continue;
             }
-            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
+            if exhausted {
+                // Budget spent AND still conflicting: a base that re-conflicts
+                // this often needs a human (ADR 0012, P4 — was a silent discover
+                // skip before #176). The needs-human filter above makes this
+                // fire exactly once; a human clears the label / `meguri run`
+                // forces another round.
+                let comment = super::escalation::pr_needs_human_comment(
+                    &format!(
+                        "resolved this PR's conflicts {MAX_RESOLVE_RUNS} times but the base keeps \
+                         re-conflicting, and needs a human."
+                    ),
+                    "Clear the needs-human label (and `meguri run --issue N` if wanted) once the \
+                     repeated conflict is understood.",
+                );
+                super::escalation::escalate_pr(deps, pr.number, &comment).await;
+                deps.store.emit(
+                    None,
+                    "conflict_resolver.exhausted",
+                    json!({ "pr": pr.number, "issue": issue }),
+                )?;
                 continue;
             }
             targets.push(Target {
@@ -341,26 +364,14 @@ impl Flavor for ConflictResolverFlavor {
     /// issue gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let Some(pr) = flow::claimed_pr(deps, &run.id) else {
-            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps
-            .forge()
-            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-            .await;
-        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-        let _ = deps
-            .forge()
-            .pr_comment(
-                pr,
-                &format!(
-                    "🔁 **meguri** could not resolve the merge conflicts on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
-                ),
-            )
-            .await;
+        let comment = super::escalation::pr_needs_human_comment(
+            "could not resolve the merge conflicts on this PR and needs a human.",
+            reason,
+        );
+        super::escalation::escalate_pr(deps, pr, &comment).await;
     }
 }
 
@@ -546,6 +557,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

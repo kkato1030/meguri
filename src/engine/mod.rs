@@ -2,6 +2,7 @@ pub mod auto_merger;
 pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
+pub mod escalation;
 pub mod fixer;
 pub mod flow;
 pub mod guard;

@@ -225,6 +225,15 @@ async fn check_auto_merge(cfg: &Config) -> bool {
         if !am.enabled {
             continue;
         }
+        // Inconsistency warn (issue #176): auto-merge is on, but the project is
+        // `attended`, so meguri will never arm it. Advisory only — not a failure.
+        if cfg.autonomy_for(project) != meguri::config::Autonomy::Full {
+            println!(
+                "⚠️  auto-merge ({}): enabled but autonomy=attended — meguri will not arm \
+                 auto-merge (set autonomy = \"full\" to arm; ADR 0012)",
+                project.id
+            );
+        }
         // Auto-merge is a GitHub-PR concern; a local-mode project has no slug
         // and no PRs to arm, so there is nothing to check.
         let Some(slug) = &project.repo_slug else {

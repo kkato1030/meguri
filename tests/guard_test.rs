@@ -123,6 +123,7 @@ async fn setup(labels: &[&str], impl_guard: bool) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
     };
 
     let deps = Deps::with_label_source(
@@ -288,11 +289,12 @@ async fn plan_guard_clean_flips_to_spec_ready_via_status_and_body() {
     assert!(wt.join(DIFF_FILE).exists());
 }
 
-/// guard(Plan) findings: a failure status, the summary in the body, and
-/// spec-reviewing kept for the next push. The reviewed head is deduped (the
-/// status is the key); a new head re-guards.
+/// guard(Plan) findings escalate (issue #176, ADR 0012): a failure status, the
+/// summary in the body, spec-reviewing kept, and — new — needs-human so a person
+/// resolves the findings. The parked PR is skipped by discovery until a human
+/// clears the label, even on a new head.
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
+async fn plan_guard_findings_escalate_and_park_on_needs_human() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     let run = create_guard_run(&env);
 
@@ -314,6 +316,13 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
         "{labels:?}"
     );
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
+    // The guard is the human gate: findings park the PR on needs-human.
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    assert_eq!(env.forge.comments_of(PR).len(), 1, "one escalation comment");
     assert_eq!(
         env.forge.commit_status_of(&env.head_sha, GUARD_STATUS),
         Some(CommitStatusState::Failure)
@@ -326,13 +335,18 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
         .unwrap();
     assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
 
-    // Idempotency: the reviewed head (now carrying a guard status) is skipped.
+    // A needs-human PR is parked: even a new head is not re-guarded until a
+    // human clears the label.
+    env.forge.set_pr_head(PR, "feedfacefeedface");
     assert!(
         GuardLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "same head must not be guarded twice"
+        "a needs-human PR must not be re-guarded until a human clears it"
     );
-    // A new push moves the head past the status → re-guarded.
-    env.forge.set_pr_head(PR, "feedfacefeedface");
+    // Once the label is cleared, the new head is guardable again.
+    env.forge
+        .remove_pr_label(PR, LABEL_NEEDS_HUMAN)
+        .await
+        .unwrap();
     let targets = GuardLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
         targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
@@ -341,7 +355,8 @@ async fn plan_guard_findings_keep_reviewing_and_dedup_by_status() {
 }
 
 /// guard(Impl): reviews an implementation PR, writes the guard status + body
-/// summary, and NEVER touches spec-* labels (criterion 3a). No inline threads.
+/// summary, escalates findings to needs-human (issue #176), and NEVER touches
+/// spec-* labels (criterion 3a). No inline threads.
 #[tokio::test(flavor = "multi_thread")]
 async fn impl_guard_reviews_without_touching_spec_labels() {
     // An impl PR: no spec-reviewing label, impl guard enabled.
@@ -374,6 +389,11 @@ async fn impl_guard_reviews_without_touching_spec_labels() {
     assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
     assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    // Findings escalate: the impl PR is parked on needs-human (issue #176).
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "{labels:?}"
+    );
     let pr = env
         .forge
         .prs()
@@ -382,7 +402,8 @@ async fn impl_guard_reviews_without_touching_spec_labels() {
         .unwrap();
     assert!(pr.body.contains("guard review (impl)"), "body: {}", pr.body);
     assert!(env.forge.threads_of(PR).is_empty());
-    assert!(env.forge.pr_comments_of(PR).is_empty());
+    // The escalation comment is a normal PR comment (not an inline review thread).
+    assert_eq!(env.forge.comments_of(PR).len(), 1);
 }
 
 /// guard(Impl) OFF (the default): impl PRs are not discovered.
@@ -482,7 +503,7 @@ async fn needs_human_escalates_on_the_pr() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
-    let comments = env.forge.pr_comments_of(PR);
+    let comments = env.forge.comments_of(PR);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
 }
@@ -527,6 +548,12 @@ async fn second_round_reuses_pane_and_worktree() {
     let head2 = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
     run_git(&clone, &["checkout", "main"]).await.unwrap();
     env.forge.set_pr_head(PR, &head2);
+    // Round 1's findings escalated to needs-human (issue #176); a human clears
+    // the label so the pushed fix can be re-guarded on the review lane.
+    env.forge
+        .remove_pr_label(PR, LABEL_NEEDS_HUMAN)
+        .await
+        .unwrap();
 
     let run2 = create_guard_run(&env);
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_guard(&env.deps, &run2.id))

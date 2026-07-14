@@ -18,6 +18,8 @@ use meguri::forge::{
 fn deps_with(forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.pr.auto_merge.enabled = true;
+    // The auto-merger only arms under full autonomy (issue #176).
+    config.autonomy = meguri::config::Autonomy::Full;
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: "/tmp/unused".into(),
@@ -34,6 +36,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),
@@ -120,7 +123,7 @@ async fn guard_gate_escalates_a_failure_status_and_does_not_arm() {
     );
     assert!(
         forge
-            .pr_comments_of(pr)
+            .comments_of(pr)
             .iter()
             .any(|c| c.contains("guard review"))
     );

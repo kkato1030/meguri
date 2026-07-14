@@ -900,6 +900,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

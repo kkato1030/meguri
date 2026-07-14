@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::Deps;
 use super::guard::GUARD_STATUS;
-use crate::config::{AutoMergeConfig, AutoMergeOptIn};
+use crate::config::{AutoMergeConfig, AutoMergeOptIn, Autonomy};
 use crate::forge::{self, ArmOutcome, CommitStatusState, MergePolicy, MergeStrategy, PullRequest};
 
 /// Head-branch prefix identifying meguri's own PRs — auto-merge only ever
@@ -119,6 +119,13 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     }
     let am = deps.config.pr_for(&deps.project).auto_merge.clone();
     if !am.enabled {
+        return Ok(());
+    }
+    // Autonomy gate (issue #176, ADR 0012): meguri only arms auto-merge when the
+    // project is `full` — under `attended` (the default) a human is the merge
+    // gate, so a green PR is left for a person to merge. Orthogonal to
+    // `auto_merge.opt_in`, which selects *which* PRs are eligible.
+    if deps.config.autonomy_for(&deps.project) != Autonomy::Full {
         return Ok(());
     }
     // Fetched at most once per sweep (only when a candidate reaches
@@ -261,21 +268,14 @@ async fn guard_gate(deps: &Deps, pr: &PullRequest) -> Result<GuardGate> {
 /// merge). Reached only when the label is absent (condition 2 blocks it
 /// otherwise), so the escalation and its comment fire once.
 async fn escalate_guard_failed(deps: &Deps, pr: &PullRequest) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps
-        .forge()
-        .comment_pr(
-            pr.number,
-            &format!(
-                "🔁 **meguri** — auto-merge は `{}` の guard review が失敗しているため arm しません。\n\
-                 指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
-                short_sha(&pr.head_sha)
-            ),
-        )
-        .await;
+    let comment = super::escalation::pr_needs_human_comment(
+        &format!(
+            "は `{}` の guard review が失敗しているため auto-merge を arm できません。",
+            short_sha(&pr.head_sha)
+        ),
+        "指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
+    );
+    super::escalation::escalate_pr(deps, pr.number, &comment).await;
     let _ = deps.store.emit(
         None,
         "automerge.guard_failed",

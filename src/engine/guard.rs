@@ -173,9 +173,15 @@ impl GuardLoop {
     /// at this head, or — for impl — CI not green).
     async fn candidate_kind(&self, deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
         let review = deps.config.review_for(&deps.project);
+        // needs-human is a human stop signal on both sides: once the guard (or
+        // anything else) escalated a PR, do not re-guard it until a human clears
+        // the label (issue #176 — plan was previously guarded unconditionally,
+        // so a guard-findings escalation would re-fire forever; now symmetric
+        // with impl).
         if pr.state != "open"
             || pr.has_label(forge::LABEL_HOLD)
             || pr.has_label(forge::LABEL_WORKING)
+            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
         {
             return Ok(None);
         }
@@ -186,11 +192,10 @@ impl GuardLoop {
         match kind {
             Kind::Plan => {} // spec-reviewing PRs are always guardable
             Kind::Impl => {
-                // Same ownership guard as the fixer: meguri branch only, not
-                // needs-human, and no spec-phase label (spec-ready is the
-                // combined spec worker's territory).
+                // Same ownership guard as the fixer: meguri branch only, and no
+                // spec-phase label (spec-ready is the combined spec worker's
+                // territory). needs-human is handled in common above.
                 if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
-                    || pr.has_label(forge::LABEL_NEEDS_HUMAN)
                     || pr.has_label(forge::LABEL_SPEC_READY)
                 {
                     return Ok(None);
@@ -373,22 +378,11 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 }
 
 async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-    let _ = deps
-        .forge()
-        .comment_pr(
-            pr,
-            &format!(
-                "🔁 **meguri** could not finish guarding this PR and needs a human.\n\n> {reason}\n\n\
-                 The agent's pane (if still open) has the full context — \
-                 see `meguri ps` / `meguri attach` on the host running meguri."
-            ),
-        )
-        .await;
+    let comment = super::escalation::pr_needs_human_comment(
+        "could not finish guarding this PR and needs a human.",
+        reason,
+    );
+    super::escalation::escalate_pr(deps, pr, &comment).await;
 }
 
 enum Prepared {
@@ -686,8 +680,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &GuardCheckpoint) -> Result<St
 
     // Plan guard drives the label state machine (ADR 0008 §3): a clean spec
     // review flips spec-reviewing → spec-ready (the combined spec worker keys
-    // off it); findings keep spec-reviewing for the next push. The impl guard
-    // never touches spec labels.
+    // off it). The impl guard never touches spec labels.
     if cp.kind == Kind::Plan && verdict == ReviewVerdict::Clean {
         deps.forge()
             .add_pr_label(pr, forge::LABEL_SPEC_READY)
@@ -697,10 +690,37 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &GuardCheckpoint) -> Result<St
             .await
             .ok();
     }
-    deps.forge()
-        .remove_pr_label(pr, forge::LABEL_WORKING)
-        .await
-        .ok();
+
+    match verdict {
+        ReviewVerdict::Clean => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
+        // The guard is the human gate (ADR 0012): findings on either side
+        // (plan or impl) mean a person must decide — the self-review already
+        // handled everything auto-fixable, so escalate instead of leaving a red
+        // status nobody acts on. This is P1/P3 for the guard sites. `escalate_pr`
+        // drops the working claim and adds needs-human (which also stops discover
+        // from re-guarding until a human clears it).
+        ReviewVerdict::Findings => {
+            let lead = format!(
+                "guard review ({}) found issues that need a human before this PR can proceed.",
+                cp.kind.as_str()
+            );
+            let comment = super::escalation::pr_needs_human_comment(
+                &lead,
+                "See the folded 🛡️ guard review in the PR body for the findings.",
+            );
+            super::escalation::escalate_pr(deps, pr, &comment).await;
+            deps.store.emit(
+                Some(&run.id),
+                "guard.escalated",
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+            )?;
+        }
+    }
     Ok(cp.pr_url.clone())
 }
 
@@ -869,6 +889,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            autonomy: None,
         };
         let deps = Deps::with_label_source(
             store,

@@ -79,6 +79,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),
