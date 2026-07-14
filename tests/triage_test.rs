@@ -1221,6 +1221,57 @@ async fn auto_mode_escalates_pending_proposal_and_respects_rejection() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_does_not_rescan_a_pending_proposal_kind_outside_apply() {
+    // A pending proposal whose kind is not in `apply` can never be escalated
+    // (promote_one no-ops it), so it must not keep the sweep perpetually due —
+    // otherwise it re-scans every interval forever.
+    let mut env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1 (advise): propose `plan` on the candidate.
+    let run1 = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "plan", "confidence": 0.9,
+                "estimated_complexity": "large", "rationale": "needs a spec", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run1.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        env.forge.get_issue(CANDIDATE).await.unwrap().labels,
+        vec![LABEL_TRIAGE_PLAN.to_string()]
+    );
+
+    // Switch to auto with the default apply = ["ready"]. The pending `plan`
+    // proposal is not promotable here, so discovery must stay quiet (content
+    // unchanged, head still, no new issue).
+    env.deps.config.triage.mode = TriageMode::Auto;
+    assert!(
+        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "a pending proposal whose kind is outside `apply` must not re-trigger the sweep"
+    );
+
+    // Add `plan` to apply — now the same pending proposal is real pending work,
+    // so discovery fires.
+    env.deps.config.triage.apply = vec![TriageAction::Ready, TriageAction::Plan];
+    assert!(
+        !TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "once `plan` is in `apply`, the pending plan proposal must re-trigger the sweep"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auto_mode_throttles_promotions_by_max_actions_per_tick() {
     let env = setup_with_triage(TriageConfig {
         mode: TriageMode::Auto,

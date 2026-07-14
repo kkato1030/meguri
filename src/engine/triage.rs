@@ -229,6 +229,19 @@ impl Recommendation {
             Self::Skip => "skip",
         }
     }
+
+    /// The inverse of [`as_str`], for reading a recommendation back out of a
+    /// hidden marker. Unknown text yields `None` (a malformed or future marker).
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "ready" => Some(Self::Ready),
+            "plan" => Some(Self::Plan),
+            "needs-human" => Some(Self::NeedsHuman),
+            "hold" => Some(Self::Hold),
+            "skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
 }
 
 /// Rough size of the work an issue implies.
@@ -687,8 +700,12 @@ fn content_hash(issue: &Issue) -> String {
 /// - `auto`: a `real` marker means already promoted (or promoted then reverted
 ///   = a human rejection) — not eligible. A `proposal` marker means the last
 ///   action was only a v1 proposal: eligible **iff a proposal label is still
-///   present** (a pending proposal to escalate); if the label was removed, the
-///   human rejected it, so respect that until the content changes.
+///   present AND its recommendation is promotable under the current `apply`**
+///   (a pending proposal `auto` could actually escalate). If the label was
+///   removed, the human rejected it; if its kind is outside `apply` (e.g. a v1
+///   `plan` proposal under the default `apply = ["ready"]`), escalation would
+///   always no-op — treating either as pending would re-scan the issue every
+///   interval forever.
 ///
 /// `no_marker` is the answer when the issue has no marker at all — `true` for
 /// candidate gathering (a never-triaged issue is a candidate), `false` for the
@@ -701,12 +718,21 @@ async fn triage_action_pending(deps: &Deps, issue: &Issue, no_marker: bool) -> R
     if marker.hash != content_hash(issue) {
         return Ok(true); // content moved: re-triage
     }
-    if deps.config.triage_for(&deps.project).mode != TriageMode::Auto {
+    let cfg = deps.config.triage_for(&deps.project);
+    if cfg.mode != TriageMode::Auto {
         return Ok(false); // report/advise: unchanged marker = already actioned
     }
     match marker.applied {
         AppliedLevel::Real => Ok(false), // already promoted, or rejected promotion
-        AppliedLevel::Proposal => Ok(has_proposal_label(issue)), // pending → escalate; rejected → respect
+        AppliedLevel::Proposal => {
+            // Pending → escalate; rejected (label gone) or kind outside `apply`
+            // (escalation would no-op) → not pending, so this doesn't re-scan
+            // forever.
+            let promotable = marker
+                .recommendation
+                .is_some_and(|rec| promote_label(rec, &cfg.apply).is_some());
+            Ok(has_proposal_label(issue) && promotable)
+        }
     }
 }
 
@@ -1435,6 +1461,11 @@ struct AdviseMarker {
     /// A marker predating this field (v1 advise) parses as `Proposal` — the
     /// only action v1 ever took.
     applied: AppliedLevel,
+    /// The recommendation this marker recorded. `None` for a malformed or
+    /// future value; used to decide whether an unchanged proposal is still
+    /// promotable under the current `apply` (so a proposal kind outside `apply`
+    /// isn't re-scanned forever).
+    recommendation: Option<Recommendation>,
 }
 
 fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
@@ -1442,6 +1473,7 @@ fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
     let fields = rest.split("-->").next()?;
     let mut hash = None;
     let mut applied = AppliedLevel::Proposal;
+    let mut recommendation = None;
     for part in fields.split_whitespace() {
         if let Some(v) = part.strip_prefix("hash=") {
             hash = Some(v.to_string());
@@ -1451,11 +1483,14 @@ fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
             } else {
                 AppliedLevel::Proposal
             };
+        } else if let Some(v) = part.strip_prefix("recommendation=") {
+            recommendation = Recommendation::from_str(v);
         }
     }
     Some(AdviseMarker {
         hash: hash?,
         applied,
+        recommendation,
     })
 }
 
@@ -2056,21 +2091,23 @@ mod tests {
         let parsed = parse_advise_marker(&format!("{marker}\nsome rationale")).unwrap();
         assert_eq!(parsed.hash, hash);
         assert_eq!(parsed.applied, AppliedLevel::Proposal);
+        assert_eq!(parsed.recommendation, Some(Recommendation::Ready));
         assert_eq!(parse_advise_marker("no marker here"), None);
 
-        // A `real` marker roundtrips its level.
+        // A `real` marker roundtrips its level and recommendation.
         let real = advise_marker(&hash, Recommendation::Plan, AppliedLevel::Real);
-        assert_eq!(
-            parse_advise_marker(&real).unwrap().applied,
-            AppliedLevel::Real
-        );
+        let parsed = parse_advise_marker(&real).unwrap();
+        assert_eq!(parsed.applied, AppliedLevel::Real);
+        assert_eq!(parsed.recommendation, Some(Recommendation::Plan));
         // A marker predating the `applied` field parses as `proposal` (v1's
-        // only action level), for backward compatibility.
-        let old = format!("<!-- meguri:triage-advise hash={hash} recommendation=ready -->");
-        assert_eq!(
-            parse_advise_marker(&old).unwrap().applied,
-            AppliedLevel::Proposal
-        );
+        // only action level), for backward compatibility, keeping its recommendation.
+        let old = format!("<!-- meguri:triage-advise hash={hash} recommendation=plan -->");
+        let parsed = parse_advise_marker(&old).unwrap();
+        assert_eq!(parsed.applied, AppliedLevel::Proposal);
+        assert_eq!(parsed.recommendation, Some(Recommendation::Plan));
+        // A malformed/unknown recommendation is tolerated as `None`.
+        let bad = format!("<!-- meguri:triage-advise hash={hash} recommendation=bogus -->");
+        assert_eq!(parse_advise_marker(&bad).unwrap().recommendation, None);
 
         let changed_hash = content_hash(&Issue {
             number: 1,
