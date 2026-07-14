@@ -298,6 +298,15 @@ pub struct Checkpoint {
     /// crash mid-escalation doesn't re-climb.
     #[serde(default)]
     pub escalation_level: u32,
+    /// Validation-fix turns run under the *current* pinned profile since it was
+    /// (re)pinned (routing 3/3, issue #66). Reset to 0 on each escalation, and
+    /// that reset is persisted *before* the pin advances — so escalation only
+    /// fires once the current profile has actually had a fix turn
+    /// (`>= 1`). This is what makes escalation crash-safe: a resume after the
+    /// pin advanced but before the fix turn ran sees `0` and lets the new pin
+    /// try, instead of skipping it to the next chain entry.
+    #[serde(default)]
+    pub pin_fix_turns: u32,
 }
 
 /// Error kind signalling "a human needs to look"; the run is failed on the
@@ -1050,15 +1059,27 @@ fn resolve_run_profile(
     Ok((name, profile))
 }
 
-/// Signal-driven profile escalation (routing 3/3, issue #66). Called on the
-/// 2nd+ validation-fix turn: if routing is active, escalation is enabled, and
-/// the run's currently-pinned profile has a stronger entry in its role's
-/// escalation chain, re-pin one step up, retire the live author pane, and clear
-/// the session so the next turn spawns fresh (a model change can't `--resume`).
-/// Returns whether it escalated, so the caller can flag it in the fix prompt.
-/// A no-op (returns `false`) past the chain end — the run then rides the
-/// existing `validate_turns` → needs-human backstop, so escalation is finite.
-async fn maybe_escalate(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result<bool> {
+/// Signal-driven profile escalation (routing 3/3, issue #66). Called once the
+/// current pinned profile has had a failing fix turn (`cp.pin_fix_turns >= 1`):
+/// if routing is active, escalation is enabled, and the profile has a stronger
+/// entry in its role's escalation chain, re-pin one step up, retire the live
+/// author pane, and clear the session so the next turn spawns fresh (a model
+/// change can't `--resume`). Returns whether it escalated, so the caller can
+/// flag it in the fix prompt. A no-op (returns `false`) past the chain end — the
+/// run then rides the existing `validate_turns` → needs-human backstop, so
+/// escalation is finite.
+///
+/// Crash-safety: `pin_fix_turns` is reset to 0 and **persisted before** the pin
+/// advances. So a crash between the reset and the pin write (or between the pin
+/// write and the fix turn) resumes to `pin_fix_turns == 0`, which blocks a
+/// second escalation until the new pin has actually run a fix turn — no chain
+/// entry is ever skipped without a try.
+async fn maybe_escalate(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+    persist_step: &str,
+) -> Result<bool> {
     // Common gate: escalation is a refinement of active routing and honors the
     // top-level kill switch. Both conditions fail in legacy → never escalate.
     if deps.config.routing.is_none() || !deps.config.escalation.enabled {
@@ -1075,9 +1096,15 @@ async fn maybe_escalate(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Re
         return Ok(false);
     };
 
+    // Mark the new pin as "not yet tried" and persist it BEFORE advancing the
+    // pin, so a crash in the window below can't let a resume escalate again off
+    // a profile that never ran (which would skip a chain entry, issue #66).
+    cp.escalation_level += 1;
+    cp.pin_fix_turns = 0;
+    save_step(deps, run, persist_step, cp)?;
+
     // Re-pin one step stronger; the next author-lane spawn reads this back.
     deps.store.update_run_agent_profile(&run.id, &next)?;
-    cp.escalation_level += 1;
 
     // Retire the live author pane and forbid a resume: the model changed, so
     // `--resume <id>` under the new profile can't restore the old session.
@@ -1461,12 +1488,15 @@ pub(crate) async fn validate(
             .into());
         }
 
-        // Signal-driven escalation (issue #66): from the 2nd fix turn on, climb
-        // to a stronger profile if the run's role has an escalation chain to
-        // climb. A no-op past the chain end, so a genuinely stuck run still
-        // exhausts `validate_turns` and lands on needs-human above.
-        let escalated = if cp.fix_turns_used >= 2 {
-            maybe_escalate(deps, run, cp).await?
+        // Signal-driven escalation (issue #66): once the current profile has had
+        // a failing fix turn (`pin_fix_turns >= 1`), climb to a stronger profile
+        // if the run's role has an escalation chain. Keying on "did the current
+        // pin try?" instead of `fix_turns_used` keeps it crash-safe — a resume
+        // that re-runs the check can't skip a chain entry that never ran. A
+        // no-op past the chain end, so a genuinely stuck run still exhausts
+        // `validate_turns` and lands on needs-human above.
+        let escalated = if cp.pin_fix_turns >= 1 {
+            maybe_escalate(deps, run, cp, persist_step).await?
         } else {
             false
         };
@@ -1513,7 +1543,14 @@ pub(crate) async fn validate(
         let (outcome, _) = run_turn(deps, run, worktree, "fix-validation", &prompt).await?;
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
-                TurnStatus::Success => continue,
+                TurnStatus::Success => {
+                    // The current pin just spent a fix turn; record it so the
+                    // next failure may escalate off it (and a resume knows this
+                    // pin has been tried).
+                    cp.pin_fix_turns += 1;
+                    save_step(deps, run, persist_step, cp)?;
+                    continue;
+                }
                 // needs_plan/decompose make no sense once work is committed
                 // and failing validation — escalate like the other two.
                 TurnStatus::Failure

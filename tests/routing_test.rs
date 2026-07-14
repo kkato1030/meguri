@@ -369,6 +369,37 @@ worker = ["worker-cheap", "worker-strong"]
     tune(toml::from_str(toml).unwrap())
 }
 
+/// Like [`escalation_config`] but a three-step chain, and a higher fix-turn
+/// budget so the run can reach the top rung. Used to prove no intermediate
+/// profile is skipped.
+fn escalation_config_3step() -> Config {
+    let toml = r#"
+[agents.profiles.worker-cheap]
+command = "echo"
+args = ["cheap"]
+
+[agents.profiles.worker-mid]
+command = "echo"
+args = ["mid"]
+
+[agents.profiles.worker-strong]
+command = "echo"
+args = ["strong"]
+
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "worker-cheap"
+
+[escalation]
+worker = ["worker-cheap", "worker-mid", "worker-strong"]
+"#;
+    let mut config = tune(toml::from_str(toml).unwrap());
+    config.limits.validate_turns = 5;
+    config
+}
+
 /// Auto routing where the worker's mainline pick (`claude-sonnet`) is overridden
 /// to a detectable `echo` command, so `resolve` lands on it and the explore
 /// alternative is the recommendation chain's next entry (`default`, wired to a
@@ -516,6 +547,34 @@ async fn escalation_stops_at_the_chain_end_and_hands_to_human() {
         .filter(|e| e.kind == "run.escalated")
         .count();
     assert_eq!(escalations, 1, "exactly one escalation, not a loop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn escalation_climbs_a_multi_step_chain_without_skipping() {
+    // A three-step chain with a never-passing check: the run must visit each
+    // rung in turn (cheap → mid → strong), spawning each exactly once. If a
+    // resume/replay ever escalated off a pin that hadn't run yet, `mid` would be
+    // skipped and the spawns would read cheap → strong — this pins that it can't.
+    let (commands, store, run_id, outcome) =
+        drive_worker_scenario(escalation_config_3step(), Some("false")).await;
+    assert!(
+        outcome.is_err(),
+        "a never-passing check ends in needs-human: {outcome:?}"
+    );
+
+    let tags: Vec<&str> = commands.iter().map(|c| c[1].as_str()).collect();
+    assert_eq!(
+        tags,
+        vec!["cheap", "mid", "strong"],
+        "every chain entry gets a turn, in order: {commands:?}"
+    );
+    let escalations = store
+        .events_for_run(&run_id, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.escalated")
+        .count();
+    assert_eq!(escalations, 2, "two escalations across a three-step chain");
 }
 
 #[tokio::test(flavor = "multi_thread")]
