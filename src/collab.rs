@@ -22,6 +22,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::config::{CollabMode, Config};
+use crate::store::RunRecord;
+use crate::tasks::TaskKey;
 
 /// Home-relative path to the agmsg skill's runtime scripts. The agmsg runtime
 /// is this bundle of bash scripts (the `agmsg` npm binary on PATH is only a
@@ -60,6 +62,18 @@ pub fn advisor_role(cfg: &Config) -> &str {
 /// only holds `RunRecord.loop_kind`, never the flow's `Flavor`.
 pub fn supports_advisor_loop_kind(loop_kind: &str) -> bool {
     loop_kind == crate::engine::worker::KIND || loop_kind == crate::engine::spec_worker::KIND
+}
+
+/// Whether this run will actually get an advisor spawned: collab active, an
+/// advisor-eligible loop kind, AND a github issue. The issue check is
+/// load-bearing — advisor addressing is issue-scoped (`team_name`), so a local
+/// task gets no advisor. flow's `ensure_advisor` and the scheduler's slot
+/// weighting must agree on exactly this predicate, or a run books a slot for an
+/// advisor it never receives.
+pub fn run_gets_advisor(cfg: &Config, run: &RunRecord) -> bool {
+    advisor_active(cfg)
+        && supports_advisor_loop_kind(&run.loop_kind)
+        && matches!(run.task_key(), TaskKey::Issue(_))
 }
 
 /// The absolute path to the agmsg version script, built from the home
@@ -215,6 +229,42 @@ mod tests {
         assert!(!supports_advisor_loop_kind("planner"));
         assert!(!supports_advisor_loop_kind("fixer"));
         assert!(!supports_advisor_loop_kind("pr-reviewer"));
+    }
+
+    #[test]
+    fn run_gets_advisor_requires_issue_eligible_loop_and_collab_on() {
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        // Distinct issue numbers: only one active run is allowed per
+        // (project, loop, issue).
+        let issue_run = |kind: &str, issue: i64| {
+            let r = store.create_run_for_loop("proj", kind, issue, "t").unwrap();
+            store.get_run(&r.id).unwrap().unwrap()
+        };
+        let worker_run = issue_run(crate::engine::worker::KIND, 7);
+        let spec_worker_run = issue_run(crate::engine::spec_worker::KIND, 8);
+        let planner_run = issue_run("planner", 9);
+        // A *local* task worker run — no issue lane, so no advisor.
+        let local_run = {
+            let r = store
+                .create_run_for_task("proj", crate::engine::worker::KIND, 42, "t")
+                .unwrap();
+            store.get_run(&r.id).unwrap().unwrap()
+        };
+
+        let on = cfg_from("[collab]\nmode = \"advisor\"\n");
+        let off = cfg_from("");
+
+        // On + issue + eligible loop → yes.
+        assert!(run_gets_advisor(&on, &worker_run));
+        assert!(run_gets_advisor(&on, &spec_worker_run));
+        // On but a local task → no (the bug this predicate fixes: no advisor is
+        // ever spawned for a local run, so it must not book the extra slot).
+        assert!(!run_gets_advisor(&on, &local_run));
+        // On but an ineligible loop → no.
+        assert!(!run_gets_advisor(&on, &planner_run));
+        // Off → no.
+        assert!(!run_gets_advisor(&off, &worker_run));
     }
 
     #[test]

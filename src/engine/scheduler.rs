@@ -16,13 +16,12 @@ use crate::store::{RunRecord, RunStatus, Store};
 use crate::tasks::TaskKey;
 
 /// The slot budget is spent by *weight*, not run count (issue #111). A collab
-/// advisor is a real agent on the subscription quota, so a run that spawns one
-/// (collab active + advisor-eligible loop) weighs 2; every other run weighs 1.
-/// The map is run_id → weight, so `active_weight` sums the budget in flight.
+/// advisor is a real agent on the subscription quota, so a run that actually
+/// spawns one weighs 2; every other run weighs 1. This must use the same
+/// `run_gets_advisor` predicate flow's `ensure_advisor` does — a run that gets
+/// no advisor (e.g. a local task) must not book the extra slot.
 fn run_weight(deps: &Deps, run: &RunRecord) -> usize {
-    if crate::collab::advisor_active(&deps.config)
-        && crate::collab::supports_advisor_loop_kind(&run.loop_kind)
-    {
+    if crate::collab::run_gets_advisor(&deps.config, run) {
         2
     } else {
         1
@@ -390,6 +389,14 @@ mod tests {
         deps.store.get_run(&run.id).unwrap().unwrap()
     }
 
+    fn local_run_of_kind(deps: &Deps, loop_kind: &str) -> RunRecord {
+        let run = deps
+            .store
+            .create_run_for_task("proj", loop_kind, 42, "t")
+            .unwrap();
+        deps.store.get_run(&run.id).unwrap().unwrap()
+    }
+
     #[test]
     fn active_weight_sums_weights() {
         let mut m = HashMap::new();
@@ -414,6 +421,15 @@ mod tests {
         );
         // A non-advisor loop still weighs 1 even with collab on.
         assert_eq!(run_weight(&deps, &run_of_kind(&deps, "planner")), 1);
+        // A *local* worker run gets no advisor (no issue lane), so it must not
+        // book the extra slot even with collab on.
+        assert_eq!(
+            run_weight(
+                &deps,
+                &local_run_of_kind(&deps, crate::engine::worker::KIND)
+            ),
+            1
+        );
     }
 
     #[test]

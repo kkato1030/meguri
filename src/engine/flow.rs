@@ -622,10 +622,7 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
 /// down and a fresh one spawned ("捨てて張り直す"), so a resume or restart never
 /// adopts a stale individual.
 pub(crate) async fn ensure_advisor(deps: &Deps, run: &RunRecord, worktree: &Path, cp: &Checkpoint) {
-    if !crate::collab::advisor_active(&deps.config)
-        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
-        || !matches!(run.task_key(), TaskKey::Issue(_))
-    {
+    if !crate::collab::run_gets_advisor(&deps.config, run) {
         return;
     }
     if let Err(e) = spawn_advisor(deps, run, worktree, cp).await {
@@ -748,9 +745,7 @@ fn resolve_advisor_profile(
 /// The session id is not saved on release (guarded in `release_pane_record`),
 /// and the bare advisor dir is removed.
 pub(crate) async fn release_advisor(deps: &Deps, run: &RunRecord) {
-    if !crate::collab::advisor_active(&deps.config)
-        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
-    {
+    if !crate::collab::run_gets_advisor(&deps.config, run) {
         return;
     }
     let Some(record) = deps
@@ -783,9 +778,7 @@ pub(crate) async fn release_advisor(deps: &Deps, run: &RunRecord) {
 /// "spawn succeeded" signal, so a failed spawn yields the same bytes as
 /// collab-off — never advertising an absent advisor.
 pub(crate) fn advisor_consult_section(deps: &Deps, run: &RunRecord) -> String {
-    if !crate::collab::advisor_active(&deps.config)
-        || !crate::collab::supports_advisor_loop_kind(&run.loop_kind)
-    {
+    if !crate::collab::run_gets_advisor(&deps.config, run) {
         return String::new();
     }
     let live = deps
