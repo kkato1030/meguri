@@ -349,17 +349,30 @@ pub fn next_escalation(
 }
 
 /// The alternative ("explore") profile a canary run is diverted to instead of
-/// the mainline pick (issue #66): the next entry after the mainline pick in the
+/// the mainline pick (issue #66): the next entry after the *auto* pick in the
 /// role's [`recommended_chain`] that exists, is detected, and differs from the
 /// mainline. None (no divert) when the mainline is already the chain's tail or
 /// nothing after it is usable — the run then stays on the mainline. `default`
 /// is a legitimate alternative here (it answers "is routing better than the
 /// bare `[agent]`?") and is returned without detection, mirroring [`resolve`].
+///
+/// Explore only ever canaries the *auto recommendation*. It is a no-op when the
+/// role's profile isn't the auto pick — legacy (no `[routing]`), manual mode, or
+/// an explicit `[routing.roles]` entry — because ADR 0003 promises an explicit
+/// pick is honored verbatim: a user who pinned `worker = "claude-sonnet"` gets
+/// exactly that, never a silently-diverted next-in-chain.
 pub fn explore_alternative(
     cfg: &Config,
     role: &str,
     detect: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
+    let routing = cfg.routing.as_ref()?;
+    // Manual mode has no auto recommendation to canary; an explicit override is
+    // the user's deliberate choice and must not be diverted.
+    if routing.mode == RoutingMode::Manual || role_override(&routing.roles, role).is_some() {
+        return None;
+    }
+    // With those ruled out, `resolve` returns the auto chain pick = the mainline.
     let mainline = resolve(cfg, role, detect).ok()?;
     let chain = recommended_chain(role);
     let pos = chain.iter().position(|c| *c == mainline)?;
@@ -1079,6 +1092,61 @@ worker = ["claude-sonnet", "codex", "claude-opus"]
         // alternative → no divert.
         assert_eq!(
             explore_alternative(&cfg, "cleaner", &only(&["claude"])),
+            None
+        );
+    }
+
+    #[test]
+    fn explore_is_a_noop_for_explicit_and_manual_roles() {
+        // An explicit `[routing.roles]` pick is honored verbatim (ADR 0003) —
+        // even a chain member like claude-sonnet is never diverted.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "auto"
+
+[routing.roles]
+worker = "claude-sonnet"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "worker", &only(&["claude"])),
+            None
+        );
+        // A deprecated alias for the same role also counts as explicit.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "auto"
+
+[routing.roles]
+spec-worker = "claude-sonnet"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "worker", &only(&["claude"])),
+            None
+        );
+
+        // Manual mode has no auto recommendation to canary — even an explicit
+        // chain member stays put.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+pr-reviewer = "codex"
+"#,
+        );
+        assert_eq!(
+            explore_alternative(&cfg, "pr-reviewer", &only(&["codex", "claude"])),
+            None
+        );
+
+        // Legacy (no `[routing]`) never explores.
+        assert_eq!(
+            explore_alternative(&Config::default(), "worker", &only(&["claude"])),
             None
         );
     }
