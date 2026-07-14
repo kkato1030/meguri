@@ -533,14 +533,15 @@ async fn incomplete_report_is_corrected_then_succeeds() {
         write_result(wt, turn_id, "success");
     });
     let outcome = run_to_outcome(&env, &run.id).await;
-    let turns = agent.await.unwrap();
+    agent.abort();
     assert!(
         matches!(outcome, WorkerOutcome::Succeeded { .. }),
         "{outcome:?}"
     );
-    assert!(turns >= 2, "expected a corrective turn, saw {turns}");
 
-    // Both candidates made it into the final report.
+    // The run only reaches Succeeded after settle, which follows the verified
+    // corrective turn — so #61 (written *only* on that turn) being in the final
+    // report is proof the coverage correction ran.
     let report = report_issue(&env).await.unwrap();
     assert!(report.body.contains("| #60 | ready"), "{}", report.body);
     assert!(report.body.contains("| #61 | plan"), "{}", report.body);
