@@ -2093,27 +2093,33 @@ mod tests {
             repo.path().to_path_buf(),
             worktree_root.path().to_path_buf(),
             crate::config::WorktreeSetupConfig {
-                commands: vec!["sleep 2 && echo late > marker.txt".into()],
+                commands: vec!["sleep 5 && echo late > marker.txt".into()],
                 timeout_secs: 1,
                 ..Default::default()
             },
         );
         let cp = Checkpoint::default();
 
+        // The command is killed at its 1s timeout, so prepare-worktree returns
+        // in ~1s (plus git-worktree overhead) rather than blocking for the
+        // command's full 5s sleep. The 4s budget is deliberately loose: it
+        // still catches a regression that awaits the whole 5s, but leaves ample
+        // headroom for git ops under heavy parallel-test load (the tight 2s
+        // budget here used to flake).
         let start = std::time::Instant::now();
         create_branch_worktree(&deps, &run, &cp).await.unwrap();
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
+            start.elapsed() < std::time::Duration::from_secs(4),
             "prepare-worktree must not block past the command's timeout"
         );
 
         let run = deps.store.get_run(&run.id).unwrap().unwrap();
         let wt = PathBuf::from(run.worktree_path.unwrap());
 
-        // Wait past when the sleep would have finished had it survived the
+        // Wait past when the 5s sleep would have finished had it survived the
         // timeout; if `kill_on_drop` didn't actually kill it, marker.txt
         // would show up here.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert!(
             !wt.join("marker.txt").exists(),
             "the timed-out command must be killed, not left running in the background"
