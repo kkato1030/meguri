@@ -57,6 +57,7 @@ fn make_project(
         autonomy: None,
         worktree_setup: Default::default(),
         schedules,
+        prompts: Default::default(),
     }
 }
 

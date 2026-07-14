@@ -121,6 +121,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(

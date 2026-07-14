@@ -890,6 +890,7 @@ mod tests {
             },
             schedules: Vec::new(),
             autonomy: None,
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,

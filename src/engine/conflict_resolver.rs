@@ -496,6 +496,7 @@ mod tests {
             worktree_setup: Default::default(),
             schedules: Vec::new(),
             autonomy: None,
+            prompts: Default::default(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

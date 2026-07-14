@@ -36,6 +36,7 @@ fn deps_with(forge: Arc<FakeForge>, store: Store, reconcile: ReconcileConfig) ->
         worktree_setup: Default::default(),
         schedules: Vec::new(),
         autonomy: None,
+        prompts: Default::default(),
     };
     Deps::with_label_source(store, Arc::new(FakeMux::new(false)), forge, config, project)
 }
