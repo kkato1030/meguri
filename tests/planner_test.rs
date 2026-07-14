@@ -553,7 +553,10 @@ async fn planner_decompose_files_children_with_deps_labels_and_parent_comment() 
     .unwrap();
     assert!(!branches.contains("meguri/"), "{branches}");
 
-    // The prompt invited the decompose ending.
+    // The prompt now invites a *decomposition proposal* spec (issue #134), not
+    // the immediate `status: decompose` — the reviewed path. (The filing
+    // machinery this test drives, `on_decompose`, is retained and still invoked
+    // by the flow when a `decompose` result is written, as here.)
     let wt = find_worktree(&env.worktree_root).unwrap();
     let prompts = prompts_in(&wt);
     let execute_prompt = prompts
@@ -561,7 +564,10 @@ async fn planner_decompose_files_children_with_deps_labels_and_parent_comment() 
         .find(|p| p.contains("# Issue:"))
         .expect("execute prompt exists");
     assert!(execute_prompt.contains("# Too big for one spec?"));
-    assert!(execute_prompt.contains(r#""status": "decompose""#));
+    assert!(execute_prompt.contains("decomposition proposal"));
+    assert!(execute_prompt.contains("json meguri-children"));
+    assert!(execute_prompt.contains("meguri:decompose-proposal"));
+    assert!(!execute_prompt.contains(r#""status": "decompose""#));
 }
 
 /// A [`ForgeFactory`] backed by a slug→FakeForge map: the cross-repo

@@ -655,6 +655,36 @@ pub async fn fetch_base_tip(repo_path: &Path, base_branch: &str) -> Result<Strin
     .with_context(|| format!("base branch {base_branch} exists neither on origin nor locally"))
 }
 
+/// Fetch a PR head branch from origin and return its freshly-fetched tip sha
+/// (`origin/<branch>`). The decompose materializer pins this against the PR's
+/// approved head_sha to notice a head that moved mid-sweep (issue #134).
+///
+/// The fetch is **not** best-effort here (unlike [`fetch_base_tip`]): this gates
+/// an irreversible issue-creation, so a failed fetch — network down, or the
+/// branch deleted on the remote (`git fetch origin <gone>` errors) — must surface
+/// as an error, never fall through to a stale local remote-tracking ref that
+/// could still match the approved sha. The sweep then skips and retries next tick.
+pub async fn fetch_branch_tip(repo_path: &Path, branch: &str) -> Result<String> {
+    run_git(repo_path, &["fetch", "origin", branch])
+        .await
+        .with_context(|| format!("fetching branch {branch} from origin"))?;
+    run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("origin/{branch}")],
+    )
+    .await
+    .with_context(|| format!("branch {branch} not found on origin"))
+}
+
+/// Read a file's contents at a git ref (`git show <ref>:<path>`); the ref may be
+/// a branch or a sha. The decompose materializer reads the proposal spec from
+/// the exact approved head sha, not the working tree (issue #134).
+pub async fn show_file_at_ref(repo_path: &Path, git_ref: &str, path: &str) -> Result<String> {
+    run_git(repo_path, &["show", &format!("{git_ref}:{path}")])
+        .await
+        .with_context(|| format!("reading {path} at {git_ref}"))
+}
+
 /// Whether `ancestor` is reachable from `descendant` — how the conflict
 /// resolver proves the base tip was actually merged, not cherry-picked
 /// around. Synchronous: called from `Flavor::verify_work`.
