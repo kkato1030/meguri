@@ -58,6 +58,12 @@ async fn process_issue(deps: &Deps, issue: i64, labels: &[String]) -> Result<()>
     let Some(pr) = deps.forge().pr_for_branch(&branch).await? else {
         return Ok(());
     };
+    // A reviewed decomposition proposal never hands off to the worker: its
+    // parent becomes a tracking issue, not a `ready` implementation issue. The
+    // materializer sweep owns it (issue #134).
+    if super::planner::is_decompose_proposal(&pr.body) {
+        return Ok(());
+    }
     // Only a *merged* spec PR advances the issue. An open one is still under
     // review / awaiting merge; a closed-unmerged one was abandoned (a human
     // re-triages — meguri must not silently implement against a rejected spec).

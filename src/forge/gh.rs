@@ -46,6 +46,22 @@ fn label_scheme(label: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Extract an `owner/repo` slug from a GitHub API `repository_url`
+/// (`https://api.github.com/repos/owner/repo`). Used to tag each blocker with
+/// its home repo for cross-repo decomposition (issue #134).
+fn slug_from_repository_url(url: &str) -> Option<String> {
+    url.split("/repos/")
+        .nth(1)
+        .map(|s| s.trim_end_matches('/').to_string())
+}
+
+/// Whether a `gh api` dependency POST failed only because the edge already
+/// exists — the idempotent no-op case for [`GhForge::add_blocked_by_in`].
+fn is_dependency_exists(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("already") && (lower.contains("depend") || lower.contains("block"))
+}
+
 pub struct GhForge {
     /// "owner/repo"
     repo: String,
@@ -509,6 +525,20 @@ impl Forge for GhForge {
                             .get("state_reason")
                             .and_then(Value::as_str)
                             .map(str::to_lowercase),
+                        // The dependency endpoint returns the whole blocker
+                        // issue object, so its body and home repo come for free
+                        // — no extra get_issue per blocker (issue #134). Missing
+                        // fields degrade to empty (never matches a marker).
+                        body: b
+                            .get("body")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        repo: b
+                            .get("repository_url")
+                            .and_then(Value::as_str)
+                            .and_then(slug_from_repository_url)
+                            .unwrap_or_default(),
                     })
                     .collect()
             })
@@ -541,6 +571,41 @@ impl Forge for GhForge {
             .with_context(|| format!("no issue number in gh issue create output: {out}"))
     }
 
+    async fn find_issue_by_marker(&self, marker: &str) -> Result<Option<i64>> {
+        // All states: an already-created child may have been closed by a human
+        // or a worker before we recorded it (issue #134). `--search "… in:body"`
+        // scopes the term to issue bodies where the marker lives.
+        let raw = self
+            .gh(&[
+                "issue",
+                "list",
+                "--repo",
+                &self.repo,
+                "--state",
+                "all",
+                "--search",
+                &format!("{marker} in:body"),
+                "--json",
+                "number,body",
+                "--limit",
+                "50",
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh issue list output")?;
+        // GitHub search is token-based, so confirm the exact marker substring is
+        // present in the body before trusting a hit.
+        Ok(v.as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|i| {
+                    i.get("body")
+                        .and_then(Value::as_str)
+                        .is_some_and(|b| b.contains(marker))
+                })
+                .and_then(|i| i.get("number").and_then(Value::as_i64))
+        }))
+    }
+
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()> {
         let repo = self.repo.clone();
         self.add_blocked_by_in(issue, &repo, blocker).await
@@ -559,16 +624,27 @@ impl Forge for GhForge {
             .get("id")
             .and_then(Value::as_i64)
             .with_context(|| format!("issue {blocker_repo}#{blocker} has no id: {raw}"))?;
-        self.gh(&[
-            "api",
-            "-X",
-            "POST",
-            &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
-            "-F",
-            &format!("issue_id={id}"),
-        ])
-        .await?;
-        Ok(())
+        // Idempotent: re-adding an existing edge must succeed as a no-op (the
+        // decompose materializer re-wires every sweep, issue #134). GitHub
+        // returns a 4xx whose body says the dependency already exists; swallow
+        // exactly that and surface anything else.
+        match self
+            .gh_try(&[
+                "api",
+                "-X",
+                "POST",
+                &format!("repos/{}/issues/{issue}/dependencies/blocked_by", self.repo),
+                "-F",
+                &format!("issue_id={id}"),
+            ])
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(stderr) if is_dependency_exists(&stderr) => Ok(()),
+            Err(stderr) => {
+                bail!("adding blocked_by {blocker_repo}#{blocker} to #{issue}: {stderr}")
+            }
+        }
     }
 
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()> {
@@ -1204,6 +1280,18 @@ impl Forge for GhForge {
         self.gh(&["pr", "ready", &pr.to_string(), "--repo", &self.repo])
             .await?;
         Ok(())
+    }
+
+    async fn close_pr(&self, pr: i64) -> Result<()> {
+        // Idempotent: closing an already-closed PR just reports it closed.
+        match self
+            .gh_try(&["pr", "close", &pr.to_string(), "--repo", &self.repo])
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(stderr) if stderr.to_ascii_lowercase().contains("already") => Ok(()),
+            Err(stderr) => bail!("closing PR #{pr}: {stderr}"),
+        }
     }
 
     async fn set_commit_status(
