@@ -642,10 +642,16 @@ fn is_engaged_label(label: &str) -> bool {
 }
 
 /// The open issues this sweep considers: not engaged by another loop or held,
-/// no unresolved blocker, and — for an issue already carrying one of our own
-/// `advise` proposal labels — only if its content changed since that
-/// proposal (recovering v0's ADR-0006 point 2 TODO: re-triage follows content,
-/// not just label absence). Sorted by number for a stable prompt and report.
+/// no unresolved blocker, and not already advised on this exact content — an
+/// issue whose latest advise evidence marker still matches its title/body is
+/// excluded (recovering v0's ADR-0006 point 2 TODO: re-triage follows
+/// content, not just label absence). The marker check deliberately ignores
+/// whether a proposal label is still present: a human rejecting a proposal
+/// removes the label but not the evidence comment, and the promise "a
+/// rejected proposal stays rejected until the content changes" has to hold
+/// here too, not only in `propose_one` — otherwise the rejected issue would
+/// re-enter the candidate list and re-appear in the central report on the
+/// next unrelated sweep. Sorted by number for a stable prompt and report.
 async fn gather_candidates(deps: &Deps) -> Result<Vec<Issue>> {
     let mut candidates = Vec::new();
     for issue in deps.forge().list_open_issues().await? {
@@ -655,11 +661,7 @@ async fn gather_candidates(deps: &Deps) -> Result<Vec<Issue>> {
         if has_unresolved_blockers(deps, issue.number).await {
             continue;
         }
-        let proposed = issue
-            .labels
-            .iter()
-            .any(|l| forge::TRIAGE_PROPOSAL_LABELS.contains(&l.as_str()));
-        if proposed && !content_changed_since_advise(deps, &issue).await? {
+        if !content_changed_since_advise(deps, &issue).await? {
             continue;
         }
         candidates.push(issue);
@@ -675,9 +677,9 @@ fn content_hash(issue: &Issue) -> String {
     tasks::body_digest(&format!("{}\n{}", issue.title, issue.body))
 }
 
-/// Whether a previously proposed issue's content has moved on since its
-/// evidence comment's hidden marker. No marker at all (a proposal label
-/// applied by hand, or a marker that predates this feature) counts as
+/// Whether an issue's content has moved on since its latest evidence
+/// comment's hidden marker. No marker at all (never proposed, a proposal
+/// label applied by hand, or a marker that predates this feature) counts as
 /// changed, so the issue is still offered for a fresh recommendation.
 async fn content_changed_since_advise(deps: &Deps, issue: &Issue) -> Result<bool> {
     let Some(marker) = latest_advise_marker(deps, issue.number).await? else {

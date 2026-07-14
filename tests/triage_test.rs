@@ -675,9 +675,12 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
     let report = report_issue(&env).await.unwrap();
 
     // Human rejects: removes the proposal label. A new issue forces a
-    // rescan, and — since #60 no longer carries a proposal label — it is
-    // still offered to the agent, but its content hasn't changed, so the
-    // rejection must stick: no label, no new comment.
+    // rescan, and — even though #60 no longer carries a proposal label —
+    // its content hasn't changed since the evidence marker, so the rejection
+    // must stick all the way up in candidate gathering: #60 is not offered
+    // to the agent at all (the scripted report covering only #71 passes the
+    // exact-coverage check), gets no label and no new comment, and is not
+    // re-listed in the central report.
     env.forge
         .remove_label(CANDIDATE, LABEL_TRIAGE_READY)
         .await
@@ -687,9 +690,7 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_report(
             wt,
-            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
-                "estimated_complexity": "small", "rationale": "clear small change", "missing_info": null},
-               {"issue": 71, "recommendation": "ready", "confidence": 0.6,
+            r#"[{"issue": 71, "recommendation": "ready", "confidence": 0.6,
                 "estimated_complexity": "small", "rationale": "new one", "missing_info": null}]"#,
         );
         write_result(wt, turn_id, "success");
@@ -698,7 +699,8 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
     agent.abort();
     assert!(
         matches!(outcome, WorkerOutcome::Succeeded { .. }),
-        "{outcome:?}"
+        "a report covering only #71 must satisfy coverage — the rejected, \
+         unchanged #60 must not be a candidate: {outcome:?}"
     );
     assert!(
         env.forge
@@ -718,6 +720,15 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
     assert_eq!(
         env.forge.get_issue(71).await.unwrap().labels,
         vec![LABEL_TRIAGE_READY.to_string()]
+    );
+    // ...and the rewritten central report re-lists only #71, not the
+    // rejected #60.
+    let report2 = env.forge.get_issue(report.number).await.unwrap();
+    assert!(report2.body.contains("| #71 |"), "{}", report2.body);
+    assert!(
+        !report2.body.contains("| #60 |"),
+        "a rejected, unchanged issue must not re-appear in the report: {}",
+        report2.body
     );
 
     // Now the candidate's content actually changes — re-triage is warranted,
@@ -751,6 +762,9 @@ async fn advise_mode_is_idempotent_and_respects_rejection_until_content_changes(
         2,
         "the content change must produce a fresh evidence comment"
     );
+    // The edited issue is back in the central report as well.
+    let report3 = env.forge.get_issue(report.number).await.unwrap();
+    assert!(report3.body.contains("| #60 | plan"), "{}", report3.body);
 }
 
 #[tokio::test(flavor = "multi_thread")]
