@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{AgentProfile, Config, LaunchMode, ProjectConfig};
+use meguri::config::{AgentProfile, Config, LaunchMode, PlanDelivery, ProjectConfig};
 use meguri::engine::pr_reviewer::{
     self, DIFF_FILE, PR_REVIEW_STATUS, PrReviewerLoop, REVIEW_FILE, run_pr_reviewer,
 };
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::{Deps, Loop, WorkerOutcome, reaper};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     CommitStatusState, Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY,
@@ -23,7 +23,8 @@ use meguri::forge::{
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
-use meguri::store::{LANE_PR_REVIEW, RunStatus, Store};
+use meguri::notify::fake::recording_notifier;
+use meguri::store::{InteractionState, LANE_PR_REVIEW, RunStatus, Store};
 
 const PR: i64 = 12;
 /// The canonical issue the PR's head branch encodes — runs are keyed by it.
@@ -723,4 +724,207 @@ async fn direct_pr_reviewer_releases_the_lanes_leftover_pane_mode_pane() {
         "the pane mapping must be detached"
     );
     assert!(record.reclaimed_at.is_some());
+}
+
+// --- parked-review signal (ADR 0009 / issue #153) ---------------------------
+
+/// The URL FakeForge assigns the PR under review (its `list_open_prs` shape).
+fn pr_url() -> String {
+    format!("https://fake.example/pr/{PR}")
+}
+
+/// Whether the run emitted the parked-review event.
+fn emitted_park_event(env: &TestEnv, run_id: &str) -> bool {
+    env.deps
+        .store
+        .events_for_run(run_id, 500)
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == "review.awaiting_human")
+}
+
+/// Drive one plan review round to completion with the given verdict.
+async fn run_review(env: &TestEnv, verdict: &'static str, run_id: &str) {
+    let review = format!("- {verdict} note");
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), move |_, wt, turn_id| {
+        write_review(wt, verdict, &review);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, run_id))
+        .await
+        .expect("pr-review timed out")
+        .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+}
+
+/// Plan findings park (criteria 1, 2, 4, 5): the run ends Succeeded but carries
+/// AwaitingHuman, emits `review.awaiting_human`, shows in the parked-review
+/// query, and pages a human once — pointing at the PR, not a pane.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_findings_parks_the_run_and_pages_the_pr() {
+    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let (notifier, gw) = recording_notifier();
+    env.deps.notifier = notifier;
+    let run = create_pr_reviewer_run(&env);
+
+    run_review(&env, "findings", &run.id).await;
+
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Succeeded);
+    assert_eq!(
+        record.interaction_state,
+        Some(InteractionState::AwaitingHuman)
+    );
+    assert!(emitted_park_event(&env, &run.id));
+
+    let parked = env.deps.store.list_parked_reviews().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].id, run.id);
+
+    let delivered = gw.delivered();
+    assert_eq!(delivered.len(), 1, "one page per parked head");
+    assert_eq!(delivered[0].reason, "spec_review_parked");
+    assert_eq!(delivered[0].url.as_deref(), Some(pr_url().as_str()));
+    assert!(delivered[0].attach.is_none(), "no pane to attach to");
+}
+
+/// Plan clean under `plan_delivery=separate` (the default) parks too: the human
+/// must merge the spec PR. The `spec-reviewing → spec-ready` transition still
+/// happens (criterion 1, 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_clean_parks_under_separate_delivery() {
+    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    assert_eq!(env.deps.project.plan_delivery, PlanDelivery::Separate);
+    let (notifier, gw) = recording_notifier();
+    env.deps.notifier = notifier;
+    let run = create_pr_reviewer_run(&env);
+
+    run_review(&env, "clean", &run.id).await;
+
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(
+        record.interaction_state,
+        Some(InteractionState::AwaitingHuman)
+    );
+    assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
+    assert_eq!(gw.delivered().len(), 1);
+    // The label transition is unchanged.
+    let labels = env.forge.pr_labels_of(PR);
+    assert!(labels.contains(&LABEL_SPEC_READY.to_string()), "{labels:?}");
+}
+
+/// Plan clean under `plan_delivery=combined` does NOT park: the spec worker
+/// picks up `spec-ready` and continues automatically (criterion 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_clean_does_not_park_under_combined_delivery() {
+    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    env.deps.project.plan_delivery = PlanDelivery::Combined;
+    let (notifier, gw) = recording_notifier();
+    env.deps.notifier = notifier;
+    let run = create_pr_reviewer_run(&env);
+
+    run_review(&env, "clean", &run.id).await;
+
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_ne!(
+        record.interaction_state,
+        Some(InteractionState::AwaitingHuman),
+        "combined clean is not a park"
+    );
+    assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
+    assert!(gw.delivered().is_empty());
+    // But the handoff label still lands.
+    assert!(
+        env.forge
+            .pr_labels_of(PR)
+            .contains(&LABEL_SPEC_READY.to_string())
+    );
+}
+
+/// The impl review never parks — that side has the auto-merge arm gate →
+/// needs-human path (ADR 0008 §5), not this signal (criterion 7, regression).
+#[tokio::test(flavor = "multi_thread")]
+async fn impl_findings_does_not_park() {
+    let mut env = setup(&[LABEL_IMPLEMENTING], true).await;
+    let (notifier, gw) = recording_notifier();
+    env.deps.notifier = notifier;
+    let run = create_pr_reviewer_run(&env);
+
+    run_review(&env, "findings", &run.id).await;
+
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_ne!(
+        record.interaction_state,
+        Some(InteractionState::AwaitingHuman)
+    );
+    assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
+    assert!(gw.delivered().is_empty());
+    assert!(!emitted_park_event(&env, &run.id));
+}
+
+/// A fresh review round for the issue clears the prior head's park (criterion
+/// 6a): only the newest parked review remains on the dashboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_review_round_clears_the_prior_park() {
+    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let clone = env.deps.project.repo_path.clone();
+
+    let run1 = create_pr_reviewer_run(&env);
+    run_review(&env, "findings", &run1.id).await;
+    assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
+
+    // The author pushes a fix: the head moves, a new round runs.
+    run_git(&clone, &["checkout", PR_BRANCH]).await.unwrap();
+    std::fs::write(clone.join("docs/specs/issue-5.md"), "# Spec v2\n").unwrap();
+    run_git(&clone, &["commit", "-am", "address findings"])
+        .await
+        .unwrap();
+    run_git(&clone, &["push", "origin", PR_BRANCH])
+        .await
+        .unwrap();
+    let head2 = run_git(&clone, &["rev-parse", "HEAD"]).await.unwrap();
+    run_git(&clone, &["checkout", "main"]).await.unwrap();
+    env.forge.set_pr_head(PR, &head2);
+
+    let run2 = create_pr_reviewer_run(&env);
+    run_review(&env, "findings", &run2.id).await;
+
+    // run1's park was cleared when run2 claimed; only run2 remains parked.
+    assert_eq!(
+        env.deps
+            .store
+            .get_run(&run1.id)
+            .unwrap()
+            .unwrap()
+            .interaction_state,
+        None
+    );
+    let parked = env.deps.store.list_parked_reviews().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].id, run2.id);
+}
+
+/// Closing the issue clears its park via the reaper sweep (criterion 6b): the
+/// clean-park-then-merge path where no next head ever arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_close_clears_the_park_via_reaper_sweep() {
+    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let run = create_pr_reviewer_run(&env);
+    run_review(&env, "findings", &run.id).await;
+    assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
+
+    env.forge.close_issue(ISSUE);
+    reaper::sweep(&env.deps).await.unwrap();
+
+    assert_eq!(
+        env.deps
+            .store
+            .get_run(&run.id)
+            .unwrap()
+            .unwrap()
+            .interaction_state,
+        None
+    );
+    assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
 }

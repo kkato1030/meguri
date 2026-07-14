@@ -439,6 +439,12 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
         "pr.claimed",
         json!({ "pr": pr.number, "head": pr.head_sha, "kind": kind_of(&pr).as_str() }),
     )?;
+    // A fresh review round supersedes any prior parked review of this issue
+    // (ADR 0009): drop the previous head's AwaitingHuman so it leaves the
+    // dashboard. The just-claimed run is still Running, so this never touches it.
+    deps.store
+        .clear_parked_reviews_for_issue(&deps.project.id, run.issue_number)
+        .ok();
     Ok(Prepared::Claimed(pr))
 }
 
@@ -705,7 +711,41 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
         .remove_pr_label(pr, forge::LABEL_WORKING)
         .await
         .ok();
+
+    // Parked-review signal (ADR 0009 / issue #153): a plan review that leaves a
+    // human in charge raises an active signal (interaction_state + notify +
+    // event), off the conversation timeline. Two plan parks qualify:
+    //   - findings: the author must push a fix (the head stays spec-reviewing);
+    //   - clean under plan_delivery=separate: the human must merge the spec PR
+    //     (combined hands off to the spec worker automatically — not a park).
+    // The impl review never parks here.
+    if cp.kind == Kind::Plan && plan_review_parks(deps, verdict) {
+        flow::signal_review_parked(
+            deps,
+            run,
+            pr,
+            &cp.pr_url,
+            verdict_str(verdict),
+            &cp.head_sha,
+        )
+        .await;
+    }
     Ok(cp.pr_url.clone())
+}
+
+/// Whether a settled plan review leaves a human in charge (ADR 0009).
+fn plan_review_parks(deps: &Deps, verdict: ReviewVerdict) -> bool {
+    match verdict {
+        ReviewVerdict::Findings => true,
+        ReviewVerdict::Clean => deps.project.plan_delivery != crate::config::PlanDelivery::Combined,
+    }
+}
+
+fn verdict_str(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::Clean => "clean",
+        ReviewVerdict::Findings => "findings",
+    }
 }
 
 #[cfg(test)]

@@ -415,7 +415,9 @@ impl TurnControl for StoreControl {
                 issue_number: run.as_ref().map_or(0, |r| r.issue_number),
                 issue_title: run.and_then(|r| r.issue_title),
                 reason: data["reason"].as_str().unwrap_or("unknown").to_string(),
-                attach: data["attach"].as_str().unwrap_or_default().to_string(),
+                // Turn-scoped escalations point at the live pane, never a URL.
+                attach: Some(data["attach"].as_str().unwrap_or_default().to_string()),
+                url: None,
             }
         });
         let _ = self.store.emit(Some(&self.run_id), kind, data);
