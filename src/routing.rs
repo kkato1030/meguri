@@ -991,8 +991,15 @@ args = ["--foo"]
         );
         // Rule 1: explicit non-empty wins over inheritance.
         assert_eq!(
-            effective_headless_args(&base("claude", Some(vec!["-p".into(), "--model".into(), "haiku".into()]))),
-            Some(vec!["-p".to_string(), "--model".to_string(), "haiku".to_string()])
+            effective_headless_args(&base(
+                "claude",
+                Some(vec!["-p".into(), "--model".into(), "haiku".into()])
+            )),
+            Some(vec![
+                "-p".to_string(),
+                "--model".to_string(),
+                "haiku".to_string()
+            ])
         );
         // Rule 2: explicit empty = opt-out sentinel.
         assert_eq!(effective_headless_args(&base("claude", Some(vec![]))), None);

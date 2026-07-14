@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use meguri::app::{AddParams, add_core, compose_refined_body, infer_project, initial_title, issue_url};
+use meguri::app::{
+    AddParams, add_core, compose_refined_body, infer_project, initial_title, issue_url,
+};
 use meguri::config::Config;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_PLAN};
@@ -81,7 +83,10 @@ async fn capture_is_unlabeled_and_refine_restructures_with_verbatim_memo() {
 
     let issue = forge.get_issue(n).await.unwrap();
     // Refined title replaced the raw one-liner.
-    assert_eq!(issue.title, "ログイン後のリダイレクト先が意図しないページになる");
+    assert_eq!(
+        issue.title,
+        "ログイン後のリダイレクト先が意図しないページになる"
+    );
     // Body carries the structure...
     assert!(issue.body.contains("## 症状"));
     // ...and the original memo verbatim in its own section (基準 2).
@@ -166,7 +171,11 @@ async fn refine_footer_preserves_memo_whitespace() {
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
-    assert!(issue.body.ends_with("## 原文メモ\n  行頭スペースと\n改行を保つ  "));
+    assert!(
+        issue
+            .body
+            .ends_with("## 原文メモ\n  行頭スペースと\n改行を保つ  ")
+    );
 }
 
 #[tokio::test]

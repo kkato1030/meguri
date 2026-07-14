@@ -17,8 +17,8 @@ use crate::engine::{self, Deps};
 use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
-use crate::refine::{HeadlessRefiner, Refined, Refiner};
 use crate::notify::Notifier;
+use crate::refine::{HeadlessRefiner, Refined, Refiner};
 use crate::store::{
     DesiredState, DriftRow, LANE_AUTHOR, LANE_PR_REVIEW, RunRecord, RunStatus, Store,
 };
@@ -242,7 +242,10 @@ pub async fn add_core(
     print!("refining… ");
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    let refined = match refiner.refine(trimmed, params.repo_path, params.language).await {
+    let refined = match refiner
+        .refine(trimmed, params.repo_path, params.language)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             println!("skipped: {e:#} — issue #{number} left raw");
