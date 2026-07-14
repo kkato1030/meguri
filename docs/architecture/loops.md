@@ -60,13 +60,14 @@ plan_handoff.sweep  spec_worker      │
 (帯域外、ADR 0008)   (author lane、    │
   spec PR merge 済み  同一 branch/PR   │
   の speccing issue   を継続)          │
-  を検知               self-review    │
-  → issue:            (self-review    │
-    speccing→ready    lane、spec+実装  │
-  (以降は worker が    統合 diff、      │
-   新PRで直行と合流)   ADR 0011)       │
-   │                  → 実装 commit   │
-   │                  を同一 PR に積む  │
+  を検知               → 実装 commit  │
+  → issue:            を同一 PR に積む │
+    speccing→ready    validate →     │
+  (以降は worker が    self-review    │
+   新PRで直行と合流)   (self-review    │
+   │                  lane、spec+実装  │
+   │                  統合 diff、      │
+   │                  ADR 0011)⇄fix   │
    │                  issue: speccing │
    │                  →implementing   │
    │                  (このPRが issue  │
@@ -179,7 +180,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 |---|---|---|---|---|---|---|
 | planner | author(+ self-review) | `meguri:plan` issue | issue | 新 branch | self-review(self-review lane、ADR 0008/0011)→ spec PR 作成、issue: `plan`→`speccing` | 維持(author pane) |
 | pr_reviewer | pr-review(独立) | Plan: `spec-reviewing` PR(既定 on)/ Impl: 実装 PR(opt-in)、head 未レビュー | issue + `pr-review` lane | read-only detached、`pr-reviewer-<issue>` 固定 | `meguri/pr-review` commit status + PR 本文 `<details>` 要約(Plan の clean は PR: `spec-ready`)、次の push 待ち | 維持(独立 pane) |
-| spec_worker | author(継続、+ self-review) | `spec-ready` PR(`plan_delivery = combined` 限定 — separate では discover が空) | issue(branch から復元) | 既存 branch を継ぐ | self-review(self-review lane、spec+実装の統合 diff、ADR 0011)→ 実装 commit を同一 PR に統合、issue: `speccing`→`implementing` | 維持、author pane を継続 |
+| spec_worker | author(継続、+ self-review) | `spec-ready` PR(`plan_delivery = combined` 限定 — separate では discover が空) | issue(branch から復元) | 既存 branch を継ぐ | 実装 commit を同一 PR に統合 → validate/self-review(self-review lane、spec+実装の統合 diff、ADR 0011)、issue: `speccing`→`implementing` | 維持、author pane を継続 |
 | worker | author(+ self-review) | `meguri:ready` issue | issue | 新 branch | self-review(self-review lane、ADR 0006)→ PR `Closes #N`、issue: `ready`→`implementing` | 維持(author pane) |
 | fixer | author(継続) | PR の未解決スレッド(人間/外部bot) | issue(branch から復元) | PR head に attach | スレッドに返信、再レビュー待ち | 維持、author pane を継続 |
 | ci_fixer | author(継続) | meguri PR の CI red | issue(branch から復元) | PR head に attach | fix push(≤3 round)、超過は `needs-human` | 維持、author pane を継続 |
