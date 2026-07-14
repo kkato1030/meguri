@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use meguri::agent_skills;
 use meguri::app;
@@ -23,6 +23,22 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => cmd_init(),
         Command::Doctor { probe } => cmd_doctor(probe).await,
+        Command::AddProject {
+            slug,
+            create,
+            public,
+            id,
+            local,
+        } => {
+            app::cmd_add_project(
+                slug.as_deref(),
+                create,
+                public,
+                id.as_deref(),
+                local.as_deref(),
+            )
+            .await
+        }
         Command::Watch => app::cmd_watch().await,
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon::cmd_start(),
@@ -115,7 +131,8 @@ fn cmd_init() -> Result<()> {
     println!("db ready: {}", db.display());
     std::fs::create_dir_all(config::worktrees_root())?;
     println!(
-        "\nNext: edit {} — fill in the [[projects]] stub (repo_path, repo_slug).",
+        "\nNext: `meguri add-project owner/repo` to add your first project \
+         (or `--local <path>` for a local-mode project). It appends to {}.",
         cfg_path.display()
     );
     offer_agent_skills_install();
@@ -398,36 +415,6 @@ async fn project_clone_state(cfg: &Config, project: &ProjectConfig) -> ProjectCl
     }
 }
 
-/// Whether a GitHub `viewerPermission` string allows pushing. Split from the
-/// `gh` call so the decision is unit-tested without the network.
-fn can_push(viewer_permission: &str) -> bool {
-    matches!(viewer_permission, "ADMIN" | "MAINTAIN" | "WRITE")
-}
-
-/// The caller's permission on a repo, via `gh repo view`. `Err` means the check
-/// was inconclusive (gh missing, network, private-repo visibility) — doctor
-/// treats that as a warning, not a failure, mirroring the live-probe policy.
-async fn gh_viewer_permission(slug: &str) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("gh")
-        .args([
-            "repo",
-            "view",
-            slug,
-            "--json",
-            "viewerPermission",
-            "-q",
-            ".viewerPermission",
-        ])
-        .output()
-        .await
-        .context("spawning gh")?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-}
-
 /// Doctor's managed-clone section (issue #195): per github project, show the
 /// clone state and whether the gh token can push. "Not cloned" is ✅ (it will be
 /// materialized on the next watch tick); a broken clone fails; a read-only token
@@ -475,8 +462,8 @@ async fn doctor_clones(cfg: &Config) -> bool {
         // gh push permission — the write-scope check (a read-only token passes
         // discovery but fails at push/PR, so surface it here).
         if let Some(slug) = project.repo_slug.as_deref() {
-            match gh_viewer_permission(slug).await {
-                Ok(perm) if can_push(&perm) => {
+            match app::gh_viewer_permission(slug).await {
+                Ok(perm) if app::can_push(&perm) => {
                     println!("     ✅ gh token can push ({perm})");
                 }
                 Ok(perm) => {
@@ -1072,12 +1059,13 @@ mod tests {
 
     #[test]
     fn can_push_accepts_write_and_up_only() {
-        // The write-scope decision is pure, so doctor can test it without gh.
+        // The write-scope decision is pure and now shared with add-project
+        // (`meguri::app::can_push`), so doctor can test it without gh.
         for perm in ["ADMIN", "MAINTAIN", "WRITE"] {
-            assert!(can_push(perm), "{perm} should be able to push");
+            assert!(app::can_push(perm), "{perm} should be able to push");
         }
         for perm in ["READ", "TRIAGE", "NONE", ""] {
-            assert!(!can_push(perm), "{perm} must not be able to push");
+            assert!(!app::can_push(perm), "{perm} must not be able to push");
         }
     }
 

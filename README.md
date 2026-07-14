@@ -63,9 +63,10 @@ Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`c
 Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
 
 ```bash
-cargo install --path .   # or: cargo build --release
-meguri init              # writes ~/.meguri/config.toml, creates the db
-meguri doctor            # checks gh auth, mux, agent CLI
+cargo install --path .            # or: cargo build --release
+meguri init                       # writes ~/.meguri/config.toml (no live projects yet), creates the db
+meguri add-project owner/repo     # appends a [[projects]] entry and clones the repo
+meguri doctor                     # checks gh auth, mux, agent CLI
 ```
 
 Other ways to get the binary:
@@ -73,7 +74,16 @@ Other ways to get the binary:
 - **Prebuilt binary** — download the archive for your platform (macOS arm64 / Linux x86_64) from the [latest GitHub Release](https://github.com/kkato1030/meguri/releases/latest), verify its `.sha256`, extract, and put `meguri` on your `PATH`.
 - **crates.io** — `cargo install meguri` (once the crate is published; see [Status / roadmap](#status--roadmap)).
 
-`meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
+**Add a project with one command.** `meguri init` writes a minimal `~/.meguri/config.toml` with **no live projects** (the `[[projects]]` stub is commented out). `meguri add-project` is how you add one — it appends a `[[projects]]` entry (preserving your comments and hand edits), materializes the clone, and runs the environment checks in-line:
+
+```bash
+meguri add-project owner/repo              # existing GitHub repo
+meguri add-project owner/repo --create     # create a brand-new repo first (gh repo create, initial commit incl.)
+meguri add-project owner/repo --id myproj  # override the derived project id (default: the repo name)
+meguri add-project --local /abs/path       # a local-mode project (no GitHub; see Local mode)
+```
+
+`--create` makes a real GitHub repo with an initial commit (so it has a default branch immediately) and **cannot be rolled back automatically** — meguri never deletes a repo it created. It defaults to a private repo; add `--public` for a public one. You can still hand-write `[[projects]]` if you prefer — the entry `add-project` writes is a normal one:
 
 ```toml
 [[projects]]
