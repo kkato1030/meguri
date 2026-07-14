@@ -1765,6 +1765,13 @@ fn validate_project_id(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("project id must not be empty");
     }
+    // On Unix `Path::components()` treats `\` as an ordinary character, so `a\b`
+    // would pass the single-component check below — yet it is a separator on
+    // Windows and in many tools. Reject it explicitly so an id is portable and
+    // can never gain a separator on another platform.
+    if id.contains('\\') {
+        anyhow::bail!("project id {id:?} must not contain `\\`");
+    }
     let mut components = Path::new(id).components();
     match (components.next(), components.next()) {
         // Exactly one plain component (e.g. `myproj`) — the only safe shape.
@@ -2894,7 +2901,7 @@ check_command = "cargo test"
     fn dangerous_project_ids_are_rejected() {
         // Acceptance criterion 7: an id that isn't a single safe path component
         // would let a managed clone escape ~/.meguri/repos.
-        for bad in ["../x", "a/b", "/x", ".", "..", "", "a/"] {
+        for bad in ["../x", "a/b", "a\\b", "/x", ".", "..", "", "a/"] {
             let raw = format!("[[projects]]\nid = {bad:?}\nrepo_slug = \"me/g\"\n");
             let cfg: Config = toml::from_str(&raw).unwrap();
             assert!(cfg.validate().is_err(), "id {bad:?} should be rejected");

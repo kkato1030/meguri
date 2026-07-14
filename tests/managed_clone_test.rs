@@ -53,7 +53,9 @@ fn deps_for(project: ProjectConfig) -> Deps {
     )
 }
 
-/// A local bare origin with one commit, to clone managed copies from.
+/// A local bare origin at `<root>/owner/repo.git`, so a managed clone of it has
+/// a `remote.origin.url` whose tail resolves to the slug `owner/repo` (matching
+/// the project's `repo_slug` — the health check verifies this).
 async fn bare_origin(root: &Path) -> PathBuf {
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -65,7 +67,8 @@ async fn bare_origin(root: &Path) -> PathBuf {
     ] {
         run_git(&work, &args).await.unwrap();
     }
-    let origin = root.join("origin.git");
+    let origin = root.join("owner").join("repo.git");
+    std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
     run_git(
         root,
         &[

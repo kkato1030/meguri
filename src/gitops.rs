@@ -83,7 +83,7 @@ pub enum CloneHealth {
 /// exist": a clone that died after `git clone --bare` wrote `HEAD` but before
 /// the refspec/fetch completed must be caught as `Broken`, not silently treated
 /// as healthy (which would make later `origin/<default>` lookups fail obscurely).
-pub async fn clone_health(dest: &Path) -> CloneHealth {
+pub async fn clone_health(dest: &Path, repo_slug: &str) -> CloneHealth {
     match std::fs::read_dir(dest) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CloneHealth::Absent,
         Err(e) => return CloneHealth::Broken(format!("cannot read {}: {e}", dest.display())),
@@ -98,11 +98,23 @@ pub async fn clone_health(dest: &Path) -> CloneHealth {
         Ok(out) => return CloneHealth::Broken(format!("not a bare repository (is-bare={out:?})")),
         Err(e) => return CloneHealth::Broken(format!("not a git repository ({e})")),
     }
-    if run_git(dest, &["config", "--get", "remote.origin.url"])
-        .await
-        .is_err()
-    {
-        return CloneHealth::Broken("remote.origin.url is not set".into());
+    // The origin URL must name the same repo the config declares. Otherwise
+    // changing `repo_slug` while keeping the same project `id` would leave the
+    // old bare clone in place: the forge would see the new slug while
+    // worktree/fetch/push kept using the stale repo — silent cross-repo work.
+    match run_git(dest, &["config", "--get", "remote.origin.url"]).await {
+        Err(_) => return CloneHealth::Broken("remote.origin.url is not set".into()),
+        Ok(url) => match slug_from_remote_url(&url) {
+            Some(got) if got.eq_ignore_ascii_case(repo_slug) => {}
+            Some(got) => {
+                return CloneHealth::Broken(format!(
+                    "remote.origin.url points at {got}, not {repo_slug}"
+                ));
+            }
+            None => {
+                return CloneHealth::Broken(format!("cannot parse remote.origin.url {url:?}"));
+            }
+        },
     }
     match run_git(dest, &["config", "--get-all", "remote.origin.fetch"]).await {
         Ok(out) if out.lines().any(|l| l == MANAGED_FETCH_REFSPEC) => {}
@@ -131,6 +143,24 @@ pub async fn clone_health(dest: &Path) -> CloneHealth {
         }
     }
     CloneHealth::Healthy
+}
+
+/// Extract `owner/repo` from a git remote URL (or path), so a clone's
+/// `remote.origin.url` can be matched against the declared `repo_slug`
+/// regardless of the transport gh happened to use. Handles the common shapes —
+/// `https://host/owner/repo(.git)`, `git@host:owner/repo(.git)`,
+/// `ssh://…/owner/repo(.git)`, and a plain filesystem path ending in
+/// `owner/repo(.git)` — by taking the last two `/`- or `:`-separated segments.
+fn slug_from_remote_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let parts: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        [.., owner, repo] if !owner.is_empty() && !repo.is_empty() => {
+            Some(format!("{owner}/{repo}"))
+        }
+        _ => None,
+    }
 }
 
 /// Set the managed fetch refspec and run the initial fetch on a freshly-cloned
@@ -162,7 +192,7 @@ async fn configure_managed_remote(dest: &Path) -> Result<()> {
 ///   loudly with a "remove it and re-run" hint. meguri never `rm -rf`s a
 ///   directory it did not create.
 pub async fn ensure_bare_clone(dest: &Path, repo_slug: &str) -> Result<()> {
-    match clone_health(dest).await {
+    match clone_health(dest, repo_slug).await {
         CloneHealth::Healthy => return Ok(()),
         CloneHealth::Absent => {}
         CloneHealth::Broken(why) => bail!(
@@ -941,15 +971,19 @@ mod tests {
         }
     }
 
-    /// A bare origin with one commit on `main`, for the managed-clone tests.
-    async fn bare_origin(dir: &Path) {
+    /// A bare origin at `<dir>/owner/repo.git` — its path tail is `owner/repo`,
+    /// so a managed clone of it has a `remote.origin.url` that
+    /// [`slug_from_remote_url`] resolves to the slug `owner/repo`. Returns the
+    /// bare path.
+    async fn bare_origin(dir: &Path) -> PathBuf {
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
         init_repo(&work).await;
         run_git(&work, &["commit", "--allow-empty", "-m", "seed"])
             .await
             .unwrap();
-        let bare = dir.join("origin.git");
+        let bare = dir.join("owner").join("repo.git");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
         run_git(
             dir,
             &[
@@ -961,6 +995,21 @@ mod tests {
         )
         .await
         .unwrap();
+        bare
+    }
+
+    #[test]
+    fn slug_from_remote_url_handles_common_shapes() {
+        for (url, want) in [
+            ("https://github.com/owner/repo.git", "owner/repo"),
+            ("https://github.com/owner/repo", "owner/repo"),
+            ("git@github.com:owner/repo.git", "owner/repo"),
+            ("ssh://git@github.com/owner/repo.git", "owner/repo"),
+            ("/tmp/x/owner/repo.git", "owner/repo"),
+        ] {
+            assert_eq!(slug_from_remote_url(url).as_deref(), Some(want), "{url}");
+        }
+        assert_eq!(slug_from_remote_url("bogus"), None);
     }
 
     #[tokio::test]
@@ -969,8 +1018,7 @@ mod tests {
         // `ensure_bare_clone`'s clone step leaves behind, so we can test the
         // refspec + fetch finalize against a local origin.
         let root = tempfile::tempdir().unwrap();
-        bare_origin(root.path()).await;
-        let origin = root.path().join("origin.git");
+        let origin = bare_origin(root.path()).await;
         let dest = root.path().join("managed.git");
         run_git(
             root.path(),
@@ -985,7 +1033,10 @@ mod tests {
         .unwrap();
 
         // `git clone --bare` sets no fetch refspec and no remote-tracking refs.
-        assert!(matches!(clone_health(&dest).await, CloneHealth::Broken(_)));
+        assert!(matches!(
+            clone_health(&dest, "owner/repo").await,
+            CloneHealth::Broken(_)
+        ));
 
         configure_managed_remote(&dest).await.unwrap();
 
@@ -1007,21 +1058,37 @@ mod tests {
             "origin refs: {origin_refs:?}"
         );
 
-        // Now healthy — and `ensure_bare_clone` is a no-op (never touches gh).
-        assert!(matches!(clone_health(&dest).await, CloneHealth::Healthy));
+        // Now healthy for the matching slug — and `ensure_bare_clone` is a no-op
+        // (never touches gh).
+        assert!(matches!(
+            clone_health(&dest, "owner/repo").await,
+            CloneHealth::Healthy
+        ));
         ensure_bare_clone(&dest, "owner/repo").await.unwrap();
+
+        // …but a DIFFERENT slug on the same path is broken: changing `repo_slug`
+        // while keeping the project `id` must not silently reuse the old clone.
+        match clone_health(&dest, "owner/other").await {
+            CloneHealth::Broken(why) => assert!(why.contains("owner/repo"), "{why}"),
+            other => panic!("expected Broken on slug mismatch, got {other:?}"),
+        }
+        // `ensure_bare_clone` bails on the mismatch rather than reusing it.
+        assert!(ensure_bare_clone(&dest, "owner/other").await.is_err());
     }
 
     #[tokio::test]
     async fn clone_health_treats_missing_and_empty_as_absent() {
         let root = tempfile::tempdir().unwrap();
         assert!(matches!(
-            clone_health(&root.path().join("nope")).await,
+            clone_health(&root.path().join("nope"), "owner/repo").await,
             CloneHealth::Absent
         ));
         let empty = root.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(matches!(clone_health(&empty).await, CloneHealth::Absent));
+        assert!(matches!(
+            clone_health(&empty, "owner/repo").await,
+            CloneHealth::Absent
+        ));
     }
 
     #[tokio::test]

@@ -188,7 +188,7 @@ pub async fn ensure_project_clone(deps: &Deps) -> Result<()> {
     // Emit `repo.cloned` only on the tick that actually materializes it, not on
     // every healthy no-op tick.
     let was_absent = matches!(
-        gitops::clone_health(&dest).await,
+        gitops::clone_health(&dest, &slug).await,
         gitops::CloneHealth::Absent
     );
     match gitops::ensure_bare_clone(&dest, &slug).await {

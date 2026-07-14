@@ -388,7 +388,10 @@ async fn project_clone_state(cfg: &Config, project: &ProjectConfig) -> ProjectCl
     if !cfg.is_managed_clone(project) {
         return ProjectCloneState::Present;
     }
-    match gitops::clone_health(&cfg.repo_path_for(project)).await {
+    // A managed clone is always github mode, so a slug is present (validate
+    // guarantees it); default to "" so a somehow-missing slug reads as broken.
+    let slug = project.repo_slug.as_deref().unwrap_or_default();
+    match gitops::clone_health(&cfg.repo_path_for(project), slug).await {
         CloneHealth::Healthy => ProjectCloneState::Present,
         CloneHealth::Absent => ProjectCloneState::NotCloned,
         CloneHealth::Broken(why) => ProjectCloneState::Broken(why),
