@@ -272,6 +272,9 @@ async fn materialize(
 struct Filed {
     number: i64,
     slug: String,
+    /// The forge of the child's home repo (its own repo, or a workspace sibling
+    /// for a cross-repo child) — where finalize applies its phase label.
+    forge: std::sync::Arc<dyn forge::Forge>,
 }
 
 /// The projects a child may target: the parent's own project plus its workspace
@@ -370,26 +373,36 @@ async fn adopt_or_create(
         }
     };
 
-    // Idempotent wiring for both created and adopted children: sibling deps,
-    // label, and ledger. Labels/deps are no-op on repeat.
+    // Idempotent wiring for both created and adopted children: sibling deps and
+    // the ledger. The phase label is deliberately NOT applied here — it is
+    // applied in finalize, once every child's blockers are wired, so a partial
+    // run never leaves a labeled-but-unblocked (prematurely discoverable) child.
     for &dep in &child.blocked_by {
         let blocker = &filed[dep];
         child_forge
             .add_blocked_by_in(number, &blocker.slug, blocker.number)
             .await?;
     }
-    if let Some(label) = planner::child_label(child) {
-        child_forge.add_label(number, label).await?;
-    }
     append_parent_marker(deps, parent, &ledger_marker(idx, &slug, number)).await?;
 
-    Ok(Some(Filed { number, slug }))
+    Ok(Some(Filed {
+        number,
+        slug,
+        forge: child_forge,
+    }))
 }
 
 /// Create child `child` in its target repo with the stable key + parent footer
 /// in its body, then link it into the parent's dependency graph. The key is
 /// written atomically with the create, so "created" and "findable" are
 /// inseparable.
+///
+/// The child is created **unlabeled**: its phase label (`meguri:ready` /
+/// `meguri:plan`) is applied only in [`finalize`], after every child exists and
+/// every `blocked_by` edge is wired. Labeling at create time would make a child
+/// discoverable by the worker/planner (which run before this sweep on the next
+/// tick) before its own blockers were set — a crash between create and the
+/// sibling `blocked_by` add could let a blocked child start out of order.
 async fn create_child(
     deps: &Deps,
     child_forge: &std::sync::Arc<dyn forge::Forge>,
@@ -404,10 +417,7 @@ async fn create_child(
         child.body.trim(),
         decompose_child_footer_ref(&child_parent_ref(parent, parent_slug, child_slug)),
     );
-    let labels: Vec<&str> = planner::child_label(child).into_iter().collect();
-    let number = child_forge
-        .create_issue(&child.title, &body, &labels)
-        .await?;
+    let number = child_forge.create_issue(&child.title, &body, &[]).await?;
     // Cross-repo children need the slug-qualified add (issue #154): the parent
     // graph must include the sibling child so a resume can adopt it.
     deps.forge()
@@ -499,6 +509,18 @@ async fn finalize(
         deps.forge()
             .add_blocked_by_in(parent, &f.slug, f.number)
             .await?;
+    }
+
+    // Apply each child's phase label now — only here, after every child exists
+    // and every blocked_by edge is wired. This is what makes a child
+    // discoverable by the worker/planner, so a blocked child never becomes
+    // actionable before its blocker edge is in place (idempotent; `human`
+    // children carry no trigger label). A crash mid-labeling is safe: any child
+    // already labeled already has its blockers, so discovery gates it correctly.
+    for (child, f) in children.iter().zip(filed) {
+        if let Some(label) = planner::child_label(child) {
+            f.forge.add_label(f.number, label).await?;
+        }
     }
 
     // Tracking checklist (upserted so re-runs replace, not duplicate).
@@ -1113,6 +1135,37 @@ mod tests {
             vec![2],
             "parent now waits on the child"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_materialize_leaves_created_children_unlabeled() {
+        // Crash mid-materialization (here forced via a deferred later child):
+        // an already-created child must not carry its phase label yet, or the
+        // worker/planner discovery (which runs before this sweep next tick) could
+        // start it before its dependency edges settle. Labels land only in
+        // finalize, once the whole graph is wired.
+        let (forge, deps) = setup();
+        let pr = pr_of(&forge).await;
+        // Reserve child idx 1 so it defers; idx 0 (A) is created this sweep.
+        forge
+            .update_issue_body(1, &reserve_marker(1, 0))
+            .await
+            .unwrap();
+        materialize(&deps, &pr, 1, "me/proj", &two_children())
+            .await
+            .unwrap();
+
+        // A (#2) was created and linked, but carries NO phase label yet.
+        assert_eq!(forge.all_issues().len(), 2, "only A created; B deferred");
+        assert_eq!(forge.blockers_of(1), vec![2], "parent → A edge wired");
+        let a_labels = forge.labels_of(2);
+        assert!(
+            !a_labels.contains(&crate::forge::LABEL_READY.to_string())
+                && !a_labels.contains(&crate::forge::LABEL_PLAN.to_string()),
+            "a partially-materialized child stays unlabeled (not discoverable): {a_labels:?}"
+        );
+        // The proposal PR is still open — finalize (and labeling) has not run.
+        assert_eq!(forge.get_pr(10).await.unwrap().state, "open");
     }
 
     #[test]
