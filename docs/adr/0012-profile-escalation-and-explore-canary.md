@@ -1,6 +1,6 @@
 # ADR 0012: 詰まったら昇格 — シグナル駆動のプロファイルエスカレーションと explore canary
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-14
 - Issue: #66(routing 3/3)
 - 関連: docs/adr/0003-role-based-agent-routing.md(役割→プロファイル基盤)、

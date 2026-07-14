@@ -60,6 +60,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_schedules",
         include_str!("migrations/0010_schedules.sql"),
     ),
+    // routing 3/3 (#66): runs.routing_arm — mainline / explore / escalated.
+    // A single ADD COLUMN on the runs table recreated by 0007_tasks.
+    (
+        "0011_routing_arm",
+        include_str!("migrations/0011_routing_arm.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).
