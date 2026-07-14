@@ -77,13 +77,15 @@ meguri doctor            # checks gh auth, mux, agent CLI
 ```toml
 [[projects]]
 id = "myproj"
-repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
+# repo_path = "/abs/path/to/clone"  # 省略すると meguri が clone を管理します（下記参照）
 # default_branch = "main"
 # check_command = "cargo test"   # 推奨: meguri 自身がこれを実行して検証します
 ```
 
 それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
+
+**managed clone（管理 clone）。** `repo_path` を省略すると、meguri が `repo_slug` から `~/.meguri/repos/<id>` に **bare** clone を実体化して所有します（`gh` 経由で認証を継承）。slug を宣言すれば clone は meguri が面倒を見ます。置き場所は `~/.meguri/worktrees` の外で、checkout は持たず、次の `watch`/`run` で(無ければ)作られます。`meguri doctor` は各プロジェクトを *clone 済み* / *未 clone* / *壊れている* で表示し、push できない `gh` トークンも検出します。自分で維持する clone を使いたいときは `repo_path` を明示します（従来どおり。meguri が上書き clone することはありません)。なお managed clone では、`worktree_setup` が secrets（`.env` や `.claude/settings.local.json`）を `cp` する元の working copy が無いので、host 側の供給源から渡してください。**local mode は従来どおり `repo_path` 必須**です（clone 元の `repo_slug` が無いため)。
 
 ### コーディングエージェントに meguri を勧めさせる
 

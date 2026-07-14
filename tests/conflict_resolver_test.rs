@@ -102,7 +102,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -253,7 +253,7 @@ async fn resolver_happy_path_merges_base_and_pushes() {
     // The check command also proves validation runs on the resolved tree.
     let env = setup(Some("test -f feature.txt")).await;
     let run = create_resolver_run(&env);
-    let clone = env.deps.project.repo_path.clone();
+    let clone = env.deps.project.repo_path.clone().unwrap();
     let tip_before = origin_tip(&clone).await;
     let base_tip = run_git(&clone, &["rev-parse", "origin/main"])
         .await
@@ -556,9 +556,12 @@ async fn resolver_needs_human_escalates_on_the_pr_and_stays_quiet() {
     );
 
     // Nothing was pushed.
-    let tip = origin_tip(&env.deps.project.repo_path).await;
-    let pr_commit = run_git(&env.deps.project.repo_path, &["rev-parse", PR_BRANCH])
-        .await
-        .unwrap();
+    let tip = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
+    let pr_commit = run_git(
+        env.deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", PR_BRANCH],
+    )
+    .await
+    .unwrap();
     assert_eq!(tip, pr_commit);
 }

@@ -26,6 +26,16 @@ pub fn worktrees_root() -> PathBuf {
     meguri_home().join("worktrees")
 }
 
+/// Root of meguri-managed bare clones: `~/.meguri/repos`. Each project whose
+/// `repo_path` is omitted gets `repos_root().join(<id>)` (a bare clone
+/// materialized from its `repo_slug`). Deliberately a sibling of
+/// [`worktrees_root`], NOT under it: the reaper's only guard against reaping the
+/// primary clone is a `worktrees_root` prefix comparison, so a managed clone
+/// placed under it would be mis-reaped.
+pub fn repos_root() -> PathBuf {
+    meguri_home().join("repos")
+}
+
 /// Minimal `config.toml` written by `meguri init`. Loading fills every
 /// omitted section/key from the serde defaults, so the template only carries
 /// the projects stub plus commented override examples.
@@ -34,12 +44,13 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 
 [[projects]]
 id = "myproj"
-repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
+# repo_path = "/abs/path/to/clone"  # 省略すると ~/.meguri/repos/<id> に bare clone を自動実体化。
+                                    # 手元の clone を使いたいときだけ絶対パスを明示(従来どおり)。
 # default_branch = "main"
 # check_command = "cargo test"
-# mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、成果物はローカルブランチ)。
-                      # `meguri add "タスク"` で投入。詳細は README を参照。
+# mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、repo_path は必須、
+                      # 成果物はローカルブランチ)。`meguri add "タスク"` で投入。詳細は README を参照。
 
 # [projects.worktree_setup]                  # worktree 準備のたびに(再利用時も)実行する汎用フック
 # commands = ["apm install --frozen"]        # 例: agent 指示ファイルの再生成。apm 専用ではなく任意コマンド列
@@ -1165,8 +1176,14 @@ pub struct CadenceRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
-    /// Absolute path to the primary clone.
-    pub repo_path: PathBuf,
+    /// Absolute path to the clone meguri operates on. Optional in github mode:
+    /// when omitted, it is derived to `~/.meguri/repos/<id>` (a meguri-managed
+    /// bare clone materialized from `repo_slug`) — see [`Config::repo_path_for`].
+    /// Local mode has no clone source, so it must be set explicitly there
+    /// (enforced by [`Config::validate`]). Never read this field directly for
+    /// the effective path; go through `repo_path_for` / `Deps::repo_path`.
+    #[serde(default)]
+    pub repo_path: Option<PathBuf>,
     /// "owner/repo" on GitHub. Optional: required unless `mode = "local"`.
     #[serde(default)]
     pub repo_slug: Option<String>,
@@ -1367,11 +1384,26 @@ impl Config {
             ),
         }
         for p in &self.projects {
+            // `id` becomes a filesystem path element (managed clone root
+            // `repos_root()/<id>`, and worktree paths), so it must be a single
+            // safe path component — reject empty, `/`, `\`, `.`, `..`, and any
+            // multi-component or absolute value before it can escape the tree.
+            validate_project_id(&p.id)?;
             if p.mode != ProjectMode::Local && p.repo_slug.is_none() {
                 anyhow::bail!(
                     "project {:?} has mode = {:?} but no repo_slug (required unless mode = \"local\")",
                     p.id,
                     p.mode.as_str()
+                );
+            }
+            // Local mode has no remote to clone from, so `repo_path` cannot be
+            // derived — it must be set explicitly (github mode may omit it and
+            // let meguri materialize a managed bare clone from `repo_slug`).
+            if p.mode == ProjectMode::Local && p.repo_path.is_none() {
+                anyhow::bail!(
+                    "project {:?} is mode = \"local\" but has no repo_path \
+                     (required in local mode — there is no repo_slug to clone from)",
+                    p.id
                 );
             }
             if p.mode == ProjectMode::Local && p.deliver == Some(Deliver::Pr) {
@@ -1607,6 +1639,26 @@ impl Config {
         })
     }
 
+    /// The clone path meguri operates on for a project. An explicit `repo_path`
+    /// wins; when omitted (github mode only — [`Config::validate`] rejects the
+    /// omission in local mode), it is derived to `repos_root().join(<id>)`, a
+    /// meguri-managed bare clone materialized from `repo_slug`. The single place
+    /// the derivation lives; callers must go through here (or [`super::engine::
+    /// Deps::repo_path`]) rather than reading the raw field.
+    pub fn repo_path_for(&self, project: &ProjectConfig) -> PathBuf {
+        project
+            .repo_path
+            .clone()
+            .unwrap_or_else(|| repos_root().join(&project.id))
+    }
+
+    /// Whether a project's clone is meguri-managed (derived path), i.e. the
+    /// `repo_path` was omitted so meguri owns and materializes it. `false` for an
+    /// explicit `repo_path` (the host's own clone — meguri never clones over it).
+    pub fn is_managed_clone(&self, project: &ProjectConfig) -> bool {
+        project.repo_path.is_none()
+    }
+
     /// Effective cleaner settings for a project (project override wins).
     pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
         project.clean.as_ref().unwrap_or(&self.clean)
@@ -1701,6 +1753,36 @@ fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
         validate_repo_relative(rel).with_context(|| format!("{label} key {key:?}"))?;
     }
     Ok(())
+}
+
+/// Reject a project `id` that is not a single safe path component. The `id`
+/// becomes a filesystem path element — the managed clone root
+/// (`repos_root()/<id>`) and the worktree paths — so `../x`, `a/b`, a leading
+/// `/`, `.`, `..`, or an empty string must fail loudly at load time rather than
+/// silently placing a clone outside `~/.meguri/repos`. Same "interpret as a
+/// path and reject dangerous components" stance as [`validate_repo_relative`].
+fn validate_project_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("project id must not be empty");
+    }
+    // On Unix `Path::components()` treats `\` as an ordinary character, so `a\b`
+    // would pass the single-component check below — yet it is a separator on
+    // Windows and in many tools. Reject it explicitly so an id is portable and
+    // can never gain a separator on another platform.
+    if id.contains('\\') {
+        anyhow::bail!("project id {id:?} must not contain `\\`");
+    }
+    let mut components = Path::new(id).components();
+    match (components.next(), components.next()) {
+        // Exactly one plain component (e.g. `myproj`) — the only safe shape.
+        // The `to_str` equality also rejects a trailing slash (`a/` normalizes
+        // to one `Normal("a")` component whose string no longer equals `a/`).
+        (Some(std::path::Component::Normal(c)), None) if c.to_str() == Some(id) => Ok(()),
+        _ => anyhow::bail!(
+            "project id {id:?} must be a single path component \
+             (no `/`, `\\`, `.`, `..`, or leading `/`)"
+        ),
+    }
 }
 
 /// Reject a configured preamble path that could escape the repo lexically: an
@@ -2776,6 +2858,58 @@ check_command = "cargo test"
         let cfg: Config = toml::from_str(raw).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("repo_slug"), "{err}");
+    }
+
+    #[test]
+    fn repo_path_for_derives_when_omitted_and_honors_explicit() {
+        // github mode without repo_path → derived under repos_root()/<id>.
+        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let p = cfg.project("g").unwrap();
+        assert!(cfg.is_managed_clone(p));
+        assert_eq!(cfg.repo_path_for(p), repos_root().join("g"));
+
+        // Explicit repo_path is returned verbatim and is not a managed clone.
+        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\nrepo_path = \"/tmp/g\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let p = cfg.project("g").unwrap();
+        assert!(!cfg.is_managed_clone(p));
+        assert_eq!(cfg.repo_path_for(p), PathBuf::from("/tmp/g"));
+    }
+
+    #[test]
+    fn github_project_may_omit_repo_path() {
+        // Acceptance criterion 1: id + repo_slug alone is a valid github project.
+        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.project("g").unwrap().repo_path, None);
+    }
+
+    #[test]
+    fn local_without_repo_path_is_rejected() {
+        // Acceptance criterion 3: local mode has no slug to clone from, so
+        // repo_path is required.
+        let raw = "[[projects]]\nid = \"l\"\nmode = \"local\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("repo_path"), "{err}");
+    }
+
+    #[test]
+    fn dangerous_project_ids_are_rejected() {
+        // Acceptance criterion 7: an id that isn't a single safe path component
+        // would let a managed clone escape ~/.meguri/repos.
+        for bad in ["../x", "a/b", "a\\b", "/x", ".", "..", "", "a/"] {
+            let raw = format!("[[projects]]\nid = {bad:?}\nrepo_slug = \"me/g\"\n");
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            assert!(cfg.validate().is_err(), "id {bad:?} should be rejected");
+        }
+        // A normal id passes.
+        let raw = "[[projects]]\nid = \"my-proj_1\"\nrepo_slug = \"me/g\"\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

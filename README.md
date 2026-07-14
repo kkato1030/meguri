@@ -78,13 +78,15 @@ Other ways to get the binary:
 ```toml
 [[projects]]
 id = "myproj"
-repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
+# repo_path = "/abs/path/to/clone"  # omit to let meguri manage the clone (see below)
 # default_branch = "main"
 # check_command = "cargo test"   # recommended: meguri runs this itself
 ```
 
 Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
+
+**Managed clone.** Omit `repo_path` and meguri materializes a **bare** clone at `~/.meguri/repos/<id>` from `repo_slug` (via `gh`, inheriting its credentials) and owns it — you declare the slug, meguri handles the clone. It lives outside `~/.meguri/worktrees`, is never checked out, and is created (and re-created if missing) on the next `watch`/`run`; `meguri doctor` shows each project as *cloned*, *not cloned yet*, or *broken*, and flags a `gh` token that can't push. Set `repo_path` explicitly to point at a clone you maintain yourself (the previous behavior — meguri never clones over it). Note: with a managed clone there is no working copy for a `worktree_setup` step to `cp` secrets (`.env`, `.claude/settings.local.json`) *from* — supply those from a host-side source instead. **Local-mode projects still require `repo_path`** (there is no `repo_slug` to clone from).
 
 ### Let coding agents propose meguri
 
