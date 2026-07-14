@@ -56,6 +56,7 @@ fn make_project(
         review: None,
         worktree_setup: Default::default(),
         schedules,
+        cadence: Vec::new(),
         prompts: Default::default(),
     }
 }

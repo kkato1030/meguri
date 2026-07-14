@@ -122,7 +122,7 @@ impl Scheduler {
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
                 // flips its issue speccing → ready so the worker implements it.
-                if let Err(e) = super::handoff::sweep(deps).await {
+                if let Err(e) = super::plan_handoff::sweep(deps).await {
                     tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Ride the poll: recompute routing outcome drift from run
@@ -184,11 +184,12 @@ impl Scheduler {
                     // someone raced us. Run creation branches on the key so
                     // the target travels from discovery through claim.
                     let created = match target.key {
-                        TaskKey::Issue(n) => deps.store.create_run_for_loop(
+                        TaskKey::Issue(n) => deps.store.create_run_for_loop_cadence(
                             &deps.project.id,
                             lp.kind(),
                             n,
                             &target.title,
+                            target.cadence_label.as_deref(),
                         ),
                         TaskKey::Local(id) => deps.store.create_run_for_task(
                             &deps.project.id,

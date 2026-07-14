@@ -52,6 +52,10 @@ pub enum Command {
         /// Read the task from a markdown file (first heading → title, body → body)
         #[arg(long)]
         file: Option<String>,
+        /// Hold the task until this instant (YYYY-MM-DD or RFC3339 UTC); it is
+        /// discovered only once the time passes (issue #148)
+        #[arg(long)]
+        not_before: Option<String>,
         /// Task title (omit only when --file supplies a heading)
         title: Option<String>,
     },

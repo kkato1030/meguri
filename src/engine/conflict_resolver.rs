@@ -93,6 +93,7 @@ impl super::Loop for ConflictResolverLoop {
             targets.push(Target {
                 key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -321,15 +322,16 @@ impl Flavor for ConflictResolverFlavor {
             .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
             .await;
         let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        // Launch-mode-aware closing sentence (issue #169): a direct-mode
+        // fixer has no pane to attach to.
+        let hint = flow::attach_hint(deps, run);
         let _ = deps
             .forge()
             .pr_comment(
                 pr,
                 &format!(
                     "🔁 **meguri** could not resolve the merge conflicts on this \
-                     PR and needs a human.\n\n> {reason}\n\n\
-                     The agent's pane (if still open) has the full context — \
-                     see `meguri ps` / `meguri attach` on the host running meguri."
+                     PR and needs a human.\n\n> {reason}\n\n{hint}"
                 ),
             )
             .await;
@@ -484,6 +486,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         Deps::with_label_source(

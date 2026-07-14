@@ -51,6 +51,10 @@ repo_slug = "owner/repo"
 # id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
 # projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
 
+# プロジェクト内在の設定(check_command / language / pr.draft)は repo ルートの
+# meguri.toml にも書ける。値は run 開始時にそのブランチから読まれて run に固定され、
+# host [projects.*] があれば host が勝つ。詳細は README の Configuration / ADR 0011。
+
 # [prompts]                            # ロール別 preamble: turn プロンプト冒頭に埋め込む恒常規律(issue #149)
 # all = "ops/agents/guardrails.md"     # 全ロール共通。値は repo 相対パス(絶対パス/`..` は不可)
 # worker = "ops/agents/worker.md"      # キーは routing のロール名(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
@@ -94,6 +98,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
+    /// (no legacy/off state) — a role with no entry here still resolves
+    /// through the built-in recommendation table.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
     /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
     /// presence switches role routing on (see [`routing`]), so a
@@ -103,6 +112,12 @@ pub struct Config {
     /// regressions are still caught.
     #[serde(default)]
     pub drift: DriftConfig,
+    /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
+    /// #66). Top-level like `[drift]` so toggling it never materializes
+    /// `[routing]` and flips role routing on. Only fires when routing is
+    /// active (a common gate in the flow).
+    #[serde(default)]
+    pub escalation: EscalationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -189,7 +204,7 @@ fn default_review_lenses() -> Vec<String> {
 /// `[review.guard]` — the optional external GitHub guard review, toggled
 /// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
 /// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
-/// off (opt-in; external-bot compatible). Its output is a `meguri/guard-review`
+/// off (opt-in; external-bot compatible). Its output is a `meguri/pr-review`
 /// commit status + a folded PR-body `<details>` — never inline threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardConfig {
@@ -438,6 +453,13 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
+    /// Extra args that make the launch non-interactive, for `direct` launch
+    /// mode (issue #169): the full command line is `{command} {args}
+    /// {direct_args} [{resume_args} <session-id>] <trigger>`, run as a plain
+    /// subprocess instead of inside a mux pane. Defaults to Claude Code's
+    /// `-p` (headless one-shot).
+    #[serde(default = "default_agent_direct_args")]
+    pub direct_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -454,6 +476,7 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
+            direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
         }
@@ -483,6 +506,39 @@ pub enum RoutingMode {
     Manual,
 }
 
+/// How a role's turns are launched (issue #169, ADR 0012): `pane` keeps the
+/// historical live mux pane (a human can attach; the turn engine nudges a
+/// quiet agent); `direct` spawns the agent CLI as a plain subprocess for one
+/// turn and reads its exit + the result file — no pane, no attach, no
+/// nudging. Orthogonal to `[routing]`'s profile axis: this only decides
+/// *how* the chosen profile is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    Pane,
+    Direct,
+}
+
+impl LaunchMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// `[launch]`: role→launch-mode resolution (issue #169). Unlike `[routing]`,
+/// there is no legacy/off state — a role with no explicit entry always
+/// resolves through the built-in recommendation table
+/// ([`crate::launch::recommended_mode`]); an explicit `[launch.roles]` entry
+/// always wins over it. See `crate::launch`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchConfig {
+    #[serde(default)]
+    pub roles: HashMap<String, LaunchMode>,
+}
+
 /// `[routing]`: role→profile resolution. Present = routing is active (auto or
 /// manual); absent = legacy (every role runs `default`, no detection).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -496,6 +552,52 @@ pub struct RoutingConfig {
     /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
+    /// Fraction (0.0–1.0) of runs assigned to a comparison ("explore")
+    /// profile instead of the mainline pick (routing 3/3, issue #66). Default
+    /// `0.0` = off: no run is diverted, so behavior matches routing 1/3. The
+    /// selection is deterministic by target number, and lives inside
+    /// `[routing]` because explore is part of how routing assigns profiles —
+    /// you only set it when routing is already wanted.
+    #[serde(default)]
+    pub explore_ratio: f64,
+}
+
+/// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
+/// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
+/// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
+/// switches role routing on (see [`crate::routing`]), so a `[routing.escalation]`
+/// table would silently activate routing for a user who only wanted to turn
+/// escalation off — the same reason ADR 0007 gave `[drift]` a top-level home.
+/// Escalation still only fires when routing is active (a common gate in the
+/// flow), so `[escalation]` alone changes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Kill switch. Default `true`, but escalation only fires for roles that
+    /// have an escalation chain AND when routing is active, so the default is
+    /// inert until both hold.
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    /// Per-role chain overrides. Keys are the 6 routing roles (see
+    /// `crate::routing::KNOWN_ROLES`); values are ordered profile-name chains
+    /// (weakest → strongest), e.g. `worker = ["claude-sonnet", "claude-opus"]`.
+    /// An empty chain (`worker = []`) turns escalation off for that role
+    /// without touching the others. Flattened so `enabled` and the role chains
+    /// share the one `[escalation]` table.
+    #[serde(flatten, default)]
+    pub roles: HashMap<String, Vec<String>>,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            roles: HashMap::new(),
+        }
+    }
+}
+
+fn default_escalation_enabled() -> bool {
+    true
 }
 
 /// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
@@ -547,6 +649,10 @@ fn default_agent_args() -> Vec<String> {
 
 fn default_agent_resume_args() -> Vec<String> {
     vec!["--resume".into()]
+}
+
+fn default_agent_direct_args() -> Vec<String> {
+    vec!["-p".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -856,6 +962,26 @@ pub struct ScheduleConfig {
     pub allow_overlap: bool,
 }
 
+/// One `[[projects.cadence]]` entry (issue #148): a per-label消化レート上限。
+/// `label`(例: `sns`)を持つ issue を、窓あたり上限件数までしか消化しない。
+/// 期間モードは `max_per_day`(UTC 暦日あたり)**または** `per_hours` + `max`
+/// (ローリング窓)のちょうど一方(`[`Config::validate`] が保証)。消化実績は
+/// forge ではなくローカル run 履歴(`runs.cadence_label`)で数える(ADR 0011)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CadenceRule {
+    /// 対象 issue ラベル(github mode 専用。local タスクにラベル軸は無い)。
+    pub label: String,
+    /// UTC 暦日あたりの上限。`per_hours`/`max` と排他。
+    #[serde(default)]
+    pub max_per_day: Option<u32>,
+    /// ローリング窓の長さ(時間)。`max` と対で使い、`max_per_day` と排他。
+    #[serde(default)]
+    pub per_hours: Option<u32>,
+    /// ローリング窓あたりの上限。`per_hours` と対で使う。
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -903,6 +1029,9 @@ pub struct ProjectConfig {
     /// Cron schedules that periodically enqueue issues/tasks (issue #146).
     #[serde(default)]
     pub schedules: Vec<ScheduleConfig>,
+    /// Per-label消化レート上限(issue #148)。github mode 専用。
+    #[serde(default)]
+    pub cadence: Vec<CadenceRule>,
     /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
     /// Same shape as the top-level `[prompts]`; a per-project entry overrides
     /// the top-level one for the same canonical role key. See
@@ -913,6 +1042,75 @@ pub struct ProjectConfig {
 
 fn default_branch() -> String {
     "main".into()
+}
+
+/// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
+/// the "project-intrinsic facts" subset of [`ProjectConfig`] a repo may carry
+/// for itself. Read from the run's worktree once at claim time and pinned to
+/// the run (see [`crate::engine::flow`] and ADR 0011); host `config.toml`
+/// always wins last (see [`Deps::with_repo_config`]).
+///
+/// `#[serde(deny_unknown_fields)]` is the boundary's enforcement: a host-only
+/// key (`repo_slug`, `agent`, `[[workspaces]]`, …) in `meguri.toml` is a parse
+/// error, surfaced by `meguri doctor` rather than silently ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoConfig {
+    /// Deliverable language; folds under host `language` / project `language`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Independent-verification command; folds under the project's
+    /// `check_command`. Pinned at claim time so a run cannot weaken its own
+    /// completion contract mid-run (ADR 0011 §security).
+    #[serde(default)]
+    pub check_command: Option<String>,
+    /// The repo-eligible slice of `[pr]` (only `draft`; `auto_merge` is
+    /// host-only and absent here, so writing it under `[pr]` is a parse error).
+    #[serde(default)]
+    pub pr: Option<RepoPrConfig>,
+}
+
+/// The repo-eligible subset of `[pr]`. Carries `draft` but not `auto_merge`:
+/// arming GitHub-native auto-merge uses the host's `gh` token, so it stays
+/// host-only. `deny_unknown_fields` makes `[pr] auto_merge = …` in a
+/// `meguri.toml` a parse error — the first key-level boundary inside one
+/// section (ADR 0011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoPrConfig {
+    #[serde(default)]
+    pub draft: Option<bool>,
+}
+
+impl RepoConfig {
+    /// Read `<worktree>/meguri.toml`.
+    /// - absent → `Ok(None)` (opt-in default: no repo config).
+    /// - present but invalid TOML / host-only key → `Err` (the caller warns,
+    ///   emits `repo_config.invalid`, and falls back to "as if absent").
+    ///
+    /// Reads the working-tree file directly (no git); the run scopes which
+    /// branch's `meguri.toml` this is by which branch the worktree checked out.
+    pub fn load_from_worktree(worktree: &Path) -> Result<Option<Self>> {
+        let path = worktree.join("meguri.toml");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", path.display()));
+            }
+        };
+        let cfg: RepoConfig = toml::from_str(&raw)
+            .with_context(|| format!("invalid repo config at {}", path.display()))?;
+        Ok(Some(cfg))
+    }
+
+    /// Whether this repo config actually carries an override worth folding in
+    /// (all `None` means the file was empty — nothing to layer over the host).
+    pub fn has_values(&self) -> bool {
+        self.language.is_some()
+            || self.check_command.is_some()
+            || self.pr.as_ref().is_some_and(|p| p.draft.is_some())
+    }
 }
 
 /// `[[workspaces]]` — a static grouping of related projects (issue #154).
@@ -1003,6 +1201,56 @@ impl Config {
                 );
             }
             self.validate_schedules(p)?;
+            self.validate_cadence(p)?;
+        }
+        Ok(())
+    }
+
+    /// Reject cadence rules that would never enforce cleanly: an empty or
+    /// duplicate `label`, or a period mode that is neither exactly `max_per_day`
+    /// nor exactly (`per_hours` + `max`), or a non-positive limit. github-only
+    /// is not rejected here (a local project simply carries unused rules — the
+    /// local task source has no labels to match), matching how the local
+    /// planner is left dormant rather than errored.
+    fn validate_cadence(&self, p: &ProjectConfig) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for c in &p.cadence {
+            if c.label.trim().is_empty() {
+                anyhow::bail!("project {:?} has a cadence rule with an empty label", p.id);
+            }
+            if !seen.insert(c.label.as_str()) {
+                anyhow::bail!(
+                    "project {:?} has duplicate cadence label {:?}",
+                    p.id,
+                    c.label
+                );
+            }
+            match (c.max_per_day, c.per_hours, c.max) {
+                (Some(n), None, None) => {
+                    if n == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has max_per_day = 0 (must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                (None, Some(h), Some(m)) => {
+                    if h == 0 || m == 0 {
+                        anyhow::bail!(
+                            "project {:?} cadence label {:?} has per_hours/max = 0 (both must be > 0)",
+                            p.id,
+                            c.label
+                        );
+                    }
+                }
+                _ => anyhow::bail!(
+                    "project {:?} cadence label {:?} must set exactly one of `max_per_day` \
+                     or (`per_hours` + `max`)",
+                    p.id,
+                    c.label
+                ),
+            }
         }
         self.validate_prompts()?;
         Ok(())
@@ -1375,6 +1623,14 @@ impl ConfigReloader {
             tracing::warn!(
                 "config reload rejected: no projects configured — keeping the last good config"
             );
+            return None;
+        }
+        // `[launch.roles]` typos are a loud startup error (`crate::launch::
+        // validate`, issue #169) — a hot reload must reject the same way
+        // instead of silently applying an ignored override.
+        if let Err(e) = crate::launch::validate(&next) {
+            self.last_seen = Some(raw);
+            tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
             return None;
         }
 
@@ -1831,6 +2087,30 @@ language = "English"
     }
 
     #[test]
+    fn reloader_rejects_unknown_launch_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            "language = \"B\"\n[launch.roles]\nnonsense = \"direct\"\n",
+        )
+        .unwrap();
+        let mut applied = false;
+        assert!(
+            r.poll(|_, _| -> Result<()> {
+                applied = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!applied, "an unknown launch role must reject before apply");
+        assert_ne!(r.current().language.as_deref(), Some("B"));
+    }
+
+    #[test]
     fn reloader_survives_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1963,6 +2243,47 @@ window = 50
             cfg.routing.is_none(),
             "[drift] must stay legacy for routing"
         );
+    }
+
+    #[test]
+    fn escalation_defaults_and_does_not_activate_routing() {
+        // No `[escalation]` section: enabled by default, no role chains, and it
+        // certainly doesn't imply `[routing]`.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.escalation.enabled);
+        assert!(cfg.escalation.roles.is_empty());
+        assert!(cfg.routing.is_none());
+
+        // A top-level `[escalation]` table parses `enabled` + per-role chains
+        // from the one flattened section, and must NOT materialize `[routing]`
+        // (the whole point of keeping it out of `[routing.escalation]`).
+        let cfg: Config = toml::from_str(
+            r#"
+[escalation]
+enabled = false
+worker = ["claude-sonnet", "claude-opus"]
+fixer = []
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.escalation.enabled);
+        assert_eq!(
+            cfg.escalation.roles["worker"],
+            vec!["claude-sonnet", "claude-opus"]
+        );
+        assert_eq!(cfg.escalation.roles["fixer"], Vec::<String>::new());
+        assert!(
+            cfg.routing.is_none(),
+            "[escalation] must stay legacy for routing"
+        );
+    }
+
+    #[test]
+    fn explore_ratio_defaults_off_and_lives_under_routing() {
+        let cfg: Config = toml::from_str("[routing]\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.0);
+        let cfg: Config = toml::from_str("[routing]\nexplore_ratio = 0.1\n").unwrap();
+        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.1);
     }
 
     #[test]
@@ -2222,6 +2543,67 @@ allow_overlap = true
         assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
     }
 
+    #[test]
+    fn cadence_rules_parse_both_period_modes() {
+        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"nl\"\nper_hours = 168\nmax = 2\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let cadence = &cfg.project("d").unwrap().cadence;
+        assert_eq!(cadence.len(), 2);
+        assert_eq!(cadence[0].label, "sns");
+        assert_eq!(cadence[0].max_per_day, Some(1));
+        assert_eq!(cadence[1].per_hours, Some(168));
+        assert_eq!(cadence[1].max, Some(2));
+    }
+
+    #[test]
+    fn cadence_rejects_empty_or_duplicate_label() {
+        let empty = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                     [[projects.cadence]]\nlabel = \"\"\nmax_per_day = 1\n";
+        let err = toml::from_str::<Config>(empty)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty label"), "{err}");
+
+        let dup = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
+                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 2\n";
+        let err = toml::from_str::<Config>(dup)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate cadence label"), "{err}");
+    }
+
+    #[test]
+    fn cadence_rejects_ambiguous_or_zero_period() {
+        // Both modes set.
+        let both = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\nper_hours = 24\nmax = 1\n";
+        // Rolling mode missing its `max`.
+        let missing = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                       [[projects.cadence]]\nlabel = \"sns\"\nper_hours = 24\n";
+        // Neither mode.
+        let none = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\n";
+        // Zero value.
+        let zero = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 0\n";
+        for raw in [both, missing, none, zero] {
+            let err = toml::from_str::<Config>(raw)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cadence label"), "{err}");
+        }
+    }
+
     /// Minimal valid config carrying the given projects plus the extra lines.
     fn config_with_projects(ids: &[&str], extra: &str) -> String {
         let mut raw = String::new();
@@ -2312,6 +2694,19 @@ allow_overlap = true
         assert!(err.contains("no projects"), "{err}");
     }
 
+    // ---- repo config (issue #165) ----
+
+    #[test]
+    fn repo_config_absent_is_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // No meguri.toml in the worktree → opt-out, not an error.
+        assert!(
+            RepoConfig::load_from_worktree(dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     const A_PROJECT: &str =
         "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";
 
@@ -2378,6 +2773,80 @@ allow_overlap = true
         assert_eq!(
             cfg.preambles_for(p, "planner"),
             vec![("all".to_string(), "all.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn repo_config_parses_eligible_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "language = \"日本語\"\ncheck_command = \"cargo test\"\n\n[pr]\ndraft = false\n",
+        )
+        .unwrap();
+        let repo = RepoConfig::load_from_worktree(dir.path())
+            .unwrap()
+            .expect("meguri.toml present");
+        assert_eq!(repo.language.as_deref(), Some("日本語"));
+        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
+        assert_eq!(repo.pr.and_then(|p| p.draft), Some(false));
+    }
+
+    #[test]
+    fn repo_config_rejects_host_only_key() {
+        // A host-only key (the doctor's failure case) is a parse error, not a
+        // silent drop — `deny_unknown_fields`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "check_command = \"cargo test\"\nrepo_slug = \"me/x\"\n",
+        )
+        .unwrap();
+        let err = RepoConfig::load_from_worktree(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("repo_slug")
+                || format!("{err:#}").contains("unknown field"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn repo_config_rejects_auto_merge_under_pr() {
+        // The key-level boundary: `[pr] draft` is fine, `[pr] auto_merge` is
+        // host-only and must be rejected inside meguri.toml.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "[pr]\ndraft = false\n\n[pr.auto_merge]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn repo_config_has_values() {
+        assert!(!RepoConfig::default().has_values());
+        assert!(
+            RepoConfig {
+                check_command: Some("x".into()),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        assert!(
+            RepoConfig {
+                pr: Some(RepoPrConfig { draft: Some(true) }),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        // An empty [pr] table (draft = None) is not itself an override.
+        assert!(
+            !RepoConfig {
+                pr: Some(RepoPrConfig { draft: None }),
+                ..Default::default()
+            }
+            .has_values()
         );
     }
 
