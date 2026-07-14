@@ -28,6 +28,7 @@ fn profile_for(command: PathBuf) -> AgentProfile {
         command: command.to_string_lossy().into_owned(),
         args: vec!["--model".into(), "sonnet".into()],
         resume_args: vec![],
+        direct_args: vec![],
         herdr_agent_hint: None,
         session_dir: None,
     }

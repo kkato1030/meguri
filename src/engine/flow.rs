@@ -14,10 +14,12 @@ use serde_json::json;
 
 use super::{Deps, StoreControl, WorkerOutcome, lane_for_loop};
 use crate::agent_session;
-use crate::config::Deliver;
+use crate::config::{Deliver, LaunchMode};
 use crate::forge;
 use crate::gitops;
+use crate::launch;
 use crate::mux::{PaneId, PaneSpec};
+use crate::routing;
 use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::{self, TaskKey};
 use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
@@ -183,9 +185,13 @@ pub trait Flavor: Send + Sync {
     /// Failure escalation ("Authority": the durable record of why the run
     /// stopped lives with the task). Default: the coordination layer's
     /// escalate (needs-human label + comment / `status='needs_human'` +
-    /// reason).
+    /// reason), with a launch-mode-aware attach hint (issue #169).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        let _ = deps.task_source.escalate(&run.task_key(), reason).await;
+        let hint = attach_hint(deps, run);
+        let _ = deps
+            .task_source
+            .escalate(&run.task_key(), reason, &hint)
+            .await;
     }
 
     /// The agent ended its execute turn with `needs_plan`: a design decision
@@ -511,6 +517,9 @@ pub(crate) enum StepFlow {
 /// ("until-issue-closed") keeps the pane for the reaper, which reclaims it
 /// once the issue closes on the forge; "never" releases it right away
 /// (high-throughput operation). Unknown values are rejected at config load.
+/// `keep_pane` is a pane-mode-only setting (ADR 0012): a direct-mode lane has
+/// no live pane row, so [`super::reaper::release_pane`] below is already a
+/// no-op for it — no special-casing needed here.
 pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
     if deps.config.mux.keep_pane == "never" {
         super::reaper::release_pane(
@@ -551,16 +560,52 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -
     Ok(())
 }
 
+/// The escalation comment's closing "how to look at this" sentence (issue
+/// #169): pane attach for a pane-mode lane (unchanged wording), or — for a
+/// direct-mode lane — a `claude --resume <session-id>` hint built from the
+/// lane's own saved session, falling back to a plain "no pane, no session
+/// yet" note when none was ever recorded.
+pub(crate) fn attach_hint(deps: &Deps, run: &RunRecord) -> String {
+    let lane = lane_for_loop(&run.loop_kind);
+    let routing_role = routing::routing_role_for_loop(&run.loop_kind);
+    match launch::resolve(&deps.config, routing_role) {
+        LaunchMode::Pane => tasks::DEFAULT_ATTACH_HINT.to_string(),
+        LaunchMode::Direct => {
+            let session = deps
+                .store
+                .get_pane(&deps.project.id, run.issue_number, lane)
+                .ok()
+                .flatten()
+                .and_then(|p| p.agent_session_id);
+            match session {
+                Some(id) => format!(
+                    "This role runs headless (no pane to attach to) — resume its context \
+                     with `claude --resume {id}` in the run's worktree, or see `meguri ps`."
+                ),
+                None => "This role runs headless (no pane to attach to) and no resumable \
+                     session was recorded yet — see `meguri ps`."
+                    .to_string(),
+            }
+        }
+    }
+}
+
 /// Failure escalation on the forge ("Authority": the durable record of why
 /// the run stopped lives on the issue, not in meguri's local state). Used by
 /// forge loops that escalate on the issue directly (the spec worker); the
 /// worker/planner default escalate goes through the task source instead.
+/// Uses the generic pane-attach hint — its callers (spec worker, and the
+/// fixer family's before-PR-claimed fallback) all default to `pane` launch
+/// mode (ADR 0012's recommendation table).
 pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
     let forge = deps.forge();
     let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
     let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
     let _ = forge
-        .comment(issue, &tasks::needs_human_comment(reason))
+        .comment(
+            issue,
+            &tasks::needs_human_comment(reason, tasks::DEFAULT_ATTACH_HINT),
+        )
         .await;
 }
 
@@ -1030,33 +1075,41 @@ async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
     }
 }
 
-/// Which pane lane a turn runs in, and the launch profile it uses. Threading
-/// this explicitly lets the worker's self-review run its review turn in a
-/// separate lane under a different profile than the fix turns (ADR 0006).
+/// Which lane a turn runs in, the launch profile it uses, and how it is
+/// launched (issue #169). Threading this explicitly lets the worker's
+/// self-review run its review turn in a separate lane under a different
+/// profile — and potentially a different launch mode — than the fix turns
+/// (ADR 0006). "Lane" now means "issue-scoped resumable context"; a pane is
+/// optional (`mode == Direct` never has one).
 pub(crate) struct Lane {
     lane: &'static str,
     profile_name: String,
     profile: crate::config::AgentProfile,
+    mode: LaunchMode,
 }
 
 /// The run's own lane: its loop's pane lane, under the profile pinned on the
-/// run (resolved and pinned lazily on first spawn).
+/// run (resolved and pinned lazily on first spawn), and the launch mode its
+/// routing role resolves to.
 fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
     let lane = lane_for_loop(&run.loop_kind);
     let (profile_name, profile) = resolve_run_profile(deps, run)?;
+    let mode = launch::resolve(&deps.config, routing::routing_role_for_loop(&run.loop_kind));
     Ok(Lane {
         lane,
         profile_name,
         profile,
+        mode,
     })
 }
 
-/// The self-review lane: a separate pane keyed by the same issue, launched
+/// The self-review lane: a separate lane keyed by the same issue, launched
 /// under the `self-reviewer` routing profile (formerly `impl-reviewer` /
 /// `self-review`, ADR 0003 revision) so the review turn can be a different
 /// model than the author doing the fixes. Resolved without pinning the run's
 /// own profile. Shared by the plan and impl self-review (the loop is
-/// symmetric).
+/// symmetric). Its launch mode resolves independently too — recommended
+/// `direct` (ADR 0012): an internal loop no human ever attaches to.
 fn self_review_lane(deps: &Deps) -> Result<Lane> {
     let profile_name = crate::routing::resolve(
         &deps.config,
@@ -1064,10 +1117,12 @@ fn self_review_lane(deps: &Deps) -> Result<Lane> {
         &crate::routing::detect_command,
     )?;
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
+    let mode = launch::resolve(&deps.config, "self-reviewer");
     Ok(Lane {
         lane: crate::store::LANE_SELF_REVIEW,
         profile_name,
         profile,
+        mode,
     })
 }
 
@@ -1173,17 +1228,12 @@ async fn run_turn_in(
 ) -> Result<(TurnOutcome, String)> {
     let preamble = resolve_preamble(deps, run, worktree, role)?;
     let prepared = prepare_turn(worktree, prompt_body, &preamble)?;
-    let ensured = ensure_pane(deps, run, worktree, lane, &prepared.trigger_line).await?;
-    let pane = ensured.pane.clone();
     deps.store.begin_turn(
         &run.id,
         &prepared.turn_id,
         purpose,
         &prepared.prompt_path.to_string_lossy(),
     )?;
-    if !ensured.freshly_spawned {
-        deps.mux.send_line(&pane, &prepared.trigger_line).await?;
-    }
 
     let control = StoreControl {
         store: deps.store.clone(),
@@ -1191,11 +1241,62 @@ async fn run_turn_in(
         notifier: deps.notifier.clone(),
     };
     let engine = turn_engine(deps);
-    let outcome = engine
-        .await_completion(&pane, worktree, &prepared.turn_id, &control)
-        .await?;
 
-    record_agent_session(deps, run, worktree, lane.lane, &pane, &ensured, &outcome).await?;
+    let (outcome, pane, resumed) = match lane.mode {
+        LaunchMode::Pane => {
+            let ensured = ensure_pane(deps, run, worktree, lane, &prepared.trigger_line).await?;
+            let pane = ensured.pane.clone();
+            if !ensured.freshly_spawned {
+                deps.mux.send_line(&pane, &prepared.trigger_line).await?;
+            }
+            let outcome = engine
+                .await_completion(&pane, worktree, &prepared.turn_id, &control)
+                .await?;
+            (outcome, Some(pane), ensured.resumed)
+        }
+        LaunchMode::Direct => {
+            // A lane that ran in pane mode before its role was switched to
+            // `direct` may still have a live pane. ADR 0012's invariant is
+            // that a direct lane has no live pane, so release it through the
+            // shared reaper path (session save + kill + mark_pane_reclaimed)
+            // rather than merely clearing the row's mux columns — a cleared
+            // row would orphan the still-running pane process, invisible to
+            // the reaper's sweeps. Releasing first also refreshes the saved
+            // session id, which the resume lookup below then picks up. No-op
+            // for a lane with no live pane (the steady direct-mode state).
+            super::reaper::release_pane(
+                deps,
+                run.issue_number,
+                lane.lane,
+                "lane switched to direct launch mode",
+            )
+            .await;
+            let (child, resumed) = spawn_direct_process(
+                deps,
+                run,
+                worktree,
+                lane,
+                &prepared.turn_id,
+                &prepared.trigger_line,
+            )
+            .await?;
+            let outcome = engine
+                .await_completion_direct(child, worktree, &prepared.turn_id, &control)
+                .await?;
+            (outcome, None, resumed)
+        }
+    };
+
+    record_agent_session(
+        deps,
+        run,
+        worktree,
+        lane.lane,
+        pane.as_ref(),
+        resumed,
+        &outcome,
+    )
+    .await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -1212,23 +1313,89 @@ async fn run_turn_in(
     Ok((outcome, prepared.turn_id))
 }
 
+/// Spawn one direct-mode turn (issue #169): `{command} {args} {direct_args}
+/// [{resume_args} <session-id>] <trigger>` as a plain subprocess, cwd the
+/// worktree. Unlike [`ensure_pane`] there is nothing to reuse across turns —
+/// direct mode has no persistent process — so this always spawns fresh; a
+/// saved session id (if any) is only ever used to `--resume`, never probed
+/// for survival (a bad id simply makes the CLI exit without a result, which
+/// `await_completion_direct` already maps to `PaneDied`, clearing the id for
+/// the next turn). Returns the child plus whether this was a resume attempt.
+async fn spawn_direct_process(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    lane: &Lane,
+    turn_id: &str,
+    initial_trigger: &str,
+) -> Result<(tokio::process::Child, bool)> {
+    let lane_name = lane.lane;
+    let profile = &lane.profile;
+
+    let session_id = deps
+        .store
+        .get_pane(&deps.project.id, run.issue_number, lane_name)?
+        .and_then(|p| p.agent_session_id);
+
+    let mut args = profile.args.clone();
+    args.extend(profile.direct_args.iter().cloned());
+    if let Some(session_id) = &session_id {
+        args.extend(profile.resume_args.iter().cloned());
+        args.push(session_id.clone());
+    }
+    args.push(initial_trigger.to_string());
+
+    // No pane scrollback in direct mode; capture stdout+stderr to a per-turn
+    // log so a "died without a result" turn still leaves something to read
+    // (the closest direct-mode equivalent of `meguri attach`).
+    let log_path = crate::turn::prompts::meguri_dir(worktree).join(format!("direct-{turn_id}.log"));
+    std::fs::create_dir_all(crate::turn::prompts::meguri_dir(worktree))?;
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
+
+    let mut cmd = tokio::process::Command::new(&profile.command);
+    cmd.args(&args)
+        .current_dir(worktree)
+        .kill_on_drop(true)
+        .stdout(
+            log.try_clone()
+                .with_context(|| "cloning direct-mode log handle")?,
+        )
+        .stderr(log);
+    if let Some(hint) = &profile.herdr_agent_hint {
+        cmd.env("HERDR_AGENT", hint);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning direct-mode agent `{}`", profile.command))?;
+
+    deps.store.emit(
+        Some(&run.id),
+        "direct.spawned",
+        json!({ "lane": lane_name, "profile": lane.profile_name,
+                "resumed": session_id.is_some(), "log": log_path.to_string_lossy() }),
+    )?;
+    Ok((child, session_id.is_some()))
+}
+
 /// Keep the lane's resumable session id in sync with what the turn taught
 /// us. The truth lives on the pane row (`panes.agent_session_id`, issue
-/// lifetime) — the resume path reads only that. After every completed turn
-/// the primary source is a file scan of the worktree's transcripts
-/// (`agent_session::latest_session_id`, reliable and independent of agent
-/// self-reporting); the result file's self-report and the mux (herdr
-/// carries it on `pane get`) are fallbacks. `runs.agent_session_id` is
-/// still written for observability. A resumed pane dying without a result
-/// means the stored id no longer restores a working session, so drop it
-/// rather than resume-loop on it forever.
+/// lifetime) — the resume path reads only that, whether or not the lane has
+/// a live pane (issue #169 broadens "lane" from "pane" to "pane optional").
+/// After every completed turn the primary source is a file scan of the
+/// worktree's transcripts (`agent_session::latest_session_id`, reliable and
+/// independent of agent self-reporting); the result file's self-report and
+/// (pane mode only) the mux (herdr carries it on `pane get`) are fallbacks.
+/// `runs.agent_session_id` is still written for observability. A resumed
+/// executor dying without a result means the stored id no longer restores a
+/// working session, so drop it rather than resume-loop on it forever.
 async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
     lane_name: &str,
-    pane: &PaneId,
-    ensured: &EnsuredPane,
+    pane: Option<&PaneId>,
+    resumed: bool,
     outcome: &TurnOutcome,
 ) -> Result<()> {
     match outcome {
@@ -1238,30 +1405,34 @@ async fn record_agent_session(
                 Some(id) => Some(id),
                 None => match &r.agent_session_id {
                     Some(id) => Some(id.clone()),
-                    None => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+                    None => match pane {
+                        Some(pane) => deps.mux.agent_session_id(pane).await.unwrap_or(None),
+                        None => None,
+                    },
                 },
             };
             if let Some(id) = session_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
             {
-                deps.store.save_pane_session(
+                deps.store.upsert_pane_session(
                     &deps.project.id,
                     run.issue_number,
                     lane_name,
+                    &worktree.to_string_lossy(),
                     Some(&id),
                 )?;
                 deps.store.update_run_agent_session(&run.id, Some(&id))?;
             }
         }
-        TurnOutcome::PaneDied if ensured.resumed => {
+        TurnOutcome::PaneDied if resumed => {
             deps.store
                 .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
             deps.store.update_run_agent_session(&run.id, None)?;
             deps.store.emit(
                 Some(&run.id),
                 "agent_session.cleared",
-                json!({ "reason": "resumed pane died without a result" }),
+                json!({ "reason": "resumed executor died without a result" }),
             )?;
         }
         _ => {}

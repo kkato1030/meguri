@@ -136,21 +136,28 @@ pub trait TaskSource: Send + Sync {
 
     /// Hand the task to a human; `reason` is stored durably (label + comment
     /// in github mode, `status='needs_human'` + `reason` in local mode).
-    async fn escalate(&self, key: &TaskKey, reason: &str) -> Result<()>;
+    /// `hint` is the launch-mode-aware "how to look at this" sentence (issue
+    /// #169) — pane attach, or a `claude --resume` hint for a direct-mode
+    /// role — folded into the github comment; local mode ignores it (nothing
+    /// renders markdown there).
+    async fn escalate(&self, key: &TaskKey, reason: &str, hint: &str) -> Result<()>;
 
     /// The task shipped a deliverable (github: drop the trigger/working
     /// labels; local: `status='done'`).
     async fn complete(&self, key: &TaskKey) -> Result<()>;
 }
 
+/// Fallback attach hint for callers with no launch-mode context of their own
+/// (pane is always a plausible guess before mode is known).
+pub const DEFAULT_ATTACH_HINT: &str = "The agent's pane (if still open) has the full context — \
+     see `meguri ps` / `meguri attach` on the host running meguri.";
+
 /// The needs-human comment left on an escalated issue (shared by
 /// [`LabelTaskSource`] and [`crate::engine::flow::escalate_on_forge`]).
-pub fn needs_human_comment(reason: &str) -> String {
-    format!(
-        "🔁 **meguri** could not finish this issue and needs a human.\n\n> {reason}\n\n\
-         The agent's pane (if still open) has the full context — \
-         see `meguri ps` / `meguri attach` on the host running meguri."
-    )
+/// `hint` is the closing "how to look at this" sentence — pane attach by
+/// default, or a mode-aware alternative the caller computed (issue #169).
+pub fn needs_human_comment(reason: &str, hint: &str) -> String {
+    format!("🔁 **meguri** could not finish this issue and needs a human.\n\n> {reason}\n\n{hint}")
 }
 
 /// Dependency gate (looper ADR-0004): only a blocker closed as completed
@@ -300,11 +307,14 @@ impl TaskSource for LabelTaskSource {
         Ok(())
     }
 
-    async fn escalate(&self, key: &TaskKey, reason: &str) -> Result<()> {
+    async fn escalate(&self, key: &TaskKey, reason: &str, hint: &str) -> Result<()> {
         if let TaskKey::Issue(n) = *key {
             let _ = self.forge.add_label(n, forge::LABEL_NEEDS_HUMAN).await;
             let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
-            let _ = self.forge.comment(n, &needs_human_comment(reason)).await;
+            let _ = self
+                .forge
+                .comment(n, &needs_human_comment(reason, hint))
+                .await;
         }
         Ok(())
     }
@@ -377,7 +387,7 @@ impl TaskSource for LocalTaskSource {
         Ok(())
     }
 
-    async fn escalate(&self, key: &TaskKey, reason: &str) -> Result<()> {
+    async fn escalate(&self, key: &TaskKey, reason: &str, _hint: &str) -> Result<()> {
         if let TaskKey::Local(id) = *key {
             self.store.escalate_task(id, reason)?;
         }
@@ -459,7 +469,9 @@ mod tests {
         assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_some());
         assert!(forge.labels_of(7).contains(&LABEL_WORKING.to_string()));
 
-        src.escalate(&key, "stuck").await.unwrap();
+        src.escalate(&key, "stuck", DEFAULT_ATTACH_HINT)
+            .await
+            .unwrap();
         let labels = forge.labels_of(7);
         assert!(labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
         assert!(!labels.contains(&LABEL_WORKING.to_string()));

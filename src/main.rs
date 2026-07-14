@@ -489,6 +489,25 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+    ok &= doctor_launch(cfg);
+    ok
+}
+
+/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
+/// resolved (no legacy/off state, unlike routing). Explicit launch config
+/// errors (an unknown role key) are startup errors, surfaced here like
+/// routing's.
+fn doctor_launch(cfg: &Config) -> bool {
+    use meguri::{launch, routing};
+    let mut ok = true;
+    if let Err(e) = launch::validate(cfg) {
+        println!("  ❌ launch config: {e:#}");
+        ok = false;
+    }
+    println!("launch mode:");
+    for role in routing::KNOWN_ROLES {
+        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    }
     ok
 }
 
@@ -609,6 +628,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
         }
