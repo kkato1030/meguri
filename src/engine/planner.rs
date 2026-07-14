@@ -897,6 +897,7 @@ mod tests {
             worktree_root: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),

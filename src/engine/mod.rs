@@ -17,6 +17,7 @@ pub mod scheduler_fire;
 pub mod self_review;
 pub mod spec_fixer;
 pub mod spec_worker;
+pub mod triage;
 pub mod worker;
 
 use std::sync::Arc;
@@ -389,6 +390,7 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(worker::WorkerLoop),
         Arc::new(planner::PlannerLoop),
         Arc::new(cleaner::CleanerLoop),
+        Arc::new(triage::TriageLoop),
     ]
 }
 
@@ -495,6 +497,7 @@ mod tests {
             "ci-fixer",
             "conflict-resolver",
             "cleaner",
+            "triage",
         ] {
             assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
@@ -596,6 +599,7 @@ mod tests {
             language: None,
             pr: None,
             clean: None,
+            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),

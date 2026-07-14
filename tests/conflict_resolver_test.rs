@@ -112,6 +112,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         language: None,
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
