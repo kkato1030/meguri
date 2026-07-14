@@ -41,7 +41,14 @@ findings park を「まず自動で直す」ループの欠落は #188 として
    - `Notification` を組んで `deps.notifier.notify_awaiting_human(…)`(reason は下記の新規値。「見に行く先」は PR URL だが、`attach` は「pane に attach する shell command」という契約なので流用しない — 新設の `url` フィールドに載せる。契約変更の詳細は下記 5.),
    - `store.emit(Some(run_id), "review.awaiting_human", …)`(verdict / head / pr を data に載せる)。
    kind にも verdict にも依存させない(pr_reviewer の findings/clean 両分岐、将来の #188 上限超過エスカレーションから同一ヘルパを呼べる形)。
-3. **`src/store/runs.rs`** — review park だけを拾う専用クエリ `list_parked_reviews()`(`status='succeeded' AND loop_kind='pr-reviewer' AND interaction_state='awaiting_human'`)を追加。`AwaitingHuman` は turn 側でも立ち、`update_run_status` はそれを消さない。だから `status NOT IN (active)` だけで絞ると、人間待ちのまま stop/cancel された run や failed/skipped で終わった run まで「parked review」として拾ってしまう。見せたいのは pr_reviewer(Plan) の正常終了 park だけなので、`status='succeeded'`(異常終了を除外)と `loop_kind='pr-reviewer'`(park ヘルパを呼ぶのはこの loop だけ)の2条件で閉じる。クリアは既存 `update_interaction_state(id, None)`(`:685-693`)を再利用。
+3. **`src/store/runs.rs`** — review park だけを拾う専用クエリ `list_parked_reviews()` を追加。条件は「**park ヘルパが実際に走った run**」であり、それを表すのは `review.awaiting_human` イベントの存在だけである:
+   ```sql
+   status = 'succeeded'
+   AND interaction_state = 'awaiting_human'
+   AND EXISTS (SELECT 1 FROM events e
+               WHERE e.run_id = runs.id AND e.kind = 'review.awaiting_human')
+   ```
+   なぜ状態だけでは足りないか: `AwaitingHuman` は turn 側でも立つ(`turn.awaiting_human`)。pr_reviewer(Impl)、あるいは combined の pr_reviewer(Plan) が runtime/quiet で人間待ちになったあと、同じ run がレビューを書いて `Succeeded` で終わると、`update_run_status(Succeeded)` は `interaction_state` を消さないので状態は残る。これらは park ヘルパを**呼ばない**経路なので、dashboard に出してはいけない。両者を分ける唯一の印は「ヘルパが emit した `review.awaiting_human` イベントがあるか」。`loop_kind='pr-reviewer'` では Impl と combined-Plan の turn linger を除けないので使わない(将来 #188 の spec_fixer が別 loop から同ヘルパを呼んでも、イベント条件ならそのまま拾える)。`status='succeeded'` は異常終了への保険、`interaction_state='awaiting_human'` は「まだクリアされていない park」の担保。クリアは既存 `update_interaction_state(id, None)`(`:685-693`)を再利用。
 4. **`src/app.rs`** — `top_refresh`(`:921`)に parked run を合流させる。parked 行は pane が無く(あるいは死んで)ても表示する(動作対象は PR)。既存の `awaiting_human` 強調(`▶`、フラグ計算 `:963-972`・marker `:1027`)と `render_top`(`:997`)はそのまま流用できる。active 行との run_id 重複は排除。
 5. **`src/notify/mod.rs`** — 通知契約を「pane 前提」から「pane または web 上の待ち先」へ広げる。現行の `Notification.attach` は「pane に attach する shell command」(`src/notify/mod.rs:27-28`)、macOS 通知本文は `meguri attach <run_id>` 固定(`:144`)、webhook は `attach`/`attach_cli` を併記(`:175-176`)— parked run はこの契約に乗らない(pane は notify 直後の `finish_pane` で消え、動作対象は PR)ので、流用ではなく契約を変更する:
    - `Notification.url: Option<String>` を新設。parked review では PR URL を入れる(既存の turn 系エスカレーションは `None`)。
@@ -55,7 +62,7 @@ findings park を「まず自動で直す」ループの欠落は #188 として
 
 1. **run は `Succeeded` のまま。** park 専用 `RunStatus` は増やさない(ADR 0009 の代替案 A 却下)。
 2. **通知は imperative(`deps.notifier`)で emit。** engine は turn の外なので `StoreControl::event` 経由ではない。event 名は `review.awaiting_human`(turn スコープの `turn.awaiting_human` と区別)。
-3. **dashboard は専用クエリで parked を拾う。** `list_runs(true)` の意味は scheduler と共有のため変えない。クエリは `status='succeeded' AND loop_kind='pr-reviewer'` に絞る — `AwaitingHuman` は turn 側や中断した run にも残るので、状態だけで判定すると別物を拾う。
+3. **dashboard は専用クエリで parked を拾う。** `list_runs(true)` の意味は scheduler と共有のため変えない。拾う印は状態(`AwaitingHuman`)ではなく **`review.awaiting_human` イベントの存在** — これが「park ヘルパが走った」ことの唯一の証拠。状態だけで判定すると、pr-reviewer 自身の turn linger(Impl / combined-Plan)まで拾う。
 4. **park クリアは「次 head 着手時」＋「issue close 時」。** さもないと dashboard に古い park が滞留する。
 5. **clean park は `plan_delivery=separate` のときだけ配線する。** combined では `spec-ready` を `spec_worker` が自動継続するため park ではない(`src/engine/spec_worker.rs:66`)。ラベル遷移(`spec-reviewing → spec-ready`)自体は本 spec では触らない。
 6. **findings 直後の page は #188 着地までの暫定で、着地後は上限超過時へ移る。** 移し替えは #188 側で行う(前節)。本 spec の不変条件は「無標識 park を作らない」ことであり、「findings で必ず page する」ことではない。
@@ -67,7 +74,7 @@ findings park を「まず自動で直す」ループの欠落は #188 として
 2. park 時に `deps.notifier.notify_awaiting_human` が叩かれ、通知が PR を指す: macOS 本文と webhook `url` に PR URL が載り、pane 導線は出ない(webhook の `attach` は null、`attach_cli` キーは無し)。既存の turn 系通知(`url` 無し)の内容は従来どおり。
 3. 重複抑止は best-effort: 同一プロセス・throttle 窓内の再 park では再配送されない(既存 per-`run_id` throttle)。settle 再実行・デーモン再起動をまたぐ head 単位の厳密1回は**保証しない**(主要な決定 7)。
 4. `review.awaiting_human` イベントが emit される(verdict/head/pr を含む)。
-5. `meguri top` に該当 run が `▶` 強調行で出る(`Succeeded` でも、pane が無くても)。逆に、turn 側で人間待ちになったまま stop/cancel された run や failed/skipped で終わった run(いずれも `AwaitingHuman` が残る)は出ない — 拾うのは succeeded な pr-reviewer park だけ。
+5. `meguri top` に該当 run が `▶` 強調行で出る(`Succeeded` でも、pane が無くても)。逆に `AwaitingHuman` が残っているだけの run は出ない: turn 側で人間待ちになったまま stop/cancel/failed/skipped で終わった run も、pr-reviewer 自身の turn linger(Impl / combined-Plan が runtime/quiet で awaiting_human → 同 run が Succeeded)も、`review.awaiting_human` イベントを持たないので拾わない。
 6. 次 head を push → 新 review 着手で、古い parked run の `interaction_state` がクリアされ、dashboard に残留しない。
 7. **回帰なし:** clean 判定のラベル遷移(`spec-reviewing → spec-ready`)と findings 判定の `spec-reviewing` 維持は従来どおり。combined では clean で park シグナルが出ず、`spec_worker` の自動継続を妨げない。pr_reviewer(Impl) では park ヘルパは呼ばれない。
 8. notify 無効時 / webhook 未設定時も落ちない(best-effort、既存挙動どおり)。
@@ -76,7 +83,7 @@ findings park を「まず自動で直す」ループの欠落は #188 として
 
 - **unit(park ヘルパ):** ヘルパ呼び出しで対象 run の `interaction_state` が `AwaitingHuman` になり、notifier が叩かれること。`Deps::notifier` は `pub` フィールドなので、テストでは構築後に `FakeGateway`(`src/notify/fake.rs`)を包んだ `Notifier` へ差し替えて配送を観測する。
 - **unit(notify 契約):** `url` 有りの `Notification` で osascript 本文が PR URL を含み `meguri attach` を含まないこと、webhook payload に `url` が載り `attach` が null・`attach_cli` キーが無いこと。`url` 無し(turn 系)の payload が従来形(`attach`/`attach_cli` 併記)を維持すること。
-- **unit(store):** `list_parked_reviews()` が succeeded な pr-reviewer + AwaitingHuman の run を返し、active run・interaction 無しの run を返さないこと。加えて **cancelled/failed/skipped + AwaitingHuman の run**(turn 側の人間待ちを stop した、あるいは異常終了した run)と、**pr-reviewer 以外の succeeded + AwaitingHuman の run** を返さないこと。クリア(`update_interaction_state(id, None)`)で消えること。
+- **unit(store):** `list_parked_reviews()` が「Succeeded + AwaitingHuman + `review.awaiting_human` イベント有り」の run を返し、active run・interaction 無しの run を返さないこと。除外ケースを必ず入れる: (a) **cancelled/failed/skipped + AwaitingHuman**(turn 側の人間待ちを stop、または異常終了)、(b) **Succeeded + AwaitingHuman だが `review.awaiting_human` イベント無し**(= park ヘルパ未実行の turn linger。pr-reviewer の run でも起きる)。どちらも返さないこと。クリア(`update_interaction_state(id, None)`)で消えること。
 - **integration(`pr_reviewer` settle findings):** `FakeForge` + `FakeMux` で plan PR の review=`findings` を通し、run が `Succeeded` + `interaction_state=AwaitingHuman`、notifier delivered==1、`review.awaiting_human` emit を確認(既存の `tests/pr_reviewer_test.rs` の道具立てをそのまま使える)。
 - **integration(`pr_reviewer` settle clean):** `plan_delivery=separate` では clean でも park シグナル(interaction_state + notify)が出ること。`combined` では出ず、`spec-ready` 遷移だけが起きること。
 - **clearing:** 同一 issue の2回目 head の `prepare_work`(claim)で prior parked run の `interaction_state` が None に落ちること。
