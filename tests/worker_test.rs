@@ -1209,7 +1209,12 @@ fn validate_commands(env: &TestEnv, run_id: &str) -> Vec<String> {
         .unwrap()
         .iter()
         .filter(|e| e.kind == "validate.running")
-        .filter_map(|e| e.data.get("command").and_then(|c| c.as_str()).map(str::to_string))
+        .filter_map(|e| {
+            e.data
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -1290,7 +1295,10 @@ async fn repo_check_command_from_meguri_toml_is_applied() {
     // The repo's pr.draft = false took effect (host default is draft = true).
     let prs = env.forge.prs();
     assert_eq!(prs.len(), 1);
-    assert!(!prs[0].draft, "repo pr.draft = false must open a non-draft PR");
+    assert!(
+        !prs[0].draft,
+        "repo pr.draft = false must open a non-draft PR"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

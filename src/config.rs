@@ -2152,7 +2152,11 @@ allow_overlap = true
     fn repo_config_absent_is_ok_none() {
         let dir = tempfile::tempdir().unwrap();
         // No meguri.toml in the worktree → opt-out, not an error.
-        assert!(RepoConfig::load_from_worktree(dir.path()).unwrap().is_none());
+        assert!(
+            RepoConfig::load_from_worktree(dir.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2183,7 +2187,8 @@ allow_overlap = true
         .unwrap();
         let err = RepoConfig::load_from_worktree(dir.path()).unwrap_err();
         assert!(
-            format!("{err:#}").contains("repo_slug") || format!("{err:#}").contains("unknown field"),
+            format!("{err:#}").contains("repo_slug")
+                || format!("{err:#}").contains("unknown field"),
             "{err:#}"
         );
     }
@@ -2204,21 +2209,27 @@ allow_overlap = true
     #[test]
     fn repo_config_has_values() {
         assert!(!RepoConfig::default().has_values());
-        assert!(RepoConfig {
-            check_command: Some("x".into()),
-            ..Default::default()
-        }
-        .has_values());
-        assert!(RepoConfig {
-            pr: Some(RepoPrConfig { draft: Some(true) }),
-            ..Default::default()
-        }
-        .has_values());
+        assert!(
+            RepoConfig {
+                check_command: Some("x".into()),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        assert!(
+            RepoConfig {
+                pr: Some(RepoPrConfig { draft: Some(true) }),
+                ..Default::default()
+            }
+            .has_values()
+        );
         // An empty [pr] table (draft = None) is not itself an override.
-        assert!(!RepoConfig {
-            pr: Some(RepoPrConfig { draft: None }),
-            ..Default::default()
-        }
-        .has_values());
+        assert!(
+            !RepoConfig {
+                pr: Some(RepoPrConfig { draft: None }),
+                ..Default::default()
+            }
+            .has_values()
+        );
     }
 }
