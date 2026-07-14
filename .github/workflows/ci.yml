@@ -74,6 +74,52 @@ jobs:
       - name: cargo test --doc
         run: cargo test --doc
 
+  # 獲得スキル配布物のドリフト検知(issue #151 / ADR 0012 §4): 未導入ユーザー向けの
+  # `apm install kkato1030/meguri/skills/meguri` チャネルが、apm のバージョン更新で黙って
+  # 壊れていないかを最小コストで確認する。apm は SHA256 でピンして取得し(ADR 0007 の衛生)、
+  # skills/meguri を各ターゲットへ install して SKILL.md が想定パスに展開されることを assert する。
+  skills-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # apm.lock.yaml の apm_version と揃える。バージョンを上げるときは SHA256 も
+      # リリースの apm-linux-x86_64.tar.gz.sha256 から取り直す。
+      APM_VERSION: 0.24.0
+      APM_SHA256: 54b58a212d66e0de0b71068e7b3b23169af872183de10bc0fc29e006354d63eb
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # curl 取得は README の配布バイナリ手順と同じく SHA256 検証を必須にする(可変タグに頼らない)
+      - name: Install pinned apm
+        run: |
+          set -euo pipefail
+          curl -fsSL -o apm.tar.gz \
+            "https://github.com/microsoft/apm/releases/download/v${APM_VERSION}/apm-linux-x86_64.tar.gz"
+          echo "${APM_SHA256}  apm.tar.gz" | sha256sum -c -
+          tar xzf apm.tar.gz
+          echo "${GITHUB_WORKSPACE}/apm-linux-x86_64" >> "${GITHUB_PATH}"
+
+      # 使い捨て cwd から絶対パスで install する。リポジトリルートで走らせると skills/meguri を
+      # 本体の apm.yml(meguri 開発用)に足してしまうため、必ずルート外の cwd で回す。
+      - name: Verify skills/meguri installs across targets
+        run: |
+          set -euo pipefail
+          apm --version
+          work="$(mktemp -d)"
+          cd "${work}"
+          apm install "${GITHUB_WORKSPACE}/skills/meguri" --target claude,codex,copilot,agent-skills
+          # claude は .claude/skills/ 直下(README の配布コマンドが約束するパス)、
+          # codex/copilot/agent-skills は共有の .agents/skills/ に入る。
+          test -f "${work}/.claude/skills/meguri/SKILL.md"
+          test -f "${work}/.agents/skills/meguri/SKILL.md"
+          echo "acquisition channel intact: skills/meguri -> .claude/skills/ and .agents/skills/"
+
   # ワークフロー静的解析(issue #78): 危険な権限 / pull_request_target / 式インジェクション /
   # 未ピン action 等を検出。指摘があれば job が fail し PR をブロックする。
   zizmor:

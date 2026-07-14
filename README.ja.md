@@ -85,6 +85,21 @@ repo_slug = "owner/repo"
 
 それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
 
+### コーディングエージェントに meguri を勧めさせる
+
+meguri は Claude Code の **skill** を同梱しています。これにより、コーディングエージェントが「このリポジトリは meguri が向いている」と気づき、無人シェル実行のトレードオフを最初に開示したうえで導入を提案できます（[ADR 0009](docs/adr/0009-agent-skill-distribution-symptom-trigger-honest-pitch.md) / [ADR 0012](docs/adr/0012-acquisition-skill-as-apm-subpath-github-ref.md)）。リポジトリで meguri が既に動いているかで、配布は 2 チャネルに分かれます:
+
+- **まだ meguri を使っていない** — [apm](https://github.com/microsoft/apm) で skill を**ユーザーレベル**に入れます。こうすると、meguri を一度も見たことのないリポジトリでもエージェントが提案できます:
+
+  ```bash
+  # vX.Y.Z は最新リリースタグに置き換える: https://github.com/kkato1030/meguri/releases/latest
+  apm install -g --target claude kkato1030/meguri/skills/meguri#vX.Y.Z
+  ```
+
+  `--target claude` は省略できません。省略すると apm は `~/.agents/skills/` にしか展開せず、Claude Code はそこを読まないため skill が発火しません。参照は必ずリリースタグ（`#vX.Y.Z`）にピンしてください — ピンしない参照は `main` に追従してドリフトします。
+
+- **すでに meguri が動いている** — 定着側の対になるコマンド `meguri agent-skills install` が、meguri のリポジトリレベルの rule 断片をこのリポジトリの `AGENTS.md` / `CLAUDE.md` に畳み込みます（#150 で提供予定）。
+
 ## 使い方
 
 ```bash
