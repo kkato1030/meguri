@@ -300,12 +300,19 @@ pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
                 WorkerOutcome::Stopped => {
                     deps.store
                         .update_run_status(run_id, RunStatus::Cancelled, None)?;
-                    if let Some(pane_id) = &run.mux_pane_id {
-                        let _ = deps
-                            .mux
-                            .kill_pane(&crate::mux::PaneId(pane_id.clone()))
-                            .await;
-                    }
+                    // Go through the shared release path (session save +
+                    // mark_pane_reclaimed), like flow::finalize_cancelled —
+                    // not a raw kill_pane off run.mux_pane_id, which used to
+                    // leave the pane row dangling until the next dead-pane
+                    // sweep (issue #169; under the recommended `direct`
+                    // launch mode for cleaner this is a no-op, no live pane).
+                    super::reaper::release_pane(
+                        deps,
+                        run.issue_number,
+                        ROLE_AUTHOR,
+                        "stopped by user",
+                    )
+                    .await;
                     deps.store.emit(Some(run_id), "run.cancelled", json!({}))?;
                 }
                 WorkerOutcome::Interrupted(reason) => {

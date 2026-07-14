@@ -88,6 +88,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
+    /// (no legacy/off state) — a role with no entry here still resolves
+    /// through the built-in recommendation table.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
     /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
     /// presence switches role routing on (see [`routing`]), so a
@@ -404,6 +409,13 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
+    /// Extra args that make the launch non-interactive, for `direct` launch
+    /// mode (issue #169): the full command line is `{command} {args}
+    /// {direct_args} [{resume_args} <session-id>] <trigger>`, run as a plain
+    /// subprocess instead of inside a mux pane. Defaults to Claude Code's
+    /// `-p` (headless one-shot).
+    #[serde(default = "default_agent_direct_args")]
+    pub direct_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -420,6 +432,7 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
+            direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
         }
@@ -447,6 +460,39 @@ pub enum RoutingMode {
     /// Roles absent from `[routing.roles]` resolve to `default`; the
     /// recommendation table is off.
     Manual,
+}
+
+/// How a role's turns are launched (issue #169, ADR 0012): `pane` keeps the
+/// historical live mux pane (a human can attach; the turn engine nudges a
+/// quiet agent); `direct` spawns the agent CLI as a plain subprocess for one
+/// turn and reads its exit + the result file — no pane, no attach, no
+/// nudging. Orthogonal to `[routing]`'s profile axis: this only decides
+/// *how* the chosen profile is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    Pane,
+    Direct,
+}
+
+impl LaunchMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// `[launch]`: role→launch-mode resolution (issue #169). Unlike `[routing]`,
+/// there is no legacy/off state — a role with no explicit entry always
+/// resolves through the built-in recommendation table
+/// ([`crate::launch::recommended_mode`]); an explicit `[launch.roles]` entry
+/// always wins over it. See `crate::launch`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchConfig {
+    #[serde(default)]
+    pub roles: HashMap<String, LaunchMode>,
 }
 
 /// `[routing]`: role→profile resolution. Present = routing is active (auto or
@@ -513,6 +559,10 @@ fn default_agent_args() -> Vec<String> {
 
 fn default_agent_resume_args() -> Vec<String> {
     vec!["--resume".into()]
+}
+
+fn default_agent_direct_args() -> Vec<String> {
+    vec!["-p".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

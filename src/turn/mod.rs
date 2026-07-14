@@ -1,10 +1,17 @@
-//! The turn engine: drive one agent turn inside a mux pane to completion,
-//! tolerating (and expecting) human intervention at any point.
+//! The turn engine: drive one agent turn to completion, tolerating (and
+//! expecting) human intervention at any point. Two executors share the same
+//! completion authority — the result file (`.meguri/result.json` with a
+//! matching turn id) — never the screen:
 //!
-//! Completion authority is the result file (`.meguri/result.json` with a
-//! matching turn id) — never the screen. Mux agent state refines behavior:
-//! Blocked pauses timers and pings a human; Working defers acceptance
-//! briefly; Idle feeds the stagnation clock that triggers nudges.
+//! - [`TurnEngine::await_completion`] (pane launch mode): the agent lives in
+//!   a mux pane. Mux agent state refines behavior — Blocked pauses timers and
+//!   pings a human; Working defers acceptance briefly; Idle feeds the
+//!   stagnation clock that triggers nudges.
+//! - [`TurnEngine::await_completion_direct`] (direct launch mode, issue
+//!   #169): the agent is a plain non-interactive subprocess for exactly one
+//!   turn. There is no screen to read, no nudging (nothing to type into), no
+//!   Blocked state — the executor only waits for the process to exit, then
+//!   reads the result file.
 
 pub mod prompts;
 
@@ -57,7 +64,10 @@ pub enum TurnOutcome {
     Completed(TurnResultFile),
     /// `meguri stop` was requested; caller cleans up.
     Stopped,
-    /// The pane (or its process) died before completing.
+    /// The executor died before completing: a pane died (pane launch mode),
+    /// or a direct subprocess exited without writing a matching result file
+    /// (direct launch mode, issue #169). Both map to the same Interrupted
+    /// handling upstream — callers never need to know which executor ran.
     PaneDied,
 }
 
@@ -287,6 +297,72 @@ impl TurnEngine {
                             "turn_id": turn_id,
                             "reason": "runtime_budget_exceeded",
                             "attach": self.mux.attach_command(pane),
+                        }),
+                    )
+                    .await;
+            }
+
+            tokio::time::sleep(self.cfg.poll_interval).await;
+        }
+    }
+
+    /// Wait for a direct-mode turn (issue #169) to finish: watch `child`
+    /// until it exits, then read the result file. There is no pane, so no
+    /// agent-state polling and no nudging (nothing interactive to nudge);
+    /// `Blocked` cannot happen (the CLI runs non-interactively, e.g.
+    /// `claude -p`, and never shows a permission prompt). `meguri stop` kills
+    /// the subprocess; `Paused`/`Takeover` have no pane to hand a human, so
+    /// both just keep waiting.
+    pub async fn await_completion_direct(
+        &self,
+        mut child: tokio::process::Child,
+        worktree: &Path,
+        turn_id: &str,
+        control: &dyn TurnControl,
+    ) -> Result<TurnOutcome> {
+        control
+            .set_interaction(InteractionState::AgentWorking)
+            .await;
+
+        let mut runtime_clock = Duration::ZERO;
+        let mut escalated = false;
+
+        loop {
+            if let Some(DesiredState::Stopped) = control.desired().await {
+                let _ = child.start_kill();
+                control
+                    .event("turn.stopped", json!({ "turn_id": turn_id }))
+                    .await;
+                return Ok(TurnOutcome::Stopped);
+            }
+
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    if let Some(result) = prompts::read_result(worktree, turn_id) {
+                        return self.complete(control, turn_id, result).await;
+                    }
+                    control
+                        .event("turn.pane_died", json!({ "turn_id": turn_id }))
+                        .await;
+                    return Ok(TurnOutcome::PaneDied);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e.into()),
+            }
+
+            runtime_clock += self.cfg.poll_interval;
+            if !escalated && runtime_clock >= self.cfg.max_turn_runtime {
+                escalated = true;
+                control
+                    .set_interaction(InteractionState::AwaitingHuman)
+                    .await;
+                control
+                    .event(
+                        "turn.awaiting_human",
+                        json!({
+                            "turn_id": turn_id,
+                            "reason": "runtime_budget_exceeded",
+                            "attach": "no pane (direct launch mode) — see `meguri ps`",
                         }),
                     )
                     .await;

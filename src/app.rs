@@ -95,6 +95,7 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
+    crate::launch::validate(&cfg)?;
     let project = pick_project(&cfg, project)?;
     if project.mode == ProjectMode::Local {
         bail!(
@@ -158,6 +159,7 @@ pub async fn cmd_watch() -> Result<()> {
     let mut reloader = config::ConfigReloader::load(&config::config_path())?;
     let cfg = reloader.current().clone();
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
+    crate::launch::validate(&cfg)?;
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
@@ -594,10 +596,16 @@ pub fn cmd_ps(all: bool) -> Result<()> {
         println!("no {}runs", if all { "" } else { "active " });
         return Ok(());
     }
+    // Workspace grouping (issue #154) is display-only and opt-in: with no
+    // workspaces configured — or an unreadable config — the listing is exactly
+    // as before (acceptance criterion 5). The same config also resolves each
+    // run's launch mode (issue #169) — unreadable config falls back to "-"
+    // rather than guessing.
+    let cfg = Config::load().ok();
     let print_header = || {
         println!(
-            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} PANE",
-            "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE"
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {:<7} PANE",
+            "RUN", "PROJECT", "TARGET", "STATUS", "INTERACTION", "STEP", "PROFILE", "MODE"
         );
     };
     let print_row = |run: &RunRecord| {
@@ -607,8 +615,12 @@ pub fn cmd_ps(all: bool) -> Result<()> {
             crate::tasks::TaskKey::Issue(n) => format!("#{n}"),
             crate::tasks::TaskKey::Local(id) => format!("t{id}"),
         };
+        let mode = cfg.as_ref().map_or("-", |c| {
+            crate::launch::resolve(c, crate::routing::routing_role_for_loop(&run.loop_kind))
+                .as_str()
+        });
         println!(
-            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {}",
+            "{:<14} {:<8} {:>6}  {:<12} {:<16} {:<10} {:<14} {:<7} {}",
             run.id,
             run.project_id,
             target,
@@ -616,14 +628,11 @@ pub fn cmd_ps(all: bool) -> Result<()> {
             run.interaction_state.map(|s| s.as_str()).unwrap_or("-"),
             run.step,
             run.agent_profile.as_deref().unwrap_or("-"),
+            mode,
             run.mux_pane_id.as_deref().unwrap_or("-"),
         );
     };
 
-    // Workspace grouping (issue #154) is display-only and opt-in: with no
-    // workspaces configured — or an unreadable config — the listing is exactly
-    // as before (acceptance criterion 5).
-    let cfg = Config::load().ok();
     let groups = group_by_workspace(cfg.as_ref(), &runs);
     match groups {
         None => {

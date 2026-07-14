@@ -185,8 +185,9 @@ pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
     }
 }
 
-/// Map a (possibly deprecated) config role key to its canonical name.
-fn canonical_role(role: &str) -> &str {
+/// Map a (possibly deprecated) config role key to its canonical name. Shared
+/// with `crate::launch`, which resolves the same 6-role vocabulary.
+pub(crate) fn canonical_role(role: &str) -> &str {
     DEPRECATED_ROLE_ALIASES
         .iter()
         .find(|(old, _)| *old == role)
@@ -222,6 +223,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "opus".into(),
             ],
             resume_args: vec!["--resume".into()],
+            direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
         },
@@ -236,6 +238,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "sonnet".into(),
             ],
             resume_args: vec!["--resume".into()],
+            direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
         },
@@ -246,6 +249,9 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             command: "codex".into(),
             args: vec!["--yolo".into()],
             resume_args: vec!["resume".into()],
+            // codex's non-interactive one-shot form is the `exec` subcommand
+            // (mirrors `resume_args` also being a bare subcommand).
+            direct_args: vec!["exec".into()],
             herdr_agent_hint: None,
             session_dir: None,
         },
