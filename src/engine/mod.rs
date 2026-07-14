@@ -21,9 +21,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
-use crate::config::{Config, ProjectConfig};
-use crate::forge::{Forge, PullRequest};
+use crate::config::{Config, PlanDelivery, ProjectConfig};
+use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
 use crate::notify::{Notification, Notifier};
@@ -55,6 +56,11 @@ pub struct Deps {
     pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
+    /// Per-tick cache of `list_open_prs`, shared by the fixer-family loops
+    /// (fixer / ci_fixer / conflict_resolver) so their discovery costs the
+    /// forge one call per project per tick instead of three (issue #170).
+    /// `Scheduler` clears it at the top of every tick; see [`OpenPrCache`].
+    pub open_prs: OpenPrCache,
 }
 
 impl Deps {
@@ -87,6 +93,7 @@ impl Deps {
             forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
+            open_prs: OpenPrCache::default(),
         }
     }
 
@@ -106,6 +113,97 @@ impl Deps {
             .as_ref()
             .expect("forge is required for this loop (github mode)")
     }
+}
+
+/// Per-tick cache of `list_open_prs` (issue #170): lazily filled by whichever
+/// fixer-family loop's `discover` runs first for a project this tick, reused
+/// by the other two, and reset by `Scheduler::discover` at the top of the
+/// next tick. Mirrors `reaper::IssueStates`, adapted to `Deps`'s shape — one
+/// `Deps` per project rather than a map keyed by id, so a bare `Mutex<Option<_>>`
+/// behind a cheap-to-clone `Arc` is enough.
+#[derive(Clone, Default)]
+pub struct OpenPrCache(Arc<Mutex<Option<Vec<PullRequest>>>>);
+
+impl OpenPrCache {
+    /// The project's open PRs: the cached list if this tick already fetched
+    /// one, otherwise one `list_open_prs` call that fills the cache.
+    pub async fn get(&self, deps: &Deps) -> Result<Vec<PullRequest>> {
+        let mut cached = self.0.lock().await;
+        if let Some(prs) = cached.as_ref() {
+            return Ok(prs.clone());
+        }
+        let prs = deps.forge().list_open_prs().await?;
+        *cached = Some(prs.clone());
+        Ok(prs)
+    }
+
+    /// Drop the cached list so the next tick's first caller re-fetches.
+    pub async fn clear(&self) {
+        *self.0.lock().await = None;
+    }
+}
+
+/// Head-branch prefix identifying meguri's own PRs — the fixer-family loops
+/// (fixer / ci_fixer / conflict_resolver) only ever touch work meguri opened.
+pub(crate) const MEGURI_BRANCH_PREFIX: &str = "meguri/";
+
+/// Whether the project uses combined plan delivery (ADR 0008) — the mode in
+/// which a `spec-ready` PR's branch belongs to the spec worker, so no
+/// fixer-family loop may touch it.
+pub(crate) fn is_combined(deps: &Deps) -> bool {
+    deps.project.plan_delivery == PlanDelivery::Combined
+}
+
+/// Whether a fixer-family loop (fixer / ci_fixer / conflict_resolver) may
+/// touch `pr` at all, independent of the loop's own symptom (review threads /
+/// red CI / conflicts). The three loops used to carry near-identical copies
+/// of this guard, which let them drift apart silently: conflict_resolver's
+/// copy never gained the `spec-ready` gate the other two got under ADR 0008
+/// (issue #170) — a resolver could merge the base into a branch the spec
+/// worker still owned. Lifted here so the shared gates cannot drift again;
+/// only each loop's own symptom check stays outside.
+///
+/// `skip_spec_ready` is the one gate that legitimately varies: pass
+/// `is_combined(deps)`. Under combined delivery a `spec-ready` PR's branch
+/// belongs to the spec worker's takeover (ADR 0008 §6), so no fixer-family
+/// loop may touch it; under separate delivery the spec worker never takes
+/// the branch over, so a `spec-ready` spec/ADR PR is a standalone PR like any
+/// other.
+pub fn pr_is_touchable(pr: &PullRequest, skip_spec_ready: bool) -> Option<String> {
+    if pr.state != "open" {
+        return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
+    }
+    if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
+        return Some(format!(
+            "PR #{} head `{}` was not opened by meguri",
+            pr.number, pr.head_branch
+        ));
+    }
+    if skip_spec_ready && pr.has_label(forge::LABEL_SPEC_READY) {
+        return Some(format!(
+            "PR #{} is {} (the spec worker owns the branch)",
+            pr.number,
+            forge::LABEL_SPEC_READY
+        ));
+    }
+    if pr.has_label(forge::LABEL_HOLD) {
+        return Some(format!("PR #{} is on hold", pr.number));
+    }
+    if pr.has_label(forge::LABEL_WORKING) {
+        return Some(format!(
+            "PR #{} is already claimed ({})",
+            pr.number,
+            forge::LABEL_WORKING
+        ));
+    }
+    if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
+        return Some(format!(
+            "PR #{} is escalated ({})",
+            pr.number,
+            forge::LABEL_NEEDS_HUMAN
+        ));
+    }
+    None
 }
 
 /// A unit of work a loop wants a run for: the task to drive. The `key` is the
@@ -357,5 +455,116 @@ mod tests {
         ] {
             assert_eq!(role_for_loop(kind), ROLE_AUTHOR, "loop: {kind}");
         }
+    }
+
+    #[test]
+    fn touchable_guards_state_ownership_and_claim_labels() {
+        let base = pr(3, "meguri/9-add-feature-abc123", "");
+        assert!(pr_is_touchable(&base, true).is_none());
+
+        let merged = PullRequest {
+            state: "merged".into(),
+            ..base.clone()
+        };
+        assert!(pr_is_touchable(&merged, true).unwrap().contains("merged"));
+
+        let human = PullRequest {
+            head_branch: "feature/manual".into(),
+            ..base.clone()
+        };
+        assert!(
+            pr_is_touchable(&human, true)
+                .unwrap()
+                .contains("not opened by meguri")
+        );
+
+        // spec-ready: skipped only under combined delivery (the spec worker
+        // owns the branch); an ordinary standalone PR under separate (ADR
+        // 0008 §6, issue #170).
+        let spec_ready = PullRequest {
+            labels: vec![forge::LABEL_SPEC_READY.to_string()],
+            ..base.clone()
+        };
+        assert!(
+            pr_is_touchable(&spec_ready, true)
+                .unwrap()
+                .contains(forge::LABEL_SPEC_READY)
+        );
+        assert!(
+            pr_is_touchable(&spec_ready, false).is_none(),
+            "separate delivery: a spec-ready PR is touchable"
+        );
+
+        let held = PullRequest {
+            labels: vec![forge::LABEL_HOLD.to_string()],
+            ..base.clone()
+        };
+        assert!(pr_is_touchable(&held, true).unwrap().contains("hold"));
+
+        let working = PullRequest {
+            labels: vec![forge::LABEL_WORKING.to_string()],
+            ..base.clone()
+        };
+        assert!(
+            pr_is_touchable(&working, true)
+                .unwrap()
+                .contains(forge::LABEL_WORKING)
+        );
+
+        let needs_human = PullRequest {
+            labels: vec![forge::LABEL_NEEDS_HUMAN.to_string()],
+            ..base
+        };
+        assert!(
+            pr_is_touchable(&needs_human, true)
+                .unwrap()
+                .contains(forge::LABEL_NEEDS_HUMAN)
+        );
+    }
+
+    #[tokio::test]
+    async fn open_pr_cache_fetches_once_per_project_per_tick() {
+        use crate::mux::fake::FakeMux;
+
+        let forge = Arc::new(crate::forge::fake::FakeForge::default());
+        forge.push_pr("meguri/9-add-feature-abc123", "Add feature (#9)", &[]);
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: "/tmp/unused".into(),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            prompts: Default::default(),
+        };
+        let deps = Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(FakeMux::new(false)),
+            forge.clone(),
+            Config::default(),
+            project,
+        );
+
+        let first = deps.open_prs.get(&deps).await.unwrap();
+        assert_eq!(first.len(), 1);
+        // A second PR appears on the forge mid-tick: the cache must not see
+        // it until cleared, proving the three fixer-family loops would share
+        // one fetch this tick.
+        forge.push_pr("meguri/10-other-def456", "Other (#10)", &[]);
+        let second = deps.open_prs.get(&deps).await.unwrap();
+        assert_eq!(second.len(), 1, "cached list reused within the tick");
+
+        deps.open_prs.clear().await;
+        let third = deps.open_prs.get(&deps).await.unwrap();
+        assert_eq!(third.len(), 2, "next tick re-fetches");
     }
 }

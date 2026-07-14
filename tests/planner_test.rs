@@ -97,6 +97,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -612,6 +613,7 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
     let sibling_project = ProjectConfig {
         id: "sib".into(),

@@ -186,8 +186,9 @@ pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
 }
 
 /// Map a (possibly deprecated) config role key to its canonical name. Shared
-/// with `crate::launch`, which resolves the same 6-role vocabulary.
-pub(crate) fn canonical_role(role: &str) -> &str {
+/// with `crate::launch` (same 6-role vocabulary) and public so `config` can
+/// canonicalize `[prompts]` keys the same way (issue #149).
+pub fn canonical_role(role: &str) -> &str {
     DEPRECATED_ROLE_ALIASES
         .iter()
         .find(|(old, _)| *old == role)

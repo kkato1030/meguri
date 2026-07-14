@@ -130,12 +130,28 @@ When you have FULLY completed the task above, write a JSON file at
 }
 
 /// Write the full prompt file for a turn; returns its path.
-pub fn write_prompt_file(worktree: &Path, turn_id: &str, body: &str) -> Result<PathBuf> {
+///
+/// `preamble` is the project's standing-discipline block (issue #149): when
+/// non-empty it is placed right after the header and before `{body}`, so it
+/// reads as a preface while the completion contract stays last and
+/// authoritative. An empty `preamble` yields byte-for-byte the historical
+/// output.
+pub fn write_prompt_file(
+    worktree: &Path,
+    turn_id: &str,
+    body: &str,
+    preamble: &str,
+) -> Result<PathBuf> {
     let dir = meguri_dir(worktree);
     std::fs::create_dir_all(&dir)?;
     let path = prompt_path(worktree, turn_id);
+    let preamble_block = if preamble.is_empty() {
+        String::new()
+    } else {
+        format!("{preamble}\n\n")
+    };
     let content = format!(
-        "<!-- meguri prompt -->\nturn_id: {turn_id}\n\n{body}\n\n{contract}\n",
+        "<!-- meguri prompt -->\nturn_id: {turn_id}\n\n{preamble_block}{body}\n\n{contract}\n",
         contract = completion_contract(turn_id)
     );
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
@@ -178,7 +194,7 @@ mod tests {
     #[test]
     fn prompt_file_contains_contract_and_turn_id() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_prompt_file(dir.path(), "abc-123", "Implement the thing.").unwrap();
+        let path = write_prompt_file(dir.path(), "abc-123", "Implement the thing.", "").unwrap();
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("turn_id: abc-123"));
         assert!(content.contains("Implement the thing."));
@@ -187,6 +203,42 @@ mod tests {
         assert!(content.contains("pr_body"));
         assert!(content.contains("subject"));
         assert!(content.contains("agent_session_id"));
+    }
+
+    #[test]
+    fn empty_preamble_leaves_output_unchanged() {
+        // The whole point of the empty-preamble path: a project with no
+        // `[prompts]` config gets byte-for-byte the historical prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let with = write_prompt_file(dir.path(), "t", "Body here.", "").unwrap();
+        let content = std::fs::read_to_string(with).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "<!-- meguri prompt -->\nturn_id: t\n\nBody here.\n\n{}\n",
+                completion_contract("t")
+            )
+        );
+    }
+
+    #[test]
+    fn preamble_sits_before_body_and_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_file(
+            dir.path(),
+            "t",
+            "ISSUE BODY",
+            "## 恒常規律\nRead the guardrails.",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        let preamble_at = content.find("恒常規律").unwrap();
+        let body_at = content.find("ISSUE BODY").unwrap();
+        let contract_at = content.find("Completion contract").unwrap();
+        // preamble before the issue body, and the completion contract stays
+        // last so it keeps final authority (ADR 0012).
+        assert!(preamble_at < body_at, "preamble must precede the body");
+        assert!(body_at < contract_at, "contract must stay last");
     }
 
     #[test]

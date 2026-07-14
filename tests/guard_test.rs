@@ -132,6 +132,7 @@ async fn setup_with(labels: &[&str], impl_guard: bool, tweak: impl FnOnce(&mut C
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
 
     let mux = Arc::new(FakeMux::new(false));

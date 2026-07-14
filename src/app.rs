@@ -73,6 +73,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
         config: cfg.clone(),
         project: project.clone(),
+        open_prs: Default::default(),
     })
 }
 

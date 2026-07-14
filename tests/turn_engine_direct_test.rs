@@ -78,7 +78,7 @@ fn sh_child(worktree: &std::path::Path, script: &str) -> tokio::process::Child {
 #[tokio::test]
 async fn completes_when_the_process_exits_with_a_matching_result() {
     let dir = tempfile::tempdir().unwrap();
-    let prepared = prepare_turn(dir.path(), "do the thing").unwrap();
+    let prepared = prepare_turn(dir.path(), "do the thing", "").unwrap();
     let control = FakeControl::new();
 
     let child = sh_child(
@@ -108,7 +108,7 @@ async fn completes_when_the_process_exits_with_a_matching_result() {
 #[tokio::test]
 async fn exiting_without_a_result_maps_to_pane_died() {
     let dir = tempfile::tempdir().unwrap();
-    let prepared = prepare_turn(dir.path(), "do the thing").unwrap();
+    let prepared = prepare_turn(dir.path(), "do the thing", "").unwrap();
     let control = FakeControl::new();
 
     // The subprocess exits (e.g. the CLI crashed) without writing the result
@@ -126,7 +126,7 @@ async fn exiting_without_a_result_maps_to_pane_died() {
 #[tokio::test]
 async fn stop_kills_the_subprocess() {
     let dir = tempfile::tempdir().unwrap();
-    let prepared = prepare_turn(dir.path(), "do the thing").unwrap();
+    let prepared = prepare_turn(dir.path(), "do the thing", "").unwrap();
     let control = FakeControl::new();
     *control.desired.lock().unwrap() = Some(DesiredState::Stopped);
 
@@ -143,7 +143,7 @@ async fn stop_kills_the_subprocess() {
 #[tokio::test]
 async fn runtime_budget_escalates_without_killing() {
     let dir = tempfile::tempdir().unwrap();
-    let prepared = prepare_turn(dir.path(), "do the thing").unwrap();
+    let prepared = prepare_turn(dir.path(), "do the thing", "").unwrap();
     let control = FakeControl::new();
     let mut cfg = fast_cfg();
     cfg.max_turn_runtime = Duration::from_millis(60);
