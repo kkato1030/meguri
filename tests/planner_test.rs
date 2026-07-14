@@ -97,6 +97,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
 
@@ -613,6 +614,7 @@ async fn setup_cross_repo() -> (TestEnv, Arc<FakeForge>) {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     let sibling_project = ProjectConfig {

@@ -696,7 +696,14 @@ pub enum PreparedWork {
 /// second host took it) — so skip, don't escalate.
 async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result<PreparedWork> {
     let key = run.task_key();
-    match deps.task_source.claim(&key, tasks::LOCAL_HOST).await? {
+    // Pass the bucket the run was stamped with at creation so the label source
+    // can reject a claim whose issue no longer belongs to that cadence bucket
+    // (issue #148) — a benign race, like a de-labeled trigger.
+    match deps
+        .task_source
+        .claim(&key, tasks::LOCAL_HOST, run.cadence_label.as_deref())
+        .await?
+    {
         Some(task) => {
             // Carry the auto-merge opt-in from the issue to the PR (auto-merge
             // 1/3, #41): recorded now, applied in open-pr (non-draft + label
@@ -2339,6 +2346,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         let deps = Deps::with_label_source(

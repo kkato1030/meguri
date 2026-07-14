@@ -204,6 +204,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     let deps = Deps::with_label_source(
@@ -462,6 +463,7 @@ async fn drive_worker_scenario(
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
     let store = Store::open_in_memory().unwrap();

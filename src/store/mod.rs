@@ -60,11 +60,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_schedules",
         include_str!("migrations/0010_schedules.sql"),
     ),
+    // issue #148: cadence — runs.cadence_label + tasks.not_before + an index
+    // for the window COUNT. Simple ALTERs; runs was already recreated by 0007.
+    ("0011_cadence", include_str!("migrations/0011_cadence.sql")),
     // routing 3/3 (#66): runs.routing_arm — mainline / explore / escalated.
-    // A single ADD COLUMN on the runs table recreated by 0007_tasks.
+    // A single ADD COLUMN on the runs table recreated by 0007_tasks. Renumbered
+    // to 0012 after main claimed 0011 for cadence; an independent ALTER, so the
+    // order relative to 0011_cadence doesn't matter.
     (
-        "0011_routing_arm",
-        include_str!("migrations/0011_routing_arm.sql"),
+        "0012_routing_arm",
+        include_str!("migrations/0012_routing_arm.sql"),
     ),
 ];
 

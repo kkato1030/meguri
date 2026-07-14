@@ -22,6 +22,10 @@ pub struct TaskRow {
     pub claimed_by: Option<String>,
     pub lease_until: Option<String>,
     pub created_at: String,
+    /// Earliest start instant (issue #148, RFC3339 UTC), the local counterpart
+    /// of the github not-before body marker. NULL = no gate. `discover` skips
+    /// the task while this is in the future.
+    pub not_before: Option<String>,
 }
 
 fn task_from_row(row: &Row<'_>) -> rusqlite::Result<TaskRow> {
@@ -37,6 +41,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<TaskRow> {
         claimed_by: row.get("claimed_by")?,
         lease_until: row.get("lease_until")?,
         created_at: row.get("created_at")?,
+        not_before: row.get("not_before")?,
     })
 }
 
@@ -51,11 +56,27 @@ impl Store {
         body: &str,
         origin: &str,
     ) -> Result<TaskRow> {
+        self.create_task_with_not_before(project_id, kind, title, body, origin, None)
+    }
+
+    /// Queue a task with an optional `not_before` gate (issue #148,
+    /// `meguri add --not-before`). `not_before` is a normalized RFC3339 UTC
+    /// instant; `discover` skips the task until it passes.
+    pub fn create_task_with_not_before(
+        &self,
+        project_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        origin: &str,
+        not_before: Option<&str>,
+    ) -> Result<TaskRow> {
         let id = self.with_conn(|c| {
             c.execute(
-                "INSERT INTO tasks (project_id, kind, title, body, origin, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-                params![project_id, kind, title, body, origin, now()],
+                "INSERT INTO tasks (project_id, kind, title, body, origin, status,
+                                    created_at, not_before)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                params![project_id, kind, title, body, origin, now(), not_before],
             )?;
             Ok(c.last_insert_rowid())
         })?;
@@ -181,6 +202,28 @@ mod tests {
         assert_eq!(open[0].title, "Do a thing");
         // Scoped by project.
         assert!(store.list_tasks("other", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn not_before_is_persisted_and_read_back() {
+        let store = Store::open_in_memory().unwrap();
+        let plain = store.create_task("proj", "work", "t", "", "local").unwrap();
+        assert_eq!(plain.not_before, None);
+
+        let gated = store
+            .create_task_with_not_before(
+                "proj",
+                "work",
+                "t",
+                "",
+                "local",
+                Some("2026-07-20T00:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(gated.not_before.as_deref(), Some("2026-07-20T00:00:00Z"));
+        // Survives a re-read (discover keys off this field).
+        let got = store.get_task(gated.id).unwrap().unwrap();
+        assert_eq!(got.not_before.as_deref(), Some("2026-07-20T00:00:00Z"));
     }
 
     #[test]
