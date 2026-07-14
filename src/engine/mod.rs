@@ -14,6 +14,7 @@ pub mod reconcile;
 pub mod routing_drift;
 pub mod scheduler;
 pub mod scheduler_fire;
+pub mod spec_fixer;
 pub mod spec_worker;
 pub mod worker;
 
@@ -342,6 +343,9 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
         Arc::new(conflict_resolver::ConflictResolverLoop),
         Arc::new(ci_fixer::CiFixerLoop),
         Arc::new(fixer::FixerLoop),
+        // Plan-side fixer family (issue #188): unparks spec PRs the plan guard
+        // flagged, so it sits with the other fixers, above new-work loops.
+        Arc::new(spec_fixer::SpecFixerLoop),
         Arc::new(spec_worker::SpecWorkerLoop),
         Arc::new(guard::GuardLoop),
         Arc::new(worker::WorkerLoop),
@@ -448,6 +452,7 @@ mod tests {
             "worker",
             "planner",
             "spec-worker",
+            "spec-fixer",
             "fixer",
             "ci-fixer",
             "conflict-resolver",
@@ -455,6 +460,19 @@ mod tests {
         ] {
             assert_eq!(role_for_loop(kind), ROLE_AUTHOR, "loop: {kind}");
         }
+    }
+
+    #[test]
+    fn spec_fixer_sits_in_the_fixer_family_above_new_work() {
+        // Registration order is priority (issue #188): the spec-fixer must
+        // unpark a spec PR before the worker/planner start new work, and it
+        // belongs after the fixer, with the guard/worker/planner behind it.
+        let kinds: Vec<&str> = default_loops().iter().map(|l| l.kind()).collect();
+        let pos = |k: &str| kinds.iter().position(|x| *x == k).expect(k);
+        assert!(pos("fixer") < pos("spec-fixer"));
+        assert!(pos("spec-fixer") < pos("spec-worker"));
+        assert!(pos("spec-fixer") < pos("worker"));
+        assert!(pos("spec-fixer") < pos("planner"));
     }
 
     #[test]
