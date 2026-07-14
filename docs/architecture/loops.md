@@ -18,8 +18,11 @@ meguri の loop についての説明は今まで2系統に散らばっていた
 入口は2つ — `meguri:plan`(spec 先行、opt-in)と `meguri:ready`(直行)。ADR 0008 でこの2つの
 実装 diff の担保は対称になった: どちらの経路も、実装 diff を積む loop(直行の worker、または
 spec 先行で実装を担う worker/spec_worker)は forge に触れない内部 self-review(独立 lane、
-ADR 0006)を通ってから PR を開き、加えて opt-in の `pr_reviewer`(kind = Impl)が外部 GitHub
-レビューを任意で載せられる([ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md))。
+ADR 0006)を通ってから、その diff を PR として世に出す — ただし出し方は loop によって違う。
+worker(直行/separate)は self-review の後に**新規 PR を open** するが、combined の
+spec_worker は新規 PR を作らず、self-review の後に**既存の spec PR を通常の実装 PR として
+進める**(`meguri:spec-ready` ラベルを外すだけ)。加えて opt-in の `pr_reviewer`(kind = Impl)が
+外部 GitHub レビューを任意で載せられる([ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md))。
 spec 先行経路はさらに
 `plan_delivery` 設定(`separate` | `combined`)で二手に分かれる: **separate**(既定)は spec PR と
 実装 PR を別々に完結させ、`plan_handoff.sweep` が両者を橋渡しする。**combined** は
