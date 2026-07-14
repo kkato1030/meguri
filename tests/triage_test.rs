@@ -503,3 +503,45 @@ async fn ignore_list_silences_recommendations() {
     assert!(report.body.contains("_No open issues to triage._"));
     assert!(parse_triage_marker(&report.body).is_some());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_report_is_corrected_then_succeeds() {
+    let env = setup().await;
+    // A second unlabeled candidate, so an under-report can drop one.
+    env.forge.issues.lock().unwrap().push(Issue {
+        number: 61,
+        title: "second".into(),
+        body: "also untriaged".into(),
+        labels: vec![],
+    });
+
+    let run = create_triage_run(&env, 0);
+    // First turn covers only #60 (drops #61 → coverage correction); the
+    // corrective turn covers both and the run then succeeds.
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |n, wt, turn_id| {
+        if n == 1 {
+            write_report(wt, READY_REC);
+        } else {
+            write_report(
+                wt,
+                r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                    "estimated_complexity": "small", "rationale": "clear", "missing_info": null},
+                   {"issue": 61, "recommendation": "plan", "confidence": 0.5,
+                    "estimated_complexity": "large", "rationale": "vague", "missing_info": null}]"#,
+            );
+        }
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    let turns = agent.await.unwrap();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    assert!(turns >= 2, "expected a corrective turn, saw {turns}");
+
+    // Both candidates made it into the final report.
+    let report = report_issue(&env).await.unwrap();
+    assert!(report.body.contains("| #60 | ready"), "{}", report.body);
+    assert!(report.body.contains("| #61 | plan"), "{}", report.body);
+}

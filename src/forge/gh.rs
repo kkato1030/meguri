@@ -348,23 +348,30 @@ impl Forge for GhForge {
     }
 
     async fn list_open_issues(&self) -> Result<Vec<Issue>> {
+        // Triage's contract is to see *every* untriaged open issue, so this
+        // must not truncate the way `gh issue list --limit N` does — an old,
+        // low-numbered unlabeled issue past the cap would never be triaged, and
+        // `max_open_issue` would read a subset. `gh api --paginate` follows the
+        // Link headers and merges every page into one array. The REST issues
+        // endpoint returns PRs too (a PR is an issue there), so drop anything
+        // carrying a `pull_request` object; its JSON shape (number/title/body,
+        // `labels[].name`) is exactly what `issue_from_json` already reads.
         let raw = self
             .gh(&[
-                "issue",
-                "list",
-                "--repo",
-                &self.repo,
-                "--state",
-                "open",
-                "--limit",
-                "50",
-                "--json",
-                "number,title,body,labels",
+                "api",
+                "--paginate",
+                &format!("repos/{}/issues?state=open&per_page=100", self.repo),
             ])
             .await?;
-        let v: Value = serde_json::from_str(&raw).context("parsing gh issue list output")?;
+        let v: Value = serde_json::from_str(&raw).context("parsing gh api issues output")?;
         Ok(v.as_array()
-            .map(|items| items.iter().filter_map(Self::issue_from_json).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|it| it.get("pull_request").is_none())
+                    .filter_map(Self::issue_from_json)
+                    .collect()
+            })
             .unwrap_or_default())
     }
 

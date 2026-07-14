@@ -621,6 +621,52 @@ fn read_report(worktree: &Path) -> std::result::Result<TriageReportFile, String>
     })
 }
 
+/// Verify the report covers exactly the issues it was asked to triage: one
+/// recommendation per candidate, no duplicates, none for an issue outside the
+/// list. Returns a corrective message otherwise — without this a report that
+/// silently drops (or invents) issues would still be accepted, and settle would
+/// advance the marker over the dropped issues, leaving them un-triaged until the
+/// head or issue set next moves. Only called with a non-empty candidate set (an
+/// empty one is short-circuited before the agent runs).
+fn coverage_problem(candidates: &[Issue], recs: &[TriageItem]) -> Option<String> {
+    use std::collections::BTreeSet;
+    let expected: BTreeSet<i64> = candidates.iter().map(|i| i.number).collect();
+    let mut seen: BTreeSet<i64> = BTreeSet::new();
+    let mut duplicate: BTreeSet<i64> = BTreeSet::new();
+    let mut out_of_scope: BTreeSet<i64> = BTreeSet::new();
+    for r in recs {
+        if !expected.contains(&r.issue) {
+            out_of_scope.insert(r.issue);
+        } else if !seen.insert(r.issue) {
+            duplicate.insert(r.issue);
+        }
+    }
+    let missing: Vec<i64> = expected.difference(&seen).copied().collect();
+    if missing.is_empty() && duplicate.is_empty() && out_of_scope.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("no recommendation for issue(s) {missing:?}"));
+    }
+    if !duplicate.is_empty() {
+        let d: Vec<i64> = duplicate.into_iter().collect();
+        parts.push(format!("more than one recommendation for issue(s) {d:?}"));
+    }
+    if !out_of_scope.is_empty() {
+        let o: Vec<i64> = out_of_scope.into_iter().collect();
+        parts.push(format!(
+            "a recommendation for issue(s) {o:?} that were not in the triage list"
+        ));
+    }
+    Some(format!(
+        "- the report must cover exactly the issues listed for triage, one \
+         recommendation each: {}. Fix `{REPORT_FILE}` to include every listed \
+         issue exactly once and none other.",
+        parts.join("; ")
+    ))
+}
+
 enum ExecuteFlow {
     Verified,
     Stopped,
@@ -685,7 +731,8 @@ async fn execute(
         }
 
         // Trust but verify: the checkout must be pristine and still at the
-        // claimed head, and the report file must parse.
+        // claimed head, the report file must parse, and it must cover exactly
+        // the issues we asked about.
         let clean = gitops::status_clean(worktree).await?;
         let head_now = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
         let problem = if !clean || head_now != cp.head_sha {
@@ -698,7 +745,10 @@ async fn execute(
                 expected = cp.head_sha,
             ))
         } else {
-            read_report(worktree).err()
+            match read_report(worktree) {
+                Err(e) => Some(e),
+                Ok(report) => coverage_problem(&candidates, &report.recommendations),
+            }
         };
         let Some(problem) = problem else {
             let report = read_report(worktree).expect("verified above");
@@ -1090,6 +1140,44 @@ mod tests {
         let prompt = execute_prompt(&candidates, "deadbeef", Some("日本語"));
         assert!(prompt.contains("# Output language"));
         assert!(prompt.contains("日本語"));
+    }
+
+    #[test]
+    fn coverage_flags_missing_duplicate_and_out_of_scope() {
+        let candidate = |n: i64| Issue {
+            number: n,
+            title: "t".into(),
+            body: String::new(),
+            labels: vec![],
+        };
+        let candidates = vec![candidate(60), candidate(70)];
+        let rec = |n: i64| TriageItem {
+            issue: n,
+            recommendation: Recommendation::Ready,
+            confidence: 0.5,
+            estimated_complexity: Complexity::Small,
+            rationale: "x".into(),
+            missing_info: None,
+        };
+
+        // Exact cover: accepted.
+        assert!(coverage_problem(&candidates, &[rec(60), rec(70)]).is_none());
+
+        // A dropped issue is corrected (this is the case that would otherwise
+        // let the marker advance over an un-triaged issue).
+        let p = coverage_problem(&candidates, &[rec(60)]).unwrap();
+        assert!(p.contains("no recommendation for issue(s) [70]"), "{p}");
+
+        // An empty report with candidates present is "missing all".
+        assert!(coverage_problem(&candidates, &[]).is_some());
+
+        // A duplicate is corrected.
+        let p = coverage_problem(&candidates, &[rec(60), rec(60), rec(70)]).unwrap();
+        assert!(p.contains("more than one"), "{p}");
+
+        // An out-of-scope issue number is corrected.
+        let p = coverage_problem(&candidates, &[rec(60), rec(70), rec(99)]).unwrap();
+        assert!(p.contains("[99]"), "{p}");
     }
 
     fn sample_items() -> Vec<TriageItem> {
