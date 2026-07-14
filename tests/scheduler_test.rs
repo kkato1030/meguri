@@ -80,6 +80,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };

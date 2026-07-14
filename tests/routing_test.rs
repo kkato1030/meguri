@@ -205,6 +205,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
@@ -465,6 +466,7 @@ async fn drive_worker_scenario(
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };

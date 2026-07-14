@@ -140,6 +140,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
@@ -589,9 +590,31 @@ async fn spec_worker_needs_human_escalates_like_the_worker() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
 
+    // The combined PR is parked on needs-human too (issue #176): spec-ready
+    // survives the failed run, so the PR-side label is what stops the next
+    // poll from picking the same PR up again.
     let pr_labels = env.forge.pr_labels_of(1);
     assert!(!pr_labels.contains(&LABEL_WORKING.to_string()));
     assert!(pr_labels.contains(&LABEL_SPEC_READY.to_string()));
+    assert!(
+        pr_labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the escalation must park the PR itself: {pr_labels:?}"
+    );
+    assert!(
+        SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "an escalated spec-ready PR must not be rediscovered until a human clears it"
+    );
+    // A human clearing the PR label re-arms the takeover (the failed run never
+    // counted as shipped).
+    env.forge
+        .remove_pr_label(1, LABEL_NEEDS_HUMAN)
+        .await
+        .unwrap();
+    let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
+    assert_eq!(
+        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        vec![5]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -636,8 +659,9 @@ async fn spec_worker_skips_quietly_when_label_removed_after_discovery() {
 async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
     let env = setup(None).await;
 
-    // Alongside the actionable spec PR: held, claimed, non-meguri-branch,
-    // and closed ones (each on its own issue-numbered branch).
+    // Alongside the actionable spec PR: held, claimed, escalated,
+    // non-meguri-branch, and closed ones (each on its own issue-numbered
+    // branch).
     for (number, branch, labels, state) in [
         (
             2,
@@ -649,6 +673,12 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
             3,
             "meguri/7-claimed-abc",
             vec![LABEL_SPEC_READY, LABEL_WORKING],
+            "open",
+        ),
+        (
+            6,
+            "meguri/9-escalated-abc",
+            vec![LABEL_SPEC_READY, LABEL_NEEDS_HUMAN],
             "open",
         ),
         (4, "feature/manual", vec![LABEL_SPEC_READY], "open"),

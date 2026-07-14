@@ -55,6 +55,7 @@ fn make_project(
         triage: None,
         plan_delivery: Default::default(),
         review: None,
+        autonomy: None,
         worktree_setup: Default::default(),
         schedules,
         cadence: Vec::new(),

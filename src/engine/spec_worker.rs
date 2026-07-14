@@ -72,9 +72,15 @@ impl super::Loop for SpecWorkerLoop {
             .await?;
         let mut targets = Vec::new();
         for pr in prs {
+            // needs-human parks the PR (issue #176): a failed takeover leaves
+            // spec-ready in place (settle never ran), so without this check the
+            // escalated PR would be rediscovered and retried every poll. The
+            // escalation path (`Flavor::escalate` below) puts the label on the
+            // PR; a human clears it to re-arm the takeover.
             if pr.state != "open"
                 || pr.has_label(forge::LABEL_HOLD)
                 || pr.has_label(forge::LABEL_WORKING)
+                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
             {
                 continue;
             }
@@ -221,6 +227,13 @@ impl Flavor for SpecWorkerFlavor {
                 "PR #{} is already claimed ({})",
                 pr.number,
                 forge::LABEL_WORKING
+            )));
+        }
+        if pr.has_label(forge::LABEL_NEEDS_HUMAN) {
+            return Ok(PreparedWork::Skip(format!(
+                "PR #{} is escalated ({})",
+                pr.number,
+                forge::LABEL_NEEDS_HUMAN
             )));
         }
         deps.forge()
@@ -415,9 +428,33 @@ impl Flavor for SpecWorkerFlavor {
     }
 
     /// Same escalation as the worker — needs-human label + comment on the
-    /// issue — plus releasing the PR claim so a human retrigger can reclaim.
+    /// issue — plus parking the combined PR itself on needs-human via the
+    /// central helper. The issue-side label alone does not stop this loop:
+    /// discovery is PR-triggered and the failed run's `spec-ready` label
+    /// survives (settle never ran), so without the PR-side label the next
+    /// poll would pick the same PR up again (issue #176). `escalate_pr` also
+    /// drops the `working` claim, and every other PR loop already treats a
+    /// needs-human PR as untouchable (`pr_is_touchable`, the pr-reviewer,
+    /// merge-watch), so the park is uniform.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
-        self.release_claim(deps, run).await;
+        let pr = match claimed_pr(deps, &run.id) {
+            Some(pr) => Some(pr),
+            // Escalated before the claim landed: park the PR that triggered
+            // the run (found the same way discovery found it).
+            None => spec_ready_pr(deps, run.issue_number)
+                .await
+                .ok()
+                .flatten()
+                .map(|pr| pr.number),
+        };
+        if let Some(pr) = pr {
+            let comment = super::escalation::pr_needs_human_comment(
+                "could not finish the spec-ready takeover of this PR and needs a human.",
+                reason,
+                &flow::attach_hint(deps, run),
+            );
+            super::escalation::escalate_pr(deps, pr, &comment).await;
+        }
         flow::escalate_on_forge(deps, run.issue_number, reason).await;
     }
 }
@@ -585,6 +622,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

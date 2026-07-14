@@ -124,24 +124,20 @@ pub async fn run_ci_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
 /// still red — park the PR on `meguri:needs-human`. Best-effort like the
 /// other escalations; the label is what stops rediscovery.
 async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps
-        .forge()
-        .pr_comment(
-            pr.number,
-            &format!(
-                "🔁 **meguri** pushed {MAX_CI_FIX_RUNS} CI fixes to this PR but its \
-                 checks are still failing, and needs a human.\n\n\
-                 Clear the `{}` label (and re-run with `meguri run --issue {}` \
-                 if wanted) once the cause is understood.",
-                forge::LABEL_NEEDS_HUMAN,
-                pr.number
-            ),
-        )
-        .await;
+    let comment = super::escalation::pr_needs_human_comment(
+        &format!(
+            "pushed {MAX_CI_FIX_RUNS} CI fixes to this PR but its checks are still failing, \
+             and needs a human."
+        ),
+        &format!(
+            "Clear the `{}` label (and re-run with `meguri run --issue {}` if wanted) once the \
+             cause is understood.",
+            forge::LABEL_NEEDS_HUMAN,
+            pr.number
+        ),
+        crate::tasks::DEFAULT_ATTACH_HINT,
+    );
+    super::escalation::escalate_pr(deps, pr.number, &comment).await;
     let _ = deps.store.emit(
         None,
         "ci_fixer.budget_exhausted",
@@ -354,27 +350,17 @@ impl Flavor for CiFixerFlavor {
     /// issue gets the notice via the issue API instead.
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         let Some(pr) = flow::claimed_pr(deps, &run.id) else {
-            flow::escalate_on_forge(deps, run.issue_number, reason).await;
+            super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
-        let _ = deps
-            .forge()
-            .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-            .await;
-        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-        // Launch-mode-aware closing sentence (issue #169): a direct-mode
-        // fixer has no pane to attach to.
-        let hint = flow::attach_hint(deps, run);
-        let _ = deps
-            .forge()
-            .pr_comment(
-                pr,
-                &format!(
-                    "🔁 **meguri** could not fix the failing CI checks on this \
-                     PR and needs a human.\n\n> {reason}\n\n{hint}"
-                ),
-            )
-            .await;
+        // The central helper posts the label/comment/event; the closing hint is
+        // launch-mode-aware (issue #169) — a direct-mode fixer has no pane.
+        let comment = super::escalation::pr_needs_human_comment(
+            "could not fix the failing CI checks on this PR and needs a human.",
+            reason,
+            &flow::attach_hint(deps, run),
+        );
+        super::escalation::escalate_pr(deps, pr, &comment).await;
     }
 }
 
@@ -523,6 +509,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

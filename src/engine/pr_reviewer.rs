@@ -175,9 +175,15 @@ impl PrReviewerLoop {
     /// reviewed at this head, or — for impl — CI not green).
     async fn candidate_kind(&self, deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
         let review = deps.config.review_for(&deps.project);
+        // needs-human is a human stop signal on both sides: once the
+        // pr-reviewer (or anything else) escalated a PR, do not re-review it
+        // until a human clears the label (issue #176 — plan was previously
+        // reviewed unconditionally, so a findings escalation would re-fire
+        // forever; now symmetric with impl).
         if pr.state != "open"
             || pr.has_label(forge::LABEL_HOLD)
             || pr.has_label(forge::LABEL_WORKING)
+            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
         {
             return Ok(None);
         }
@@ -188,11 +194,10 @@ impl PrReviewerLoop {
         match kind {
             Kind::Plan => {} // spec-reviewing PRs are always reviewable
             Kind::Impl => {
-                // Same ownership guard as the fixer: meguri branch only, not
-                // needs-human, and no spec-phase label (spec-ready is the
-                // combined spec worker's territory).
+                // Same ownership guard as the fixer: meguri branch only, and no
+                // spec-phase label (spec-ready is the combined spec worker's
+                // territory). needs-human is handled in common above.
                 if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
-                    || pr.has_label(forge::LABEL_NEEDS_HUMAN)
                     || pr.has_label(forge::LABEL_SPEC_READY)
                 {
                     return Ok(None);
@@ -375,23 +380,14 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
 }
 
 async fn escalate_on_pr(deps: &Deps, run: &RunRecord, pr: i64, reason: &str) {
-    let _ = deps
-        .forge()
-        .add_pr_label(pr, forge::LABEL_NEEDS_HUMAN)
-        .await;
-    let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
-    // The closing "how to look at this" sentence is launch-mode-aware
-    // (issue #169): a direct-mode pr-reviewer has no pane to attach to.
-    let hint = flow::attach_hint(deps, run);
-    let _ = deps
-        .forge()
-        .comment_pr(
-            pr,
-            &format!(
-                "🔁 **meguri** could not finish reviewing this PR and needs a human.\n\n> {reason}\n\n{hint}"
-            ),
-        )
-        .await;
+    // The central helper posts the label/comment/event; the closing hint is
+    // launch-mode-aware (issue #169) — a direct-mode pr-reviewer has no pane.
+    let comment = super::escalation::pr_needs_human_comment(
+        "could not finish reviewing this PR and needs a human.",
+        reason,
+        &flow::attach_hint(deps, run),
+    );
+    super::escalation::escalate_pr(deps, pr, &comment).await;
 }
 
 enum Prepared {
@@ -690,8 +686,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
 
     // Plan review drives the label state machine (ADR 0008 §3): a clean spec
     // review flips spec-reviewing → spec-ready (the combined spec worker keys
-    // off it); findings keep spec-reviewing for the next push. The impl
-    // review never touches spec labels.
+    // off it). The impl review never touches spec labels.
     if cp.kind == Kind::Plan && verdict == ReviewVerdict::Clean {
         deps.forge()
             .add_pr_label(pr, forge::LABEL_SPEC_READY)
@@ -701,10 +696,39 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
             .await
             .ok();
     }
-    deps.forge()
-        .remove_pr_label(pr, forge::LABEL_WORKING)
-        .await
-        .ok();
+
+    match verdict {
+        ReviewVerdict::Clean => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
+        // The pr-reviewer is the human gate (ADR 0012): findings on either
+        // side (plan or impl) mean a person must decide — the self-review
+        // already handled everything auto-fixable, so escalate instead of
+        // leaving a red status nobody acts on. This is P1/P3 for the
+        // pr-reviewer sites. `escalate_pr` drops the working claim and adds
+        // needs-human (which also stops discover from re-reviewing until a
+        // human clears it).
+        ReviewVerdict::Findings => {
+            let lead = format!(
+                "PR review ({}) found issues that need a human before this PR can proceed.",
+                cp.kind.as_str()
+            );
+            let comment = super::escalation::pr_needs_human_comment(
+                &lead,
+                "See the folded 🛡️ PR review in the PR body for the findings.",
+                &flow::attach_hint(deps, run),
+            );
+            super::escalation::escalate_pr(deps, pr, &comment).await;
+            deps.store.emit(
+                Some(&run.id),
+                "pr_review.escalated",
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+            )?;
+        }
+    }
     Ok(cp.pr_url.clone())
 }
 
@@ -874,6 +898,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

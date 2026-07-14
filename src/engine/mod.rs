@@ -2,6 +2,7 @@ pub mod auto_merger;
 pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
+pub mod escalation;
 pub mod fixer;
 pub mod flow;
 pub mod merge_watch;
@@ -584,6 +585,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
         };

@@ -33,6 +33,7 @@ fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
         triage: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
     };
