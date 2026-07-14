@@ -397,6 +397,33 @@ body_file = "ops/daily-tidy.md" # repo-relative body file — or `body = "..."` 
 
 Since local mode has no planner, `kind = "plan"` is github-only — a local `plan` schedule is rejected at config load (the task would never be consumed).
 
+### Throttling discovery: not-before and cadence (`[[projects.cadence]]`, optional)
+
+Enqueue is only half of time-driven operation; the other half is pacing *consumption*. Discovery normally drains the queue as fast as the slot budget allows, so two kinds of time-bound work need a brake (issue #148). Both skip **silently** — no label, no comment on the forge, exactly like a blocked GitHub-native dependency — and both are visible in `meguri tasks`.
+
+- **not-before** — "don't start before this instant." In github mode put a hidden marker in the issue body; in local mode pass `--not-before`:
+
+  ```
+  <!-- meguri:not-before 2026-07-20 -->          # a bare date is midnight UTC
+  <!-- meguri:not-before 2026-07-20T09:00:00Z --># or a full RFC3339 UTC instant
+  ```
+  ```sh
+  meguri add --not-before 2026-07-20 "Launch post"
+  ```
+  A garbled date fails **closed** (the task stays held, surfaced in `meguri tasks`) rather than leaking early.
+
+- **cadence** — "consume this label at most N per window." Declare per-label rate limits; discovery counts consumption from the local run history (never from GitHub — labels are workflow state, execution records are local) and holds the label once the window is full:
+
+  ```toml
+  [[projects.cadence]]
+  label = "sns"          # a github issue label
+  max_per_day = 1        # at most one per UTC calendar day
+  # — or a rolling window instead of a calendar day: —
+  # per_hours = 168
+  # max = 1
+  ```
+  Cadence is github-only (local tasks carry no labels). Consumption counts every attempt except a benign skip — a failed run still spends the day's slot, so a broken post can't retry past the media's rate limit. An issue matching two rules fails closed (a run counts toward one bucket only); `meguri run --issue N` bypasses the gate but still counts toward the window. `meguri doctor` shows each rule's current window usage.
+
 ### Role-based agent routing (optional)
 
 By default every role — planner, self-review, guard, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.

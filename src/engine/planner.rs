@@ -101,6 +101,7 @@ impl super::Loop for PlannerLoop {
             .map(|t| Target {
                 key: t.key,
                 title: t.title,
+                cadence_label: t.cadence_label,
             })
             .collect())
     }
@@ -900,6 +901,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            cadence: Vec::new(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

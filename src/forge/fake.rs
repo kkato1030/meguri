@@ -108,13 +108,19 @@ pub struct FakeForge {
 impl FakeForge {
     pub fn with_issue(number: i64, title: &str, body: &str, labels: &[&str]) -> Self {
         let forge = Self::default();
-        forge.issues.lock().unwrap().push(Issue {
+        forge.add_issue(number, title, body, labels);
+        forge
+    }
+
+    /// Seed an additional issue on the fake forge (multi-issue discovery /
+    /// cadence tests).
+    pub fn add_issue(&self, number: i64, title: &str, body: &str, labels: &[&str]) {
+        self.issues.lock().unwrap().push(Issue {
             number,
             title: title.into(),
             body: body.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         });
-        forge
     }
 
     /// A fake standing in for a specific repo slug (issue #154 cross-repo

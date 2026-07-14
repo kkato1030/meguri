@@ -1,5 +1,6 @@
 pub mod agent_session;
 pub mod app;
+pub mod cadence;
 pub mod cli;
 pub mod config;
 pub mod cron;

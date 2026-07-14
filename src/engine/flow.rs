@@ -1885,6 +1885,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            cadence: Vec::new(),
         };
         let deps = Deps::with_label_source(
             store,

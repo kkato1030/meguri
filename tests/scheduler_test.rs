@@ -79,6 +79,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),
@@ -571,6 +572,7 @@ impl Loop for FixedLoop {
         Ok(vec![Target {
             key: TaskKey::Issue(99),
             title: "Fixed target".into(),
+            cadence_label: None,
         }])
     }
 
@@ -613,6 +615,7 @@ impl Loop for StubLoop {
                 targets.push(Target {
                     key: TaskKey::Issue(*n),
                     title: format!("stub {n}"),
+                    cadence_label: None,
                 });
             }
         }
@@ -807,6 +810,7 @@ impl Loop for RecordingLoop {
             targets.push(Target {
                 key: TaskKey::Issue(*issue),
                 title: format!("target {issue}"),
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -1017,6 +1021,7 @@ impl Loop for LanguageRecordingLoop {
                 targets.push(Target {
                     key: TaskKey::Issue(n),
                     title: format!("lang {n}"),
+                    cadence_label: None,
                 });
             }
         }

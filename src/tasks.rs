@@ -17,16 +17,28 @@
 //! than a reshaped contract: `claim(key, host) -> Option<Task>`, where `None`
 //! is a benign race (someone else took it, or it is no longer actionable).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::config::ReconcileConfig;
+use crate::cadence;
+use crate::config::{CadenceRule, ReconcileConfig};
 use crate::engine::{planner, worker};
 use crate::forge::{self, Forge};
 use crate::store::Store;
+
+/// Injected epoch-seconds clock (issue #148): production reads the system
+/// clock, tests supply a fixed value so not-before passage and cadence window
+/// rollover are deterministic. Mirrors `scheduler_fire`'s injected-clock seam.
+pub type EpochClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The default clock: the same wall-clock the schedule sweep uses.
+fn system_clock() -> EpochClock {
+    Arc::new(crate::engine::scheduler_fire::epoch_now)
+}
 
 /// The reconcile loop's fingerprint of an issue body (issue #142): a SHA-256
 /// over the body with whitespace normalized (trim + collapse every run of
@@ -116,6 +128,11 @@ pub struct Task {
     /// the `meguri:automerge` label; local mode is always `false`. Carried into
     /// the checkpoint at claim time and applied when the PR opens.
     pub automerge: bool,
+    /// The cadence bucket (issue #148) this task's issue falls under, set only
+    /// by `discover` (never by `claim`). The scheduler stamps it onto the
+    /// created run so consumption can be counted. `None` outside any cadence
+    /// rule and for all local tasks.
+    pub cadence_label: Option<String>,
 }
 
 /// The task coordination layer: discover / claim / release / escalate /
@@ -175,6 +192,10 @@ pub struct LabelTaskSource {
     /// suppression in `discover`. When false, a succeeded run suppresses the
     /// issue permanently as before.
     reconcile: ReconcileConfig,
+    /// Per-label cadence rules (issue #148); empty = no rate limiting.
+    cadence: Vec<CadenceRule>,
+    /// Injected clock for the not-before / cadence gates (issue #148).
+    clock: EpochClock,
 }
 
 impl LabelTaskSource {
@@ -183,13 +204,23 @@ impl LabelTaskSource {
         store: Store,
         project_id: String,
         reconcile: ReconcileConfig,
+        cadence: Vec<CadenceRule>,
     ) -> Self {
         Self {
             forge,
             store,
             project_id,
             reconcile,
+            cadence,
+            clock: system_clock(),
         }
+    }
+
+    /// Swap in a fixed clock (tests exercise not-before passage and window
+    /// rollover deterministically).
+    pub fn with_clock(mut self, clock: EpochClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Whether a succeeded run already covers this issue at its *current* body
@@ -229,6 +260,51 @@ impl LabelTaskSource {
         }
         Ok(false)
     }
+
+    /// Decide (and spend) one candidate's cadence allowance for this pass.
+    /// `Skip` = fail-closed (two rules match — a single `cadence_label` cannot
+    /// count both) or the window is full; `Unbucketed` = no rule applies;
+    /// `Reserved` = a slot was free and is now taken.
+    fn reserve_cadence(
+        &self,
+        issue: &forge::Issue,
+        now: u64,
+        remaining: &mut HashMap<String, i64>,
+    ) -> Result<CadenceReservation> {
+        let label = match cadence::cadence_bucket(&issue.labels, &self.cadence) {
+            Ok(Some(label)) => label,
+            Ok(None) => return Ok(CadenceReservation::Unbucketed),
+            Err(_) => return Ok(CadenceReservation::Skip),
+        };
+        let Some(rule) = self.cadence.iter().find(|r| r.label == label) else {
+            return Ok(CadenceReservation::Unbucketed); // unreachable: bucket came from a rule
+        };
+        if !remaining.contains_key(&label) {
+            let start = cadence::window_start(rule, now);
+            let consumed = self
+                .store
+                .cadence_consumed(&self.project_id, &label, start)?;
+            remaining.insert(label.clone(), i64::from(cadence::limit(rule)) - consumed);
+        }
+        match remaining.get_mut(&label) {
+            Some(rem) if *rem > 0 => {
+                *rem -= 1;
+                Ok(CadenceReservation::Reserved(label))
+            }
+            _ => Ok(CadenceReservation::Skip),
+        }
+    }
+}
+
+/// The outcome of the cadence gate for one candidate (see
+/// [`LabelTaskSource::reserve_cadence`]).
+enum CadenceReservation {
+    /// Skip this candidate silently (window full, or conflicting labels).
+    Skip,
+    /// No cadence rule applies; emit with `cadence_label = None`.
+    Unbucketed,
+    /// A slot was reserved; emit with this bucket stamped.
+    Reserved(String),
 }
 
 #[async_trait]
@@ -236,6 +312,12 @@ impl TaskSource for LabelTaskSource {
     async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>> {
         let (label, loop_kind) = kind.label_and_loop();
         let issues = self.forge.list_issues_with_label(label).await?;
+        let now = (self.clock)();
+        // Per-bucket remaining allowance for this pass, seeded lazily from the
+        // window's consumption (`limit - consumed`). Decremented as candidates
+        // are emitted so one pass never over-emits a bucket; only actionable
+        // candidates (past every earlier gate) reach here and spend the quota.
+        let mut remaining: HashMap<String, i64> = HashMap::new();
         let mut tasks = Vec::new();
         for issue in issues {
             if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
@@ -244,9 +326,24 @@ impl TaskSource for LabelTaskSource {
             if self.already_shipped(loop_kind, &issue)? {
                 continue;
             }
+            // not-before gate (before dependencies): a garbled marker or a
+            // future instant silently drops the issue — no label, no comment.
+            match cadence::parse_not_before(&issue.body) {
+                Err(_) => continue,
+                Ok(nb) if cadence::not_before_wait(nb, now).is_some() => continue,
+                Ok(_) => {}
+            }
             if has_unresolved_blockers(&*self.forge, issue.number).await {
                 continue;
             }
+            // cadence gate (last, so the shared window allowance is spent only
+            // on dependency-cleared candidates): match the bucket, then check
+            // this pass's remaining quota.
+            let cadence_label = match self.reserve_cadence(&issue, now, &mut remaining)? {
+                CadenceReservation::Skip => continue,
+                CadenceReservation::Unbucketed => None,
+                CadenceReservation::Reserved(label) => Some(label),
+            };
             tasks.push(Task {
                 key: TaskKey::Issue(issue.number),
                 kind,
@@ -254,6 +351,7 @@ impl TaskSource for LabelTaskSource {
                 title: issue.title,
                 body: issue.body,
                 issue: Some(issue.number),
+                cadence_label,
             });
         }
         Ok(tasks)
@@ -290,6 +388,10 @@ impl TaskSource for LabelTaskSource {
             title: issue.title,
             body: issue.body,
             issue: Some(n),
+            // claim never re-derives the bucket: the run was already created
+            // (and stamped) at discovery, and this Task is only used for
+            // title/body/automerge on re-verification.
+            cadence_label: None,
         }))
     }
 
@@ -323,11 +425,24 @@ impl TaskSource for LabelTaskSource {
 pub struct LocalTaskSource {
     store: Store,
     project_id: String,
+    /// Injected clock for the not-before gate (issue #148). Local mode has no
+    /// cadence (tasks carry no labels), so only not-before uses it.
+    clock: EpochClock,
 }
 
 impl LocalTaskSource {
     pub fn new(store: Store, project_id: String) -> Self {
-        Self { store, project_id }
+        Self {
+            store,
+            project_id,
+            clock: system_clock(),
+        }
+    }
+
+    /// Swap in a fixed clock (tests exercise not-before passage).
+    pub fn with_clock(mut self, clock: EpochClock) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -346,18 +461,29 @@ fn row_to_task(row: crate::store::TaskRow) -> Task {
         title: row.title,
         body: row.body,
         issue: origin_issue(&row.origin),
+        // Local mode has no cadence (no labels); never stamped.
+        cadence_label: None,
     }
 }
 
 #[async_trait]
 impl TaskSource for LocalTaskSource {
     async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>> {
-        Ok(self
-            .store
-            .discover_tasks(&self.project_id, kind.as_str())?
-            .into_iter()
-            .map(row_to_task)
-            .collect())
+        let now = (self.clock)();
+        let mut tasks = Vec::new();
+        for row in self.store.discover_tasks(&self.project_id, kind.as_str())? {
+            // not-before gate: a garbled or future instant drops the task
+            // silently (the local counterpart of the github marker skip).
+            if let Some(raw) = &row.not_before {
+                match cadence::parse_not_before_value(raw) {
+                    Err(_) => continue,
+                    Ok(ts) if cadence::not_before_wait(Some(ts), now).is_some() => continue,
+                    Ok(_) => {}
+                }
+            }
+            tasks.push(row_to_task(row));
+        }
+        Ok(tasks)
     }
 
     async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>> {
@@ -449,6 +575,7 @@ mod tests {
             Store::open_in_memory().unwrap(),
             "proj".into(),
             ReconcileConfig::default(),
+            Vec::new(),
         );
         let key = TaskKey::Issue(7);
 

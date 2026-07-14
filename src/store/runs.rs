@@ -164,6 +164,11 @@ pub struct RunRecord {
     /// as "matches any body" by [`Store::issue_processed_current_body`] so the
     /// old permanent-suppression behavior survives an upgrade.
     pub body_digest: Option<String>,
+    /// The cadence bucket (issue label) this run consumed (issue #148), stamped
+    /// in the creating INSERT and never changed. NULL for runs outside any
+    /// cadence rule. [`Store::cadence_consumed`] counts non-skipped runs by
+    /// this column within the window.
+    pub cadence_label: Option<String>,
 }
 
 impl RunRecord {
@@ -210,6 +215,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
         body_digest: row.get("body_digest")?,
+        cadence_label: row.get("cadence_label")?,
     })
 }
 
@@ -245,19 +251,71 @@ impl Store {
         issue_number: i64,
         issue_title: &str,
     ) -> Result<RunRecord> {
+        self.create_run_for_loop_cadence(project_id, loop_kind, issue_number, issue_title, None)
+    }
+
+    /// Like [`Store::create_run_for_loop`] but stamps the cadence bucket
+    /// (issue #148) in the *same* INSERT that creates the run — never a
+    /// follow-up UPDATE. If the process died between run creation and a
+    /// separate stamp, a NULL-labelled `sns` run would slip past the window
+    /// COUNT and the next tick would consume the bucket a second time; folding
+    /// the stamp into the INSERT removes that crash window entirely. Only the
+    /// scheduler's issue branch and manual `meguri run` pass a non-None bucket.
+    pub fn create_run_for_loop_cadence(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+        issue_title: &str,
+        cadence_label: Option<&str>,
+    ) -> Result<RunRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         // Short ids are friendlier CLI handles; keep full uuid uniqueness.
         let id = format!("run-{}", &id[..8]);
         self.with_conn(|c| {
             c.execute(
                 "INSERT INTO runs (id, project_id, loop_kind, issue_number, issue_title,
-                                   status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-                params![id, project_id, loop_kind, issue_number, issue_title, now()],
+                                   status, created_at, cadence_label)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                params![
+                    id,
+                    project_id,
+                    loop_kind,
+                    issue_number,
+                    issue_title,
+                    now(),
+                    cadence_label
+                ],
             )?;
             Ok(())
         })?;
         Ok(self.get_run(&id)?.expect("run just inserted"))
+    }
+
+    /// Count consumption of a cadence bucket within its window (issue #148):
+    /// non-`skipped` runs for `(project, label)` created at or after
+    /// `window_start`. `skipped` runs are benign races that touched nothing, so
+    /// they do not consume the quota; every other status counts as one attempt
+    /// (success or failure alike — ADR 0011). `window_start` is epoch seconds;
+    /// `runs.created_at` is our RFC3339 UTC shape, whose lexicographic order is
+    /// chronological, so the bound is formatted the same way before comparison.
+    pub fn cadence_consumed(
+        &self,
+        project_id: &str,
+        label: &str,
+        window_start: u64,
+    ) -> Result<i64> {
+        let bound = super::format_epoch(window_start);
+        self.with_conn(|c| {
+            let count = c.query_row(
+                "SELECT COUNT(*) FROM runs
+                   WHERE project_id = ?1 AND cadence_label = ?2
+                     AND created_at >= ?3 AND status != 'skipped'",
+                params![project_id, label, bound],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
     }
 
     /// Create a run targeting a local task (local/silent mode). `issue_number`
@@ -832,6 +890,54 @@ mod tests {
             !store
                 .issue_processed_current_body("demo", "worker", 11, "aaa")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn cadence_consumed_counts_non_skipped_stamped_runs_in_window() {
+        let store = Store::open_in_memory().unwrap();
+        // Window start well before now; every fresh run's created_at is inside.
+        let start = 0;
+
+        // Unstamped run: not counted.
+        store.create_run_for_loop("demo", "worker", 1, "t").unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 0);
+
+        // Two stamped runs, one succeeded one failed: both count (attempt, not
+        // outcome).
+        let a = store
+            .create_run_for_loop_cadence("demo", "worker", 2, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&a.id, RunStatus::Succeeded, None)
+            .unwrap();
+        let b = store
+            .create_run_for_loop_cadence("demo", "worker", 3, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&b.id, RunStatus::Failed, None)
+            .unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 2);
+
+        // A skipped stamped run does not count.
+        let c = store
+            .create_run_for_loop_cadence("demo", "worker", 4, "t", Some("sns"))
+            .unwrap();
+        store
+            .update_run_status(&c.id, RunStatus::Skipped, None)
+            .unwrap();
+        assert_eq!(store.cadence_consumed("demo", "sns", start).unwrap(), 2);
+
+        // Scoped by project and label.
+        assert_eq!(store.cadence_consumed("other", "sns", start).unwrap(), 0);
+        assert_eq!(store.cadence_consumed("demo", "nl", start).unwrap(), 0);
+
+        // A window start in the far future excludes everything.
+        assert_eq!(
+            store
+                .cadence_consumed("demo", "sns", 32_000_000_000)
+                .unwrap(),
+            0
         );
     }
 

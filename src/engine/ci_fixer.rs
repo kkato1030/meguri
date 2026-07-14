@@ -144,6 +144,7 @@ impl super::Loop for CiFixerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(issue),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -619,6 +620,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            cadence: Vec::new(),
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

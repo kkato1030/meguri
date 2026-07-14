@@ -396,6 +396,33 @@ body_file = "ops/daily-tidy.md" # repo 相対の本文ファイル — または
 
 local mode には planner が無いため、`kind = "plan"` は github 専用です — local の `plan` スケジュールは config ロード時に拒否されます(タスクが消化されないため)。
 
+### discovery の調速: not-before と cadence(`[[projects.cadence]]`、オプトイン)
+
+時刻駆動運用の片輪が起票なら、もう片輪は**消化のペース制御**です。discovery は通常、並列上限の許す限りキューを消化するので、時刻に縛られた2種類の仕事にはブレーキが要ります(issue #148)。どちらも**サイレントにスキップ**します — ラベルもコメントも forge に残しません(ブロックされた GitHub-native 依存とまったく同じ流儀)— そして `meguri tasks` で見えます。
+
+- **not-before** — 「この日時までは着手しない」。github mode は issue 本文の hidden マーカー、local mode は `--not-before` で指定します:
+
+  ```
+  <!-- meguri:not-before 2026-07-20 -->          # 裸の日付は UTC 深夜
+  <!-- meguri:not-before 2026-07-20T09:00:00Z --># または完全な RFC3339 UTC
+  ```
+  ```sh
+  meguri add --not-before 2026-07-20 "公開ポスト"
+  ```
+  日付のタイポは fail-**closed**(タスクは止まったままで `meguri tasks` に表示)。早期公開の事故を避けます。
+
+- **cadence** — 「このラベルは窓あたり N 件まで消化」。ラベルごとのレート上限を宣言すると、discovery は消化実績をローカルの run 履歴から数え(GitHub からは数えません — ラベルは workflow 状態、実行の記録はローカル)、窓が埋まっている間そのラベルを止めます:
+
+  ```toml
+  [[projects.cadence]]
+  label = "sns"          # github の issue ラベル
+  max_per_day = 1        # UTC 暦日あたり最大1件
+  # — 暦日ではなくローリング窓にするなら: —
+  # per_hours = 168
+  # max = 1
+  ```
+  cadence は github 専用です(local タスクにラベルが無いため)。消化は benign な skip を除く全試行を数えます — 失敗した run も当日の枠を消費するので、壊れた投稿が媒体のレート上限を超えてリトライすることはありません。2つの rule に一致する issue は fail-closed(run はひとつのバケツにしか計上できないため)。`meguri run --issue N` はゲートをバイパスしますが窓には計上します。`meguri doctor` が各 rule の現在の窓消化を表示します。
+
 ## 開発
 
 ```bash

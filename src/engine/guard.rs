@@ -157,6 +157,7 @@ impl super::Loop for GuardLoop {
             targets.push(Target {
                 key: TaskKey::Issue(canonical_key(&pr)),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -869,6 +870,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            cadence: Vec::new(),
         };
         let deps = Deps::with_label_source(
             store,
