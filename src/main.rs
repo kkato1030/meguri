@@ -39,9 +39,16 @@ async fn main() -> Result<()> {
             project,
             plan,
             file,
+            not_before,
             title,
-        } => app::cmd_add(project.as_deref(), plan, file.as_deref(), title.as_deref()),
-        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all),
+        } => app::cmd_add(
+            project.as_deref(),
+            plan,
+            file.as_deref(),
+            title.as_deref(),
+            not_before.as_deref(),
+        ),
+        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
         Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
@@ -196,6 +203,9 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
             ok &= doctor_schedules(cfg);
+            // Cadence rules (issue #148): shape is already validated at load;
+            // here we show each rule's current window consumption.
+            doctor_cadence(cfg, store.as_ref());
             // Repo config (issue #165): lint each project's `meguri.toml`,
             // failing on a host-only key or TOML error (deny_unknown_fields).
             ok &= doctor_repo_configs(cfg);
@@ -333,6 +343,45 @@ fn doctor_schedules(cfg: &Config) -> bool {
         }
     }
     ok
+}
+
+/// Doctor's cadence section (issue #148): the config shape (label uniqueness,
+/// period mode, positive values) already fail-fasts at load, so here we simply
+/// show each rule's current window consumption — "N/M used, K left" — so an
+/// operator can see why a labelled issue is being held back. Projects without
+/// cadence rules print nothing; a missing store just omits the counts.
+fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
+    use meguri::cadence;
+
+    let has_any = cfg.projects.iter().any(|p| !p.cadence.is_empty());
+    if !has_any {
+        return;
+    }
+    let now = meguri::engine::scheduler_fire::epoch_now();
+    println!("\ncadence:");
+    for project in &cfg.projects {
+        for rule in &project.cadence {
+            let mode = match rule.per_hours {
+                Some(h) => format!("per {h}h"),
+                None => "per day (UTC)".to_string(),
+            };
+            let max = cadence::limit(rule);
+            let usage = match store {
+                Some(store) => {
+                    let start = cadence::window_start(rule, now);
+                    match store.cadence_consumed(&project.id, &rule.label, start) {
+                        Ok(consumed) => {
+                            let left = (max as i64 - consumed).max(0);
+                            format!("{consumed}/{max} used, {left} left")
+                        }
+                        Err(_) => format!("max {max} (count unavailable)"),
+                    }
+                }
+                None => format!("max {max}"),
+            };
+            println!("  ✅ {}/{} ({mode}) — {usage}", project.id, rule.label);
+        }
+    }
 }
 
 /// Doctor's repo-config section (issue #165): lint each project's repo root

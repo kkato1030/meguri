@@ -184,11 +184,12 @@ impl Scheduler {
                     // someone raced us. Run creation branches on the key so
                     // the target travels from discovery through claim.
                     let created = match target.key {
-                        TaskKey::Issue(n) => deps.store.create_run_for_loop(
+                        TaskKey::Issue(n) => deps.store.create_run_for_loop_cadence(
                             &deps.project.id,
                             lp.kind(),
                             n,
                             &target.title,
+                            target.cadence_label.as_deref(),
                         ),
                         TaskKey::Local(id) => deps.store.create_run_for_task(
                             &deps.project.id,

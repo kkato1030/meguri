@@ -158,6 +158,7 @@ impl super::Loop for PrReviewerLoop {
             targets.push(Target {
                 key: TaskKey::Issue(canonical_key(&pr)),
                 title: pr.title,
+                cadence_label: None,
             });
         }
         Ok(targets)
@@ -872,6 +873,7 @@ mod tests {
                 ..Default::default()
             },
             schedules: Vec::new(),
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         let deps = Deps::with_label_source(

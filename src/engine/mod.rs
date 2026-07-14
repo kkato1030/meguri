@@ -82,6 +82,7 @@ impl Deps {
             store.clone(),
             project.id.clone(),
             config.reconcile,
+            project.cadence.clone(),
         ));
         let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {
@@ -247,6 +248,10 @@ pub struct Target {
     /// task row). Also the run-creation and dispatch-sort key.
     pub key: TaskKey,
     pub title: String,
+    /// The cadence bucket (issue #148) discovery matched, if any. The scheduler
+    /// stamps it onto the created run so consumption can be counted. `None`
+    /// outside any cadence rule and for all non-task-source loops.
+    pub cadence_label: Option<String>,
 }
 
 /// The GitHub issue a PR belongs to: the branch encoding first
@@ -575,6 +580,7 @@ mod tests {
             review: None,
             worktree_setup: Default::default(),
             schedules: Vec::new(),
+            cadence: Vec::new(),
             prompts: Default::default(),
         };
         let deps = Deps::with_label_source(

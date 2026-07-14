@@ -48,6 +48,7 @@ fn build_coordination(
                 store.clone(),
                 project.id.clone(),
                 cfg.reconcile,
+                project.cadence.clone(),
             ));
             Ok((Some(forge), ts))
         }
@@ -109,7 +110,26 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
     let deps = build_deps(&cfg, project, mux_override)?;
 
     let gh_issue = deps.forge().get_issue(issue).await?;
-    let run = match deps.store.create_run(&project.id, issue, &gh_issue.title) {
+    // Manual run bypasses the cadence gate (it is a human's explicit override —
+    // always run it), but if the issue falls under a cadence rule the run must
+    // still count toward the window, or a same-day `watch` would consume the
+    // bucket a second time. Conflicting rules are the one case we refuse: a
+    // single `cadence_label` cannot count two buckets, so a human must pick.
+    let cadence_label = match crate::cadence::cadence_bucket(&gh_issue.labels, &project.cadence) {
+        Ok(bucket) => bucket,
+        Err(labels) => bail!(
+            "issue #{issue} matches multiple cadence rules ({}); a run can only count \
+             toward one — remove all but one of these labels",
+            labels.join(", ")
+        ),
+    };
+    let run = match deps.store.create_run_for_loop_cadence(
+        &project.id,
+        "worker",
+        issue,
+        &gh_issue.title,
+        cadence_label.as_deref(),
+    ) {
         Ok(run) => run,
         Err(_) => {
             // An active run exists (possibly interrupted): resume it.
@@ -456,6 +476,7 @@ pub fn cmd_add(
     plan: bool,
     file: Option<&str>,
     title: Option<&str>,
+    not_before: Option<&str>,
 ) -> Result<()> {
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
@@ -467,17 +488,42 @@ pub fn cmd_add(
             project.mode.as_str()
         );
     }
+    // Normalize --not-before to our RFC3339 UTC shape up front, so a typo is
+    // caught here rather than silently keeping the task queued forever.
+    let not_before = match not_before {
+        Some(raw) => {
+            let ts = crate::cadence::parse_not_before_value(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid --not-before {:?}: expected YYYY-MM-DD or an RFC3339 UTC instant",
+                    e.raw
+                )
+            })?;
+            Some(crate::store::format_epoch(ts))
+        }
+        None => None,
+    };
     let (title, body) = resolve_task_input(title, file)?;
     let kind = if plan { TaskKind::Plan } else { TaskKind::Work };
     let store = open_store()?;
-    let task = store.create_task(&project.id, kind.as_str(), &title, &body, "local")?;
+    let task = store.create_task_with_not_before(
+        &project.id,
+        kind.as_str(),
+        &title,
+        &body,
+        "local",
+        not_before.as_deref(),
+    )?;
     println!(
         "queued task #{} [{}] {}",
         task.id,
         kind.as_str(),
         task.title
     );
-    println!("`meguri watch` will pick it up within one poll interval.");
+    if let Some(nb) = &task.not_before {
+        println!("not-before {nb} — held until then, then picked up automatically.");
+    } else {
+        println!("`meguri watch` will pick it up within one poll interval.");
+    }
     Ok(())
 }
 
@@ -512,17 +558,30 @@ fn first_heading(markdown: &str) -> Option<String> {
     Some(line.trim_start_matches('#').trim().to_string())
 }
 
-/// `meguri tasks`: list a project's local tasks, newest first. needs_human
-/// tasks are highlighted with their reason so a human can pick them up.
-pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
+/// `meguri tasks`: inspect a project's discovery queue and why each item is (or
+/// is not) running. In local mode it lists the local tasks; in github mode it
+/// fetches the `ready`/`plan` issues and shows each one's disposition — the same
+/// gate discovery applies (issue #148), so silently-skipped work (not-before /
+/// cadence) that leaves no trace on the forge is visible here.
+pub async fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
+    match project.mode {
+        ProjectMode::Local => cmd_tasks_local(project, all),
+        ProjectMode::Github => cmd_tasks_github(&cfg, project).await,
+    }
+}
+
+/// Local-mode listing: the sqlite `tasks`, with a not-before annotation on any
+/// still-queued task whose gate has not yet opened.
+fn cmd_tasks_local(project: &ProjectConfig, all: bool) -> Result<()> {
     let store = open_store()?;
     let tasks = store.list_tasks(&project.id, all)?;
     if tasks.is_empty() {
         println!("no {}tasks", if all { "" } else { "open " });
         return Ok(());
     }
+    let now = crate::engine::scheduler_fire::epoch_now();
     println!("{:>4}  {:<6} {:<12} TITLE", "ID", "KIND", "STATUS");
     for t in tasks {
         let flag = if t.status == "needs_human" {
@@ -537,8 +596,102 @@ pub fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
         if let Some(reason) = t.reason.filter(|_| t.status == "needs_human") {
             println!("        ↳ {reason}");
         }
+        if t.status == "queued"
+            && let Some(raw) = &t.not_before
+        {
+            match crate::cadence::parse_not_before_value(raw) {
+                Err(_) => println!("        ↳ ⏳ not-before 待ち(解析不能: {raw})"),
+                Ok(ts) if crate::cadence::not_before_wait(Some(ts), now).is_some() => {
+                    println!(
+                        "        ↳ ⏳ not-before 待ち(until {})",
+                        crate::store::format_epoch(ts)
+                    );
+                }
+                Ok(_) => {}
+            }
+        }
     }
     Ok(())
+}
+
+/// Github-mode listing: the discovery queue (`ready`/`plan` issues) with each
+/// issue's live disposition. Goes through `LabelTaskSource::dispositions`, the
+/// same gate pipeline (and per-pass cadence allowance) discovery uses — so what
+/// shows `ready` is exactly what discover would run: a second same-bucket issue
+/// this pass reads `cadence 待ち`, not `ready`, even when the store count alone
+/// is still under the limit.
+async fn cmd_tasks_github(cfg: &Config, project: &ProjectConfig) -> Result<()> {
+    let store = open_store()?;
+    let source = LabelTaskSource::new(
+        Arc::new(GhForge::new(project.repo_slug.as_deref().context(
+            "github-mode project has no repo_slug (config validation should have caught this)",
+        )?)),
+        store,
+        project.id.clone(),
+        cfg.reconcile,
+        project.cadence.clone(),
+    );
+
+    // ready (worker) and plan (planner) are separate discovery passes, each
+    // with its own cadence allowance — mirror that here (an issue rarely carries
+    // both trigger labels; dedup by number keeps it listed once if it does).
+    let mut rows: Vec<(crate::forge::Issue, crate::cadence::Disposition)> =
+        source.dispositions(TaskKind::Work).await?;
+    for row in source.dispositions(TaskKind::Plan).await? {
+        if !rows.iter().any(|(i, _)| i.number == row.0.number) {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        println!(
+            "no {}/{} issues",
+            crate::forge::LABEL_READY,
+            crate::forge::LABEL_PLAN
+        );
+        return Ok(());
+    }
+    rows.sort_by_key(|(i, _)| i.number);
+
+    println!("{:>6}  STATE", "ISSUE");
+    for (issue, disposition) in rows {
+        println!(
+            "{:>6}  {}",
+            format!("#{}", issue.number),
+            format_disposition(&disposition)
+        );
+        println!("        {}", issue.title);
+    }
+    Ok(())
+}
+
+/// One-line rendering of a [`crate::cadence::Disposition`] for `meguri tasks`.
+fn format_disposition(disposition: &crate::cadence::Disposition) -> String {
+    use crate::cadence::Disposition;
+    use crate::store::format_epoch;
+    match disposition {
+        Disposition::Ready => "✅ ready".to_string(),
+        Disposition::WaitingNotBefore { until } => {
+            format!("⏳ not-before 待ち(until {})", format_epoch(*until))
+        }
+        Disposition::UnparsableNotBefore { raw } => {
+            format!("⏳ not-before 待ち(解析不能: {raw})")
+        }
+        Disposition::Blocked => "⛔ blocked(未解決の依存)".to_string(),
+        Disposition::ConflictingCadenceLabels { labels } => {
+            format!("⚠️  cadence ラベル競合({})", labels.join(", "))
+        }
+        Disposition::WaitingCadence {
+            label,
+            consumed,
+            max,
+            resets_at,
+        } => {
+            let resets = resets_at
+                .map(|t| format!(", resets {}", format_epoch(t)))
+                .unwrap_or_default();
+            format!("⏳ cadence 待ち({label} {consumed}/{max}{resets})")
+        }
+    }
 }
 
 /// `meguri schedules`: list a project's cron schedules with their definition,

@@ -60,16 +60,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_schedules",
         include_str!("migrations/0010_schedules.sql"),
     ),
+    // issue #148: cadence — runs.cadence_label + tasks.not_before + an index
+    // for the window COUNT. Simple ALTERs; runs was already recreated by 0007.
+    ("0011_cadence", include_str!("migrations/0011_cadence.sql")),
     // issue #168: panes.role -> panes.lane (+ value remap review/impl-review
     // -> pr-review/self-review). Same rebuild-the-table shape as 0006.
+    // Renumbered from 0011 after main claimed it for cadence (#148).
     (
-        "0011_panes_lane",
-        include_str!("migrations/0011_panes_lane.sql"),
+        "0012_panes_lane",
+        include_str!("migrations/0012_panes_lane.sql"),
     ),
     // issue #168: runs.loop_kind 'guard' -> 'pr-reviewer'. Pure data UPDATE.
     (
-        "0012_loop_kind_pr_reviewer",
-        include_str!("migrations/0012_loop_kind_pr_reviewer.sql"),
+        "0013_loop_kind_pr_reviewer",
+        include_str!("migrations/0013_loop_kind_pr_reviewer.sql"),
     ),
 ];
 
@@ -323,7 +327,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let idx = MIGRATIONS
             .iter()
-            .position(|(n, _)| *n == "0012_loop_kind_pr_reviewer")
+            .position(|(n, _)| *n == "0013_loop_kind_pr_reviewer")
             .unwrap();
         apply_migrations(&conn, idx); // everything before this migration
 

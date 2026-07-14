@@ -128,6 +128,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        cadence: Vec::new(),
         prompts: Default::default(),
     };
 
