@@ -31,7 +31,7 @@ advisor_role = "planner"  # advisor が借りる routing role(既定 "planner")
 - `collab: Option<CollabConfig>`。**セクション無し = 機能 off**(現状とバイト単位で同一)。
 - `CollabConfig { mode: CollabMode, advisor_role: String }`。`CollabMode = Off | Advisor`(serde lowercase、既定 `Off`)。`advisor_role` 既定 `"planner"`。
 - `mode = "off"` は明示 off(セクションはあるが不活性)。**有効化は `mode = "advisor"` の一点**。
-- watch の毎 tick 再読込(#73/ConfigReloader)に自動で乗る(process-bound ではないので pin 不要)。
+- **`[collab]` は process-bound** — watch の毎 tick 再読込(#73/`ConfigReloader`)には乗せず、`mux.kind` / `[daemon]` と同類として起動時の値に pin し、reload での変更検知は restart-required warn にする(`meguri watch` の再起動で反映)。理由:`mode = "advisor"` の有効性は起動時の `collab::validate`(agmsg 検出、下記 2)と対でしか保証されないが、`ConfigReloader::poll` は validate を再実行しない(`routing::validate` も同じく起動時のみの「loud, early error surface」)。reload に乗せると、watch 稼働中に agmsg 未検出のまま `mode = "advisor"` を足す編集が通り、起動時なら明示エラーで落ちるはずの設定が run 時の best-effort spawn 失敗(下記 3)へ静かに化ける — 「silent fallback しない」(基準 3)が reload 経路で破れる。reload closure に `collab::validate` を足す代替案は退けた:reload の可否が agmsg の有無という**環境**に依存するようになり、「候補の拒否は内容だけで決まる(parse 失敗 / no projects)」という `ConfigReloader` の現在の性質を壊す上、routing すら reload で validate しない中で collab だけ検証するのは非対称。
 
 ### 2. 起動時の agmsg 検出 — `src/collab.rs`(新規)+ 起動時 validate
 
@@ -112,11 +112,12 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 7. advisor は書き込み可能な worktree を持たない:cwd は git 登録の無い空ディレクトリで、repo の checkout を一切渡さない(read-only は配線で保証)。
 8. collab 有効時、worker / spec-worker の run はスケジューラ予算を 2 スロット消費する(`max_concurrent_runs = 1` でも単独なら起動できる)。collab 無効時の会計は現状と同一。
 9. README(en/ja)が `[collab]` 節と「routing の次段」の位置づけを記述している。
+10. `[collab]` は process-bound:watch 稼働中に config の `[collab]` を編集しても起動時の値に pin され(restart-required warn)、稼働中の効力は変わらない — 起動時 `collab::validate` を通っていない `[collab]` 設定が効力を持つ経路が存在しない(`ConfigReloader` の pin テストで担保)。
 
 ## テスト計画
 
 - `src/collab.rs` の単体テスト:`validate`(off / advisor×検出あり / advisor×未検出→bail / 未知 advisor_role→bail)、`team_name`、プロンプト断片ビルダ(`send.sh` / `inbox.sh` の呼び出し形と team・id が入ること)。routing のテストが detector を closure 注入するパターン(`routing.rs:247` `only(...)`)をそのまま流用しサブプロセスを起こさない。
-- `src/config.rs`:`[collab]` の parse(既定 off / mode / advisor_role)、セクション無しで `collab.is_none()`。
+- `src/config.rs`:`[collab]` の parse(既定 off / mode / advisor_role)、セクション無しで `collab.is_none()`。`ConfigReloader` が `[collab]` の変更を pin して warn すること(既存 `reloader_pins_process_bound_settings` に collab ケースを追加、基準 10)。
 - profile 解決:直近成功 planner run の pin あり→継ぐ / pin 無し→現在解決にフォールバック / pin 失効(config から消えた)→フォールバック + `collab.advisor_profile_fallback` emit(基準 2)。
 - `worker.rs` / `spec_worker.rs`:execute プロンプトが collab off で不変(基準 1)、spawn 成功時のみ相談ブロックを含む(基準 2)、spawn 失敗時は off と文字列一致(基準 4)。既存の `prompt_invites_needs_plan` パターン(`worker.rs:196`)に倣う。
 - flow 統合(FakeMux + FakeForge):collab on で advisor pane が spawn され run 終端で release される(pane + ディレクトリ、基準 5)、advisor spawn 失敗を注入しても run が成功しプロンプトが不変(基準 4)、resume 時に既存 advisor が捨てられ張り直される(基準 5)、collab off で pane 数不変(基準 1)。`supports_advisor()` が false の loop で spawn されない(基準 6)。
@@ -125,7 +126,7 @@ agmsg 自身が「トランスポートは素朴に、プロトコルは各 agen
 
 ## 触るファイル
 
-- `src/config.rs` — `[collab]` セクション(`CollabConfig` / `CollabMode`、`Config.collab: Option<_>`)
+- `src/config.rs` — `[collab]` セクション(`CollabConfig` / `CollabMode`、`Config.collab: Option<_>`、pin 比較のため `PartialEq` derive)+ `ConfigReloader::poll` の process-bound pin に `collab` を追加(`mux` / `daemon` の隣、restart-required warn)
 - `src/collab.rs` — 新規。`validate`(agmsg script 検出 = routing 流用)、`team_name`、seed / 相談ブロックのプロンプトビルダ
 - `src/store/panes.rs` — `ROLE_ADVISOR = "advisor"` 定数
 - `src/store/runs.rs` — 読み取りクエリ 1 本(issue × loop_kind の直近成功 run の `agent_profile`)
