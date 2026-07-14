@@ -1271,6 +1271,120 @@ async fn auto_mode_does_not_rescan_a_pending_proposal_kind_outside_apply() {
     );
 }
 
+/// Drive the advise→auto migration where the auto sweep declines the pending
+/// proposal (below threshold, or ignored), and assert the decline is recorded
+/// and discovery goes quiet. `auto_confidence` is what the agent returns on the
+/// auto sweep; `ignore` is applied before it.
+async fn drive_auto_decline(auto_confidence: f64, ignore: Vec<String>) -> TestEnv {
+    let mut env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default() // confidence_threshold 0.7, apply ["ready"]
+    })
+    .await;
+
+    // Sweep 1 (advise): propose `ready` on the candidate (advise has no bar).
+    let run1 = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "ready", "confidence": 0.8,
+                "estimated_complexity": "small", "rationale": "clear", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run1.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    let report = report_issue(&env).await.unwrap();
+    assert_eq!(
+        env.forge.get_issue(CANDIDATE).await.unwrap().labels,
+        vec![LABEL_TRIAGE_READY.to_string()]
+    );
+
+    // Switch to auto (applying any ignore). The pending proposal makes discovery
+    // due for one sweep.
+    env.deps.config.triage.mode = TriageMode::Auto;
+    env.deps.config.triage.ignore = ignore;
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // Sweep 2 (auto): the agent returns `ready` at `auto_confidence`.
+    let run2 = create_triage_run(&env, report.number);
+    let recs = format!(
+        r#"[{{"issue": 60, "recommendation": "ready", "confidence": {auto_confidence},
+             "estimated_complexity": "small", "rationale": "clear", "missing_info": null}}]"#
+    );
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), move |_, wt, turn_id| {
+        write_report(wt, &recs);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run2.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    env
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_records_decline_for_below_threshold_pending_proposal() {
+    // Below the 0.7 bar on the auto sweep.
+    let env = drive_auto_decline(0.5, Vec::new()).await;
+
+    // Not promoted, but the decline is recorded as an `applied=declined` marker.
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert!(
+        !c60.has_label(LABEL_READY),
+        "below threshold must not promote: {:?}",
+        c60.labels
+    );
+    assert!(
+        env.forge
+            .comments_of(CANDIDATE)
+            .iter()
+            .any(|c| c.contains("applied=declined")),
+        "{:?}",
+        env.forge.comments_of(CANDIDATE)
+    );
+
+    // The loop is closed: discovery is now quiet.
+    assert!(
+        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "a declined (below-threshold) pending proposal must not keep re-triggering the sweep"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_records_decline_for_ignored_pending_proposal() {
+    // Above the confidence bar, but silenced by `triage.ignore`.
+    let env = drive_auto_decline(0.9, vec!["#60".to_string()]).await;
+
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert!(
+        !c60.has_label(LABEL_READY),
+        "an ignored recommendation must not promote: {:?}",
+        c60.labels
+    );
+    assert!(
+        env.forge
+            .comments_of(CANDIDATE)
+            .iter()
+            .any(|c| c.contains("applied=declined")),
+        "{:?}",
+        env.forge.comments_of(CANDIDATE)
+    );
+
+    // The loop is closed even though the confidence cleared the bar.
+    assert!(
+        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "a declined (ignored) pending proposal must not keep re-triggering the sweep"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_mode_throttles_promotions_by_max_actions_per_tick() {
     let env = setup_with_triage(TriageConfig {

@@ -723,11 +723,15 @@ async fn triage_action_pending(deps: &Deps, issue: &Issue, no_marker: bool) -> R
         return Ok(false); // report/advise: unchanged marker = already actioned
     }
     match marker.applied {
-        AppliedLevel::Real => Ok(false), // already promoted, or rejected promotion
+        // Already promoted (or reverted = rejection), or auto already evaluated
+        // and declined this content: settled, not pending.
+        AppliedLevel::Real | AppliedLevel::Declined => Ok(false),
         AppliedLevel::Proposal => {
             // Pending → escalate; rejected (label gone) or kind outside `apply`
             // (escalation would no-op) → not pending, so this doesn't re-scan
-            // forever.
+            // forever. Below-threshold / ignored proposals that reach the sweep
+            // get an explicit `Declined` marker (above), which lands here on the
+            // next pass — that is what stops the loop for those cases.
             let promotable = marker
                 .recommendation
                 .is_some_and(|rec| promote_label(rec, &cfg.apply).is_some());
@@ -1309,37 +1313,50 @@ async fn promote_one(
     let Some(label) = promote_label(item.recommendation, &cfg.apply) else {
         return Ok(false); // needs-human/hold/skip, or not listed in `apply`
     };
-    if item.confidence < cfg.confidence_threshold {
-        return Ok(false); // below the safety gate
-    }
-    if ignored(
-        ignore,
-        &[
-            &format!("#{}", item.issue),
-            item.recommendation.as_str(),
-            &item.rationale,
-            item.missing_info.as_deref().unwrap_or(""),
-        ],
-    ) {
-        return Ok(false);
-    }
     let issue = deps.forge().get_issue(item.issue).await?;
     if issue.labels.iter().any(|l| is_engaged_label(l)) {
         return Ok(false); // a real label already, or held — never override a human
     }
     let hash = content_hash(&issue);
-    if let Some(prev) = latest_advise_marker(deps, item.issue).await?
-        && prev.hash == hash
+    // Read the latest marker first: it decides both the settled-state early
+    // returns and whether this issue is a *standing re-scan signal* (any marker
+    // = drift or pending), which is what a decline has to settle.
+    let prev = latest_advise_marker(deps, item.issue).await?;
+    if let Some(m) = &prev
+        && m.hash == hash
     {
         // Same content as the last triage action. Suppress when it was already
-        // a real promotion (idempotent, or a human reverted it = rejection), or
-        // when a prior proposal at this content was rejected (proposal marker,
-        // no proposal label left). Escalate only a still-pending proposal.
-        match prev.applied {
-            AppliedLevel::Real => return Ok(false),
+        // a real promotion (idempotent, or a human reverted it = rejection),
+        // when auto already declined this content, or when a prior proposal
+        // here was rejected (proposal marker, no proposal label left). Escalate
+        // only a still-pending proposal.
+        match m.applied {
+            AppliedLevel::Real | AppliedLevel::Declined => return Ok(false),
             AppliedLevel::Proposal if !has_proposal_label(&issue) => return Ok(false),
             AppliedLevel::Proposal => {}
         }
+    }
+    // Would auto actually promote this? Below the confidence bar or silenced by
+    // `triage.ignore` → no. When the issue already carries a triage marker it is
+    // a standing re-scan signal (a pending proposal, or drift from a stale-hash
+    // marker), so record the decline at the current content — otherwise the
+    // sweep re-triages it every interval. A fresh issue with no marker is not a
+    // re-scan signal, so a below-threshold no-op there needs nothing recorded.
+    if item.confidence < cfg.confidence_threshold
+        || ignored(
+            ignore,
+            &[
+                &format!("#{}", item.issue),
+                item.recommendation.as_str(),
+                &item.rationale,
+                item.missing_info.as_deref().unwrap_or(""),
+            ],
+        )
+    {
+        if prev.is_some() {
+            record_decline(deps, item, &hash).await;
+        }
+        return Ok(false);
     }
     // Apply the real label, then the reason comment, then (only on success)
     // supersede the proposal labels. Ordering guards auto's "reason comment
@@ -1424,13 +1441,17 @@ fn promote_label(rec: Recommendation, apply: &[TriageAction]) -> Option<&'static
 
 /// How far triage acted on an issue at a given content hash. `advise` writes a
 /// `Proposal` marker (a proposal label + evidence comment); `auto` writes a
-/// `Real` marker (a real phase label was applied). Distinguishing them lets
-/// `auto` escalate a still-pending proposal while respecting an already-made
-/// promotion / rejection (ADR 0017 decision 3).
+/// `Real` marker (a real phase label was applied), or a `Declined` marker when
+/// it evaluated a pending proposal and chose not to promote it (below
+/// `confidence_threshold`, or silenced by `ignore`). Distinguishing them lets
+/// `auto` escalate a still-pending proposal, respect an already-made promotion
+/// / rejection (ADR 0017 decision 3), and — via `Declined` — stop re-triaging a
+/// proposal it has already decided not to promote, until the content changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppliedLevel {
     Proposal,
     Real,
+    Declined,
 }
 
 impl AppliedLevel {
@@ -1438,6 +1459,7 @@ impl AppliedLevel {
         match self {
             Self::Proposal => "proposal",
             Self::Real => "real",
+            Self::Declined => "declined",
         }
     }
 }
@@ -1478,10 +1500,10 @@ fn parse_advise_marker(comment: &str) -> Option<AdviseMarker> {
         if let Some(v) = part.strip_prefix("hash=") {
             hash = Some(v.to_string());
         } else if let Some(v) = part.strip_prefix("applied=") {
-            applied = if v == "real" {
-                AppliedLevel::Real
-            } else {
-                AppliedLevel::Proposal
+            applied = match v {
+                "real" => AppliedLevel::Real,
+                "declined" => AppliedLevel::Declined,
+                _ => AppliedLevel::Proposal,
             };
         } else if let Some(v) = part.strip_prefix("recommendation=") {
             recommendation = Recommendation::from_str(v);
@@ -1552,6 +1574,34 @@ fn render_promote_comment(item: &TriageItem, label: &str, hash: &str) -> String 
         hold = forge::LABEL_HOLD,
     ));
     body
+}
+
+/// Record that `auto` evaluated a pending proposal at this content and chose not
+/// to promote it (below `confidence_threshold`, or silenced by `triage.ignore`),
+/// so the next sweep treats the decision as settled and stops re-triaging it
+/// until the content changes. Best-effort — a failed write just means the next
+/// interval retries. The proposal label is left in place (a human can still
+/// promote it by hand); this only silences auto's own re-evaluation.
+async fn record_decline(deps: &Deps, item: &TriageItem, hash: &str) {
+    if let Err(e) = deps
+        .forge()
+        .comment(item.issue, &render_decline_comment(item, hash))
+        .await
+    {
+        tracing::warn!("triage auto-decline note on issue #{}: {e:#}", item.issue);
+    }
+}
+
+/// The note recorded when `auto` declines a pending proposal: a hidden
+/// `applied=declined` marker over the current content, plus a short reason.
+fn render_decline_comment(item: &TriageItem, hash: &str) -> String {
+    format!(
+        "{marker}\n🔀 **meguri triage** — この内容では自動昇格しません(確信度 {confidence:.2} が \
+         `triage.confidence_threshold` 未満、または `triage.ignore` に該当)。内容が変われば再評価\
+         します。人手での昇格は引き続き可能です。\n",
+        marker = advise_marker(hash, item.recommendation, AppliedLevel::Declined),
+        confidence = item.confidence,
+    )
 }
 
 fn ignored(patterns: &[String], haystacks: &[&str]) -> bool {
@@ -2099,6 +2149,12 @@ mod tests {
         let parsed = parse_advise_marker(&real).unwrap();
         assert_eq!(parsed.applied, AppliedLevel::Real);
         assert_eq!(parsed.recommendation, Some(Recommendation::Plan));
+        // A `declined` marker roundtrips too.
+        let declined = advise_marker(&hash, Recommendation::Ready, AppliedLevel::Declined);
+        assert_eq!(
+            parse_advise_marker(&declined).unwrap().applied,
+            AppliedLevel::Declined
+        );
         // A marker predating the `applied` field parses as `proposal` (v1's
         // only action level), for backward compatibility, keeping its recommendation.
         let old = format!("<!-- meguri:triage-advise hash={hash} recommendation=plan -->");
