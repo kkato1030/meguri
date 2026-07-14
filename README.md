@@ -52,6 +52,7 @@ meguri's core trade-off is unattended execution, and that's worth understanding 
 - **The agent gets real shell access.** The default `[agent].args` includes `--dangerously-skip-permissions`, so once a loop picks up an issue, the agent runs arbitrary commands in its worktree — git, cargo, network calls, anything the CLI allows — with no per-command confirmation. That's what makes an unattended loop possible; it also means you should only run meguri somewhere you're fine with an agent having that level of access (a disposable VM or container, or a machine/account whose blast radius you accept). If you'd rather gate every command, set `args = ["--permission-mode", "acceptEdits"]` (see [Configuration](#configuration)) and answer dialogs by attaching to the pane.
 - **Issue bodies are prompt input.** The full issue body (and comments a loop reads) is injected into the agent's prompt verbatim, so on a repo where anyone can open issues, a malicious one is a prompt-injection attempt against an agent with shell access. The mitigation is the [label gate](#labels): a loop only acts on an issue that already carries a `meguri:*` phase label (`meguri:plan` / `meguri:ready`), and applying labels needs collaborator (write) access — so "who can get an agent to execute" reduces to "who has write access to this repo," not "who can open an issue." Weigh that when granting collaborator access, and don't label untrusted issues `meguri:ready` yourself.
 - **Completion is verified independently, not screen-scraped.** As described in [The completion contract](#the-completion-contract) above, meguri never takes the agent's own "success" claim at face value — it re-checks git state, commits ahead of base, and the project's `check_command` before treating a run as done. This bounds (but doesn't eliminate) the damage a compromised or misled agent can do: it can still act inside the worktree during a run, but it can't talk meguri into merging bad state just by writing "success" to the result file.
+- **A run can't weaken its own completion contract.** The verification command can live in the repo's [`meguri.toml`](#repo-config--project-intrinsic-settings-in-meguritoml-optional), so meguri reads it from the run's worktree **once, at the run's start, and pins it** for the run's life. Editing `meguri.toml` mid-run — or `update-ref`-ing a branch — does not change the `check_command` that run is held to; a crash-and-resume reuses the pinned value rather than re-reading a since-tampered worktree. The guarantee is scoped honestly: it's *"an in-flight run's contract is fixed once it starts,"* not full isolation of an adversarial agent (which shares the host's git dir and credentials, and is out of scope). A weaker contract can only reach a run by being committed to the branch it runs on, where it shows up in the PR diff for the human merge gate to catch (ADR 0011).
 
 Found a vulnerability in meguri itself? See [SECURITY.md](SECURITY.md).
 
@@ -342,6 +343,25 @@ signal_comment = true  # also leave a "re-label meguri:ready" nudge comment (fal
 Plan-first delivery is chosen per project with `plan_delivery` (default `separate` = two PRs; `combined` = the #98 one-PR morph); like `[pr]` and `[clean]`, `[projects.review]` overrides the whole `[review]` section at once.
 
 `[projects.pr]` overrides the whole `[pr]` section at once (not key-by-key): a project that sets `[projects.pr]` gets the defaults for anything it omits, `[pr.auto_merge]` included.
+
+### Repo config — project-intrinsic settings in `meguri.toml` (optional)
+
+Some settings describe the **repo itself**, not the host that runs it: how to verify its work (`check_command`), what language its deliverables use (`language`), whether its PRs open as drafts (`pr.draft`). Instead of copying those into every host's `config.toml`, put them in a `meguri.toml` at the **repo root** — versioned with the code, identical on every host. Opt-in: a repo with no `meguri.toml` behaves exactly as before.
+
+```toml
+# <repo>/meguri.toml
+language = "日本語"
+check_command = "cargo test"
+
+[pr]
+draft = false        # repo-eligible; auto_merge here is a `meguri doctor` error (host-only)
+```
+
+**The boundary** (ADR 0011): a repo may declare only **project-intrinsic facts that affect its own runs**. Anything that names *other* repos, binds to a host machine or token, or is a trust declaration stays host-only — so `repo_slug`, `mode`, `default_branch`, `[[workspaces]]`, `[agent]`, `[routing]`, `pr.auto_merge`, and the rest are rejected in `meguri.toml` (a host-only key is a `meguri doctor` error, never silently ignored). Initial repo-eligible keys: `check_command`, `language`, `pr.draft`.
+
+**Precedence** is `built-in default < host global section < repo meguri.toml < host [projects.*] override` — the host always wins last, so an operator can override a repo's setting locally. A broken or invalid `meguri.toml` is warned about and treated as absent (the run continues on host config; the process never dies).
+
+**When it takes effect**: the values are read from the run's worktree once at the start of each run and pinned for that run's life (see [Security](#security)). So a change reaches runs by landing on a branch: merge to the default branch and every later run picks it up; commit to a PR branch and that PR's own run uses it (config-with-code). Editing `meguri.toml` mid-run does not affect the run in flight. See ADR 0011 for the full model.
 
 ### Workspaces — related projects, cross-repo decomposition (optional)
 

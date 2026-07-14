@@ -196,6 +196,9 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
             ok &= doctor_schedules(cfg);
+            // Repo config (issue #165): lint each project's `meguri.toml`,
+            // failing on a host-only key or TOML error (deny_unknown_fields).
+            ok &= doctor_repo_configs(cfg);
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -308,6 +311,40 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 s.kind.as_str(),
                 s.cron,
             );
+        }
+    }
+    ok
+}
+
+/// Doctor's repo-config section (issue #165): lint each project's repo root
+/// `meguri.toml`. Doctor holds no run, so it reads the primary clone's working
+/// tree (`<repo_path>/meguri.toml`) — advisory, not the run's pinned value. A
+/// host-only key or malformed TOML fails (deny_unknown_fields); an absent file
+/// is the silent, valid opt-out. Follows routing/schedules' "never silently
+/// fall back" principle so a boundary violation surfaces here, not as a no-op.
+fn doctor_repo_configs(cfg: &Config) -> bool {
+    use meguri::config::RepoConfig;
+
+    let mut printed_header = false;
+    let mut ok = true;
+    for project in &cfg.projects {
+        match RepoConfig::load_from_worktree(&project.repo_path) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ✅ {}: meguri.toml OK", project.id);
+            }
+            Err(e) => {
+                if !printed_header {
+                    println!("\nrepo config:");
+                    printed_header = true;
+                }
+                println!("  ❌ {}: {e:#}", project.id);
+                ok = false;
+            }
         }
     }
     ok
