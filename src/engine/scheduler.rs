@@ -227,6 +227,13 @@ impl Scheduler {
                         json!({ "key": format!("{:?}", target.key), "title": target.title,
                                 "loop": lp.kind() }),
                     )?;
+                    // Admit by weight (issue #111): a collab-advisor run books 2
+                    // slots, so start it only if it fits the budget. A run that
+                    // doesn't fit stays `queued` for a later tick — head-of-line,
+                    // so a heavy run isn't starved by lighter ones behind it.
+                    if !self.admits(active, self.run_weight_for(&run)) {
+                        return Ok(());
+                    }
                     self.dispatch(&run, running, active);
                 }
             }
@@ -253,10 +260,37 @@ impl Scheduler {
                 continue;
             }
             if run.status == RunStatus::Interrupted || run.status == RunStatus::Queued {
+                // Same weighted admission as discovery (issue #111): don't
+                // resume a heavy run until it fits. Stop at the first that
+                // doesn't, so it isn't skipped over by lighter runs behind it.
+                if !self.admits(active, self.run_weight_for(&run)) {
+                    break;
+                }
                 self.dispatch(&run, running, active);
             }
         }
         Ok(())
+    }
+
+    /// The run's slot weight (issue #111), or 1 when its project is unknown
+    /// (that run can't be dispatched anyway — `dispatch` warns and skips it).
+    fn run_weight_for(&self, run: &RunRecord) -> usize {
+        self.projects
+            .iter()
+            .find(|d| d.project.id == run.project_id)
+            .map(|d| run_weight(d, run))
+            .unwrap_or(1)
+    }
+
+    /// Whether a run of `weight` can start now without over-spending the slot
+    /// budget (issue #111). One escape: a run always starts on an idle
+    /// scheduler, so a weight-2 collab-advisor run is not deadlocked at
+    /// `max_concurrent = 1` (criterion 8). Otherwise the budget is hard
+    /// (`active + weight <= max`) — never the "+1 slack" that would let an
+    /// advisor run over-subscribe a busy scheduler.
+    fn admits(&self, active: &HashMap<String, usize>, weight: usize) -> bool {
+        let current = active_weight(active);
+        current == 0 || current + weight <= self.max_concurrent
     }
 
     fn dispatch(
@@ -441,5 +475,46 @@ mod tests {
                 1
             );
         }
+    }
+
+    fn empty_scheduler(max: usize) -> Scheduler {
+        Scheduler {
+            projects: vec![],
+            loops: vec![],
+            poll_interval: Duration::from_secs(1),
+            max_concurrent: max,
+            reload: None,
+        }
+    }
+
+    fn active_map(weights: &[(&str, usize)]) -> HashMap<String, usize> {
+        weights.iter().map(|(k, w)| (k.to_string(), *w)).collect()
+    }
+
+    #[test]
+    fn admits_enforces_the_weighted_budget() {
+        // This is the gate discover/redispatch use before every dispatch, so a
+        // weight-2 collab-advisor run cannot over-subscribe the slot budget.
+        let s = empty_scheduler(2);
+        // Idle scheduler: a weight-2 advisor run fits exactly.
+        assert!(s.admits(&active_map(&[]), 2));
+        // One normal run active (weight 1): a weight-2 advisor run would push
+        // the total to 3 — rejected (the over-subscription the review caught).
+        assert!(!s.admits(&active_map(&[("a", 1)]), 2));
+        // …but a weight-1 run still fits (1 + 1 = 2).
+        assert!(s.admits(&active_map(&[("a", 1)]), 1));
+        // Full: nothing more admits.
+        assert!(!s.admits(&active_map(&[("a", 2)]), 1));
+    }
+
+    #[test]
+    fn admits_lets_a_lone_advisor_run_start_at_max_one() {
+        // Criterion 8: a single collab-advisor run (weight 2) must start even
+        // at max_concurrent = 1 (the idle-scheduler escape) …
+        let s = empty_scheduler(1);
+        assert!(s.admits(&active_map(&[]), 2));
+        // … but nothing starts alongside it.
+        assert!(!s.admits(&active_map(&[("a", 2)]), 1));
+        assert!(!s.admits(&active_map(&[("a", 1)]), 1));
     }
 }
