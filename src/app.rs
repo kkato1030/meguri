@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::notify::Notifier;
+use crate::refine::{HeadlessRefiner, Refined, Refiner};
 use crate::store::{
     DesiredState, DriftRow, LANE_AUTHOR, LANE_PR_REVIEW, RunRecord, RunStatus, Store,
 };
@@ -96,6 +97,371 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
             _ => bail!("multiple projects configured — pass --project <id>"),
         },
     }
+}
+
+/// `meguri add` — low-friction capture; the behavior follows the project mode.
+/// github → create a GitHub issue immediately (never via the LLM) and refine it
+/// best-effort (ADR 0006). local → queue a task in the sqlite `tasks` table for
+/// the watch (issue #148 / ADR 0003). Both share the "capture now, sort later"
+/// intent; the mode-specific flags are rejected on the wrong mode.
+pub async fn cmd_add(
+    project: Option<&str>,
+    text: Option<&str>,
+    plan: bool,
+    ready: bool,
+    raw: bool,
+    file: Option<&str>,
+    not_before: Option<&str>,
+) -> Result<()> {
+    let cfg = Config::load()?;
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    let project = infer_project(&cfg, project, &cwd)?;
+    check_add_flags(
+        project,
+        plan,
+        ready,
+        raw,
+        file.is_some(),
+        not_before.is_some(),
+    )?;
+    match project.mode {
+        ProjectMode::Github => {
+            let text = github_memo(text)?;
+            add_github(&cfg, project, text, plan, ready, raw).await
+        }
+        ProjectMode::Local => add_local(project, text, file, not_before),
+    }
+}
+
+/// The github-mode memo check, factored out of [`cmd_add`] so it is testable
+/// without a config file. Emptiness is judged on a trimmed view only; the
+/// memo itself is returned untouched, because `add_core` stores it verbatim
+/// (ADR 0006 原則2) — trimming here would silently strip the quoted
+/// whitespace/newlines from the issue body and the 原文メモ footer.
+pub fn github_memo(text: Option<&str>) -> Result<&str> {
+    text.filter(|t| !t.trim().is_empty())
+        .context("give `meguri add` a one-line memo to capture")
+}
+
+/// Flag ↔ mode compatibility for `meguri add`, factored out of [`cmd_add`] so
+/// it is testable without a config file on disk. Notably, `--plan` needs a
+/// github-mode project: local mode has no planner yet (issue #54 Phase 3) —
+/// `PlannerLoop::discover` returns nothing without a forge — so a local plan
+/// task would sit queued forever. Reject it up front, mirroring the
+/// config-side check that refuses a local-mode `plan` schedule.
+pub fn check_add_flags(
+    project: &ProjectConfig,
+    plan: bool,
+    ready: bool,
+    raw: bool,
+    has_file: bool,
+    has_not_before: bool,
+) -> Result<()> {
+    if plan && ready {
+        bail!("--plan and --ready are mutually exclusive — pick one");
+    }
+    match project.mode {
+        ProjectMode::Github => {
+            if has_file || has_not_before {
+                bail!(
+                    "--file / --not-before are local-mode options; a github-mode \
+                     `meguri add` captures a one-line memo as an issue"
+                );
+            }
+        }
+        ProjectMode::Local => {
+            if ready || raw {
+                bail!(
+                    "--ready / --raw are github-mode options; a local-mode `meguri add` \
+                     queues a work task"
+                );
+            }
+            if plan {
+                bail!(
+                    "project {:?} is mode = \"local\" but --plan queues planner work \
+                     (local mode has no planner yet — issue #54 — so the task would \
+                     never be consumed); use a github-mode project for --plan",
+                    project.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// github-mode capture: an issue is created immediately and, unless `--raw`,
+/// refined best-effort afterwards. Lives outside the issue↔pane↔session
+/// lifetime model (#92): only the config and the forge — no run, no pane.
+async fn add_github(
+    cfg: &Config,
+    project: &ProjectConfig,
+    text: &str,
+    plan: bool,
+    ready: bool,
+    raw: bool,
+) -> Result<()> {
+    let repo_slug = project.repo_slug.as_deref().context(
+        "github-mode project has no repo_slug (config validation should have caught this)",
+    )?;
+    let forge = GhForge::new(repo_slug);
+
+    let mut labels: Vec<&str> = Vec::new();
+    if plan {
+        labels.push(crate::forge::LABEL_PLAN);
+    }
+    if ready {
+        labels.push(crate::forge::LABEL_READY);
+    }
+
+    // `--raw` is "no refine at all". Otherwise the refiner is *not* built here:
+    // `build_refiner` runs `routing::resolve`, which under `mode = "auto"` may
+    // probe agent CLIs (`command --version`) — slow or hung detection must
+    // never delay the capture. add_core invokes this source only after
+    // `create_issue` succeeded and the number + URL are printed (capture-first,
+    // ADR 0006); a resolution failure is a skip note, the issue stays raw.
+    let refiner_source: Option<RefinerSource> = if raw {
+        None
+    } else {
+        Some(Box::new(|| {
+            build_refiner(cfg).map(|r| Box::new(r) as Box<dyn Refiner>)
+        }))
+    };
+
+    let params = AddParams {
+        text,
+        labels: &labels,
+        repo_slug,
+        repo_path: &project.repo_path,
+        language: cfg.language_for(project),
+    };
+    add_core(&forge, params, refiner_source).await?;
+    Ok(())
+}
+
+/// Inputs `add_core` needs beyond the forge, gathered so the orchestration is
+/// testable against a `FakeForge` without a live config.
+pub struct AddParams<'a> {
+    pub text: &'a str,
+    pub labels: &'a [&'a str],
+    pub repo_slug: &'a str,
+    pub repo_path: &'a Path,
+    pub language: Option<&'a str>,
+}
+
+/// Lazily resolves the refiner. `add_core` invokes it only *after*
+/// `create_issue` succeeded, so a slow or hung resolution (e.g. routing's
+/// agent-CLI detection) can never delay the capture report. `Err` is a
+/// human-readable skip note printed after the issue number; the issue stays
+/// raw. `None` at the call site means `--raw`: no refine step at all.
+pub type RefinerSource<'a> =
+    Box<dyn FnOnce() -> std::result::Result<Box<dyn Refiner>, String> + Send + 'a>;
+
+/// The capture→refine→write-back core, split out from [`cmd_add`] so tests can
+/// drive it with a fake forge and a fake refiner. Returns the created issue
+/// number. `create_issue` failing is a real error (no issue exists); every
+/// later failure — including refiner resolution itself, which only runs after
+/// capture — leaves the raw issue in place and reports capture success.
+pub async fn add_core(
+    forge: &dyn Forge,
+    params: AddParams<'_>,
+    refiner_source: Option<RefinerSource<'_>>,
+) -> Result<i64> {
+    // The memo is stored verbatim (ADR 0006 原則2): the raw `params.text`
+    // becomes the body and the refined footer, so quoted leading/trailing
+    // whitespace and newlines survive. A trimmed view is only for validation,
+    // the title, and the refine prompt.
+    let raw = params.text;
+    let trimmed = raw.trim();
+    let title0 = initial_title(raw);
+    let body0 = raw.to_string();
+
+    // Capture: the one step that may hard-fail (auth/network/slug/permissions).
+    let number = forge
+        .create_issue(&title0, &body0, params.labels)
+        .await
+        .context("creating the issue (capture)")?;
+    println!(
+        "issue #{number} created: {}",
+        issue_url(params.repo_slug, number)
+    );
+
+    // Only now — with the issue standing and reported — resolve the refiner
+    // (capture-first, ADR 0006). Resolution failure is best-effort like every
+    // other post-capture step: print the note, leave the issue raw.
+    let Some(source) = refiner_source else {
+        return Ok(number);
+    };
+    let refiner = match source() {
+        Ok(r) => r,
+        Err(note) => {
+            println!("{note}");
+            return Ok(number);
+        }
+    };
+
+    print!("refining… ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let refined = match refiner
+        .refine(trimmed, params.repo_path, params.language)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("skipped: {e:#} — issue #{number} left raw");
+            return Ok(number);
+        }
+    };
+    // Everything past capture is best-effort (ADR 0006): a forge hiccup in the
+    // write-back must leave the raw issue standing and still report success,
+    // never fail the command or half-apply the refine.
+    if let Err(e) = write_back_refine(forge, number, &title0, &body0, &refined, raw).await {
+        println!("kept raw: {e:#}");
+    }
+    Ok(number)
+}
+
+/// Apply the refine result, best-effort and coherently. Re-reads first (race
+/// guard, 論点5): only overwrites while the issue is still the raw capture, so
+/// a human edit in the refine window wins. Body is written before title, and
+/// the title is skipped if the body write fails — so a forge error can never
+/// leave a refined title on a raw body. The worst partial state is a refined
+/// body (which still holds the verbatim memo) under the raw one-line title,
+/// which is coherent. Any error is returned for the caller to report.
+async fn write_back_refine(
+    forge: &dyn Forge,
+    number: i64,
+    raw_title: &str,
+    raw_body: &str,
+    refined: &Refined,
+    original: &str,
+) -> Result<()> {
+    let current = forge
+        .get_issue(number)
+        .await
+        .context("re-reading the issue before refine write-back")?;
+    if current.title != raw_title || current.body != raw_body {
+        println!("done — issue was edited meanwhile; kept your version (refine skipped)");
+        return Ok(());
+    }
+    forge
+        .update_issue_body(number, &compose_refined_body(&refined.body, original))
+        .await
+        .context("updating the issue body")?;
+    forge
+        .update_issue_title(number, &refined.title)
+        .await
+        .context("updating the issue title")?;
+    println!("done\n  Title: {}", refined.title);
+    Ok(())
+}
+
+/// Resolve the refiner's headless launch, or a human-readable reason it can't
+/// run (which `add_core` prints after capture, leaving the issue raw).
+fn build_refiner(cfg: &Config) -> std::result::Result<HeadlessRefiner, String> {
+    let name = crate::routing::resolve(cfg, "refiner", &crate::routing::detect_command)
+        .map_err(|e| format!("refine skipped: {e:#} — issue left raw"))?;
+    let profile = crate::routing::profile_by_name(cfg, &name)
+        .map_err(|e| format!("refine skipped: {e:#} — issue left raw"))?;
+    match crate::routing::effective_headless_args(&profile) {
+        Some(argv) => Ok(HeadlessRefiner {
+            command: profile.command,
+            argv,
+        }),
+        None => Err(format!(
+            "refine skipped: profile `{name}` ({}) has no headless mode — \
+             issue left raw (set `headless_args`, see `meguri doctor`)",
+            profile.command
+        )),
+    }
+}
+
+/// Which project `meguri add` targets: explicit `--project` wins; otherwise
+/// infer from the cwd — a project whose canonical `repo_path` is a
+/// path-component ancestor of the cwd. A single cwd match wins even among many
+/// projects; multiple matches (or none with several projects configured) is an
+/// explicit error; none with a single project falls back to that sole project.
+pub fn infer_project<'a>(
+    cfg: &'a Config,
+    explicit: Option<&str>,
+    cwd: &Path,
+) -> Result<&'a ProjectConfig> {
+    if let Some(id) = explicit {
+        return cfg
+            .project(id)
+            .with_context(|| format!("project {id:?} not in config"));
+    }
+    // Canonicalize both sides so symlinks and `.`/`..` don't defeat the
+    // ancestor test; fall back to the raw path when it can't be canonicalized.
+    let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let matches: Vec<&ProjectConfig> = cfg
+        .projects
+        .iter()
+        .filter(|p| {
+            let rp = p
+                .repo_path
+                .canonicalize()
+                .unwrap_or_else(|_| p.repo_path.clone());
+            // starts_with is component-wise, so `/repo` never matches `/repo2`.
+            cwd_c.starts_with(&rp)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [_, _, ..] => bail!(
+            "the cwd is under multiple configured projects ({}) — pass --project <id>",
+            matches
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        [] => match cfg.projects.as_slice() {
+            [] => bail!(
+                "no projects configured — edit {}",
+                config::config_path().display()
+            ),
+            [only] => Ok(only),
+            _ => bail!(
+                "multiple projects configured and the cwd is under none — pass --project <id>"
+            ),
+        },
+    }
+}
+
+/// The GitHub issue URL for a freshly created issue. `create_issue` returns
+/// only the number, so the URL is composed from the `owner/repo` slug — its
+/// shape is stable and this avoids widening the forge trait.
+pub fn issue_url(repo_slug: &str, number: i64) -> String {
+    format!("https://github.com/{repo_slug}/issues/{number}")
+}
+
+/// Pre-refine title from a raw memo: the first non-empty line, trimmed and
+/// truncated so a paragraph-long memo doesn't become a monstrous title. The
+/// full memo still lands in the body verbatim, so nothing is lost.
+pub fn initial_title(text: &str) -> String {
+    const MAX: usize = 72;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() > MAX {
+        let mut t: String = line.chars().take(MAX - 1).collect();
+        t.push('…');
+        t
+    } else {
+        line.to_string()
+    }
+}
+
+/// Refined body followed by the verbatim original memo. This preservation is
+/// the orchestrator's job, never the model's (ADR 0006 原則2): the model's
+/// output is the scaffold, the original memo keeps authoring authority. The
+/// original is embedded byte-for-byte (no trimming) — quoted whitespace and
+/// newlines are part of what the author wrote.
+pub fn compose_refined_body(refined_body: &str, original: &str) -> String {
+    format!("{}\n\n---\n## 原文メモ\n{}", refined_body.trim(), original)
 }
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
@@ -529,26 +895,16 @@ pub fn cmd_stats_collab(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `meguri add`: queue a local task. Phase 1 only serves local-mode projects
-/// (silent mode's `meguri queue --issue` is Phase 2); a task added to a github
-/// project would never be discovered, so refuse it loudly instead.
-pub fn cmd_add(
-    project: Option<&str>,
-    plan: bool,
-    file: Option<&str>,
+/// local-mode capture: queue a task in the sqlite `tasks` table for the watch
+/// to pick up (issue #148 / ADR 0003). The project is already resolved and
+/// mode-checked by [`cmd_add`]. Always `TaskKind::Work` — `--plan` is rejected
+/// by [`check_add_flags`] until local mode grows a planner (issue #54).
+fn add_local(
+    project: &ProjectConfig,
     title: Option<&str>,
+    file: Option<&str>,
     not_before: Option<&str>,
 ) -> Result<()> {
-    let cfg = Config::load()?;
-    let project = pick_project(&cfg, project)?;
-    if project.mode != ProjectMode::Local {
-        bail!(
-            "`meguri add` queues local tasks, but project {:?} is mode = {:?}. \
-             Phase 1 supports local mode only (silent mode's `meguri queue --issue` is Phase 2).",
-            project.id,
-            project.mode.as_str()
-        );
-    }
     // Normalize --not-before to our RFC3339 UTC shape up front, so a typo is
     // caught here rather than silently keeping the task queued forever.
     let not_before = match not_before {
@@ -564,7 +920,7 @@ pub fn cmd_add(
         None => None,
     };
     let (title, body) = resolve_task_input(title, file)?;
-    let kind = if plan { TaskKind::Plan } else { TaskKind::Work };
+    let kind = TaskKind::Work;
     let store = open_store()?;
     let task = store.create_task_with_not_before(
         &project.id,

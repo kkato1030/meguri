@@ -39,18 +39,25 @@ async fn main() -> Result<()> {
             mux,
         } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
         Command::Add {
+            text,
             project,
             plan,
+            ready,
+            raw,
             file,
             not_before,
-            title,
-        } => app::cmd_add(
-            project.as_deref(),
-            plan,
-            file.as_deref(),
-            title.as_deref(),
-            not_before.as_deref(),
-        ),
+        } => {
+            app::cmd_add(
+                project.as_deref(),
+                text.as_deref(),
+                plan,
+                ready,
+                raw,
+                file.as_deref(),
+                not_before.as_deref(),
+            )
+            .await
+        }
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
         Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
         Command::Ps { all } => app::cmd_ps(all),
@@ -613,9 +620,10 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
         .map(|v| v.lines().next().unwrap_or_default().to_string());
     let default_ok = default_detail.is_ok();
     println!(
-        "  {} default ({}): {}",
+        "  {} default ({}) [{}]: {}",
         if default_ok { "✅" } else { "❌" },
         cfg.agent.command,
+        headless_note(&cfg.agent),
         default_detail.clone().unwrap_or_else(|e| e),
     );
     if let (Ok(v), Some(store)) = (&default_detail, store) {
@@ -634,9 +642,10 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
         let detail = run_capture(&profile.command, &["--version"])
             .map(|v| v.lines().next().unwrap_or_default().to_string());
         println!(
-            "  {} {name} ({}): {}",
+            "  {} {name} ({}) [{}]: {}",
             if detail.is_ok() { "✅" } else { "⚠️ " },
             profile.command,
+            headless_note(&profile),
             detail.clone().unwrap_or_else(|e| e),
         );
         if let (Ok(v), Some(store)) = (&detail, store) {
@@ -689,9 +698,38 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             }
         }
     }
+
+    // `meguri add`'s refine runs headless: report whether the resolved refiner
+    // profile actually has a headless mode. A miss isn't a doctor failure —
+    // capture still works, refine just stays off — but a human should know.
+    if let Ok(name) = routing::resolve(cfg, "refiner", &routing::detect_command)
+        && let Ok(profile) = routing::profile_by_name(cfg, &name)
+    {
+        match routing::effective_headless_args(&profile) {
+            Some(_) => println!("refine (`meguri add`): ✅ via {name} ({})", profile.command),
+            None => println!(
+                "refine (`meguri add`): ⚠️  {name} ({}) has no headless mode — \
+                 `meguri add` will capture raw only; set `headless_args` for it",
+                profile.command,
+            ),
+        }
+    }
+
     ok &= doctor_launch(cfg);
     ok &= doctor_collab(cfg);
     ok
+}
+
+/// One-word summary of a profile's headless (refine) resolution for doctor:
+/// explicit argv, inherited from a known CLI, opted out, or unsupported.
+fn headless_note(profile: &meguri::config::AgentProfile) -> &'static str {
+    use meguri::routing::effective_headless_args;
+    match &profile.headless_args {
+        Some(a) if !a.is_empty() => "headless: explicit",
+        Some(_) => "headless: off",
+        None if effective_headless_args(profile).is_some() => "headless: inherited",
+        None => "headless: none",
+    }
 }
 
 /// Collab advisor (issue #111): report `[collab]` and surface the same startup
@@ -854,6 +892,7 @@ mod tests {
             command: "fake-claude".into(),
             args: vec![],
             resume_args: vec![],
+            headless_args: None,
             direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,

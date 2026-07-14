@@ -662,6 +662,7 @@ async fn setup_direct(script_dir: &Path) -> TestEnv {
             command: agent.to_string_lossy().into_owned(),
             args: vec![],
             resume_args: vec![],
+            headless_args: None,
             direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,

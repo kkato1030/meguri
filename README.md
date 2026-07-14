@@ -126,6 +126,9 @@ meguri already runs in the repo:
 ## Use
 
 ```bash
+# capture: turn a one-line memo into an issue (AI refines it afterwards)
+meguri add "login redirect goes to the wrong page"
+
 # one-shot: work a single issue
 meguri run --project myproj --issue 42
 
@@ -146,6 +149,33 @@ meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
 
+### Intake (`meguri add`)
+
+The first thing that clogs is filing the work item. `meguri add "<one line>"`
+lowers that to a single command — and does the right thing for the project's
+mode.
+
+**github mode** — it creates the issue immediately, straight through
+`create_issue`, never via the LLM, and prints the number and URL. Then,
+best-effort, a headless agent reads the repo and refines the title and body;
+the original memo is always kept verbatim at the bottom, so refine is only
+scaffolding and your words keep authoring authority. Capture never waits on or
+fails from the AI: if the agent is missing, refine fails, or you hit Ctrl-C,
+the raw issue still stands. The default is unlabeled = untriaged (watch ignores
+it); label it `meguri:plan` / `meguri:ready` later, or pass `--plan` /
+`--ready` now. `--raw` skips refine entirely. Refine works out of the box with
+the default `claude` CLI; if you swap `command` to another CLI, set that
+profile's `headless_args` too or refine is skipped (raw capture only) —
+`meguri doctor` flags it.
+
+**local mode** — it queues a task in meguri's sqlite instead (see below);
+`--file` reads a markdown task and `--not-before` holds it until a time.
+`--plan` is rejected: local mode has no planner yet (issue #54), so a plan
+task would never be picked up — use a github-mode project for planner work.
+
+`--project` is inferred from the cwd (the project whose `repo_path` contains
+it); pass it explicitly when ambiguous.
+
 ### Local mode (no GitHub, no labels)
 
 For repos whose labels you can't (or won't) touch, run a project **entirely locally**: the task queue, claim, escalation, and completion live in meguri's sqlite instead of GitHub labels, and the deliverable is a verified local branch instead of a PR. Set `mode = "local"` — `repo_slug` becomes optional and `meguri doctor` stops requiring `gh`:
@@ -165,10 +195,11 @@ Queue and track work with the local task commands instead of labels:
 ```bash
 meguri add "Add a --json flag to the export command"   # queue a task
 meguri add --file task.md                              # first heading → title, rest → body
-meguri add --plan "Design the export format"           # queue for the planner instead of the worker
 meguri tasks                                           # list open tasks (needs_human highlighted)
 meguri watch                                           # picks tasks up within one poll interval
 ```
+
+(`meguri add --plan` is github-only: local mode has no planner yet — issue #54.)
 
 A local run works on a `meguri/t<task-id>-<slug>-<hash>` branch; on success it leaves the verified commits there and flips the task to `done` — nothing is pushed. A failed run marks the task `needs_human` with a reason (shown by `meguri tasks` / `meguri ps`), and the next run re-claims it and clears the flag. Review the branch yourself and merge when happy (`meguri review` / `accept` land in a later phase).
 
