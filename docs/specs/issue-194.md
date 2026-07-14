@@ -60,11 +60,22 @@ pub enum DefaultBranchFile {
   割れる(repo config は Absent=opt-out だが symlink/tree は ❌)。また `git cat-file -e` や
   `git show` は **tree object(ディレクトリ)でも成功**し、`git show <base>:<dir>` は一覧を返すので、
   「存在プローブ→git show」だけでは blob 内容を返す契約を破る(dir を中身と誤読)。
-- **判定は `git ls-tree <base> -- <rel>` の 1 コールで型を確定**する。出力の mode で分岐:
-  - 空出力 → `Absent`
-  - `100644` / `100755`(通常 blob)→ `git show <base>:<rel>` で内容取得 → `Content`
-  - `120000`(symlink)/ `040000`(tree)/ `160000`(submodule gitlink)→ `NotRegularFile`
-  - これで symlink・ディレクトリ・submodule を Content から確実に外す(finding 2 / 3)。
+- **判定は `git ls-tree` で「完全一致の 1 エントリ」を得て型を確定**する。素朴に
+  `git ls-tree <base> -- <rel>` だと、`rel` が `src/` のように**末尾スラッシュ付き**だと git は tree 自身
+  ではなく**配下を列挙**し、先頭が `100644` なら通常ファイルと誤判定する(finding)。pathspec マジックや
+  glob(`*.md` 等)も同じ穴になる。よって次で塞ぐ:
+  - `rel` の末尾スラッシュを拒否する(`validate_repo_relative` に末尾 `/` 拒否を足す。config load と
+    gitops 入口の両方で弾く)。
+  - pathspec マジックを無効化して呼ぶ: `git ls-tree --full-tree -z --format='%(objectmode) %(objecttype) %(objectname) %(path)' <base> -- ':(literal)<rel>'`(または `GIT_LITERAL_PATHSPECS=1`)。
+    ディレクトリを渡しても**再帰しない**(`-r` を付けない)ので、tree はその tree 1 エントリとして返る。
+  - 出力を `-z`(NUL 区切り)でパースし、**エントリが正確に 1 つ**かつ **`%(path)` が `rel` と完全一致**の
+    ものだけ採用する。0 件 → `Absent`。複数件や path 不一致 → `Absent` 扱い(誤って Content にしない)。
+  - mode で分岐:
+    - `100644` / `100755`(通常 blob)→ **その `%(objectname)`(blob object id)から `git cat-file blob <oid>`**
+      で内容取得 → `Content`。pathspec を再解決せず immutable な oid から読むので、判定と取得のパスがズレない。
+    - `120000`(symlink)/ `040000`(tree)/ `160000`(submodule gitlink)→ `NotRegularFile`。
+  - これで symlink・ディレクトリ(末尾スラッシュ含む)・submodule・glob を Content から確実に外す
+    (finding 2 / 3 と本 finding)。
 - doctor helper は sync(`fn`)だが async な `cmd_doctor` から呼ばれているので、**helper を async 化**して
   この関数を `await` する(`check_auto_merge` が既に async 化の先例)。sync 版
   `run_git_sync` を増やすより素直。
@@ -95,14 +106,17 @@ containment とは脱出経路の性質が変わる:
 - symlink は `ls-tree` の mode 120000 で判別して **`NotRegularFile` に落とす**(辿らない・内容も返さない)。
   したがって preamble の `Escapes`(symlink で外へ)も、内へ向く symlink も、区別なく「通常ファイルでない」
   として扱う。doctor はこれを ❌ + 「symlink」注記で **可視化**する(silent ✅ にしない)。
-- preamble パスは config load 時に `validate_repo_relative`(絶対 / `..` 拒否)を既に通る。
-  一方 **`body_file` はこの検証を通っていない**(現状 working tree 直読なので `..`/絶対で clone 外に
-  出られる軽微な穴が既にある)。統一のため **config load 時の schedule 検証(`validate_schedules`)に
-  `validate_repo_relative(body_file)` を追加**し、runtime / doctor の両方で `..`/絶対を一様に弾く。
-  ツリーの構造的閉じ込めはその backstop。
+- **`validate_repo_relative` を拡張**する: 現状の絶対 / `..` 拒否に加え、**末尾スラッシュ(`src/` 等)を拒否**する。
+  末尾スラッシュは `ls-tree` の配下列挙を誘発してディレクトリを通常ファイルと誤判定させる穴なので、
+  入口で弾く(gitops 側の「完全一致 1 エントリ」判定と二重の防御)。
+- preamble パスは config load 時に `validate_repo_relative` を既に通る。一方 **`body_file` はこの検証を
+  通っていない**(現状 working tree 直読なので `..`/絶対で clone 外に出られる軽微な穴が既にある)。統一のため
+  **config load 時の schedule 検証(`validate_schedules`)に `validate_repo_relative(body_file)` を追加**し、
+  runtime / doctor の両方で `..`/絶対/末尾スラッシュを一様に弾く。ツリーの構造的閉じ込めはその backstop。
 
-**判断**: 助言 / 発見読み取りでは「`rel` の正規化(`..`/絶対拒否)+ `ls-tree` の mode 判定 + ツリーの
-構造的閉じ込め」で足りる。symlink 追跡 containment は不要(そもそも辿らず、`NotRegularFile` として報告)。
+**判断**: 助言 / 発見読み取りでは「`rel` の正規化(`..`/絶対/末尾スラッシュ拒否)+ pathspec マジック無効化 +
+`ls-tree` で完全一致 1 エントリの mode 判定 + blob object id から内容取得」で足りる。symlink 追跡
+containment は不要(そもそも辿らず、`NotRegularFile` として報告)。
 
 ### 4. 挙動変化(既知)
 
@@ -133,13 +147,16 @@ containment とは脱出経路の性質が変わる:
 - 新 gitops 関数: (a) origin 優先で default branch の通常 blob を `Content` で読む、(b) remote 無しで
   local `<default>` fallback、(c) ツリーに無いパス→`Absent`、(d) working tree でだけ変えた値は
   反映されない(commit 済み内容が返る)、(e) default branch 上の **symlink → `NotRegularFile`**
-  (リンク先文字列を Content にしない)、(f) **ディレクトリ / submodule パス → `NotRegularFile`**
-  (`git show` の一覧出力を Content と誤読しない)、(g) base ref が無い→`Err`。
+  (リンク先文字列を Content にしない)、(f) **ディレクトリパス → `NotRegularFile`**、
+  (g) **`src/foo.rs` の隣に `src` がある状態で `rel="src/"`(末尾スラッシュ)を渡しても Content にならない**
+  (配下列挙で先頭 blob を誤採用しない)、(h) submodule gitlink → `NotRegularFile`、
+  (i) base ref が無い→`Err`。
 - `scheduler_fire`: FakeForge で、working tree 編集済み / default branch に commit 済みの `body_file`
   で fire し、enqueue された body が **default branch の内容**であることを記録に対しアサート。
 - doctor 3 helper: default branch に無い / working tree だけの `meguri.toml` / preamble / body_file で
   ✅/❌ 判定が default branch 基準になることを確認。
-- config load: `body_file` に `..`/絶対を与えると load が reject されることを追加。
+- config load: `body_file` に `..`/絶対/末尾スラッシュを与えると load が reject されること、および
+  `validate_repo_relative` が末尾スラッシュを弾くことを追加。
 
 ## 関連
 
