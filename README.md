@@ -209,9 +209,9 @@ Either way the spec itself is disposable review scaffolding: it is deleted as pa
 
 Spec and implementation are symmetric (ADR 0008): both run a **mandatory internal self-review** before the PR opens, and both can enable an **optional external guard** on the opened PR.
 
-**Internal self-review** is an *internal loop* (ADR 0006): the author reviews its own work before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` a **review turn** reads the local diff and writes `{verdict, findings[]}`, applying every configured lens (`review.lenses`, default `correctness / tests / simplicity / security`); if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; past the cap the PR is published anyway (the guard / human merge gate is the backstop). Nothing is posted to the conversation — the review turn runs under the `self-review` routing profile (so it can be a different model than the author), and the outcome is recorded off the conversation timeline: a `meguri/self-review` commit status on the pushed head and a folded `<details>` in the PR body. Set `review.enabled = false` to skip it (e.g. an external bot covers reviews).
+**Internal self-review** is an *internal loop* (ADR 0006): the author reviews its own work before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` a **review turn** reads the local diff and writes `{verdict, findings[]}`, applying every configured lens (`review.lenses`, default `correctness / tests / simplicity / security`); if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; past the cap the PR is published anyway (the guard / human merge gate is the backstop). Nothing is posted to the conversation — the review turn runs under the `self-reviewer` routing role (so it can be a different model than the author), and the outcome is recorded off the conversation timeline: a `meguri/self-review` commit status on the pushed head and a folded `<details>` in the PR body. Set `review.enabled = false` to skip it (e.g. an external bot covers reviews).
 
-**GitHub guard** is the optional external review, toggled per project × kind (`review.guard.plan` — on by default, the old spec reviewer — and `review.guard.impl` — off by default). It reviews the opened PR under an independent `guard` profile and records its verdict the same way — a `meguri/guard-review` commit status + a folded PR-body `<details>` — **never inline threads**, so the **fixer** never reacts to it and the AI↔AI ping-pong stays retired. The plan guard also drives the spec labels (clean → `spec-ready`). For a human, a red guard check is *advisory* (it does not block the merge unless you make `meguri/guard-review` a required check); for auto-merge it is a *gate* (below).
+**GitHub guard** is the optional external review, toggled per project × kind (`review.guard.plan` — on by default, the old spec reviewer — and `review.guard.impl` — off by default). It reviews the opened PR under an independent `pr-reviewer` routing role and records its verdict the same way — a `meguri/guard-review` commit status + a folded PR-body `<details>` — **never inline threads**, so the **fixer** never reacts to it and the AI↔AI ping-pong stays retired. The plan guard also drives the spec labels (clean → `spec-ready`). For a human, a red guard check is *advisory* (it does not block the merge unless you make `meguri/guard-review` a required check); for auto-merge it is a *gate* (below).
 
 Because the AI never creates review threads, the **fixer** naturally picks up only human and external-bot threads — GitHub stays the review transport exactly where a human sits.
 
@@ -373,7 +373,7 @@ required = false                           # true escalates a failing command to
 timeout_secs = 300                         # per-command; commands may fetch over the network
 ```
 
-Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `guard`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
 
 ### Scheduled enqueue (`[[projects.schedules]]`, optional)
 
@@ -399,7 +399,18 @@ Since local mode has no planner, `kind = "plan"` is github-only — a local `pla
 
 ### Role-based agent routing (optional)
 
-By default every role — planner, self-review, guard, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+`[routing.roles]` steers **6 routing roles** — the "which model should do this kind of work?" question a human actually asks. They are coarser than the internal loop kinds (`runs.loop_kind`, still tracked one-per-loop for budget counting and `meguri stats routing`); several loop kinds share a role's cost/quality shape:
+
+| role | question | internal loop(s) / phase |
+|---|---|---|
+| `planner` | plan / write the spec | `planner` |
+| `worker` | implement | `worker`, `spec-worker` |
+| `fixer` | make a PR mergeable | `fixer`, `ci-fixer`, `conflict-resolver` |
+| `self-reviewer` | internal review before the PR is public | the self-review phase (inside the worker/planner flow) |
+| `pr-reviewer` | advisory review on a published PR (auto-merge gate) | the guard loop |
+| `cleaner` | hygiene sweep | `cleaner` |
+
+By default every role runs the single `[agent]` profile (now named the `default` profile); you can define **named profiles** and route each role to a different CLI/model. The planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs — so routing keys on the role, not on an estimated issue difficulty.
 
 ```toml
 # A profile is one CLI's launch bundle — same shape as [agent].
@@ -421,16 +432,15 @@ resume_args = ["resume"]
 mode = "auto"        # auto | manual (default auto once [routing] exists)
 
 [routing.roles]      # explicit picks always beat auto; per-role overrides
-guard = "codex"           # (the old `reviewer` / `spec-reviewer` keys still work as aliases)
-# self-review = "codex"    # the model for the internal self-review turn (plan + impl)
-# guard = "codex"          # the model for the external GitHub guard review (the old spec/impl reviewer)
+pr-reviewer = "codex"     # (the old `reviewer` / `spec-reviewer` / `guard` keys still work as aliases)
+# self-reviewer = "codex"  # the model for the internal self-review turn (plan + impl)
 # worker = "claude-sonnet"
 ```
 
 - **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
-- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, self-review/guard → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **auto** applies a built-in 2026-07 recommendation table (`planner` → `claude-opus`, `self-reviewer`/`pr-reviewer` → `codex` then `claude-opus`, `worker`/`fixer` → `claude-sonnet`, `cleaner` → `default`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
 - **manual** turns the table off: roles you don't list run `default`.
-- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
+- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected). Config keys from before the role redesign (`reviewer`, `spec-reviewer`, `guard`, `impl-reviewer`, `self-review`, `spec-worker`, `conflict-resolver`, `ci-fixer`) still resolve as aliases of the new names.
 - The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
 
 ## Development
