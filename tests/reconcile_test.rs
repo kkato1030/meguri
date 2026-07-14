@@ -39,6 +39,7 @@ fn deps_with(forge: Arc<FakeForge>, store: Store, reconcile: ReconcileConfig) ->
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     Deps::with_label_source(store, Arc::new(FakeMux::new(false)), forge, config, project)
 }

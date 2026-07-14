@@ -24,7 +24,7 @@ use meguri::forge::{
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
-use meguri::notify::fake::recording_notifier;
+use meguri::notify::fake::{recording_notifier, recording_notifier_with_events};
 use meguri::store::{InteractionState, LANE_PR_REVIEW, RunStatus, Store};
 
 const PR: i64 = 12;
@@ -144,6 +144,7 @@ async fn setup_with(
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -821,9 +822,13 @@ async fn plan_clean_parks_under_separate_delivery() {
 
     let delivered = gw.delivered();
     assert_eq!(delivered.len(), 1, "one page per parked head");
-    assert_eq!(delivered[0].reason, "spec_review_parked");
+    assert_eq!(delivered[0].event, "awaiting_human");
+    assert!(
+        delivered[0].body.contains("spec レビュー"),
+        "reason surfaces in the body: {}",
+        delivered[0].body
+    );
     assert_eq!(delivered[0].url.as_deref(), Some(pr_url().as_str()));
-    assert!(delivered[0].attach.is_none(), "no pane to attach to");
 
     // The label transition is unchanged.
     let labels = env.forge.pr_labels_of(PR);
@@ -864,7 +869,10 @@ async fn plan_clean_does_not_park_under_combined_delivery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn impl_findings_does_not_park() {
     let mut env = setup(&[LABEL_IMPLEMENTING], true).await;
-    let (notifier, gw) = recording_notifier();
+    // Subscribe only awaiting_human: this test asserts the absence of the
+    // *parked-review* page, not the escalation notification the needs-human
+    // path now also emits under issue #205.
+    let (notifier, gw) = recording_notifier_with_events(&["awaiting_human"]);
     env.deps.notifier = notifier;
     let run = create_pr_reviewer_run(&env);
 
@@ -876,7 +884,10 @@ async fn impl_findings_does_not_park() {
         Some(InteractionState::AwaitingHuman)
     );
     assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
-    assert!(gw.delivered().is_empty());
+    assert!(
+        gw.delivered().is_empty(),
+        "no parked-review page for impl findings"
+    );
     assert!(!emitted_park_event(&env, &run.id));
 }
 

@@ -60,6 +60,7 @@ fn make_project(
         schedules,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     }
 }
 
@@ -382,4 +383,125 @@ async fn local_mode_fires_a_work_task_and_dedups() {
     deps.store.complete_task(id).unwrap();
     sweep(&deps, ts("2026-07-15T09:05:00Z")).await.unwrap();
     assert_eq!(deps.store.list_tasks("proj", true).unwrap().len(), 2);
+}
+
+// --- issue #205: schedule anomalies + watched labels reach the notify sink ---
+
+use meguri::config::ProjectNotifyConfig;
+use meguri::notify::fake::{FakeGateway, recording_notifier};
+
+/// Github deps whose notifier records to a returned `FakeGateway` (all event
+/// tokens enabled), so a test can assert what reached the sink.
+fn github_deps_recording(
+    forge: Arc<FakeForge>,
+    repo_path: std::path::PathBuf,
+    schedules: Vec<ScheduleConfig>,
+) -> (Deps, Arc<FakeGateway>) {
+    let mut deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge,
+        repo_path,
+        schedules,
+    );
+    let (notifier, gw) = recording_notifier();
+    deps.notifier = notifier;
+    (deps, gw)
+}
+
+#[tokio::test]
+async fn schedule_failure_emits_event_and_notifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    // An unparseable cron makes `fire_one` return Err inside the sweep.
+    let (deps, gw) = github_deps_recording(
+        forge,
+        dir.path().to_path_buf(),
+        vec![sched("broken", "not a cron", ScheduleKind::Ready, false)],
+    );
+
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap();
+
+    assert_eq!(deps.store.count_events("schedule.failed").unwrap(), 1);
+    let delivered = gw.delivered();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].event, "schedule.failed");
+    assert_eq!(delivered[0].dedup_key, "schedule:proj:broken");
+}
+
+#[tokio::test]
+async fn schedule_skip_notifies_via_overlap_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let (deps, gw) = github_deps_recording(
+        forge.clone(),
+        dir.path().to_path_buf(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire one open issue
+    assert_eq!(issue_count(&forge), 1);
+    // Next day's occurrence: the first issue is still open → skipped + notify.
+    sweep(&deps, ts("2026-07-14T09:30:00Z")).await.unwrap();
+    assert_eq!(issue_count(&forge), 1, "overlap guard held");
+
+    let skips: Vec<_> = gw
+        .delivered()
+        .into_iter()
+        .filter(|n| n.event == "schedule.skipped")
+        .collect();
+    assert_eq!(skips.len(), 1);
+    assert_eq!(skips[0].dedup_key, "schedule:proj:daily");
+}
+
+#[tokio::test]
+async fn watched_label_on_created_issue_notifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let (mut deps, gw) = github_deps_recording(
+        forge.clone(),
+        dir.path().to_path_buf(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    // Watch the label the schedule stamps on its issue.
+    deps.project.notify = Some(ProjectNotifyConfig {
+        labels: vec![LABEL_READY.to_string()],
+    });
+
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire
+
+    let labels: Vec<_> = gw
+        .delivered()
+        .into_iter()
+        .filter(|n| n.event == "label")
+        .collect();
+    assert_eq!(
+        labels.len(),
+        1,
+        "the created ready issue is a watched label"
+    );
+    assert!(labels[0].body.contains(LABEL_READY));
+}
+
+#[tokio::test]
+async fn unwatched_label_does_not_notify() {
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let (mut deps, gw) = github_deps_recording(
+        forge.clone(),
+        dir.path().to_path_buf(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    deps.project.notify = Some(ProjectNotifyConfig {
+        labels: vec!["human:todo".to_string()], // not the ready label
+    });
+
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap();
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap();
+
+    assert!(
+        gw.delivered().iter().all(|n| n.event != "label"),
+        "no watched label matched"
+    );
 }

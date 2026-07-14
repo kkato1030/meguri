@@ -414,6 +414,7 @@ mod tests {
             schedules: Vec::new(),
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
             triage: None,
             autonomy: None,
         };

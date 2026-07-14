@@ -1,9 +1,17 @@
-//! awaiting_human notifications: page a human (macOS notification + webhook)
-//! when a run needs attention, instead of leaving it buried in the event log.
+//! The notify sink (issue #7, generalized in #205): push selected events to a
+//! human — macOS notification + webhook — instead of leaving them buried in
+//! the event log.
 //!
-//! Delivery lives behind the `NotifyGateway` trait (faked in tests); the
-//! `Notifier` wraps a gateway with per-run throttling so repeated
-//! escalations of the same run don't spam the human.
+//! Sources emit their events as usual and then hand a [`Notification`] to the
+//! [`Notifier`]; the allowlist decision (which `events` tokens are delivered),
+//! per-key throttling, and the per-webhook-flavor payload shaping all live
+//! here, in one place, so no source re-implements them.
+//!
+//! Delivery lives behind the [`NotifyGateway`] trait (faked in tests). The
+//! production [`SystemGateway`] shells out to `osascript` and `curl` — the
+//! codebase embeds no HTTP client (GitHub goes through the `gh` CLI too).
+//! Every channel is best-effort: a delivery failure is logged, never fails a
+//! turn (issue #205 invariant, ADR 0018).
 
 pub mod fake;
 
@@ -11,51 +19,162 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::config::NotificationsConfig;
+use crate::config::{NotificationsConfig, WebhookKind};
 
-/// One awaiting_human escalation, ready for delivery.
-#[derive(Debug, Clone)]
+/// The public `events` allowlist tokens (config-facing names). One token can
+/// bundle several internal store event kinds — notably `awaiting_human` covers
+/// `turn.awaiting_human` / `review.awaiting_human` / `spec_fixer.budget_exhausted`
+/// (ADR 0018). `label` is intentionally absent: label watching is authorized
+/// per-project via `[projects.notify]`, not through this global list.
+pub const NOTIFY_EVENT_TOKENS: &[&str] = &[
+    "awaiting_human",
+    "escalation",
+    "schedule.failed",
+    "schedule.skipped",
+];
+
+/// One notification ready for delivery. Sources build these through the
+/// constructors below; the gateway renders them per channel.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Notification {
-    pub run_id: String,
-    pub issue_number: i64,
-    pub issue_title: Option<String>,
-    /// "agent_blocked" | "agent_quiet" | "runtime_budget_exceeded" |
-    /// "spec_review_parked"
-    pub reason: String,
-    /// Shell command a human runs to attach to the live pane, or `None` when
-    /// the wait has no pane (a parked review — the run already finished, so
-    /// the pointer is the PR, not a pane). ADR 0009 / issue #153.
-    pub attach: Option<String>,
-    /// Web page a human should open instead of attaching — the PR for a
-    /// parked review. `None` for the turn-scoped escalations (they point at a
-    /// pane via `attach`).
+    /// The config `events` token this belongs to (allowlist key). The literal
+    /// `"label"` bypasses the global allowlist — it is authorized per-project.
+    pub event: String,
+    /// Throttle/dedup key: per-run, per-schedule, or per-issue. Repeated
+    /// notifications with the same key inside the throttle window are dropped.
+    pub dedup_key: String,
+    /// Short title line (macOS title / structured payload `title`).
+    pub title: String,
+    /// One-line human body (macOS body / Slack & ntfy text / payload `text`).
+    pub body: String,
+    /// A URL the human should open (PR / issue), when there is one.
     pub url: Option<String>,
 }
 
-/// Delivery-only gateway; policy (throttling) lives in `Notifier`.
+impl Notification {
+    /// A "page a human now" notification — the three awaiting_human paths
+    /// (live pane, parked review, spec-fixer budget). `attach` is the launch
+    /// -mode attach hint (pane case); `url` points at a PR (parked case). When
+    /// neither is set the body falls back to `meguri attach <dedup_key>`.
+    pub fn awaiting_human(
+        dedup_key: String,
+        issue_number: i64,
+        issue_title: Option<String>,
+        reason: &str,
+        attach: Option<String>,
+        url: Option<String>,
+    ) -> Self {
+        let title = format!(
+            "meguri #{issue_number} {}",
+            issue_title.as_deref().unwrap_or("")
+        )
+        .trim()
+        .to_string();
+        let target = url
+            .clone()
+            .or(attach)
+            .unwrap_or_else(|| format!("meguri attach {dedup_key}"));
+        let body = format!("{} — {target}", reason_label(reason));
+        Self {
+            event: "awaiting_human".into(),
+            dedup_key,
+            title,
+            body,
+            url,
+        }
+    }
+
+    /// An issue/local task escalated to `meguri:needs-human` (via
+    /// `escalation.rs`). `target` is `"issue"` or `"local"`.
+    pub fn escalation_task(id: i64, target: &str, reason: &str) -> Self {
+        Self {
+            event: "escalation".into(),
+            dedup_key: format!("{target}:{id}"),
+            title: format!("meguri #{id} → needs-human"),
+            body: format!("#{id} ({target}) を needs-human にしました: {reason}"),
+            url: None,
+        }
+    }
+
+    /// A pull request parked on `meguri:needs-human` (via `escalation.rs`).
+    pub fn escalation_pr(pr: i64) -> Self {
+        Self {
+            event: "escalation".into(),
+            dedup_key: format!("pr:{pr}"),
+            title: format!("meguri PR #{pr} → needs-human"),
+            body: format!("PR #{pr} を needs-human にしました(人間のレビュー待ち)"),
+            url: None,
+        }
+    }
+
+    /// A schedule that failed to fire (the `sweep` Err arm, issue #205).
+    pub fn schedule_failed(project: &str, schedule: &str, error: &str) -> Self {
+        Self {
+            event: "schedule.failed".into(),
+            dedup_key: format!("schedule:{project}:{schedule}"),
+            title: format!("meguri schedule {schedule} 失敗"),
+            body: format!("schedule \"{schedule}\" ({project}) の発火に失敗しました: {error}"),
+            url: None,
+        }
+    }
+
+    /// A schedule occurrence skipped by the overlap guard (`scheduler_fire.rs`).
+    pub fn schedule_skipped(project: &str, schedule: &str, open_key: i64) -> Self {
+        Self {
+            event: "schedule.skipped".into(),
+            dedup_key: format!("schedule:{project}:{schedule}"),
+            title: format!("meguri schedule {schedule} スキップ"),
+            body: format!(
+                "schedule \"{schedule}\" ({project}) を overlap でスキップ(#{open_key} が open)"
+            ),
+            url: None,
+        }
+    }
+
+    /// A meguri-created issue carrying a watched label (per-project
+    /// `[projects.notify]`, issue #205). Bypasses the global allowlist.
+    pub fn label(issue_number: i64, issue_title: &str, label: &str, url: Option<String>) -> Self {
+        Self {
+            event: "label".into(),
+            dedup_key: format!("issue:{issue_number}"),
+            title: format!("meguri #{issue_number} {issue_title}")
+                .trim()
+                .to_string(),
+            body: format!("#{issue_number}「{issue_title}」に {label} が付きました"),
+            url,
+        }
+    }
+}
+
+/// Delivery-only gateway; policy (allowlist + throttling) lives in [`Notifier`].
 /// Implemented over osascript + webhook in production; faked in tests.
 #[async_trait]
 pub trait NotifyGateway: Send + Sync {
     async fn deliver(&self, n: &Notification);
 }
 
-/// Per-run throttling over a gateway: a notification for a run that was
-/// already delivered within the throttle window is dropped. Throttled
-/// attempts do not extend the window — it is anchored to deliveries.
+/// Allowlist + per-key throttling over a gateway. A notification whose event
+/// token is not enabled is dropped; one whose dedup key was delivered less than
+/// `throttle` ago is dropped. Throttled attempts do not extend the window — it
+/// is anchored to deliveries.
 pub struct Notifier {
     gateway: Arc<dyn NotifyGateway>,
     throttle: Duration,
+    /// Enabled `events` tokens. `label` is always allowed (per-project gated).
+    events: Vec<String>,
     last_delivered: Mutex<HashMap<String, tokio::time::Instant>>,
 }
 
 impl Notifier {
-    pub fn new(gateway: Arc<dyn NotifyGateway>, throttle: Duration) -> Self {
+    pub fn new(gateway: Arc<dyn NotifyGateway>, throttle: Duration, events: Vec<String>) -> Self {
         Self {
             gateway,
             throttle,
+            events,
             last_delivered: Mutex::new(HashMap::new()),
         }
     }
@@ -64,32 +183,44 @@ impl Notifier {
         Self::new(
             Arc::new(SystemGateway::new(cfg.clone())),
             Duration::from_secs(cfg.throttle_secs),
+            cfg.events.clone(),
         )
     }
 
-    /// Deliver unless the same run was notified less than `throttle` ago.
-    /// Returns whether the gateway was invoked.
-    pub async fn notify_awaiting_human(&self, n: &Notification) -> bool {
+    /// Whether this event token is delivered. `label` bypasses the global list
+    /// (authorized at the call site by `[projects.notify]`).
+    fn allowed(&self, event: &str) -> bool {
+        event == "label" || self.events.iter().any(|e| e == event)
+    }
+
+    /// Deliver unless the event is not allowlisted, or the same dedup key was
+    /// notified less than `throttle` ago. Returns whether the gateway was
+    /// invoked.
+    pub async fn notify(&self, n: &Notification) -> bool {
+        if !self.allowed(&n.event) {
+            tracing::debug!(event = %n.event, "notification event not in allowlist");
+            return false;
+        }
         {
             let mut last = self.last_delivered.lock().unwrap();
             let now = tokio::time::Instant::now();
             let throttled = last
-                .get(&n.run_id)
+                .get(&n.dedup_key)
                 .is_some_and(|prev| now.duration_since(*prev) < self.throttle);
             if throttled {
-                tracing::debug!(run_id = %n.run_id, reason = %n.reason, "notification throttled");
+                tracing::debug!(key = %n.dedup_key, event = %n.event, "notification throttled");
                 return false;
             }
-            last.insert(n.run_id.clone(), now);
+            last.insert(n.dedup_key.clone(), now);
         }
         self.gateway.deliver(n).await;
         true
     }
 }
 
-/// Production gateway: macOS notification via `osascript`, webhook via
-/// `curl` (the codebase shells out to CLIs rather than embedding clients).
-/// Both channels are best-effort — failures are logged, never fail the turn.
+/// Production gateway: macOS notification via `osascript`, webhook via `curl`
+/// (the codebase shells out to CLIs rather than embedding clients). Both
+/// channels are best-effort — failures are logged, never fail the turn.
 pub struct SystemGateway {
     cfg: NotificationsConfig,
 }
@@ -120,48 +251,122 @@ impl NotifyGateway for SystemGateway {
             }
         }
         if let Some(url) = &self.cfg.webhook_url {
-            let payload = webhook_payload(n).to_string();
-            match tokio::process::Command::new("curl")
-                .args(["-fsS", "--max-time", "10", "-X", "POST"])
-                .args(["-H", "Content-Type: application/json"])
-                .args(["--data", &payload])
-                .arg(url)
-                .output()
-                .await
-            {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => tracing::warn!(
-                    url,
-                    stderr = %String::from_utf8_lossy(&out.stderr),
-                    "webhook POST failed"
-                ),
-                Err(err) => tracing::warn!(url, %err, "cannot spawn curl"),
+            let kind = resolve_kind(&self.cfg, url);
+            if let Err(err) = post_webhook(url, kind, n).await {
+                tracing::warn!(url, %err, "webhook POST failed");
             }
         }
     }
 }
 
-/// `display notification` AppleScript for one escalation.
-fn osascript_notification(n: &Notification) -> String {
-    let title = format!(
-        "meguri #{} {}",
-        n.issue_number,
-        n.issue_title.as_deref().unwrap_or("")
-    );
-    // Point at the PR when there is one (parked review), else the pane.
-    let target = match &n.url {
-        Some(url) => url.clone(),
-        None => format!("meguri attach {}", n.run_id),
+/// Resolve the webhook flavor: the explicit `kind`, else auto-detect from the
+/// URL host.
+pub fn resolve_kind(cfg: &NotificationsConfig, url: &str) -> WebhookKind {
+    cfg.kind.unwrap_or_else(|| detect_kind(url))
+}
+
+/// Auto-detect the webhook flavor from the URL. Slack Incoming Webhooks live on
+/// `hooks.slack.com`; ntfy on `ntfy.sh` or a `/ntfy` path; everything else gets
+/// the generic structured JSON.
+fn detect_kind(url: &str) -> WebhookKind {
+    if url.contains("hooks.slack.com") {
+        WebhookKind::Slack
+    } else if url.contains("ntfy.sh") || url.contains("/ntfy") {
+        WebhookKind::Ntfy
+    } else {
+        WebhookKind::Json
+    }
+}
+
+/// One webhook request: HTTP headers plus the raw POST body.
+struct WebhookRequest {
+    headers: Vec<(&'static str, String)>,
+    body: String,
+}
+
+/// Shape the request body for one webhook flavor (issue #205). Slack wants
+/// `{"text": ...}`, ntfy takes the plain line as the body (title/click as
+/// headers), `json` gets the structured payload.
+fn webhook_request(kind: WebhookKind, n: &Notification) -> WebhookRequest {
+    match kind {
+        WebhookKind::Slack => {
+            let text = match &n.url {
+                Some(u) => format!("{} — {}\n{u}", n.title, n.body),
+                None => format!("{} — {}", n.title, n.body),
+            };
+            WebhookRequest {
+                headers: vec![("Content-Type", "application/json".into())],
+                body: json!({ "text": text }).to_string(),
+            }
+        }
+        WebhookKind::Ntfy => {
+            let mut headers = vec![("Title", n.title.clone())];
+            if let Some(u) = &n.url {
+                headers.push(("Click", u.clone()));
+            }
+            WebhookRequest {
+                headers,
+                body: n.body.clone(),
+            }
+        }
+        WebhookKind::Json => WebhookRequest {
+            headers: vec![("Content-Type", "application/json".into())],
+            body: json!({
+                "event": n.event,
+                "title": n.title,
+                "text": n.body,
+                "url": n.url,
+            })
+            .to_string(),
+        },
+    }
+}
+
+/// POST one notification to `url` via `curl`. Propagates the error so the
+/// doctor probe can report it; the gateway swallows it (best-effort).
+async fn post_webhook(url: &str, kind: WebhookKind, n: &Notification) -> Result<()> {
+    let req = webhook_request(kind, n);
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args(["-fsS", "--max-time", "10", "-X", "POST"]);
+    for (k, v) in &req.headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg("--data").arg(&req.body).arg(url);
+    let out = cmd.output().await.context("cannot spawn curl")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "curl exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Send a test notification to the configured webhook (doctor `--probe`). Uses
+/// the same code path as real delivery, but surfaces the error.
+pub async fn probe_webhook(cfg: &NotificationsConfig, url: &str) -> Result<()> {
+    let n = Notification {
+        event: "awaiting_human".into(),
+        dedup_key: "doctor-probe".into(),
+        title: "meguri doctor".into(),
+        body: "通知シンクのテスト送信です".into(),
+        url: None,
     };
-    let body = format!("{} — {target}", reason_label(&n.reason));
+    post_webhook(url, resolve_kind(cfg, url), &n).await
+}
+
+/// `display notification` AppleScript for one notification.
+fn osascript_notification(n: &Notification) -> String {
     format!(
         "display notification {} with title {}",
-        applescript_str(body.trim()),
-        applescript_str(title.trim())
+        applescript_str(n.body.trim()),
+        applescript_str(n.title.trim())
     )
 }
 
-/// Human-readable label for the escalation reason.
+/// Human-readable label for an awaiting_human reason.
 fn reason_label(reason: &str) -> &str {
     match reason {
         "agent_blocked" => "エージェントが人の入力を待っています",
@@ -177,125 +382,148 @@ fn applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// JSON body POSTed to the webhook.
-fn webhook_payload(n: &Notification) -> serde_json::Value {
-    let mut payload = json!({
-        "event": "turn.awaiting_human",
-        "run_id": n.run_id,
-        "issue_number": n.issue_number,
-        "issue_title": n.issue_title,
-        "reason": n.reason,
-        "attach": n.attach,
-        "url": n.url,
-    });
-    // Only advertise `meguri attach` when there is a live pane to attach to —
-    // a finished (parked) run has none, so the CLI hint would be a dead end.
-    if n.attach.is_some() {
-        payload["attach_cli"] = json!(format!("meguri attach {}", n.run_id));
-    }
-    payload
-}
-
 #[cfg(test)]
 mod tests {
     use super::fake::FakeGateway;
     use super::*;
 
-    fn n(run: &str) -> Notification {
-        Notification {
-            run_id: run.into(),
-            issue_number: 7,
-            issue_title: Some("awaiting_human 通知".into()),
-            reason: "agent_blocked".into(),
-            attach: Some("tmux attach -t meguri".into()),
-            url: None,
-        }
+    fn awaiting(run: &str) -> Notification {
+        Notification::awaiting_human(
+            run.into(),
+            7,
+            Some("awaiting_human 通知".into()),
+            "agent_blocked",
+            Some("tmux attach -t meguri".into()),
+            None,
+        )
     }
 
-    /// A parked-review notification: no pane, points at the PR (ADR 0009).
-    fn parked(run: &str) -> Notification {
-        Notification {
-            run_id: run.into(),
-            issue_number: 7,
-            issue_title: Some("Spec: caching (#7)".into()),
-            reason: "spec_review_parked".into(),
-            attach: None,
-            url: Some("https://example.test/pr/12".into()),
-        }
+    fn permissive(gw: Arc<FakeGateway>, throttle_secs: u64) -> Notifier {
+        Notifier::new(
+            gw,
+            Duration::from_secs(throttle_secs),
+            NOTIFY_EVENT_TOKENS.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     #[tokio::test(start_paused = true)]
     async fn second_notification_inside_window_is_throttled() {
         let gw = Arc::new(FakeGateway::default());
-        let notifier = Notifier::new(gw.clone(), Duration::from_secs(60));
-        assert!(notifier.notify_awaiting_human(&n("r1")).await);
+        let notifier = permissive(gw.clone(), 60);
+        assert!(notifier.notify(&awaiting("r1")).await);
         tokio::time::advance(Duration::from_secs(59)).await;
-        assert!(!notifier.notify_awaiting_human(&n("r1")).await);
+        assert!(!notifier.notify(&awaiting("r1")).await);
         assert_eq!(gw.delivered().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn boundary_exactly_at_window_delivers() {
         let gw = Arc::new(FakeGateway::default());
-        let notifier = Notifier::new(gw.clone(), Duration::from_secs(60));
-        assert!(notifier.notify_awaiting_human(&n("r1")).await);
-        // Throttled attempt at 59s must NOT extend the window…
+        let notifier = permissive(gw.clone(), 60);
+        assert!(notifier.notify(&awaiting("r1")).await);
         tokio::time::advance(Duration::from_secs(59)).await;
-        assert!(!notifier.notify_awaiting_human(&n("r1")).await);
-        // …so exactly 60s after the delivery, the next one goes out.
+        assert!(!notifier.notify(&awaiting("r1")).await);
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(notifier.notify_awaiting_human(&n("r1")).await);
+        assert!(notifier.notify(&awaiting("r1")).await);
         assert_eq!(gw.delivered().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn distinct_runs_do_not_throttle_each_other() {
+    async fn distinct_keys_do_not_throttle_each_other() {
         let gw = Arc::new(FakeGateway::default());
-        let notifier = Notifier::new(gw.clone(), Duration::from_secs(60));
-        assert!(notifier.notify_awaiting_human(&n("r1")).await);
-        assert!(notifier.notify_awaiting_human(&n("r2")).await);
+        let notifier = permissive(gw.clone(), 60);
+        assert!(notifier.notify(&awaiting("r1")).await);
+        assert!(notifier.notify(&awaiting("r2")).await);
         assert_eq!(gw.delivered().len(), 2);
     }
 
-    #[test]
-    fn webhook_payload_carries_run_issue_reason_attach() {
-        let p = webhook_payload(&n("run-1"));
-        assert_eq!(p["event"], "turn.awaiting_human");
-        assert_eq!(p["run_id"], "run-1");
-        assert_eq!(p["issue_number"], 7);
-        assert_eq!(p["issue_title"], "awaiting_human 通知");
-        assert_eq!(p["reason"], "agent_blocked");
-        assert_eq!(p["attach"], "tmux attach -t meguri");
-        assert_eq!(p["attach_cli"], "meguri attach run-1");
-        assert!(p["url"].is_null());
-    }
-
-    #[test]
-    fn parked_payload_points_at_pr_not_pane() {
-        // A parked review has no pane: the webhook carries `url` and omits the
-        // `meguri attach` dead end (ADR 0009 / issue #153).
-        let p = webhook_payload(&parked("run-9"));
-        assert_eq!(p["reason"], "spec_review_parked");
-        assert_eq!(p["url"], "https://example.test/pr/12");
-        assert!(p["attach"].is_null());
-        assert!(p.get("attach_cli").is_none());
-    }
-
-    #[test]
-    fn parked_osascript_body_shows_the_pr_url() {
-        let script = osascript_notification(&parked("run-9"));
-        assert!(
-            script.contains("https://example.test/pr/12"),
-            "got: {script}"
+    #[tokio::test]
+    async fn event_not_in_allowlist_is_dropped() {
+        let gw = Arc::new(FakeGateway::default());
+        // Only awaiting_human enabled — an escalation must not deliver.
+        let notifier = Notifier::new(
+            gw.clone(),
+            Duration::from_secs(60),
+            vec!["awaiting_human".into()],
         );
-        assert!(!script.contains("meguri attach"), "got: {script}");
+        assert!(
+            !notifier
+                .notify(&Notification::escalation_task(7, "issue", "ci red"))
+                .await
+        );
+        assert!(notifier.notify(&awaiting("r1")).await);
+        assert_eq!(gw.delivered().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn label_bypasses_the_global_allowlist() {
+        let gw = Arc::new(FakeGateway::default());
+        // Empty allowlist: label still delivers (per-project authorized).
+        let notifier = Notifier::new(gw.clone(), Duration::from_secs(60), vec![]);
+        assert!(
+            notifier
+                .notify(&Notification::label(9, "human task", "human:todo", None))
+                .await
+        );
+        assert_eq!(gw.delivered().len(), 1);
+    }
+
+    #[test]
+    fn slack_payload_is_a_text_object() {
+        let n = Notification::escalation_pr(12);
+        let req = webhook_request(WebhookKind::Slack, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert!(v["text"].as_str().unwrap().contains("PR #12"));
+    }
+
+    #[test]
+    fn json_payload_carries_event_title_text() {
+        let n = Notification::schedule_failed("proj", "nightly", "boom");
+        let req = webhook_request(WebhookKind::Json, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(v["event"], "schedule.failed");
+        assert!(v["text"].as_str().unwrap().contains("boom"));
+        assert!(v["url"].is_null());
+    }
+
+    #[test]
+    fn ntfy_body_is_plain_text_with_title_header() {
+        let n = Notification::awaiting_human("r1".into(), 7, None, "agent_blocked", None, None);
+        let req = webhook_request(WebhookKind::Ntfy, &n);
+        assert!(req.body.contains("エージェントが人の入力を待っています"));
+        assert!(req.headers.iter().any(|(k, _)| *k == "Title"));
+    }
+
+    #[test]
+    fn kind_auto_detects_from_url() {
+        assert_eq!(
+            detect_kind("https://hooks.slack.com/services/x"),
+            WebhookKind::Slack
+        );
+        assert_eq!(detect_kind("https://ntfy.sh/mytopic"), WebhookKind::Ntfy);
+        assert_eq!(detect_kind("https://example.com/hook"), WebhookKind::Json);
+    }
+
+    #[test]
+    fn parked_awaiting_human_points_at_pr() {
+        let n = Notification::awaiting_human(
+            "run-9".into(),
+            7,
+            Some("Spec: caching (#7)".into()),
+            "spec_review_parked",
+            None,
+            Some("https://example.test/pr/12".into()),
+        );
+        assert_eq!(n.url.as_deref(), Some("https://example.test/pr/12"));
+        assert!(n.body.contains("https://example.test/pr/12"));
+        assert!(!n.body.contains("meguri attach"));
     }
 
     #[test]
     fn osascript_escapes_quotes_and_backslashes() {
-        let mut notif = n("run-1");
-        notif.issue_title = Some(r#"say "hi" \ bye"#.into());
-        let script = osascript_notification(&notif);
+        let mut n = awaiting("run-1");
+        n.title = r#"say "hi" \ bye"#.into();
+        let script = osascript_notification(&n);
         assert!(script.contains(r#"say \"hi\" \\ bye"#), "got: {script}");
         assert!(script.starts_with("display notification \""));
     }

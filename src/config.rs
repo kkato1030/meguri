@@ -73,8 +73,12 @@ repo_slug = "owner/repo"
 #
 # [notifications]
 # macos = true                       # awaiting_human を macOS 通知で知らせる
-# webhook_url = "https://example.com/hook"  # JSON POST 先(省略で無効)
-# throttle_secs = 60                 # 同一 run の連続通知の最短間隔(秒)
+# webhook_url = "https://hooks.slack.com/services/..."  # 省略で webhook 無効。${ENV} 展開可
+# kind = "slack"                     # 省略で URL から自動判別(slack/ntfy/json)
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped"]  # 既定は ["awaiting_human"]
+# throttle_secs = 60                 # 同一通知キーの連続通知の最短間隔(秒)
+# [projects.notify]                  # per-project: 指定ラベルの issue 起票を通知(issue #205)
+# labels = ["human:todo"]
 #
 # [decompose]
 # materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
@@ -953,19 +957,43 @@ fn default_throttle_secs() -> u64 {
     10
 }
 
-/// awaiting_human escalations paged to a human (issue #7).
+/// Notifications paged to a human (issue #7, generalized in #205). The
+/// `events` allowlist selects which store events reach the webhook; the
+/// default keeps the pre-#205 behavior (page a human on the three
+/// awaiting_human paths). See `src/notify/`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationsConfig {
     /// macOS notification via `osascript` (no-op on other platforms).
     #[serde(default = "default_notifications_macos")]
     pub macos: bool,
-    /// URL POSTed a JSON payload (run id / issue / reason / attach command).
-    /// None disables the webhook.
+    /// Webhook URL POSTed a per-event payload. `${ENV}` references are expanded
+    /// at load. None disables the webhook.
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Minimum seconds between notifications for the same run.
+    /// Explicit webhook flavor; None auto-detects from the URL host (Slack /
+    /// ntfy / generic JSON). Only needed for self-hosted Slack-compatible
+    /// endpoints whose URL the auto-detection cannot recognize.
+    #[serde(default)]
+    pub kind: Option<WebhookKind>,
+    /// Which event tokens are delivered (`awaiting_human` / `escalation` /
+    /// `schedule.failed` / `schedule.skipped`). Default `["awaiting_human"]`
+    /// preserves the pre-#205 behavior. Per-project label watching is
+    /// configured separately via `[projects.notify]`, not here.
+    #[serde(default = "default_notifications_events")]
+    pub events: Vec<String>,
+    /// Minimum seconds between notifications for the same dedup key.
     #[serde(default = "default_notifications_throttle")]
     pub throttle_secs: u64,
+}
+
+/// Webhook body flavor. Slack wants `{"text": ...}`, ntfy takes a plain body
+/// plus headers, `json` gets the structured payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookKind {
+    Slack,
+    Ntfy,
+    Json,
 }
 
 impl Default for NotificationsConfig {
@@ -973,6 +1001,8 @@ impl Default for NotificationsConfig {
         Self {
             macos: default_notifications_macos(),
             webhook_url: None,
+            kind: None,
+            events: default_notifications_events(),
             throttle_secs: default_notifications_throttle(),
         }
     }
@@ -980,6 +1010,9 @@ impl Default for NotificationsConfig {
 
 fn default_notifications_macos() -> bool {
     true
+}
+fn default_notifications_events() -> Vec<String> {
+    vec!["awaiting_human".to_string()]
 }
 fn default_notifications_throttle() -> u64 {
     60
@@ -1226,10 +1259,45 @@ pub struct ProjectConfig {
     /// [`Config::preambles_for`] and ADR 0012.
     #[serde(default)]
     pub prompts: HashMap<String, String>,
+    /// Per-project notify watches (`[projects.notify]`, issue #205): issue
+    /// creation carrying one of these labels is pushed to the webhook. Uses the
+    /// global `[notifications]` webhook; the labels are an additive watch on top
+    /// of the global `events` allowlist.
+    #[serde(default)]
+    pub notify: Option<ProjectNotifyConfig>,
+}
+
+/// Per-project notify watch (issue #205). Currently just watched labels: an
+/// issue meguri creates carrying one of these labels is pushed to the webhook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ProjectNotifyConfig {
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 fn default_branch() -> String {
     "main".into()
+}
+
+/// Replace every `${NAME}` in `input` with the environment variable `NAME`.
+/// Errors on an unterminated `${` or an unset variable — a webhook that would
+/// silently POST to a literal `${...}` URL is worse than a clear load failure
+/// (issue #205).
+fn expand_env_vars(input: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').context("unterminated ${...} reference")?;
+        let name = &after[..end];
+        let val = std::env::var(name)
+            .with_context(|| format!("env var {name} referenced by ${{{name}}} is not set"))?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
@@ -1347,8 +1415,20 @@ impl Config {
     }
 
     fn parse(raw: &str, path: &Path) -> Result<Self> {
-        let cfg: Config =
+        let mut cfg: Config =
             toml::from_str(raw).with_context(|| format!("invalid config at {}", path.display()))?;
+        // Expand `${ENV}` references in the webhook URL so a Slack/ntfy secret
+        // can live in the environment instead of plaintext in config.toml
+        // (issue #205). Only the webhook URL is expanded — it is the one field
+        // that carries a secret.
+        if let Some(url) = &cfg.notifications.webhook_url
+            && url.contains("${")
+        {
+            cfg.notifications.webhook_url = Some(
+                expand_env_vars(url)
+                    .with_context(|| format!("notifications.webhook_url in {}", path.display()))?,
+            );
+        }
         cfg.validate()
             .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(cfg)
@@ -1397,6 +1477,16 @@ impl Config {
             }
             self.validate_schedules(p)?;
             self.validate_cadence(p)?;
+        }
+        // Reject unknown notify event tokens so a typo fails fast at load
+        // instead of silently never delivering (issue #205).
+        for e in &self.notifications.events {
+            if !crate::notify::NOTIFY_EVENT_TOKENS.contains(&e.as_str()) {
+                anyhow::bail!(
+                    "notifications.events has unknown token {e:?} (valid: {:?})",
+                    crate::notify::NOTIFY_EVENT_TOKENS
+                );
+            }
         }
         Ok(())
     }
@@ -1919,6 +2009,11 @@ mod tests {
         assert!(back.notifications.macos);
         assert_eq!(back.notifications.webhook_url, None);
         assert_eq!(back.notifications.throttle_secs, 60);
+        assert_eq!(
+            back.notifications.events,
+            vec!["awaiting_human".to_string()]
+        );
+        assert_eq!(back.notifications.kind, None);
         assert!(back.review.enabled);
         assert_eq!(back.review.max_rounds, 3);
         assert_eq!(back.triage.mode, TriageMode::Off);
@@ -1936,6 +2031,38 @@ max_rounds = 1
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(!cfg.review.enabled);
         assert_eq!(cfg.review.max_rounds, 1);
+    }
+
+    #[test]
+    fn unknown_notify_event_token_is_rejected_at_load() {
+        let raw = r#"
+[notifications]
+events = ["escalation", "bogus"]
+"#;
+        let err = Config::parse(raw, Path::new("test.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("bogus"), "{err:#}");
+    }
+
+    #[test]
+    fn webhook_url_env_reference_is_expanded_at_load() {
+        // PATH is reliably set; reuse it rather than mutating the environment
+        // (set_var is unsafe on edition 2024).
+        let path = std::env::var("PATH").unwrap();
+        let raw = "[notifications]\nwebhook_url = \"https://h/${PATH}\"\n";
+        let cfg = Config::parse(raw, Path::new("test.toml")).unwrap();
+        assert_eq!(
+            cfg.notifications.webhook_url.as_deref(),
+            Some(format!("https://h/{path}").as_str())
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_passthrough_and_missing() {
+        assert_eq!(
+            expand_env_vars("https://example.com/hook").unwrap(),
+            "https://example.com/hook"
+        );
+        assert!(expand_env_vars("${MEGURI_DEFINITELY_UNSET_VAR_205}").is_err());
     }
 
     #[test]

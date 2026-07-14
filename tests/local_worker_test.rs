@@ -72,6 +72,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let store = Store::open_in_memory().unwrap();

@@ -36,6 +36,7 @@ fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     Deps::with_label_source(
         store.clone(),

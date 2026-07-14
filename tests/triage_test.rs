@@ -127,6 +127,7 @@ async fn setup_with_triage(triage: TriageConfig) -> TestEnv {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let deps = Deps::with_label_source(

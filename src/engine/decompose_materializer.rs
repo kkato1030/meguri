@@ -783,6 +783,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         }
     }
 
