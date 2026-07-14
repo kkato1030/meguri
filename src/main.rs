@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
             StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
+            StatsCommand::Collab { project } => app::cmd_stats_collab(project.as_deref()),
         },
         Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::TopStatus {
