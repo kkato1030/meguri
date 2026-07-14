@@ -30,7 +30,7 @@ observability / test strategy を含む design tier で書く。
 - [ ] self-review が `max_rounds` 到達で未収束のとき、footer 公開ではなく escalate する。
 - [ ] guard settle が findings(plan/impl とも)で `needs-human` を貼る(`escalation.rs` 経由)。
 - [ ] guard discover/candidate が `needs-human` の付いた **plan** PR を skip する(impl と対称)。
-- [ ] conflict_resolver が `MAX_RESOLVE_RUNS` 枯渇時に静かに止まるのではなく escalate する。
+- [ ] conflict_resolver が `MAX_RESOLVE_RUNS` 枯渇時に、**今も `CONFLICTING` の PR に限って** escalate する(競合解消済みの PR には貼らない)。
 - [ ] 人間ゲートの全 escalate が `escalation.rs` の中央ヘルパを通る(issue/local/PR の3宛先)。
 - [ ] `Autonomy` config が global 既定 + project override(wholesale)で読め、
       `Config::autonomy_for(project)` が返す。hot-reload 対象。
@@ -46,7 +46,7 @@ observability / test strategy を含む design tier で書く。
 | `src/engine/mod.rs` | `mod escalation;` 登録 |
 | `src/engine/impl_reviewer.rs` | `ReviewVerdict` を3値化。`ImplReviewFile`/`read_review`/`review_prompt` を3値対応。`needs_human`→即 escalate、未収束→`mark_unconverged` を escalate に置換 |
 | `src/engine/guard.rs` | `settle` の findings を `escalation.rs` 経由で `needs-human`。`candidate_kind` の Plan 分岐に needs-human skip を追加 |
-| `src/engine/conflict_resolver.rs` | `MAX_RESOLVE_RUNS` 枯渇の discover skip 地点で escalate(1度だけ貼るための冪等性に注意) |
+| `src/engine/conflict_resolver.rs` | `MAX_RESOLVE_RUNS` 枯渇時に escalate。ただし **PR が今も `CONFLICTING` であることを確認した後**に限る(現行の budget skip は mergeable 判定より前にあるので、その地点で貼ると既に競合解消済みの PR にも `needs-human` を付けてしまう。判定順を budget→mergeable から mergeable→budget に入れ替えるか、budget 超過を検知したら追加で mergeable を確認してから escalate する)。1度だけ貼るための冪等性(既に `needs-human` なら skip)にも注意 |
 | `src/engine/flow.rs` | `escalate_on_forge` 等の既存 escalate を `escalation.rs` へ委譲。`Checkpoint` に必要なら未収束フラグ調整 |
 | `src/engine/auto_merger.rs` | arm 条件に `autonomy == Full` を追加。guard-failed escalate は `escalation.rs` 経由へ |
 | `src/config.rs` | `Autonomy` enum・`Config.autonomy`・`ProjectConfig.autonomy`・`autonomy_for`。doctor 用の任意 warn |
@@ -105,6 +105,9 @@ observability / test strategy を含む design tier で書く。
   self-review `needs_human` / self-review 未収束 / guard(plan) findings / guard(impl) findings /
   conflict_resolver 枯渇。既存サイト(validate 枯渇・agent needs_human・spec_worker・
   ci_fixer 枯渇)の回帰も1本ずつ。
+- **conflict_resolver の枯渇 escalate は CONFLICTING 限定**: budget 超過かつ今も
+  `CONFLICTING` の PR は escalate される / budget 超過だが競合解消済み(mergeable)の PR は
+  escalate されない、の両方を FakeForge の mergeable 応答を出し分けて検証する。
 - **verdict 3値**: `read_review` が `clean`/`fixable`/`needs_human` を受理・検証する
   ユニットテスト(既存 `review_file_parses_and_validates` を拡張)。`findings` エイリアス
   受理の是非をテストで固定する。
