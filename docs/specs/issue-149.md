@@ -25,9 +25,11 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - **挿入位置 = 本文冒頭**。完了契約は末尾のままで最終権威を保つ。preamble は「プロジェクトの
   恒常規律」とラベル付けし、契約に劣後する前文として枠付けする。
 - **ロール語彙 = routing の6ロール + `all`**。`src/routing.rs` の `KNOWN_ROLES` と
-  `DEPRECATED_ROLE_ALIASES` を再利用する。旧名は正規化して受け、未知キーは config 検証で弾く。
-  issue 記述の `spec-reviewer` / `impl-reviewer` は旧名 — 現行では `pr-reviewer` /
-  `self-reviewer` に正規化される。
+  `DEPRECATED_ROLE_ALIASES` を再利用する。旧名は**検証でも解決でも**正規化して扱い、未知キーは
+  config 検証で弾く。issue 記述の `spec-reviewer` / `impl-reviewer` は旧名 — 現行では
+  `pr-reviewer` / `self-reviewer` に正規化され、その turn で実際に注入される(validate は
+  通るのに注入されない、という齟齬を作らない)。`routing::canonical_role` は現状 private
+  なので `pub` に上げて config 側から使う。
 - **合成 = `all` → ロール別を連結、上書きはキー単位**。per-project の同キーが top-level を
   上書きし、無ければ top-level に落ちる(`language_for` の流儀を map に広げた形)。
 - **欠落 = warn + イベント発火で続行**。turn は落とさない。`doctor` は別途 strict に検出。
@@ -41,11 +43,17 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - `ProjectConfig` に同型の `#[serde(default)] pub prompts: HashMap<String, String>`
   (`[projects.prompts]`)。
 - 解決ヘルパ `preambles_for(&self, project, role) -> Vec<(String /*key*/, String /*rel path*/)>`:
-  `all` とロール `role` それぞれについて per-project → top-level のキー単位フォールバックで
-  パスを引き、`[all, role]` の順で存在するものだけ返す。
+  呼び出し側は canonical なロール名(`routing_role_for_loop` の結果 / `"self-reviewer"`)を渡す。
+  マップの各キーは `routing::canonical_role` を通してから照合する — top-level・per-project
+  どちらのキーも canonical 化した上で、`all` とロール `role` それぞれを per-project → top-level
+  のキー単位フォールバックで引き、`[all, role]` の順で存在するものだけ返す。これにより
+  `spec-reviewer = "..."` と書かれた entry も `pr-reviewer` の turn で正しく注入され、
+  旧名(top)と canonical 名(project)が同じロールを指す場合は per-project が勝つ。
 - `Config::validate` にキー検証を追加: `prompts` / `[projects.prompts]` の各キーは
   `routing::canonical_role` を通して `KNOWN_ROLES` に含まれるか、`all` のどちらか。外れたら
-  `bail!`(routing の未知ロール拒否と同じメッセージ調)。
+  `bail!`(routing の未知ロール拒否と同じメッセージ調)。同一マップ内で alias と canonical が
+  同じロールに畳まれて衝突する場合(例: `pr-reviewer` と `spec-reviewer` を併記)も、
+  どちらが勝つか曖昧なので `bail!` で弾く。
 - `INIT_TEMPLATE` にコメント例を追記(過剰採用を避ける一言 —「CLAUDE.md で足りるなら不要」)。
 
 ### 2. 配線: preamble の解決・読み込み・埋め込み — `src/engine/flow.rs` + `src/turn/`
@@ -78,9 +86,12 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 
 - [ ] `[prompts]` / `[projects.prompts]` が role→path マップとしてパースされる。
 - [ ] 未知ロールキーは config 読み込みで拒否される。旧ロール名(`spec-reviewer` 等)と `all`
-      は受理される。
+      は受理される。同一マップ内での alias + canonical 併記(`pr-reviewer` と `spec-reviewer`)は
+      衝突として拒否される。
 - [ ] `preambles_for` が per-project→top-level のキー単位上書きを行い、`all`→ロールの順で返す
       (role のみ / `all` のみ / 両方 / どちらも無し の各ケース)。
+- [ ] 旧名キー(`spec-reviewer`)で設定した preamble が、canonical ロール(`pr-reviewer`)の
+      turn で注入される。top を旧名・project を canonical 名にした場合は per-project が勝つ。
 - [ ] turn プロンプトで、該当 preamble が本文冒頭・完了契約より前に埋め込まれる。設定が空の
       プロジェクトは現状と同一のプロンプトになる(後方互換)。
 - [ ] preamble パスが欠落しても turn は続行し、`prompt.preamble_missing` イベントが出る。
@@ -90,8 +101,9 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 
 ## test 戦略
 
-- **config**(`src/config.rs` unit): パース、未知キー拒否、旧名/`all` 受理、`preambles_for` の
-  合成4ケース。
+- **config**(`src/config.rs` unit): パース、未知キー拒否、alias+canonical 衝突拒否、
+  旧名/`all` 受理、`preambles_for` の合成4ケース、および旧名キーが canonical ロールで解決される
+  こと・旧名(top)↔canonical(project)上書きの2ケース。
 - **配置**(`src/turn/prompts.rs` unit): 非空 preamble が本文の前・契約の前に入ること、
   空 preamble で現行出力と一致すること(既存 `prompt_file_contains_contract_and_turn_id` を拡張)。
 - **欠落**(flow 層 / `FakeStore` で): 欠落時に `prompt.preamble_missing` が記録され turn 続行。
