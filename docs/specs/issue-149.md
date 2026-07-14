@@ -33,8 +33,9 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - **合成 = `all` → ロール別を連結、上書きはキー単位**。per-project の同キーが top-level を
   上書きし、無ければ top-level に落ちる(`language_for` の流儀を map に広げた形)。
 - **欠落 = warn + イベント発火で続行**。turn は落とさない。`doctor` は別途 strict に検出。
-- **パスは repo 相対に限定**。絶対パス・`..` を config 検証で弾く。中身は agent プロンプトに
-  埋め込まれるため、worktree 外の秘密ファイルを読ませない防御線。
+- **パスは repo 相対に限定**。絶対パス・`..` を config 検証で弾き、さらに読み込み直前に
+  canonicalize して実体が worktree 配下に残ることを確認する(symlink 越しの脱出も塞ぐ)。
+  中身は agent プロンプトに埋め込まれるため、worktree 外の秘密ファイルを読ませない防御線。
 
 ## 変更箇所
 
@@ -63,7 +64,10 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
   親ディレクトリ参照(`Component::ParentDir` を含む)を `bail!` で拒否する。`Config::validate`
   で `prompts` / `[projects.prompts]` の全値に適用する。解決も doctor も、読み込む直前に
   同じヘルパを必ず通してから `join` する(検証を単一の関門に集約し、経路差で漏れないように
-  する)。
+  する)。ただしこの字面検証だけでは足りない — repo 内の symlink が worktree 外を指す場合、
+  `worktree.join(rel)` は字面上 repo 相対のまま外のファイルに解決される。config 検証の時点では
+  実ファイルシステムを見られないので、封じ込めの本丸は次節の**読み込み時 canonicalize 検査**に
+  置く(字面検証 = 設定ミスの早期拒否、canonicalize 検査 = 実体の封じ込め、の二段構え)。
 - `INIT_TEMPLATE` にコメント例を追記(過剰採用を避ける一言 —「CLAUDE.md で足りるなら不要」)。
 
 ### 2. 配線: preamble の解決・読み込み・埋め込み — `src/engine/flow.rs` + `src/turn/`
@@ -72,7 +76,18 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
   `run_turn`(author)は `routing::routing_role_for_loop(&run.loop_kind)`、`run_review_turn`
   は `"self-reviewer"` を routing ロールとして `run_turn_in` に渡す。
 - `run_turn_in` で `preambles_for` → 各パスは `validate_repo_relative` を通してから
-  `worktree.join(rel)` で読む(config validate を通った値でも、防御的に解決関門で再確認する)。読めたものを
+  `worktree.join(rel)` で解決する(config validate を通った値でも、防御的に解決関門で再確認する)。
+- **読み込み直前の封じ込め検査(必須)**: `join` した結果をそのまま読まない。
+  `std::fs::canonicalize` で実体パスに解決し(worktree ルート側も canonicalize しておく —
+  `gitops.rs` / `engine/reaper.rs` の既存流儀)、canonical な実体が canonical な worktree ルート
+  配下(`starts_with`)に**残っている場合だけ**読む。repo 内の symlink が worktree 外
+  (例: `~/.ssh/id_rsa` への link)を指すケースは字面検証をすり抜けるが、canonicalize は
+  symlink を辿った実体で比較するのでここで捕まる。外に出ていたら読まずに warn +
+  `prompt.preamble_missing`(`"reason": "escapes_worktree"`)で飛ばして続行する
+  (欠落と同じ「死なない」扱いだが、中身は一切プロンプトに入れない)。canonicalize 自体の失敗
+  (パス欠落等)は §3 の欠落分岐に自然に合流する。この関門も `validate_repo_relative` と同じく
+  共通ヘルパ(例: `read_within(root, rel) -> Result<Option<String>>`)に集約し、解決・doctor の
+  経路差で片方だけ検査が抜ける事故を防ぐ。読めたものを
   「## プロジェクトの恒常規律(以下に従うこと。ただし meguri の完了契約・検証ルールが優先)」
   のラベル付きブロックに `all` → ロール順で連結する。
 - 位置の責務は `src/turn/prompts.rs` が持つ: `prepare_turn` / `write_prompt_file` に
@@ -82,8 +97,10 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 
 ### 3. 欠落ポリシー: warn + イベント — `src/engine/flow.rs`
 
-- パスが worktree に無い / 読めない場合、`deps.store.emit(Some(&run.id), "prompt.preamble_missing",
-  json!({ "role": …, "key": …, "path": rel }))` + warn ログを出し、その preamble を飛ばして続行。
+- パスが worktree に無い / 読めない / worktree 外へ解決される場合、
+  `deps.store.emit(Some(&run.id), "prompt.preamble_missing",
+  json!({ "role": …, "key": …, "path": rel, "reason": … }))`(`reason` は `"missing"` /
+  `"escapes_worktree"` 等)+ warn ログを出し、その preamble を飛ばして続行。
   `worktree_setup` の非 `required` 既定と同じ「死なない」方針。成功時は
   `prompt.preamble_injected`(roles/paths)を observability として発火してよい。
 
@@ -92,8 +109,10 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - `doctor_schedules` の `body_file` 検査と同型の新セクション: 各 project の `prompts` /
   top-level `prompts` を列挙し、`validate_repo_relative` を通した上で
   `project.repo_path.join(rel)` の存在を確認。無ければ ❌ で問題として報告(実行時は warn 続行
-  だが、doctor は設定ミス = typo を捕まえる役)。config validate が絶対パス/`..` を先に弾くので
-  doctor がそれらを見ることは通常ないが、解決は同じ関門を共有する。
+  だが、doctor は設定ミス = typo を捕まえる役)。存在しても、canonicalize した実体が
+  primary clone の外へ出る(symlink 越しの脱出)場合は同じく ❌ — flow と同じ封じ込め
+  ヘルパを通し、strict 側でも同一の判定を共有する。config validate が絶対パス/`..` を先に
+  弾くので doctor がそれらを見ることは通常ないが、解決は同じ関門を共有する。
 
 ## 受け入れ基準
 
@@ -110,6 +129,9 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
 - [ ] preamble パスが欠落しても turn は続行し、`prompt.preamble_missing` イベントが出る。
 - [ ] 絶対パス(例: `/etc/passwd`)や `..` を含む値(例: `../../secret`)は config 読み込みで
       拒否される。
+- [ ] repo 内の symlink が worktree 外を指す場合、その中身はプロンプトに注入されず、
+      `prompt.preamble_missing`(`reason: "escapes_worktree"`)+ warn で turn は続行する。
+      worktree 内を指す symlink は通常どおり読める。
 - [ ] `meguri doctor` が、設定済みだが primary clone に無いパスを ❌ で報告する。
 - [ ] README / config ドキュメントに新セクションと「CLAUDE.md との住み分け」を追記。
 - [ ] `cargo fmt --check` / `clippy -D warnings` / `nextest run` / `cargo test --doc` が通る。
@@ -121,6 +143,10 @@ design 寄りの薄い spec とする。判断の本体は ADR 0012 へ、ここ
   こと・旧名(top)↔canonical(project)上書きの2ケース。加えて `validate_repo_relative` の
   単体テスト(絶対パス拒否・`..` 拒否・正常な相対パス受理)と、それらを含む config が
   load で弾かれること。
+- **封じ込め**(共通ヘルパ unit、`#[cfg(unix)]`): tempdir を root に見立て、
+  (a) root 外のファイルを指す symlink → 読まれず `escapes_worktree` 扱い、
+  (b) root 内を指す symlink → 読める、(c) 実在する通常ファイル → 読める、
+  (d) 欠落パス → 欠落扱い、の4ケース(`std::os::unix::fs::symlink` で作成)。
 - **配置**(`src/turn/prompts.rs` unit): 非空 preamble が本文の前・契約の前に入ること、
   空 preamble で現行出力と一致すること(既存 `prompt_file_contains_contract_and_turn_id` を拡張)。
 - **欠落**(flow 層 / `FakeStore` で): 欠落時に `prompt.preamble_missing` が記録され turn 続行。
