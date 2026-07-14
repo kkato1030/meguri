@@ -20,6 +20,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => cmd_init(),
         Command::Doctor => cmd_doctor(),
+        Command::Add {
+            text,
+            project,
+            plan,
+            ready,
+            raw,
+        } => app::cmd_add(project.as_deref(), &text, plan, ready, raw).await,
         Command::Watch => app::cmd_watch().await,
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon::cmd_start(),
@@ -188,9 +195,10 @@ fn doctor_agents(cfg: &Config) -> bool {
         .map(|v| v.lines().next().unwrap_or_default().to_string());
     let default_ok = default_detail.is_ok();
     println!(
-        "  {} default ({}): {}",
+        "  {} default ({}) [{}]: {}",
         if default_ok { "✅" } else { "❌" },
         cfg.agent.command,
+        headless_note(&cfg.agent),
         default_detail.clone().unwrap_or_else(|e| e),
     );
     // Named profiles are optional — a missing CLI just prunes it from the auto
@@ -200,9 +208,10 @@ fn doctor_agents(cfg: &Config) -> bool {
         let detail = run_capture(&profile.command, &["--version"])
             .map(|v| v.lines().next().unwrap_or_default().to_string());
         println!(
-            "  {} {name} ({}): {}",
+            "  {} {name} ({}) [{}]: {}",
             if detail.is_ok() { "✅" } else { "⚠️ " },
             profile.command,
+            headless_note(&profile),
             detail.unwrap_or_else(|e| e),
         );
     }
@@ -234,7 +243,35 @@ fn doctor_agents(cfg: &Config) -> bool {
             }
         }
     }
+
+    // `meguri add`'s refine runs headless: report whether the resolved refiner
+    // profile actually has a headless mode. A miss isn't a doctor failure —
+    // capture still works, refine just stays off — but a human should know.
+    if let Ok(name) = routing::resolve(cfg, "refiner", &routing::detect_command)
+        && let Ok(profile) = routing::profile_by_name(cfg, &name)
+    {
+        match routing::effective_headless_args(&profile) {
+            Some(_) => println!("refine (`meguri add`): ✅ via {name} ({})", profile.command),
+            None => println!(
+                "refine (`meguri add`): ⚠️  {name} ({}) has no headless mode — \
+                 `meguri add` will capture raw only; set `headless_args` for it",
+                profile.command,
+            ),
+        }
+    }
     ok
+}
+
+/// One-word summary of a profile's headless (refine) resolution for doctor:
+/// explicit argv, inherited from a known CLI, opted out, or unsupported.
+fn headless_note(profile: &meguri::config::AgentProfile) -> &'static str {
+    use meguri::routing::effective_headless_args;
+    match &profile.headless_args {
+        Some(a) if !a.is_empty() => "headless: explicit",
+        Some(_) => "headless: off",
+        None if effective_headless_args(profile).is_some() => "headless: inherited",
+        None => "headless: none",
+    }
 }
 
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {

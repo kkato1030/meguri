@@ -71,6 +71,9 @@ repo_slug = "owner/repo"
 ## 使い方
 
 ```bash
+# capture: 一言メモから issue を立てる（あとで AI が整形する）
+meguri add "ログイン後のリダイレクトが変"
+
 # one-shot: work a single issue
 meguri run --project myproj --issue 42
 
@@ -89,6 +92,28 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
+
+### 投入口（`meguri add`）
+
+最初に詰まるのは issue を切るところです。これまで投入口は GitHub だけ —
+「ちゃんとした issue」を書いてラベルを貼る。その摩擦がスループットの上限に
+なります。投げなかったタスクは走りません。
+
+`meguri add "<メモ>"` は投入と整形を分けます。issue は即座に作られ
+（`create_issue` 直で、LLM を通しません）、番号と URL が出ます。そのあと
+best-effort で headless の agent がリポジトリを読み、タイトルと本文を整えます。
+原文メモは必ず末尾に verbatim で残るので、整形は足場にすぎず、オーサリングの
+主権は原文にあります。
+
+投入は AI を待たず、AI で失敗しません。agent が無い・整形が失敗・Ctrl-C の
+いずれでも、raw の issue は残ります。既定は無ラベル = 未トリアージ（watch は
+拾いません）。あとで `meguri:plan` / `meguri:ready` を貼るか、`--plan` /
+`--ready` で即投入します。`--raw` は整形を丸ごと省きます。
+
+`--project` は cwd（その `repo_path` 配下）から推定します。曖昧なら明示して
+ください。整形は既定の `claude` CLI ならゼロ設定で動きます。`command` を別の
+CLI に替えるなら、そのプロファイルの `headless_args` も設定してください。
+未設定だと整形はスキップされ raw のままです（`meguri doctor` が指摘します）。
 
 ### 常駐させる（daemon）
 

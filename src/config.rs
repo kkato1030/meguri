@@ -238,6 +238,22 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
+    /// Complete argv for a headless one-shot invocation (`meguri add`'s
+    /// refine), placed between `command` and the prompt: `{command}
+    /// {headless_args} <prompt>`. It is NOT combined with `args` — `args`
+    /// carries yolo (`--dangerously-skip-permissions`) and the model flag
+    /// fused together, so appending would leak yolo into a read-only refine
+    /// and replacing would drop the model. A distinct full argv keeps refine
+    /// read-only by construction while preserving the routed model.
+    ///
+    /// Resolution (see [`crate::routing::effective_headless_args`]): a
+    /// non-empty value is used as-is; an explicit empty `[]` declares "no
+    /// headless mode" (opt-out, since TOML can't write `None`); absence falls
+    /// back to a known-CLI default (`claude` → `["-p"]`) so a zero-config
+    /// `meguri init` still refines; an unknown `command` with no value means
+    /// headless is unsupported and refine is skipped with a warning.
+    #[serde(default)]
+    pub headless_args: Option<Vec<String>>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -254,6 +270,7 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
+            headless_args: None,
             herdr_agent_hint: None,
             session_dir: None,
         }

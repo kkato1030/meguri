@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +13,10 @@ use crate::engine::reaper;
 use crate::engine::scheduler::{Reload, Scheduler};
 use crate::engine::worker::{WorkerOutcome, run_worker};
 use crate::engine::{self, Deps};
+use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
+use crate::refine::{HeadlessRefiner, Refiner};
 use crate::notify::Notifier;
 use crate::store::{DesiredState, ROLE_AUTHOR, ROLE_REVIEW, RunRecord, RunStatus, Store};
 
@@ -50,6 +53,239 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
             _ => bail!("multiple projects configured — pass --project <id>"),
         },
     }
+}
+
+/// `meguri add` — capture an issue from a one-line memo, then refine it
+/// best-effort. Capture never goes through the LLM and, once `create_issue`
+/// succeeds, is never undone by a later refine failure (ADR 0006). This
+/// command lives outside the issue↔pane↔session lifetime model (#92): it needs
+/// only the config and the forge — no run, no pane, no store.
+pub async fn cmd_add(
+    project: Option<&str>,
+    text: &str,
+    plan: bool,
+    ready: bool,
+    raw: bool,
+) -> Result<()> {
+    if plan && ready {
+        bail!("--plan and --ready are mutually exclusive — pick one");
+    }
+    if text.trim().is_empty() {
+        bail!("the memo is empty — give `meguri add` something to capture");
+    }
+    let cfg = Config::load()?;
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    let project = infer_project(&cfg, project, &cwd)?;
+    let forge = GhForge::new(&project.repo_slug);
+
+    let mut labels: Vec<&str> = Vec::new();
+    if plan {
+        labels.push(crate::forge::LABEL_PLAN);
+    }
+    if ready {
+        labels.push(crate::forge::LABEL_READY);
+    }
+
+    // Build the refiner unless --raw. A profile with no headless mode is not an
+    // error: capture still runs, and add_core prints the skip note after the
+    // issue number so the capture report always comes first.
+    let (refiner, skip_note): (Option<HeadlessRefiner>, Option<String>) = if raw {
+        (None, None)
+    } else {
+        match build_refiner(&cfg) {
+            Ok(r) => (Some(r), None),
+            Err(reason) => (None, Some(reason)),
+        }
+    };
+    let refiner_dyn = refiner.as_ref().map(|r| r as &dyn Refiner);
+
+    let params = AddParams {
+        text,
+        labels: &labels,
+        repo_slug: &project.repo_slug,
+        repo_path: &project.repo_path,
+        language: cfg.language_for(project),
+    };
+    add_core(&forge, params, refiner_dyn, skip_note.as_deref()).await?;
+    Ok(())
+}
+
+/// Inputs `add_core` needs beyond the forge, gathered so the orchestration is
+/// testable against a `FakeForge` without a live config.
+pub struct AddParams<'a> {
+    pub text: &'a str,
+    pub labels: &'a [&'a str],
+    pub repo_slug: &'a str,
+    pub repo_path: &'a Path,
+    pub language: Option<&'a str>,
+}
+
+/// The capture→refine→write-back core, split out from [`cmd_add`] so tests can
+/// drive it with a fake forge and a fake refiner. Returns the created issue
+/// number. `create_issue` failing is a real error (no issue exists); every
+/// later failure leaves the raw issue in place and reports capture success.
+pub async fn add_core(
+    forge: &dyn Forge,
+    params: AddParams<'_>,
+    refiner: Option<&dyn Refiner>,
+    skip_note: Option<&str>,
+) -> Result<i64> {
+    let text = params.text.trim();
+    let title0 = initial_title(text);
+    let body0 = text.to_string();
+
+    // Capture: the one step that may hard-fail (auth/network/slug/permissions).
+    let number = forge
+        .create_issue(&title0, &body0, params.labels)
+        .await
+        .context("creating the issue (capture)")?;
+    println!(
+        "issue #{number} created: {}",
+        issue_url(params.repo_slug, number)
+    );
+
+    let Some(refiner) = refiner else {
+        if let Some(note) = skip_note {
+            println!("{note}");
+        }
+        return Ok(number);
+    };
+
+    print!("refining… ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    match refiner.refine(text, params.repo_path, params.language).await {
+        Ok(refined) => {
+            let new_body = compose_refined_body(&refined.body, text);
+            // Race guard (論点5): only overwrite while the issue is still the raw
+            // capture; a human edit in the refine window wins.
+            let current = forge
+                .get_issue(number)
+                .await
+                .context("re-reading the issue before refine write-back")?;
+            if current.title == title0 && current.body == body0 {
+                forge.update_issue_title(number, &refined.title).await?;
+                forge.update_issue_body(number, &new_body).await?;
+                println!("done\n  Title: {}", refined.title);
+            } else {
+                println!("done — issue was edited meanwhile; kept your version (refine skipped)");
+            }
+        }
+        Err(e) => {
+            println!("skipped: {e:#} — issue #{number} left raw");
+        }
+    }
+    Ok(number)
+}
+
+/// Resolve the refiner's headless launch, or a human-readable reason it can't
+/// run (which `add_core` prints after capture, leaving the issue raw).
+fn build_refiner(cfg: &Config) -> std::result::Result<HeadlessRefiner, String> {
+    let name = crate::routing::resolve(cfg, "refiner", &crate::routing::detect_command)
+        .map_err(|e| format!("refine skipped: {e:#} — issue left raw"))?;
+    let profile = crate::routing::profile_by_name(cfg, &name)
+        .map_err(|e| format!("refine skipped: {e:#} — issue left raw"))?;
+    match crate::routing::effective_headless_args(&profile) {
+        Some(argv) => Ok(HeadlessRefiner {
+            command: profile.command,
+            argv,
+        }),
+        None => Err(format!(
+            "refine skipped: profile `{name}` ({}) has no headless mode — \
+             issue left raw (set `headless_args`, see `meguri doctor`)",
+            profile.command
+        )),
+    }
+}
+
+/// Which project `meguri add` targets: explicit `--project` wins; otherwise
+/// infer from the cwd — a project whose canonical `repo_path` is a
+/// path-component ancestor of the cwd. A single cwd match wins even among many
+/// projects; multiple matches (or none with several projects configured) is an
+/// explicit error; none with a single project falls back to that sole project.
+pub fn infer_project<'a>(
+    cfg: &'a Config,
+    explicit: Option<&str>,
+    cwd: &Path,
+) -> Result<&'a ProjectConfig> {
+    if let Some(id) = explicit {
+        return cfg
+            .project(id)
+            .with_context(|| format!("project {id:?} not in config"));
+    }
+    // Canonicalize both sides so symlinks and `.`/`..` don't defeat the
+    // ancestor test; fall back to the raw path when it can't be canonicalized.
+    let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let matches: Vec<&ProjectConfig> = cfg
+        .projects
+        .iter()
+        .filter(|p| {
+            let rp = p
+                .repo_path
+                .canonicalize()
+                .unwrap_or_else(|_| p.repo_path.clone());
+            // starts_with is component-wise, so `/repo` never matches `/repo2`.
+            cwd_c.starts_with(&rp)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [_, _, ..] => bail!(
+            "the cwd is under multiple configured projects ({}) — pass --project <id>",
+            matches
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        [] => match cfg.projects.as_slice() {
+            [] => bail!(
+                "no projects configured — edit {}",
+                config::config_path().display()
+            ),
+            [only] => Ok(only),
+            _ => bail!(
+                "multiple projects configured and the cwd is under none — pass --project <id>"
+            ),
+        },
+    }
+}
+
+/// The GitHub issue URL for a freshly created issue. `create_issue` returns
+/// only the number, so the URL is composed from the `owner/repo` slug — its
+/// shape is stable and this avoids widening the forge trait.
+pub fn issue_url(repo_slug: &str, number: i64) -> String {
+    format!("https://github.com/{repo_slug}/issues/{number}")
+}
+
+/// Pre-refine title from a raw memo: the first non-empty line, trimmed and
+/// truncated so a paragraph-long memo doesn't become a monstrous title. The
+/// full memo still lands in the body verbatim, so nothing is lost.
+pub fn initial_title(text: &str) -> String {
+    const MAX: usize = 72;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() > MAX {
+        let mut t: String = line.chars().take(MAX - 1).collect();
+        t.push('…');
+        t
+    } else {
+        line.to_string()
+    }
+}
+
+/// Refined body followed by the verbatim original memo. This preservation is
+/// the orchestrator's job, never the model's (ADR 0006 原則2): the model's
+/// output is the scaffold, the original memo keeps authoring authority.
+pub fn compose_refined_body(refined_body: &str, original: &str) -> String {
+    format!(
+        "{}\n\n---\n## 原文メモ\n{}",
+        refined_body.trim(),
+        original.trim()
+    )
 }
 
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {

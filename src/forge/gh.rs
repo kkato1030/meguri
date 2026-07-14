@@ -445,6 +445,20 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn update_issue_title(&self, number: i64, title: &str) -> Result<()> {
+        self.gh(&[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--repo",
+            &self.repo,
+            "--title",
+            title,
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn add_label(&self, issue: i64, label: &str) -> Result<()> {
         self.ensure_label(label).await;
         self.gh(&[

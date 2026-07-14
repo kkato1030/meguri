@@ -230,6 +230,9 @@ pub trait Forge: Send + Sync {
     async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
     /// Overwrite an issue's body wholesale (snapshot-style report updates).
     async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
+    /// Overwrite an issue's title (the `meguri add` refine step retitles a
+    /// raw one-liner into a summarized title, issue #120).
+    async fn update_issue_title(&self, number: i64, title: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number

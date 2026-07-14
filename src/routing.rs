@@ -31,8 +31,11 @@ pub const GENERATED_AT: &str = "2026-07-12";
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// Loop kinds routing knows about (= `runs.loop_kind`). Explicit entries for
-/// anything outside this set are a startup error.
+/// Roles routing knows about. Mostly loop kinds (= `runs.loop_kind`), plus
+/// one-shot command roles that have no loop of their own — `refiner` is the
+/// `meguri add` refine step (ADR 0006), routed like any other role so a cheap
+/// model can be steered to it. Explicit entries outside this set are a
+/// startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
     "reviewer",
@@ -40,7 +43,42 @@ pub const KNOWN_ROLES: &[&str] = &[
     "spec-worker",
     "fixer",
     "conflict-resolver",
+    "refiner",
 ];
+
+/// Known CLIs that support a headless one-shot mode, and the argv that enters
+/// it, keyed by the profile `command`'s base name. Used to fill in
+/// [`effective_headless_args`] when a profile leaves `headless_args` unset, so
+/// a zero-config `meguri init` (whose `default` command is `claude`) still
+/// refines. Kept deliberately tiny: only exact base-name matches, never a
+/// guess at an unknown CLI's flags.
+fn known_headless_args(command: &str) -> Option<Vec<String>> {
+    let base = std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    match base {
+        "claude" => Some(vec!["-p".to_string()]),
+        _ => None,
+    }
+}
+
+/// The argv that actually launches a profile's headless one-shot refine, or
+/// `None` when the profile has no headless mode (refine is then skipped with a
+/// one-line warning — never a silent fallback). Resolution, in order:
+///
+/// 1. explicit non-empty `headless_args` → used verbatim (a complete argv);
+/// 2. explicit empty `[]` → `None`: the opt-out sentinel (TOML can't write
+///    `None`, and an empty argv is a valid-looking-but-broken launch);
+/// 3. unset + a known headless CLI `command` → that CLI's default argv;
+/// 4. unset + an unknown `command` → `None` (unsupported).
+pub fn effective_headless_args(profile: &AgentProfile) -> Option<Vec<String>> {
+    match &profile.headless_args {
+        Some(args) if !args.is_empty() => Some(args.clone()),
+        Some(_) => None,
+        None => known_headless_args(&profile.command),
+    }
+}
 
 /// The built-in profiles baked in alongside the recommendation table, so
 /// `[routing] mode = "auto"` works with no other config. A user
@@ -57,6 +95,8 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "opus".into(),
             ],
             resume_args: vec!["--resume".into()],
+            // Headless refine keeps the model but never yolo (read-only).
+            headless_args: Some(vec!["-p".into(), "--model".into(), "opus".into()]),
             herdr_agent_hint: None,
             session_dir: None,
         },
@@ -71,6 +111,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "sonnet".into(),
             ],
             resume_args: vec!["--resume".into()],
+            headless_args: Some(vec!["-p".into(), "--model".into(), "sonnet".into()]),
             herdr_agent_hint: None,
             session_dir: None,
         },
@@ -81,6 +122,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             command: "codex".into(),
             args: vec!["--yolo".into()],
             resume_args: vec!["resume".into()],
+            headless_args: None,
             herdr_agent_hint: None,
             session_dir: None,
         },
@@ -103,6 +145,9 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         "worker" | "spec-worker" => &["claude-sonnet", DEFAULT_PROFILE],
         // Narrow scope, small diffs — Sonnet is plenty.
         "fixer" | "conflict-resolver" => &["claude-sonnet", DEFAULT_PROFILE],
+        // One-shot title/body tidy-up (`meguri add`): the cheapest capable
+        // model is plenty; tilt the chain to the cheap side (ADR 0006).
+        "refiner" => &["claude-sonnet", DEFAULT_PROFILE],
         _ => &[DEFAULT_PROFILE],
     }
 }
@@ -439,6 +484,71 @@ args = ["--foo"]
         let p = profile_by_name(&cfg, "codex").unwrap();
         assert_eq!(p.command, "my-codex");
         assert_eq!(p.args, vec!["--foo"]);
+    }
+
+    #[test]
+    fn builtin_claude_headless_args_keep_model_and_drop_yolo() {
+        // Structural guarantee (spec 論点1/論点4): the headless argv carries the
+        // routed model but never the yolo flag, so refine stays read-only.
+        for name in ["claude-opus", "claude-sonnet"] {
+            let p = profile_by_name(&Config::default(), name).unwrap();
+            let argv = effective_headless_args(&p).unwrap();
+            assert!(argv.contains(&"--model".to_string()), "{name}: keeps model");
+            assert!(
+                !argv.contains(&"--dangerously-skip-permissions".to_string()),
+                "{name}: no yolo in headless"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_headless_args_resolution_rules() {
+        let base = |command: &str, headless: Option<Vec<String>>| AgentProfile {
+            command: command.into(),
+            args: vec![],
+            resume_args: vec![],
+            headless_args: headless,
+            herdr_agent_hint: None,
+            session_dir: None,
+        };
+        // Rule 3: unset + known CLI (default profile is `claude`) → its default.
+        assert_eq!(
+            effective_headless_args(&AgentProfile::default()),
+            Some(vec!["-p".to_string()])
+        );
+        assert_eq!(
+            effective_headless_args(&base("/usr/local/bin/claude", None)),
+            Some(vec!["-p".to_string()]),
+            "base-name match ignores the directory"
+        );
+        // Rule 1: explicit non-empty wins over inheritance.
+        assert_eq!(
+            effective_headless_args(&base("claude", Some(vec!["-p".into(), "--model".into(), "haiku".into()]))),
+            Some(vec!["-p".to_string(), "--model".to_string(), "haiku".to_string()])
+        );
+        // Rule 2: explicit empty = opt-out sentinel.
+        assert_eq!(effective_headless_args(&base("claude", Some(vec![]))), None);
+        // Rule 4: unset + unknown CLI = unsupported.
+        assert_eq!(effective_headless_args(&base("my-llm", None)), None);
+    }
+
+    #[test]
+    fn refiner_is_a_known_role_routed_to_the_cheap_chain() {
+        assert!(KNOWN_ROLES.contains(&"refiner"));
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        assert_eq!(
+            resolve(&cfg, "refiner", &only(&["claude"])).unwrap(),
+            "claude-sonnet"
+        );
+        assert_eq!(
+            resolve(&cfg, "refiner", &only(&[])).unwrap(),
+            DEFAULT_PROFILE
+        );
+        // Legacy (no [routing]) sends refiner to default like every role.
+        assert_eq!(
+            resolve(&Config::default(), "refiner", &|_: &str| true).unwrap(),
+            DEFAULT_PROFILE
+        );
     }
 
     #[test]

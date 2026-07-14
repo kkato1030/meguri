@@ -17,6 +17,25 @@ pub enum Command {
     Init,
     /// Check environment: gh auth, mux availability, git
     Doctor,
+    /// Capture an issue from a one-line memo: create it immediately (never
+    /// via the LLM), then let an agent refine title/body best-effort
+    Add {
+        /// The raw one-line memo (the only positional argument)
+        text: String,
+        /// Project id from config.toml (default: inferred from the cwd, or the
+        /// sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Also queue it for the planner loop (`meguri:plan`)
+        #[arg(long)]
+        plan: bool,
+        /// Also queue it for the worker loop (`meguri:ready`)
+        #[arg(long)]
+        ready: bool,
+        /// Skip refine entirely: capture the raw memo and stop (no LLM call)
+        #[arg(long)]
+        raw: bool,
+    },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
     /// Manage the resident watch: detach, OS supervision, status, logs

@@ -71,6 +71,9 @@ Everything else is optional: write a section/key only to override its default (s
 ## Use
 
 ```bash
+# capture: turn a one-line memo into an issue (AI refines it afterwards)
+meguri add "login redirect goes to the wrong page"
+
 # one-shot: work a single issue
 meguri run --project myproj --issue 42
 
@@ -89,6 +92,29 @@ meguri handback <run>
 meguri stop <run>         # kill pane, release the claim, cancel
 meguri prune              # reclaim panes + worktrees of closed issues (--dry-run / --force)
 ```
+
+### Intake (`meguri add`)
+
+The first thing that clogs is filing the issue. Until now the only intake was
+GitHub itself — write a proper issue, label it. That friction is a throughput
+ceiling: a task you don't file never runs.
+
+`meguri add "<memo>"` splits capture from triage. It creates the issue
+immediately — straight through `create_issue`, never via the LLM — and prints
+the number and URL. Then, best-effort, a headless agent reads the repo and
+refines the title and body. The original memo is always kept verbatim at the
+bottom, so refine is only scaffolding; your words keep authoring authority.
+
+Capture never waits on or fails from the AI: if the agent is missing, refine
+fails, or you hit Ctrl-C, the raw issue still stands. The default is unlabeled
+= untriaged (watch ignores it); label it `meguri:plan` / `meguri:ready` later,
+or pass `--plan` / `--ready` now. `--raw` skips refine entirely.
+
+`--project` is inferred from the cwd (the project whose `repo_path` contains
+it); pass it explicitly when ambiguous. Refine works out of the box with the
+default `claude` CLI (zero config). If you swap `command` to another CLI, set
+that profile's `headless_args` too, or refine is skipped (raw capture only) —
+`meguri doctor` flags it.
 
 ### Keep it running (daemon)
 
