@@ -101,6 +101,7 @@ async fn setup() -> TestEnv {
         deliver: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
 
     let deps = Deps::with_label_source(
@@ -371,6 +372,9 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
     }
+    // A new tick: the scheduler would clear the shared open-PR cache here
+    // (issue #170) before calling discover again.
+    env.deps.open_prs.clear().await;
     assert!(
         CiFixerLoop.discover(&env.deps).await.unwrap().is_empty(),
         "a PR whose CI keeps coming back red must stop being rediscovered"
@@ -386,6 +390,7 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
 
     // The next sweep hits the needs-human guard: no second comment, no
     // extra rollup poll needed.
+    env.deps.open_prs.clear().await;
     assert!(CiFixerLoop.discover(&env.deps).await.unwrap().is_empty());
     assert_eq!(env.forge.comments_of(1).len(), 1, "escalate exactly once");
 }

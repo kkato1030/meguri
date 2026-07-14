@@ -210,9 +210,9 @@ Either way the spec itself is disposable review scaffolding: it is deleted as pa
 
 Spec and implementation are symmetric (ADR 0008): both run a **mandatory internal self-review** before the PR opens, and both can enable an **optional external guard** on the opened PR.
 
-**Internal self-review** is an *internal loop* (ADR 0006): the author reviews its own work before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` a **review turn** reads the local diff and writes `{verdict, findings[]}`, applying every configured lens (`review.lenses`, default `correctness / tests / simplicity / security`); if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; past the cap the PR is published anyway (the guard / human merge gate is the backstop). Nothing is posted to the conversation — the review turn runs under the `self-review` routing profile (so it can be a different model than the author), and the outcome is recorded off the conversation timeline: a `meguri/self-review` commit status on the pushed head and a folded `<details>` in the PR body. Set `review.enabled = false` to skip it (e.g. an external bot covers reviews).
+**Internal self-review** is an *internal loop* (ADR 0006): the author reviews its own work before the PR is ever pushed, so the review→fix ping-pong never touches GitHub. Between `validate` and `open-pr` a **review turn** reads the local diff and writes `{verdict, findings[]}`, applying every configured lens (`review.lenses`, default `correctness / tests / simplicity / security`); if there are findings, a **fix turn** addresses them and commits, the project check re-runs, and it loops back to review. Convergence is bounded by a *local* rounds counter (`review.max_rounds`), not a forge marker; past the cap the PR is published anyway (the guard / human merge gate is the backstop). Nothing is posted to the conversation — the review turn runs under the `self-reviewer` routing role (so it can be a different model than the author), and the outcome is recorded off the conversation timeline: a `meguri/self-review` commit status on the pushed head and a folded `<details>` in the PR body. Set `review.enabled = false` to skip it (e.g. an external bot covers reviews).
 
-**GitHub guard** is the optional external review, toggled per project × kind (`review.guard.plan` — on by default, the old spec reviewer — and `review.guard.impl` — off by default). It reviews the opened PR under an independent `guard` profile and records its verdict the same way — a `meguri/guard-review` commit status + a folded PR-body `<details>` — **never inline threads**, so the **fixer** never reacts to it and the AI↔AI ping-pong stays retired. The plan guard also drives the spec labels (clean → `spec-ready`). For a human, a red guard check is *advisory* (it does not block the merge unless you make `meguri/guard-review` a required check); for auto-merge it is a *gate* (below).
+**GitHub guard** is the optional external review, toggled per project × kind (`review.guard.plan` — on by default, the old spec reviewer — and `review.guard.impl` — off by default). It reviews the opened PR under an independent `pr-reviewer` routing role and records its verdict the same way — a `meguri/guard-review` commit status + a folded PR-body `<details>` — **never inline threads**, so the **fixer** never reacts to it and the AI↔AI ping-pong stays retired. The plan guard also drives the spec labels (clean → `spec-ready`). For a human, a red guard check is *advisory* (it does not block the merge unless you make `meguri/guard-review` a required check); for auto-merge it is a *gate* (below).
 
 Because the AI never creates review threads, the **fixer** naturally picks up only human and external-bot threads — GitHub stays the review transport exactly where a human sits.
 
@@ -250,12 +250,15 @@ Riding the watch poll, a sweep arms a PR when **all** of these hold: it's a `meg
 ```toml
 [pr.auto_merge]
 enabled = false                  # master switch
+mode = "native"                  # native (arm GitHub auto-merge) | orchestrator (meguri merges itself)
 strategy = "squash"              # squash | merge | rebase (no fallback if the repo forbids it)
 require_branch_protection = true # refuse to arm without required-checks branch protection
 opt_in = "label"                 # label (needs meguri:automerge) | all (every eligible meguri PR)
 ```
 
 When `enabled = true`, `meguri watch` and `meguri doctor` **fail fast** if the repo can't honor auto-merge (auto-merge disabled, strategy not allowed, or protection missing) rather than degrading silently at merge time. Two caveats, both with the same escape hatch (`require_branch_protection = false`): protection detection uses the **classic branch-protection API only** (rulesets aren't detected), and reading it needs an **admin-scoped token** (a non-admin token gets HTTP 403, which meguri surfaces rather than treating as "unprotected"). To make meguri's own review a merge precondition, enable the **impl guard** (`review.guard.impl = true`): auto-merge then only arms a PR whose `meguri/guard-review` status is success (ADR 0008). With the impl guard off there is no such gate, so an opt-in PR can merge on green required checks before meguri has externally reviewed it — rely on branch protection (and the mandatory internal self-review) for the bar you want.
+
+**`mode` — native vs orchestrator.** The default `native` is described above: meguri only arms, GitHub decides. But **private repos on the Free plan cannot enable "Allow auto-merge" at all** (the API silently ignores the PATCH) and have no branch protection, so `native` always fails fast there — the same constraint meguri itself hit in `docs/adr/0004-automerge-gate-renovate-side-on-free-private.md`. `mode = "orchestrator"` is the fallback for exactly those repos: the eligibility gate is identical (same branch / link / label / thread checks), but instead of arming, **meguri merges the PR itself** (`gh pr merge --squash`-equivalent, pinned to the reviewed head) as soon as GitHub reports it `MERGEABLE`. `CONFLICTING` goes to the conflict-resolver and `UNKNOWN` waits for the next sweep. Because there is no server-side gate, orchestrator mode **explicitly accepts meguri's own pre-PR verification (`check_command` + self-review) as the only gate** (`docs/adr/0009-auto-merge-orchestrator-side-merge-on-free-private.md`); `meguri doctor` prints a reminder to that effect. Orchestrator mode requires `require_branch_protection = false` (config validation rejects the contradiction). Keep `native` wherever "Allow auto-merge" *can* be enabled — a server-side gate is always stronger than an in-process one.
 
 ## Configuration
 
@@ -393,7 +396,9 @@ required = false                           # true escalates a failing command to
 timeout_secs = 300                         # per-command; commands may fetch over the network
 ```
 
-Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `spec-reviewer`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
+See [docs/ops/apm-worktree-setup.md](docs/ops/apm-worktree-setup.md) for the wired-up, dogfooded example (#139). Note that `apm install --frozen` rewrites `apm.lock.yaml` (a tracked file) on every run, so `commands` needs a trailing `git checkout -- apm.lock.yaml` — otherwise the clean-tree check fails on a diff the agent never touched (`exclude` only suppresses untracked paths, it can't help here).
+
+Commands run with the worktree as `cwd` and get `MEGURI_ROLE` (the run's loop kind — `worker`, `fixer`, `guard`, …), `MEGURI_PROFILE` (its resolved launch profile), and `MEGURI_ISSUE` (the target issue/task number) in the environment, so a script can specialize per role. Write commands idempotently — they may run several times against the same worktree.
 
 ### Scheduled enqueue (`[[projects.schedules]]`, optional)
 
@@ -419,7 +424,18 @@ Since local mode has no planner, `kind = "plan"` is github-only — a local `pla
 
 ### Role-based agent routing (optional)
 
-By default every role — planner, self-review, guard, worker, spec-worker, fixer, conflict-resolver — runs the single `[agent]` profile. That profile is now the `default` profile; you can define **named profiles** and route each role to a different CLI/model. Roles have stable cost/quality shapes (the planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs), so routing keys on the role, not on an estimated issue difficulty.
+`[routing.roles]` steers **6 routing roles** — the "which model should do this kind of work?" question a human actually asks. They are coarser than the internal loop kinds (`runs.loop_kind`, still tracked one-per-loop for budget counting and `meguri stats routing`); several loop kinds share a role's cost/quality shape:
+
+| role | question | internal loop(s) / phase |
+|---|---|---|
+| `planner` | plan / write the spec | `planner` |
+| `worker` | implement | `worker`, `spec-worker` |
+| `fixer` | make a PR mergeable | `fixer`, `ci-fixer`, `conflict-resolver` |
+| `self-reviewer` | internal review before the PR is public | the self-review phase (inside the worker/planner flow) |
+| `pr-reviewer` | advisory review on a published PR (auto-merge gate) | the guard loop |
+| `cleaner` | hygiene sweep | `cleaner` |
+
+By default every role runs the single `[agent]` profile (now named the `default` profile); you can define **named profiles** and route each role to a different CLI/model. The planner's spec steers every downstream turn but costs little; the worker burns the bulk of the tokens; the fixer only touches small diffs — so routing keys on the role, not on an estimated issue difficulty.
 
 ```toml
 # A profile is one CLI's launch bundle — same shape as [agent].
@@ -441,17 +457,34 @@ resume_args = ["resume"]
 mode = "auto"        # auto | manual (default auto once [routing] exists)
 
 [routing.roles]      # explicit picks always beat auto; per-role overrides
-guard = "codex"           # (the old `reviewer` / `spec-reviewer` keys still work as aliases)
-# self-review = "codex"    # the model for the internal self-review turn (plan + impl)
-# guard = "codex"          # the model for the external GitHub guard review (the old spec/impl reviewer)
+pr-reviewer = "codex"     # (the old `reviewer` / `spec-reviewer` / `guard` keys still work as aliases)
+# self-reviewer = "codex"  # the model for the internal self-review turn (plan + impl)
 # worker = "claude-sonnet"
 ```
 
 - **`[routing]` is the switch.** Without it, meguri behaves exactly as before — every role runs `default`, no CLI detection. Defining `[agents.profiles.*]` alone changes nothing; profiles stay inert until `[routing]` references them.
-- **auto** applies a built-in 2026-07 recommendation table (planner → `claude-opus`, self-review/guard → `codex` then `claude-opus`, worker/spec-worker/fixer/conflict-resolver → `claude-sonnet`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
+- **auto** applies a built-in 2026-07 recommendation table (`planner` → `claude-opus`, `self-reviewer`/`pr-reviewer` → `codex` then `claude-opus`, `worker`/`fixer` → `claude-sonnet`, `cleaner` → `default`), each chain filtered by `command --version` detection and always ending at `default`. `claude-opus`, `claude-sonnet`, and `codex` are built in, so `mode = "auto"` works with no `[agents.profiles]` at all.
 - **manual** turns the table off: roles you don't list run `default`.
-- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected).
+- **Explicit always wins, loudly.** A `[routing.roles]` entry must resolve — an undefined profile, an undetected CLI, or an unknown role name aborts `meguri watch` / `meguri run` at startup (never a silent fallback). Route a single role back to the old behavior with `worker = "default"` (never detected). Config keys from before the role redesign (`reviewer`, `spec-reviewer`, `guard`, `impl-reviewer`, `self-review`, `spec-worker`, `conflict-resolver`, `ci-fixer`) still resolve as aliases of the new names.
 - The profile chosen at a run's first pane spawn is pinned to `runs.agent_profile` (shown in `meguri ps`'s PROFILE column and the `serve` API) and reused for every later spawn and resume. `meguri doctor` lists all profiles with their detection results and the final role→profile resolution.
+
+### Role preambles (`[prompts]`, optional)
+
+Standing project discipline — "read this guardrail before you start", "follow this editorial persona", "don't commit anything that misses this quality bar" — is the same for every issue, not per-issue. `[prompts]` injects it into the turn prompt, keyed by routing role, so the worker gets quality bars, the planner gets planning guidelines, the reviewer gets audit lenses. The value is a **repo-relative** path; the file's contents are embedded at the top of the prompt (a preface — the completion contract stays last and wins).
+
+```toml
+[prompts]                          # top-level default (applies to every project)
+all = "ops/agents/guardrails.md"   # shared by every role
+worker = "ops/agents/worker.md"    # keys are the 6 routing roles (worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
+
+[projects.prompts]                 # per-project override, per key
+planner = "ops/agents/planner.md"
+```
+
+- **Embedded, not referenced** — the discipline reaches the agent whether the profile is Claude or Codex, and whether or not the agent bothers to open the file (that CLI-independence is the point; [ADR 0012](docs/adr/0012-role-preamble-injected-into-turn-prompt.md)).
+- **`all` then the role**, both injected; per-project entries override the top-level one **per key** (the same role vocabulary and aliases as `[routing.roles]`; an unknown role key aborts config load).
+- **Missing is non-fatal** — a path that doesn't exist (or a symlink that escapes the worktree) is skipped with a warning and a `prompt.preamble_missing` event; the turn still runs. `meguri doctor` reports configured paths that don't resolve inside the clone.
+- **When to reach for it vs. `CLAUDE.md`**: if the same always-on context suffices for every role and only Claude runs, [agent instructions (apm)](#agent-instructions-apm) / `CLAUDE.md` already covers it — use `[prompts]` when you need per-role text or CLI-independent delivery, and keep the files short (bulky context belongs in `CLAUDE.md`).
 
 ## Development
 
@@ -476,7 +509,7 @@ apm compile                      # generates AGENTS.md (+ src/AGENTS.md) for Cod
 
 Order matters: `apm compile` skips `CLAUDE.md` only because the preceding `apm install` already populated `.claude/rules/` (Claude Code reads that directly, so `apm` dedupes `CLAUDE.md` out). Compile first, or compile against an empty tree (e.g. `--root <scratch-dir>` for isolated verification), and it generates `CLAUDE.md`/`src/CLAUDE.md` too, since there's nothing to dedupe against yet. `apm install --dry-run` doesn't preview this step either — dry-run only reports on `apm`/`mcp` package dependencies (this repo has none), not the local `.apm/instructions/` integration; a real (non-dry-run) `apm install` is what actually deploys `.claude/rules/`.
 
-Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation; wiring it up for meguri's own loops is tracked separately (#139).
+Re-run both after editing anything under `.apm/instructions/` or `apm.yml`. A real `apm install` also rewrites `apm.lock.yaml`'s `local_deployed_files` / `local_deployed_file_hashes` to match whatever is currently deployed on disk; since those track the gitignored compiled files, don't commit that diff — run `git checkout apm.lock.yaml` before committing (re-running `apm lock` does *not* clear these fields; they're carried over from the existing lockfile). meguri now has a generic [worktree setup hook](#worktree-setup-hook-optional) (`[projects.worktree_setup]`) that can run this build automatically on every worktree preparation, and it's wired up for meguri's own loops too (#139; see [docs/ops/apm-worktree-setup.md](docs/ops/apm-worktree-setup.md) for the setup and the results of dogfooding it).
 
 ## Status / roadmap
 

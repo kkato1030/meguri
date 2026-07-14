@@ -71,9 +71,9 @@ pub struct PreparedTurn {
 /// Write the prompt file + clear stale results. The caller then either
 /// spawns the pane with the trigger as the agent's initial prompt argument
 /// (turn 1) or sends the trigger line into the existing pane (later turns).
-pub fn prepare_turn(worktree: &Path, prompt_body: &str) -> Result<PreparedTurn> {
+pub fn prepare_turn(worktree: &Path, prompt_body: &str, preamble: &str) -> Result<PreparedTurn> {
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let prompt_path = prompts::write_prompt_file(worktree, &turn_id, prompt_body)?;
+    let prompt_path = prompts::write_prompt_file(worktree, &turn_id, prompt_body, preamble)?;
     prompts::clear_result(worktree)?;
     Ok(PreparedTurn {
         trigger_line: prompts::trigger_line(&turn_id),

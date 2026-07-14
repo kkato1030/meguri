@@ -1,11 +1,18 @@
-//! End-to-end role-based routing (issue #64): each loop's role resolves to
-//! its own launch profile, and the pane is spawned from that profile's
-//! command/args. Driven with a manual-mode config so resolution is
-//! deterministic and never depends on which agent CLIs the test host has.
+//! End-to-end role-based routing (issue #64, re-scoped to the 6-role
+//! `[routing.roles]` design in issue #167): each loop kind's routing role
+//! (`routing::routing_role_for_loop`) resolves to its role's launch profile,
+//! and the pane is spawned from that profile's command/args. Driven with a
+//! manual-mode config so resolution is deterministic and never depends on
+//! which agent CLIs the test host has.
 //!
 //! The flow itself is the worker flow for every case — only `runs.loop_kind`
 //! differs, which is exactly the axis routing keys on. That isolates the
 //! resolution/spawn behavior without standing up all six loops' full setups.
+//! Several loop kinds intentionally share a role (`ci-fixer` /
+//! `conflict-resolver` share `fixer`'s profile with `fixer` itself;
+//! `spec-worker` shares `worker`'s) — `ci-fixer` covers the issue #167
+//! registration bug where it fell through to `default` instead of riding its
+//! family's chain.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,28 +68,18 @@ args = ["--role", "reviewer"]
 command = "worker-cli"
 args = ["--role", "worker"]
 
-[agents.profiles.p-spec]
-command = "spec-cli"
-args = ["--role", "spec"]
-
 [agents.profiles.p-fixer]
 command = "fixer-cli"
 args = ["--role", "fixer"]
-
-[agents.profiles.p-conflict]
-command = "conflict-cli"
-args = ["--role", "conflict"]
 
 [routing]
 mode = "manual"
 
 [routing.roles]
 planner = "p-planner"
-spec-reviewer = "p-reviewer"
+pr-reviewer = "p-reviewer"
 worker = "p-worker"
-spec-worker = "p-spec"
 fixer = "p-fixer"
-conflict-resolver = "p-conflict"
 "#;
     let mut config: Config = toml::from_str(toml).unwrap();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
@@ -207,6 +204,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         review: None,
         worktree_setup: Default::default(),
         schedules: Vec::new(),
+        prompts: Default::default(),
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
@@ -236,20 +234,18 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_loop_kind_spawns_from_its_resolved_profile() {
-    // (loop_kind, expected profile name, expected command, first arg)
+async fn every_loop_kind_spawns_from_its_role_resolved_profile() {
+    // (loop_kind, expected profile name, expected command, first arg). Loop
+    // kinds that share a role (worker/spec-worker; fixer/ci-fixer/
+    // conflict-resolver) resolve to the same profile as their sibling.
     let cases = [
         ("planner", "p-planner", "planner-cli", "planner"),
-        ("spec-reviewer", "p-reviewer", "reviewer-cli", "reviewer"),
+        ("guard", "p-reviewer", "reviewer-cli", "reviewer"),
         ("worker", "p-worker", "worker-cli", "worker"),
-        ("spec-worker", "p-spec", "spec-cli", "spec"),
+        ("spec-worker", "p-worker", "worker-cli", "worker"),
         ("fixer", "p-fixer", "fixer-cli", "fixer"),
-        (
-            "conflict-resolver",
-            "p-conflict",
-            "conflict-cli",
-            "conflict",
-        ),
+        ("ci-fixer", "p-fixer", "fixer-cli", "fixer"),
+        ("conflict-resolver", "p-fixer", "fixer-cli", "fixer"),
     ];
 
     for (loop_kind, profile_name, command, role_arg) in cases {

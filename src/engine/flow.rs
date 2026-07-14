@@ -1044,7 +1044,7 @@ fn resolve_run_profile(
         None => {
             let name = crate::routing::resolve(
                 &deps.config,
-                &run.loop_kind,
+                crate::routing::routing_role_for_loop(&run.loop_kind),
                 &crate::routing::detect_command,
             )?;
             deps.store.update_run_agent_profile(&run.id, &name)?;
@@ -1103,19 +1103,78 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
 }
 
 /// The self-review lane: a separate pane keyed by the same issue, launched
-/// under the `self-review` routing profile (formerly `impl-reviewer`, ADR
-/// 0008) so the review turn can be a different model than the author doing the
-/// fixes. Resolved without pinning the run's own profile. Shared by the plan
-/// and impl self-review (the loop is symmetric).
+/// under the `self-reviewer` routing profile (formerly `impl-reviewer` /
+/// `self-review`, ADR 0003 revision) so the review turn can be a different
+/// model than the author doing the fixes. Resolved without pinning the run's
+/// own profile. Shared by the plan and impl self-review (the loop is
+/// symmetric).
 fn impl_review_lane(deps: &Deps) -> Result<Lane> {
-    let profile_name =
-        crate::routing::resolve(&deps.config, "self-review", &crate::routing::detect_command)?;
+    let profile_name = crate::routing::resolve(
+        &deps.config,
+        "self-reviewer",
+        &crate::routing::detect_command,
+    )?;
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
     Ok(Lane {
         role: crate::store::ROLE_IMPL_REVIEW,
         profile_name,
         profile,
     })
+}
+
+/// Resolve this run's role preamble(s) into the standing-discipline block that
+/// gets prepended to the turn prompt (issue #149, ADR 0012). Reads each
+/// configured file from the worktree behind the containment gate
+/// ([`crate::config::resolve_preamble_within`]): a missing path or one that
+/// escapes the worktree (via a symlink) is skipped with a warning and a
+/// `prompt.preamble_missing` event — never fatal, mirroring `worktree_setup`.
+/// Returns an empty string when nothing is configured or everything was
+/// skipped, which `write_prompt_file` renders identically to the old output.
+fn resolve_preamble(deps: &Deps, run: &RunRecord, worktree: &Path, role: &str) -> Result<String> {
+    let entries = deps.config.preambles_for(&deps.project, role);
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    let mut blocks = Vec::new();
+    let mut injected = Vec::new();
+    for (key, rel) in entries {
+        match crate::config::resolve_preamble_within(worktree, &rel) {
+            crate::config::PreambleResolution::Content(text) => {
+                blocks.push(text.trim_end().to_string());
+                injected.push(json!({ "key": key, "path": rel }));
+            }
+            crate::config::PreambleResolution::Missing => {
+                tracing::warn!("preamble for role {role} ({key}) not found at {rel} — skipping");
+                deps.store.emit(
+                    Some(&run.id),
+                    "prompt.preamble_missing",
+                    json!({ "role": role, "key": key, "path": rel, "reason": "missing" }),
+                )?;
+            }
+            crate::config::PreambleResolution::Escapes => {
+                tracing::warn!(
+                    "preamble for role {role} ({key}) at {rel} escapes the worktree — skipping"
+                );
+                deps.store.emit(
+                    Some(&run.id),
+                    "prompt.preamble_missing",
+                    json!({ "role": role, "key": key, "path": rel, "reason": "escapes_worktree" }),
+                )?;
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(String::new());
+    }
+    deps.store.emit(
+        Some(&run.id),
+        "prompt.preamble_injected",
+        json!({ "role": role, "preambles": injected }),
+    )?;
+    Ok(format!(
+        "## プロジェクトの恒常規律(以下に従うこと。ただし meguri の完了契約・検証ルールが優先)\n\n{}",
+        blocks.join("\n\n")
+    ))
 }
 
 /// Run one prompt-turn in the run's own (author) lane: prepare files, deliver
@@ -1128,7 +1187,8 @@ pub(crate) async fn run_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let lane = author_lane(deps, run)?;
-    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+    let role = crate::routing::routing_role_for_loop(&run.loop_kind);
+    run_turn_in(deps, run, worktree, &lane, role, purpose, prompt_body).await
 }
 
 /// Run one prompt-turn in the worker's self-review (impl-review) lane under
@@ -1141,7 +1201,16 @@ pub(crate) async fn run_review_turn(
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
     let lane = impl_review_lane(deps)?;
-    run_turn_in(deps, run, worktree, &lane, purpose, prompt_body).await
+    run_turn_in(
+        deps,
+        run,
+        worktree,
+        &lane,
+        "self-reviewer",
+        purpose,
+        prompt_body,
+    )
+    .await
 }
 
 async fn run_turn_in(
@@ -1149,10 +1218,12 @@ async fn run_turn_in(
     run: &RunRecord,
     worktree: &Path,
     lane: &Lane,
+    role: &str,
     purpose: &str,
     prompt_body: &str,
 ) -> Result<(TurnOutcome, String)> {
-    let prepared = prepare_turn(worktree, prompt_body)?;
+    let preamble = resolve_preamble(deps, run, worktree, role)?;
+    let prepared = prepare_turn(worktree, prompt_body, &preamble)?;
     let ensured = ensure_pane(deps, run, worktree, lane, &prepared.trigger_line).await?;
     let pane = ensured.pane.clone();
     deps.store.begin_turn(
@@ -1936,6 +2007,7 @@ mod tests {
             review: None,
             worktree_setup,
             schedules: Vec::new(),
+            prompts: Default::default(),
         };
         let deps = Deps::with_label_source(
             store,
@@ -2072,27 +2144,33 @@ mod tests {
             repo.path().to_path_buf(),
             worktree_root.path().to_path_buf(),
             crate::config::WorktreeSetupConfig {
-                commands: vec!["sleep 2 && echo late > marker.txt".into()],
+                commands: vec!["sleep 5 && echo late > marker.txt".into()],
                 timeout_secs: 1,
                 ..Default::default()
             },
         );
         let cp = Checkpoint::default();
 
+        // The command is killed at its 1s timeout, so prepare-worktree returns
+        // in ~1s (plus git-worktree overhead) rather than blocking for the
+        // command's full 5s sleep. The 4s budget is deliberately loose: it
+        // still catches a regression that awaits the whole 5s, but leaves ample
+        // headroom for git ops under heavy parallel-test load (the tight 2s
+        // budget here used to flake).
         let start = std::time::Instant::now();
         create_branch_worktree(&deps, &run, &cp).await.unwrap();
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
+            start.elapsed() < std::time::Duration::from_secs(4),
             "prepare-worktree must not block past the command's timeout"
         );
 
         let run = deps.store.get_run(&run.id).unwrap().unwrap();
         let wt = PathBuf::from(run.worktree_path.unwrap());
 
-        // Wait past when the sleep would have finished had it survived the
+        // Wait past when the 5s sleep would have finished had it survived the
         // timeout; if `kill_on_drop` didn't actually kill it, marker.txt
         // would show up here.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert!(
             !wt.join("marker.txt").exists(),
             "the timed-out command must be killed, not left running in the background"

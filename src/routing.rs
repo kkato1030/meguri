@@ -1,8 +1,12 @@
-//! Role-based agent routing (issue #64, routing 1/3).
+//! Role-based agent routing (issue #64, routing 1/3; roles re-scoped to a
+//! 6-way "kind of work" grouping in issue #167 — ADR 0003 revision).
 //!
-//! Each loop has a role (`runs.loop_kind`) whose cost/quality profile is
-//! stable, so we route a role — not an estimated issue difficulty — to a
-//! launch profile. Two rules are load-bearing (ADR 0003):
+//! `[routing.roles]` steers 6 coarse roles ([`KNOWN_ROLES`]), not the
+//! finer-grained internal loop kinds (`runs.loop_kind`): several loop kinds
+//! share a role's cost/quality profile ([`routing_role_for_loop`] is the
+//! mapping), so we route the role — not an estimated issue difficulty, and
+//! not the loop kind directly — to a launch profile. Two rules are
+//! load-bearing (ADR 0003):
 //!
 //! - **Explicit always beats auto.** A role listed in `[routing.roles]` uses
 //!   exactly that profile; a missing profile, a failed CLI detection, or an
@@ -128,34 +132,62 @@ pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// Roles routing knows about. Most are loop kinds (= `runs.loop_kind`);
-/// `self-review` is not a loop but the profile of the internal self-review
-/// turn (ADR 0006/0008), and `guard` the profile of the external guard review
-/// (ADR 0008). Both are shared across the plan and impl kinds (requirement 3:
-/// spec and impl are managed by the same model). Explicit entries for anything
-/// outside this set are a startup error.
+/// Roles routing knows about: the 6 *kinds of work* a user answers "which
+/// model should do this?" for, independent from the finer-grained internal
+/// loop kinds (`runs.loop_kind`) — see [`routing_role_for_loop`] for that
+/// mapping (ADR 0003 revision, issue #167). `self-reviewer` and `pr-reviewer`
+/// are not loop kinds at all but the profiles of the internal self-review
+/// turn (ADR 0006/0008) and the advisory guard-loop review on a published PR
+/// (ADR 0008); both are shared across the plan and impl kinds (spec and impl
+/// are managed by the same model). Explicit entries for anything outside this
+/// set are a startup error.
 pub const KNOWN_ROLES: &[&str] = &[
     "planner",
-    "self-review",
-    "guard",
     "worker",
-    "spec-worker",
     "fixer",
-    "conflict-resolver",
+    "self-reviewer",
+    "pr-reviewer",
+    "cleaner",
 ];
 
-/// Deprecated routing role keys → their current name (issue #108 / ADR 0008).
-/// A config still using the old key resolves as if it named the new one:
-/// `reviewer`/`spec-reviewer` → `guard` (the external review), `impl-reviewer`
-/// → `self-review` (the internal review).
+/// Deprecated routing role keys → their current name (ADR 0003 revision,
+/// issue #167 — folds in the ADR 0008 review-role rename too). A config
+/// still using an old key resolves as if it named the new one: the review
+/// pair `reviewer`/`spec-reviewer`/`guard` → `pr-reviewer`, `impl-reviewer`/
+/// `self-review` → `self-reviewer`, the worker pair `spec-worker` → `worker`,
+/// and the fixer family `conflict-resolver`/`ci-fixer` → `fixer`.
 const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[
-    ("reviewer", "guard"),
-    ("spec-reviewer", "guard"),
-    ("impl-reviewer", "self-review"),
+    ("reviewer", "pr-reviewer"),
+    ("spec-reviewer", "pr-reviewer"),
+    ("guard", "pr-reviewer"),
+    ("impl-reviewer", "self-reviewer"),
+    ("self-review", "self-reviewer"),
+    ("spec-worker", "worker"),
+    ("conflict-resolver", "fixer"),
+    ("ci-fixer", "fixer"),
 ];
 
-/// Map a (possibly deprecated) config role key to its canonical name.
-fn canonical_role(role: &str) -> &str {
+/// Map a loop kind (`runs.loop_kind`) to its routing role — the fine↔coarse
+/// bridge this ADR revision introduces (same pattern as `role_for_loop` for
+/// pane lanes, `src/engine/mod.rs`). Internal loop kinds stay
+/// fine-grained (budget/stats stay observable per loop); routing only cares
+/// about the 6-role grouping. `self-reviewer` has no loop kind of its own —
+/// it is resolved directly by name where the internal self-review turn runs
+/// (`impl_review_lane`).
+pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
+    match loop_kind {
+        "planner" => "planner",
+        "fixer" | "ci-fixer" | "conflict-resolver" => "fixer",
+        "guard" => "pr-reviewer",
+        "cleaner" => "cleaner",
+        // "worker" | "spec-worker", and anything unrecognized.
+        _ => "worker",
+    }
+}
+
+/// Map a (possibly deprecated) config role key to its canonical name. Public
+/// so `config` can canonicalize `[prompts]` keys the same way (issue #149).
+pub fn canonical_role(role: &str) -> &str {
     DEPRECATED_ROLE_ALIASES
         .iter()
         .find(|(old, _)| *old == role)
@@ -164,7 +196,8 @@ fn canonical_role(role: &str) -> &str {
 }
 
 /// Look up a canonical role in a user's `[routing.roles]` map, honoring the
-/// deprecated aliases (so `reviewer = …` still steers `spec-reviewer`).
+/// deprecated aliases (so a config still keyed on `reviewer = …` steers the
+/// same profile as `pr-reviewer = …`).
 fn role_override<'a>(roles: &'a HashMap<String, String>, role: &str) -> Option<&'a String> {
     if let Some(name) = roles.get(role) {
         return Some(name);
@@ -230,13 +263,15 @@ pub fn recommended_chain(role: &str) -> &'static [&'static str] {
         "planner" => &["claude-opus", DEFAULT_PROFILE],
         // Cross-vendor on purpose: reviewing with the author's model shares its
         // blind spots (and spares the Claude quota). Both the internal
-        // self-review turn and the external guard review key off this.
-        "self-review" | "guard" => &["codex", "claude-opus", DEFAULT_PROFILE],
-        // The bulk of consumption; Sonnet lands close to Opus on coding at
+        // self-review turn and the advisory pr-reviewer (guard loop) review
+        // key off this.
+        "self-reviewer" | "pr-reviewer" => &["codex", "claude-opus", DEFAULT_PROFILE],
+        // The bulk of consumption (worker, incl. the spec-triggered worker)
+        // and the narrow-scope fix-up work (fixer, incl. ci-fixer / conflict
+        // resolution) both land on Sonnet — close to Opus on coding at
         // roughly half the quota/price.
-        "worker" | "spec-worker" => &["claude-sonnet", DEFAULT_PROFILE],
-        // Narrow scope, small diffs — Sonnet is plenty.
-        "fixer" | "conflict-resolver" => &["claude-sonnet", DEFAULT_PROFILE],
+        "worker" | "fixer" => &["claude-sonnet", DEFAULT_PROFILE],
+        // cleaner (read-only hygiene sweep) and anything unrecognized.
         _ => &[DEFAULT_PROFILE],
     }
 }
@@ -404,7 +439,7 @@ args = ["--yolo"]
         );
         let never = |_: &str| panic!("detection must not run when profiles are inert");
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &never).unwrap(),
+            resolve(&cfg, "pr-reviewer", &never).unwrap(),
             DEFAULT_PROFILE
         );
         assert_eq!(resolve(&cfg, "worker", &never).unwrap(), DEFAULT_PROFILE);
@@ -432,27 +467,30 @@ worker = "claude-opus"
     #[test]
     fn auto_falls_back_along_the_chain() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
-        // codex present → guard uses codex.
+        // codex present → pr-reviewer uses codex.
         assert_eq!(
-            resolve(&cfg, "guard", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
-        // codex absent → guard falls to claude-opus.
+        // codex absent → pr-reviewer falls to claude-opus.
         assert_eq!(
-            resolve(&cfg, "guard", &only(&["claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["claude"])).unwrap(),
             "claude-opus"
         );
-        // neither present → guard falls to default.
-        assert_eq!(resolve(&cfg, "guard", &only(&[])).unwrap(), DEFAULT_PROFILE);
-        // The internal self-review role shares the cross-vendor chain.
+        // neither present → pr-reviewer falls to default.
         assert_eq!(
-            resolve(&cfg, "self-review", &only(&["codex", "claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&[])).unwrap(),
+            DEFAULT_PROFILE
+        );
+        // The internal self-reviewer role shares the cross-vendor chain.
+        assert_eq!(
+            resolve(&cfg, "self-reviewer", &only(&["codex", "claude"])).unwrap(),
             "codex"
         );
     }
 
     #[test]
-    fn auto_worker_prefers_sonnet_then_default() {
+    fn auto_worker_and_fixer_prefer_sonnet_then_default() {
         let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
         assert_eq!(
             resolve(&cfg, "worker", &only(&["claude"])).unwrap(),
@@ -460,6 +498,22 @@ worker = "claude-opus"
         );
         assert_eq!(
             resolve(&cfg, "worker", &only(&[])).unwrap(),
+            DEFAULT_PROFILE
+        );
+        assert_eq!(
+            resolve(&cfg, "fixer", &only(&["claude"])).unwrap(),
+            "claude-sonnet"
+        );
+    }
+
+    #[test]
+    fn auto_cleaner_stays_on_default() {
+        // cleaner has no model lean — it always lands on the default profile,
+        // same as before it was registered (issue #167 fixed the omission,
+        // not the outcome).
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        assert_eq!(
+            resolve(&cfg, "cleaner", &only(&["codex", "claude"])).unwrap(),
             DEFAULT_PROFILE
         );
     }
@@ -472,13 +526,13 @@ worker = "claude-opus"
 mode = "manual"
 
 [routing.roles]
-spec-reviewer = "codex"
+pr-reviewer = "codex"
 "#,
         );
         // Listed role uses its explicit profile; unlisted roles go to default
         // with no detection (chain is off in manual).
         assert_eq!(
-            resolve(&cfg, "spec-reviewer", &only(&["codex"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex"])).unwrap(),
             "codex"
         );
         let never = |_: &str| panic!("manual unlisted roles must not detect");
@@ -486,10 +540,12 @@ spec-reviewer = "codex"
     }
 
     #[test]
-    fn deprecated_review_keys_steer_the_renamed_roles() {
-        // Configs still using the old keys resolve to the ADR-0008 roles:
-        // `reviewer` / `spec-reviewer` → `guard`, `impl-reviewer` →
-        // `self-review`, and validate() accepts them all.
+    fn deprecated_role_keys_steer_the_renamed_roles() {
+        // Configs still using pre-#167 keys resolve to the current 6 roles:
+        // `reviewer` / `spec-reviewer` / `guard` → `pr-reviewer`,
+        // `impl-reviewer` / `self-review` → `self-reviewer`, `spec-worker` →
+        // `worker`, `conflict-resolver` / `ci-fixer` → `fixer`. validate()
+        // accepts them all.
         let cfg = cfg_from(
             r#"
 [routing]
@@ -498,20 +554,84 @@ mode = "manual"
 [routing.roles]
 reviewer = "codex"
 impl-reviewer = "claude-opus"
+spec-worker = "claude-sonnet"
+ci-fixer = "claude-opus"
 "#,
         );
-        assert_eq!(resolve(&cfg, "guard", &only(&["codex"])).unwrap(), "codex");
         assert_eq!(
-            resolve(&cfg, "self-review", &only(&["claude"])).unwrap(),
+            resolve(&cfg, "pr-reviewer", &only(&["codex"])).unwrap(),
+            "codex"
+        );
+        assert_eq!(
+            resolve(&cfg, "self-reviewer", &only(&["claude"])).unwrap(),
+            "claude-opus"
+        );
+        assert_eq!(
+            resolve(&cfg, "worker", &only(&["claude"])).unwrap(),
+            "claude-sonnet"
+        );
+        assert_eq!(
+            resolve(&cfg, "fixer", &only(&["claude"])).unwrap(),
             "claude-opus"
         );
         validate(&cfg, &only(&["codex", "claude"])).unwrap();
 
-        // The current `spec-reviewer` key also still steers `guard`.
-        let cfg2 =
-            cfg_from("[routing]\nmode = \"manual\"\n[routing.roles]\nspec-reviewer = \"codex\"\n");
-        assert_eq!(resolve(&cfg2, "guard", &only(&["codex"])).unwrap(), "codex");
+        // The current `spec-reviewer` key and the old `guard`/`conflict-resolver`
+        // keys also still steer their new roles.
+        let cfg2 = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+spec-reviewer = "codex"
+guard = "codex"
+conflict-resolver = "codex"
+"#,
+        );
+        assert_eq!(
+            resolve(&cfg2, "pr-reviewer", &only(&["codex"])).unwrap(),
+            "codex"
+        );
+        assert_eq!(resolve(&cfg2, "fixer", &only(&["codex"])).unwrap(), "codex");
         validate(&cfg2, &only(&["codex"])).unwrap();
+    }
+
+    #[test]
+    fn routing_role_for_loop_groups_loop_kinds_by_kind_of_work() {
+        // The 6-role grouping (issue #167): fixer's family, worker's family,
+        // and the previously-unregistered ci-fixer / cleaner all resolve.
+        assert_eq!(routing_role_for_loop("planner"), "planner");
+        assert_eq!(routing_role_for_loop("worker"), "worker");
+        assert_eq!(routing_role_for_loop("spec-worker"), "worker");
+        assert_eq!(routing_role_for_loop("fixer"), "fixer");
+        assert_eq!(routing_role_for_loop("ci-fixer"), "fixer");
+        assert_eq!(routing_role_for_loop("conflict-resolver"), "fixer");
+        assert_eq!(routing_role_for_loop("guard"), "pr-reviewer");
+        assert_eq!(routing_role_for_loop("cleaner"), "cleaner");
+    }
+
+    #[test]
+    fn ci_fixer_and_cleaner_join_their_family_auto_chain() {
+        // Before #167, ci-fixer/cleaner were missing from KNOWN_ROLES and
+        // recommended_chain, so auto routing silently dropped them to
+        // `default` while their siblings rode the family chain, and an
+        // explicit `[routing.roles] ci-fixer = ...` failed at startup. Now
+        // both loop kinds resolve through their role's chain like the rest
+        // of the family.
+        let cfg = cfg_from("[routing]\nmode = \"auto\"\n");
+        for kind in ["fixer", "ci-fixer", "conflict-resolver"] {
+            assert_eq!(
+                resolve(&cfg, routing_role_for_loop(kind), &only(&["claude"])).unwrap(),
+                "claude-sonnet",
+                "loop: {kind}"
+            );
+        }
+        validate(
+            &cfg_from("[routing]\nmode = \"manual\"\n[routing.roles]\nfixer = \"claude-sonnet\"\ncleaner = \"claude-sonnet\"\n"),
+            &only(&["claude"]),
+        )
+        .unwrap();
     }
 
     #[test]
