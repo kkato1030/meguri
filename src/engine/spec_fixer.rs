@@ -133,6 +133,10 @@ pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> 
 /// human via the `turn.awaiting_human` notifier (no turn is running at
 /// discovery time); notifying the park is #153's job (ADR 0012).
 async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
+    // Runs are keyed by the PR's canonical *issue* (issue #92), which the spec
+    // PR's own number usually differs from — so the re-run hint must name the
+    // issue, not the PR, or `meguri run --issue N` would target the wrong one.
+    let issue = canonical_key(pr);
     let _ = deps
         .forge()
         .add_pr_label(pr.number, forge::LABEL_NEEDS_HUMAN)
@@ -147,7 +151,7 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
                  Clear the `{}` label (and re-run with `meguri run --issue {}` \
                  if wanted) once the findings are understood.",
                 forge::LABEL_NEEDS_HUMAN,
-                pr.number
+                issue
             ),
         )
         .await;
@@ -489,15 +493,26 @@ mod tests {
     #[tokio::test]
     async fn discover_escalates_when_the_fix_budget_is_spent() {
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
-        seed_spec_pr(&forge, 1, "h1");
+        // The PR number (42) deliberately differs from the canonical issue (7,
+        // encoded in the branch), so the recovery hint's `--issue N` is
+        // actually exercised — a PR-number hint would send a human to the
+        // wrong issue.
+        forge.add_pr(
+            42,
+            "Write a spec for caching (#7)",
+            "Refs #7.",
+            &[forge::LABEL_SPEC_REVIEWING],
+            "meguri/7-add-caching-abc",
+            "h1",
+        );
         forge.set_commit_status_direct("h1", guard::GUARD_STATUS, CommitStatusState::Failure);
         let deps = fake_deps(forge.clone());
 
-        // Record MAX succeeded spec-fixer runs for issue #1.
+        // Record MAX succeeded spec-fixer runs for the canonical issue #7.
         for _ in 0..MAX_SPEC_FIX_RUNS {
             let run = deps
                 .store
-                .create_run_for_loop("proj", KIND, 1, "t")
+                .create_run_for_loop("proj", KIND, 7, "t")
                 .unwrap();
             deps.store
                 .update_run_status(&run.id, crate::store::RunStatus::Succeeded, None)
@@ -506,11 +521,37 @@ mod tests {
 
         let targets = SpecFixerLoop.discover(&deps).await.unwrap();
         assert!(targets.is_empty(), "budget spent → no target");
+
+        // The full escalation contract: needs-human label on the PR…
         assert!(
             forge
-                .pr_labels(1)
+                .pr_labels(42)
                 .contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
             "the exhausted PR is parked on needs-human"
+        );
+        // …a recovery comment that names the canonical *issue*, not the PR…
+        let comments = forge.comments_of(42);
+        assert_eq!(
+            comments.len(),
+            1,
+            "exactly one escalation comment: {comments:?}"
+        );
+        assert!(
+            comments[0].contains("meguri run --issue 7"),
+            "recovery hint must target the issue: {}",
+            comments[0]
+        );
+        assert!(
+            !comments[0].contains("--issue 42"),
+            "recovery hint must not name the PR number: {}",
+            comments[0]
+        );
+        // …and the audit event, emitted once.
+        assert_eq!(
+            deps.store
+                .count_events("spec_fixer.budget_exhausted")
+                .unwrap(),
+            1
         );
     }
 
