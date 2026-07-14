@@ -723,7 +723,8 @@ impl Store {
 
     /// Clear the parked-review signal on every `Succeeded` run of an issue
     /// (ADR 0009). Called when a fresh review round supersedes the prior head,
-    /// and when the issue closes — so a stale park leaves the dashboard.
+    /// when the separate-delivery handoff receives the merged spec PR, and
+    /// when the issue closes — so a stale park leaves the dashboard.
     /// Returns how many runs were cleared.
     pub fn clear_parked_reviews_for_issue(
         &self,
