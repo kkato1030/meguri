@@ -51,6 +51,10 @@ pub const LABEL_AUTOMERGE: &str = "meguri:automerge";
 /// The cleaner loop's per-project report issue (one per project; its body is
 /// a snapshot of the current divergence, rewritten on every sweep).
 pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
+/// The triage loop's per-project report issue (issue #85). Read-only, like
+/// the cleaner's: its body is a snapshot of the current triage
+/// recommendations for untriaged open issues, rewritten on every sweep.
+pub const LABEL_TRIAGE_REPORT: &str = "meguri:triage-report";
 
 /// GitHub's three merge strategies. This is the forge's vocabulary and config
 /// deserializes straight into it (`serde(lowercase)`); ADR 0003 forbids
@@ -397,6 +401,10 @@ pub trait Forge: Send + Sync {
     async fn issue_state(&self, number: i64) -> Result<IssueState>;
     /// Open issues carrying `label` (candidates for discovery).
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
+    /// Every open issue, label-agnostic (triage discovery, issue #85). The
+    /// caller filters by label/hold/blocker — no forge-side search is used, so
+    /// "untriaged = no workflow label" stays a single client-side rule.
+    async fn list_open_issues(&self) -> Result<Vec<Issue>>;
     /// Issues blocking `issue` via the forge-native dependency graph
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;

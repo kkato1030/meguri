@@ -80,6 +80,7 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         mode: Default::default(),

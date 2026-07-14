@@ -124,6 +124,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         mode: Default::default(),
         deliver: None,
         clean: None,
+        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),

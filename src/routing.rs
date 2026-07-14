@@ -180,7 +180,10 @@ const DEPRECATED_ROLE_ALIASES: &[(&str, &str)] = &[
 /// (`self_review_lane`).
 pub fn routing_role_for_loop(loop_kind: &str) -> &'static str {
     match loop_kind {
-        "planner" => "planner",
+        // The spec-fixer revises spec/ADR prose in the planner's author lane
+        // (ADR 0013), so it shares the planner's model profile — not the
+        // fixer family's, whose job is amending code (issue #188).
+        "planner" | "spec-fixer" => "planner",
         "fixer" | "ci-fixer" | "conflict-resolver" => "fixer",
         "pr-reviewer" => "pr-reviewer",
         "cleaner" => "cleaner",
@@ -826,6 +829,9 @@ conflict-resolver = "codex"
         // The 6-role grouping (issue #167): fixer's family, worker's family,
         // and the previously-unregistered ci-fixer / cleaner all resolve.
         assert_eq!(routing_role_for_loop("planner"), "planner");
+        // The spec-fixer revises spec/ADR prose, so it rides the planner
+        // profile, not the fixer family (issue #188 / ADR 0013).
+        assert_eq!(routing_role_for_loop("spec-fixer"), "planner");
         assert_eq!(routing_role_for_loop("worker"), "worker");
         assert_eq!(routing_role_for_loop("spec-worker"), "worker");
         assert_eq!(routing_role_for_loop("fixer"), "fixer");
