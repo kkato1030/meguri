@@ -299,6 +299,7 @@ async fn escalate_guard_failed(deps: &Deps, pr: &PullRequest) {
             short_sha(&pr.head_sha)
         ),
         "指摘(PR 本文の折り畳み参照)を解消して新しい head を push すると再評価します。",
+        crate::tasks::DEFAULT_ATTACH_HINT,
     );
     super::escalation::escalate_pr(deps, pr.number, &comment).await;
     let _ = deps.store.emit(

@@ -51,6 +51,10 @@ repo_slug = "owner/repo"
 # id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
 # projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
 
+# プロジェクト内在の設定(check_command / language / pr.draft)は repo ルートの
+# meguri.toml にも書ける。値は run 開始時にそのブランチから読まれて run に固定され、
+# host [projects.*] があれば host が勝つ。詳細は README の Configuration / ADR 0011。
+
 # [prompts]                            # ロール別 preamble: turn プロンプト冒頭に埋め込む恒常規律(issue #149)
 # all = "ops/agents/guardrails.md"     # 全ロール共通。値は repo 相対パス(絶対パス/`..` は不可)
 # worker = "ops/agents/worker.md"      # キーは routing のロール名(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
@@ -94,6 +98,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
+    /// (no legacy/off state) — a role with no entry here still resolves
+    /// through the built-in recommendation table.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
     /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
     /// presence switches role routing on (see [`routing`]), so a
@@ -458,6 +467,13 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
+    /// Extra args that make the launch non-interactive, for `direct` launch
+    /// mode (issue #169): the full command line is `{command} {args}
+    /// {direct_args} [{resume_args} <session-id>] <trigger>`, run as a plain
+    /// subprocess instead of inside a mux pane. Defaults to Claude Code's
+    /// `-p` (headless one-shot).
+    #[serde(default = "default_agent_direct_args")]
+    pub direct_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -474,6 +490,7 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
+            direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
         }
@@ -501,6 +518,39 @@ pub enum RoutingMode {
     /// Roles absent from `[routing.roles]` resolve to `default`; the
     /// recommendation table is off.
     Manual,
+}
+
+/// How a role's turns are launched (issue #169, ADR 0012): `pane` keeps the
+/// historical live mux pane (a human can attach; the turn engine nudges a
+/// quiet agent); `direct` spawns the agent CLI as a plain subprocess for one
+/// turn and reads its exit + the result file — no pane, no attach, no
+/// nudging. Orthogonal to `[routing]`'s profile axis: this only decides
+/// *how* the chosen profile is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    Pane,
+    Direct,
+}
+
+impl LaunchMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// `[launch]`: role→launch-mode resolution (issue #169). Unlike `[routing]`,
+/// there is no legacy/off state — a role with no explicit entry always
+/// resolves through the built-in recommendation table
+/// ([`crate::launch::recommended_mode`]); an explicit `[launch.roles]` entry
+/// always wins over it. See `crate::launch`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchConfig {
+    #[serde(default)]
+    pub roles: HashMap<String, LaunchMode>,
 }
 
 /// `[routing]`: role→profile resolution. Present = routing is active (auto or
@@ -567,6 +617,10 @@ fn default_agent_args() -> Vec<String> {
 
 fn default_agent_resume_args() -> Vec<String> {
     vec!["--resume".into()]
+}
+
+fn default_agent_direct_args() -> Vec<String> {
+    vec!["-p".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -937,6 +991,75 @@ pub struct ProjectConfig {
 
 fn default_branch() -> String {
     "main".into()
+}
+
+/// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
+/// the "project-intrinsic facts" subset of [`ProjectConfig`] a repo may carry
+/// for itself. Read from the run's worktree once at claim time and pinned to
+/// the run (see [`crate::engine::flow`] and ADR 0011); host `config.toml`
+/// always wins last (see [`Deps::with_repo_config`]).
+///
+/// `#[serde(deny_unknown_fields)]` is the boundary's enforcement: a host-only
+/// key (`repo_slug`, `agent`, `[[workspaces]]`, …) in `meguri.toml` is a parse
+/// error, surfaced by `meguri doctor` rather than silently ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoConfig {
+    /// Deliverable language; folds under host `language` / project `language`.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Independent-verification command; folds under the project's
+    /// `check_command`. Pinned at claim time so a run cannot weaken its own
+    /// completion contract mid-run (ADR 0011 §security).
+    #[serde(default)]
+    pub check_command: Option<String>,
+    /// The repo-eligible slice of `[pr]` (only `draft`; `auto_merge` is
+    /// host-only and absent here, so writing it under `[pr]` is a parse error).
+    #[serde(default)]
+    pub pr: Option<RepoPrConfig>,
+}
+
+/// The repo-eligible subset of `[pr]`. Carries `draft` but not `auto_merge`:
+/// arming GitHub-native auto-merge uses the host's `gh` token, so it stays
+/// host-only. `deny_unknown_fields` makes `[pr] auto_merge = …` in a
+/// `meguri.toml` a parse error — the first key-level boundary inside one
+/// section (ADR 0011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoPrConfig {
+    #[serde(default)]
+    pub draft: Option<bool>,
+}
+
+impl RepoConfig {
+    /// Read `<worktree>/meguri.toml`.
+    /// - absent → `Ok(None)` (opt-in default: no repo config).
+    /// - present but invalid TOML / host-only key → `Err` (the caller warns,
+    ///   emits `repo_config.invalid`, and falls back to "as if absent").
+    ///
+    /// Reads the working-tree file directly (no git); the run scopes which
+    /// branch's `meguri.toml` this is by which branch the worktree checked out.
+    pub fn load_from_worktree(worktree: &Path) -> Result<Option<Self>> {
+        let path = worktree.join("meguri.toml");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", path.display()));
+            }
+        };
+        let cfg: RepoConfig = toml::from_str(&raw)
+            .with_context(|| format!("invalid repo config at {}", path.display()))?;
+        Ok(Some(cfg))
+    }
+
+    /// Whether this repo config actually carries an override worth folding in
+    /// (all `None` means the file was empty — nothing to layer over the host).
+    pub fn has_values(&self) -> bool {
+        self.language.is_some()
+            || self.check_command.is_some()
+            || self.pr.as_ref().is_some_and(|p| p.draft.is_some())
+    }
 }
 
 /// `[[workspaces]]` — a static grouping of related projects (issue #154).
@@ -1405,6 +1528,14 @@ impl ConfigReloader {
             tracing::warn!(
                 "config reload rejected: no projects configured — keeping the last good config"
             );
+            return None;
+        }
+        // `[launch.roles]` typos are a loud startup error (`crate::launch::
+        // validate`, issue #169) — a hot reload must reject the same way
+        // instead of silently applying an ignored override.
+        if let Err(e) = crate::launch::validate(&next) {
+            self.last_seen = Some(raw);
+            tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
             return None;
         }
 
@@ -1905,6 +2036,30 @@ language = "English"
     }
 
     #[test]
+    fn reloader_rejects_unknown_launch_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_config(&path, "");
+        let mut r = ConfigReloader::load(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            "language = \"B\"\n[launch.roles]\nnonsense = \"direct\"\n",
+        )
+        .unwrap();
+        let mut applied = false;
+        assert!(
+            r.poll(|_, _| -> Result<()> {
+                applied = true;
+                Ok(())
+            })
+            .is_none()
+        );
+        assert!(!applied, "an unknown launch role must reject before apply");
+        assert_ne!(r.current().language.as_deref(), Some("B"));
+    }
+
+    #[test]
     fn reloader_survives_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -2386,6 +2541,19 @@ allow_overlap = true
         assert!(err.contains("no projects"), "{err}");
     }
 
+    // ---- repo config (issue #165) ----
+
+    #[test]
+    fn repo_config_absent_is_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // No meguri.toml in the worktree → opt-out, not an error.
+        assert!(
+            RepoConfig::load_from_worktree(dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     const A_PROJECT: &str =
         "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";
 
@@ -2452,6 +2620,80 @@ allow_overlap = true
         assert_eq!(
             cfg.preambles_for(p, "planner"),
             vec![("all".to_string(), "all.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn repo_config_parses_eligible_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "language = \"日本語\"\ncheck_command = \"cargo test\"\n\n[pr]\ndraft = false\n",
+        )
+        .unwrap();
+        let repo = RepoConfig::load_from_worktree(dir.path())
+            .unwrap()
+            .expect("meguri.toml present");
+        assert_eq!(repo.language.as_deref(), Some("日本語"));
+        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
+        assert_eq!(repo.pr.and_then(|p| p.draft), Some(false));
+    }
+
+    #[test]
+    fn repo_config_rejects_host_only_key() {
+        // A host-only key (the doctor's failure case) is a parse error, not a
+        // silent drop — `deny_unknown_fields`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "check_command = \"cargo test\"\nrepo_slug = \"me/x\"\n",
+        )
+        .unwrap();
+        let err = RepoConfig::load_from_worktree(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("repo_slug")
+                || format!("{err:#}").contains("unknown field"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn repo_config_rejects_auto_merge_under_pr() {
+        // The key-level boundary: `[pr] draft` is fine, `[pr] auto_merge` is
+        // host-only and must be rejected inside meguri.toml.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "[pr]\ndraft = false\n\n[pr.auto_merge]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn repo_config_has_values() {
+        assert!(!RepoConfig::default().has_values());
+        assert!(
+            RepoConfig {
+                check_command: Some("x".into()),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        assert!(
+            RepoConfig {
+                pr: Some(RepoPrConfig { draft: Some(true) }),
+                ..Default::default()
+            }
+            .has_values()
+        );
+        // An empty [pr] table (draft = None) is not itself an override.
+        assert!(
+            !RepoConfig {
+                pr: Some(RepoPrConfig { draft: None }),
+                ..Default::default()
+            }
+            .has_values()
         );
     }
 

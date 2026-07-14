@@ -276,7 +276,7 @@ pub async fn run_guard(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
             match claimed_pr(deps, run_id) {
-                Some(pr) => escalate_on_pr(deps, pr, &msg).await,
+                Some(pr) => escalate_on_pr(deps, &run, pr, &msg).await,
                 None => flow::escalate_on_forge(deps, run.issue_number, &msg).await,
             }
             Err(e)
@@ -377,10 +377,13 @@ async fn finalize_cancelled(deps: &Deps, run: &RunRecord) -> Result<()> {
     Ok(())
 }
 
-async fn escalate_on_pr(deps: &Deps, pr: i64, reason: &str) {
+async fn escalate_on_pr(deps: &Deps, run: &RunRecord, pr: i64, reason: &str) {
+    // The central helper posts the label/comment/event; the closing hint is
+    // launch-mode-aware (issue #169) — a direct-mode pr-reviewer has no pane.
     let comment = super::escalation::pr_needs_human_comment(
         "could not finish guarding this PR and needs a human.",
         reason,
+        &flow::attach_hint(deps, run),
     );
     super::escalation::escalate_pr(deps, pr, &comment).await;
 }
@@ -712,6 +715,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &GuardCheckpoint) -> Result<St
             let comment = super::escalation::pr_needs_human_comment(
                 &lead,
                 "See the folded 🛡️ guard review in the PR body for the findings.",
+                &flow::attach_hint(deps, run),
             );
             super::escalation::escalate_pr(deps, pr, &comment).await;
             deps.store.emit(

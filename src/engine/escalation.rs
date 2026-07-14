@@ -21,13 +21,18 @@
 use serde_json::json;
 
 use super::Deps;
+use super::flow;
 use crate::forge;
+use crate::store::RunRecord;
 use crate::tasks::{self, TaskKey};
 
 /// Escalate an issue or local task through the coordination layer. The worker
-/// and planner default `Flavor::escalate` funnels here.
-pub async fn escalate_task(deps: &Deps, key: &TaskKey, reason: &str) {
-    let _ = deps.task_source.escalate(key, reason).await;
+/// and planner default `Flavor::escalate` funnels here. The closing attach hint
+/// is launch-mode-aware (issue #169), derived from the run's lane.
+pub async fn escalate_task(deps: &Deps, run: &RunRecord, reason: &str) {
+    let key = run.task_key();
+    let hint = flow::attach_hint(deps, run);
+    let _ = deps.task_source.escalate(&key, reason, &hint).await;
     let target = match key {
         TaskKey::Issue(_) => "issue",
         TaskKey::Local(_) => "local",
@@ -42,13 +47,17 @@ pub async fn escalate_task(deps: &Deps, key: &TaskKey, reason: &str) {
 /// Escalate a github issue directly through the forge: needs-human label,
 /// drop `working`, and post the standard needs-human comment. For forge-native
 /// loops that only hold an issue number (replaces the old
-/// `flow::escalate_on_forge`).
+/// `flow::escalate_on_forge`); its callers all default to `pane` launch mode, so
+/// the generic attach hint applies (issue #169, ADR 0012).
 pub async fn escalate_issue(deps: &Deps, issue: i64, reason: &str) {
     let forge = deps.forge();
     let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
     let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
     let _ = forge
-        .comment(issue, &tasks::needs_human_comment(reason))
+        .comment(
+            issue,
+            &tasks::needs_human_comment(reason, tasks::DEFAULT_ATTACH_HINT),
+        )
         .await;
     let _ = deps.store.emit(
         None,
@@ -74,12 +83,10 @@ pub async fn escalate_pr(deps: &Deps, pr: i64, comment: &str) {
 }
 
 /// The standard needs-human PR comment. `lead` is the site-specific clause
-/// (e.g. "could not resolve the merge conflicts on this PR and needs a human.")
-/// and `reason` the underlying detail, quoted below it.
-pub fn pr_needs_human_comment(lead: &str, reason: &str) -> String {
-    format!(
-        "🔁 **meguri** {lead}\n\n> {reason}\n\n\
-         The agent's pane (if still open) has the full context — \
-         see `meguri ps` / `meguri attach` on the host running meguri."
-    )
+/// (e.g. "could not resolve the merge conflicts on this PR and needs a human."),
+/// `reason` the underlying detail (quoted below it), and `hint` the closing
+/// "how to look at this" sentence — launch-mode-aware, from [`flow::attach_hint`]
+/// (issue #169). Pass [`tasks::DEFAULT_ATTACH_HINT`] where there is no run.
+pub fn pr_needs_human_comment(lead: &str, reason: &str, hint: &str) -> String {
+    format!("🔁 **meguri** {lead}\n\n> {reason}\n\n{hint}")
 }

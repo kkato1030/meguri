@@ -104,6 +104,7 @@ impl super::Loop for ConflictResolverLoop {
                     ),
                     "Clear the needs-human label (and `meguri run --issue N` if wanted) once the \
                      repeated conflict is understood.",
+                    crate::tasks::DEFAULT_ATTACH_HINT,
                 );
                 super::escalation::escalate_pr(deps, pr.number, &comment).await;
                 deps.store.emit(
@@ -339,9 +340,12 @@ impl Flavor for ConflictResolverFlavor {
             super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
+        // The central helper posts the label/comment/event; the closing hint is
+        // launch-mode-aware (issue #169) — a direct-mode resolver has no pane.
         let comment = super::escalation::pr_needs_human_comment(
             "could not resolve the merge conflicts on this PR and needs a human.",
             reason,
+            &flow::attach_hint(deps, run),
         );
         super::escalation::escalate_pr(deps, pr, &comment).await;
     }

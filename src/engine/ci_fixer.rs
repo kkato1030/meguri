@@ -134,6 +134,7 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
             forge::LABEL_NEEDS_HUMAN,
             pr.number
         ),
+        crate::tasks::DEFAULT_ATTACH_HINT,
     );
     super::escalation::escalate_pr(deps, pr.number, &comment).await;
     let _ = deps.store.emit(
@@ -351,9 +352,12 @@ impl Flavor for CiFixerFlavor {
             super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
+        // The central helper posts the label/comment/event; the closing hint is
+        // launch-mode-aware (issue #169) — a direct-mode fixer has no pane.
         let comment = super::escalation::pr_needs_human_comment(
             "could not fix the failing CI checks on this PR and needs a human.",
             reason,
+            &flow::attach_hint(deps, run),
         );
         super::escalation::escalate_pr(deps, pr, &comment).await;
     }

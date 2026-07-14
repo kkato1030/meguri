@@ -294,9 +294,12 @@ impl Flavor for FixerFlavor {
             super::escalation::escalate_issue(deps, run.issue_number, reason).await;
             return;
         };
+        // The central helper posts the label/comment/event; the closing hint is
+        // launch-mode-aware (issue #169) — a direct-mode fixer has no pane.
         let comment = super::escalation::pr_needs_human_comment(
             "could not address the review comments on this PR and needs a human.",
             reason,
+            &flow::attach_hint(deps, run),
         );
         super::escalation::escalate_pr(deps, pr, &comment).await;
     }
