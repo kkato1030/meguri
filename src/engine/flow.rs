@@ -678,6 +678,40 @@ async fn spawn_advisor(
     std::fs::create_dir_all(&advisor_dir)
         .with_context(|| format!("cannot create advisor dir {}", advisor_dir.display()))?;
 
+    // From here on the cwd exists but no LANE_ADVISOR row does yet, and
+    // `release_advisor` returns early without one — so a failure below would
+    // strand the directory forever. Sweep it here to keep the advisor
+    // ephemeral even when its best-effort spawn fails.
+    let spawned = spawn_advisor_pane(
+        deps,
+        run,
+        &advisor_dir,
+        &profile_name,
+        &profile,
+        seed,
+        &team,
+    )
+    .await
+    .with_context(|| format!("cannot spawn advisor pane for issue #{issue}"));
+    if spawned.is_err() {
+        let _ = std::fs::remove_dir_all(&advisor_dir);
+    }
+    spawned
+}
+
+/// The fallible tail of [`spawn_advisor`], split out so the caller can sweep
+/// the already-created advisor cwd on any failure.
+async fn spawn_advisor_pane(
+    deps: &Deps,
+    run: &RunRecord,
+    advisor_dir: &Path,
+    profile_name: &str,
+    profile: &crate::config::AgentProfile,
+    seed: String,
+    team: &str,
+) -> Result<()> {
+    let issue = run.issue_number;
+
     // Re-embody, never resume: tear down any surviving advisor pane first
     // (release_pane_record guards the advisor lane against saving a session id).
     super::reaper::release_pane(deps, issue, crate::store::LANE_ADVISOR, "advisor respawn").await;
@@ -695,11 +729,19 @@ async fn spawn_advisor(
         .mux
         .spawn_pane(&PaneSpec {
             title: format!("meguri#{issue}:advisor"),
-            cwd: advisor_dir.clone(),
+            cwd: advisor_dir.to_path_buf(),
             command,
             env,
         })
         .await?;
+    // The mux can hand back a pane id even when the agent command died right
+    // away (tmux/herdr report the pane, not the process). Registering the row
+    // below is what makes `advisor_consult_section` advertise the advisor to
+    // the worker, so verify liveness first: a dead pane is a failed spawn.
+    if !deps.mux.pane_alive(&pane).await.unwrap_or(false) {
+        let _ = deps.mux.kill_pane(&pane).await;
+        bail!("advisor pane {} died immediately after spawn", pane.0);
+    }
     // Register on the advisor lane only. Unlike spawn_agent_pane we do NOT
     // update_run_mux — the run's own pane is the worker's, not this one.
     deps.store.upsert_pane(
@@ -2344,8 +2386,11 @@ mod tests {
         store.get_run(&run.id).unwrap().unwrap()
     }
 
-    /// A worker run + a collab-advisor-on Deps rooted at `worktree_root`.
-    fn advisor_env(worktree_root: &Path) -> (Deps, RunRecord) {
+    /// A worker run + a collab-advisor-on Deps rooted at `worktree_root`,
+    /// plus the FakeMux handle for tests that script spawn behavior.
+    fn advisor_env(
+        worktree_root: &Path,
+    ) -> (Deps, RunRecord, std::sync::Arc<crate::mux::fake::FakeMux>) {
         use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
         use crate::store::Store;
         let store = Store::open_in_memory().unwrap();
@@ -2381,20 +2426,21 @@ mod tests {
             triage: None,
             autonomy: None,
         };
+        let mux = std::sync::Arc::new(crate::mux::fake::FakeMux::new(false));
         let deps = Deps::with_label_source(
             store,
-            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            mux.clone(),
             std::sync::Arc::new(crate::forge::fake::FakeForge::default()),
             config,
             project,
         );
-        (deps, run)
+        (deps, run, mux)
     }
 
     #[tokio::test]
     async fn advisor_spawns_before_execute_and_reaps_after() {
         let root = tempfile::tempdir().unwrap();
-        let (deps, run) = advisor_env(root.path());
+        let (deps, run, _mux) = advisor_env(root.path());
         let cp = Checkpoint {
             issue_title: "T".into(),
             issue_body: "B".into(),
@@ -2453,7 +2499,7 @@ mod tests {
     #[tokio::test]
     async fn advisor_respawn_recreates_cwd_without_stale_files() {
         let root = tempfile::tempdir().unwrap();
-        let (deps, run) = advisor_env(root.path());
+        let (deps, run, _mux) = advisor_env(root.path());
         let cp = Checkpoint {
             issue_title: "T".into(),
             issue_body: "B".into(),
@@ -2487,6 +2533,79 @@ mod tests {
         );
     }
 
+    /// tmux/herdr can hand back a pane id even when the agent command died
+    /// immediately. The worker prompt must not advertise an advisor nobody is
+    /// running: a dead-on-arrival pane is a failed spawn — no live pane row,
+    /// no consult block, and the ephemeral cwd is swept.
+    #[tokio::test]
+    async fn advisor_dead_on_arrival_pane_yields_no_consult_block() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run, mux) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The advisor's seed prompt carries the team name; matching on it
+        // makes the spawn return a pane id whose agent is already dead.
+        mux.fail_spawns_matching("meguri-proj-7");
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        assert_eq!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .and_then(|p| p.mux_pane_id),
+            None,
+            "a dead-on-arrival pane must not be registered as live"
+        );
+        assert!(
+            advisor_consult_section(&deps, &run).is_empty(),
+            "the worker prompt must not advertise a dead advisor"
+        );
+        assert!(
+            !root.path().join("proj").join("advisor-7").exists(),
+            "the ephemeral advisor cwd must be swept on a failed spawn"
+        );
+    }
+
+    /// `release_advisor` returns early when no `LANE_ADVISOR` row exists, so
+    /// a spawn failure after the cwd was created must sweep the directory
+    /// itself — the advisor stays ephemeral even when its best-effort spawn
+    /// fails.
+    #[tokio::test]
+    async fn advisor_spawn_failure_sweeps_created_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let (deps, run, mux) = advisor_env(root.path());
+        let cp = Checkpoint {
+            issue_title: "T".into(),
+            issue_body: "B".into(),
+            ..Default::default()
+        };
+        let worktree = root.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // spawn_pane itself errors — after the advisor cwd has been created.
+        mux.error_spawns_matching("meguri-proj-7");
+
+        ensure_advisor(&deps, &run, &worktree, &cp).await;
+
+        assert!(
+            !root.path().join("proj").join("advisor-7").exists(),
+            "a spawn failure must not strand the advisor cwd"
+        );
+        assert!(
+            deps.store
+                .get_pane("proj", 7, crate::store::LANE_ADVISOR)
+                .unwrap()
+                .and_then(|p| p.mux_pane_id)
+                .is_none()
+        );
+        assert!(advisor_consult_section(&deps, &run).is_empty());
+    }
+
     #[tokio::test]
     async fn advisor_is_noop_for_ineligible_loops_and_when_off() {
         let root = tempfile::tempdir().unwrap();
@@ -2495,7 +2614,7 @@ mod tests {
         let cp = Checkpoint::default();
 
         // collab on, but a non-advisor loop kind: no pane.
-        let (deps, mut run) = advisor_env(root.path());
+        let (deps, mut run, _mux) = advisor_env(root.path());
         run.loop_kind = "planner".into();
         ensure_advisor(&deps, &run, &worktree, &cp).await;
         assert!(
@@ -2506,7 +2625,7 @@ mod tests {
         );
 
         // collab off: an eligible loop still spawns nothing.
-        let (mut deps, run) = advisor_env(root.path());
+        let (mut deps, run, _mux) = advisor_env(root.path());
         deps.config.collab = None;
         ensure_advisor(&deps, &run, &worktree, &cp).await;
         assert!(

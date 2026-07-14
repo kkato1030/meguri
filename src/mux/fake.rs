@@ -32,6 +32,10 @@ pub struct FakeMux {
     /// Spawns whose command contains this string come up already dead
     /// (emulates e.g. `claude --resume <unknown-id>` exiting immediately).
     dead_spawn_matching: Mutex<Option<String>>,
+    /// Spawns whose command contains this string fail outright: `spawn_pane`
+    /// returns an error and no pane is created (emulates the mux itself
+    /// refusing the spawn, e.g. tmux gone mid-run).
+    error_spawn_matching: Mutex<Option<String>>,
     /// Panes tiled into a dashboard, in tile order (for `meguri top` tests).
     tiled: Mutex<Vec<(PaneId, DashboardId, Split)>>,
     /// Dashboards created so far, keyed by label (idempotency for `top`).
@@ -48,6 +52,7 @@ impl FakeMux {
             panes: Mutex::new(HashMap::new()),
             spawn_log: Mutex::new(Vec::new()),
             dead_spawn_matching: Mutex::new(None),
+            error_spawn_matching: Mutex::new(None),
             tiled: Mutex::new(Vec::new()),
             dashboards: Mutex::new(HashMap::new()),
             ran_in_pane: Mutex::new(Vec::new()),
@@ -99,6 +104,12 @@ impl FakeMux {
     /// Make future spawns whose command contains `needle` come up dead.
     pub fn fail_spawns_matching(&self, needle: &str) {
         *self.dead_spawn_matching.lock().unwrap() = Some(needle.to_string());
+    }
+
+    /// Make future spawns whose command contains `needle` fail outright
+    /// (`spawn_pane` errors, no pane is created).
+    pub fn error_spawns_matching(&self, needle: &str) {
+        *self.error_spawn_matching.lock().unwrap() = Some(needle.to_string());
     }
 
     /// Every spawned command, in spawn order.
@@ -153,6 +164,14 @@ impl Multiplexer for FakeMux {
     }
 
     async fn spawn_pane(&self, spec: &PaneSpec) -> MuxResult<PaneId> {
+        if let Some(needle) = &*self.error_spawn_matching.lock().unwrap()
+            && spec.command.iter().any(|arg| arg.contains(needle))
+        {
+            return Err(MuxError::CommandFailed {
+                kind: "fake spawn",
+                detail: format!("spawn rejected (matched {needle:?})"),
+            });
+        }
         let id = PaneId(format!(
             "fake:{}",
             self.next_id.fetch_add(1, Ordering::SeqCst)
