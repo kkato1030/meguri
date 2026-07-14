@@ -257,17 +257,16 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // Cron schedules (issue #146): cron/name/body validity already
             // fail-fast at load; here we check body_file existence and show
             // the next fire.
-            ok &= doctor_schedules(cfg);
+            ok &= doctor_schedules(cfg).await;
             // Cadence rules (issue #148): shape is already validated at load;
             // here we show each rule's current window consumption.
             doctor_cadence(cfg, store.as_ref());
-            // Repo config (issue #165): lint each project's `meguri.toml`,
-            // failing on a host-only key or TOML error (deny_unknown_fields).
-            ok &= doctor_repo_configs(cfg);
+            // Repo config (issue #165): lint each project's `meguri.toml` on the
+            // default branch, failing on a host-only key or TOML error.
+            ok &= doctor_repo_configs(cfg).await;
             // Role preambles (issue #149): each configured path must resolve to
-            // a real file inside the project's clone (and not escape it via a
-            // symlink) — the same containment gate the turn uses.
-            ok &= doctor_prompts(cfg);
+            // a regular file on the default branch (ADR 0015).
+            ok &= doctor_prompts(cfg).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -359,11 +358,13 @@ async fn check_auto_merge(cfg: &Config) -> bool {
 /// Doctor's schedules section (issue #146): the cron expression, name
 /// uniqueness, body exclusivity, and local-mode `plan` rejection are already
 /// enforced at config load (so a loaded `cfg` has passed them). What load does
-/// *not* check is that each `body_file` actually exists on disk — do that here,
-/// and print each schedule's next fire. Returns false if any `body_file` is
-/// missing; projects without schedules print nothing.
-fn doctor_schedules(cfg: &Config) -> bool {
+/// *not* check is that each `body_file` is a regular file on the default branch
+/// — do that here (ADR 0015), and print each schedule's next fire. Returns false
+/// if any `body_file` is missing/unreadable; projects without schedules print
+/// nothing.
+async fn doctor_schedules(cfg: &Config) -> bool {
     use meguri::cron::Cron;
+    use meguri::gitops::{self, DefaultBranchFile};
     use meguri::store::format_epoch;
 
     let has_any = cfg.projects.iter().any(|p| !p.schedules.is_empty());
@@ -380,19 +381,26 @@ fn doctor_schedules(cfg: &Config) -> bool {
                 .and_then(|c| c.next_after(now))
                 .map(format_epoch)
                 .unwrap_or_else(|| "never".into());
-            // body_file must exist (repo-relative); inline body is always fine.
+            // body_file must be a regular file on the default branch (ADR
+            // 0015); inline body is always fine.
             let (line_ok, body_detail) = match &s.body_file {
-                Some(rel) => {
-                    let path = project.repo_path.join(rel);
-                    if path.exists() {
-                        (true, format!("body_file {rel}"))
-                    } else {
-                        (
-                            false,
-                            format!("body_file {rel} not found at {}", path.display()),
-                        )
+                Some(rel) => match gitops::read_file_at_default_branch(
+                    &project.repo_path,
+                    &project.default_branch,
+                    rel,
+                )
+                .await
+                {
+                    Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
+                    Ok(DefaultBranchFile::Absent) => {
+                        (false, format!("body_file {rel} not on default branch"))
                     }
-                }
+                    Ok(DefaultBranchFile::NotRegularFile) => (
+                        false,
+                        format!("body_file {rel} is not a regular file on default branch"),
+                    ),
+                    Err(e) => (false, format!("body_file {rel}: {e:#}")),
+                },
                 None => (true, "inline body".to_string()),
             };
             ok &= line_ok;
@@ -449,31 +457,54 @@ fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
 }
 
 /// Doctor's repo-config section (issue #165): lint each project's repo root
-/// `meguri.toml`. Doctor holds no run, so it reads the primary clone's working
-/// tree (`<repo_path>/meguri.toml`) — advisory, not the run's pinned value. A
-/// host-only key or malformed TOML fails (deny_unknown_fields); an absent file
-/// is the silent, valid opt-out. Follows routing/schedules' "never silently
+/// `meguri.toml`. Doctor holds no run, so it reads the default branch's
+/// `meguri.toml` (ADR 0015), not the working tree — advisory, not the run's
+/// pinned value. A host-only key or malformed TOML fails (deny_unknown_fields);
+/// an absent file is the silent, valid opt-out. Follows routing/schedules' "never silently
 /// fall back" principle so a boundary violation surfaces here, not as a no-op.
-fn doctor_repo_configs(cfg: &Config) -> bool {
+async fn doctor_repo_configs(cfg: &Config) -> bool {
     use meguri::config::RepoConfig;
+    use meguri::gitops::{self, DefaultBranchFile};
 
     let mut printed_header = false;
     let mut ok = true;
+    let mut header = || {
+        if !printed_header {
+            println!("\nrepo config:");
+            printed_header = true;
+        }
+    };
     for project in &cfg.projects {
-        match RepoConfig::load_from_worktree(&project.repo_path) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                if !printed_header {
-                    println!("\nrepo config:");
-                    printed_header = true;
+        // Lint the default branch's `meguri.toml` (ADR 0015), not the working
+        // tree. An absent file is the silent, valid opt-out.
+        let read = gitops::read_file_at_default_branch(
+            &project.repo_path,
+            &project.default_branch,
+            "meguri.toml",
+        )
+        .await;
+        match read {
+            Ok(DefaultBranchFile::Absent) => {}
+            Ok(DefaultBranchFile::Content(raw)) => {
+                header();
+                match RepoConfig::parse_str(&raw) {
+                    Ok(_) => println!("  ✅ {}: meguri.toml OK", project.id),
+                    Err(e) => {
+                        println!("  ❌ {}: {e:#}", project.id);
+                        ok = false;
+                    }
                 }
-                println!("  ✅ {}: meguri.toml OK", project.id);
+            }
+            Ok(DefaultBranchFile::NotRegularFile) => {
+                header();
+                println!(
+                    "  ❌ {}: meguri.toml is not a regular file on default branch",
+                    project.id
+                );
+                ok = false;
             }
             Err(e) => {
-                if !printed_header {
-                    println!("\nrepo config:");
-                    printed_header = true;
-                }
+                header();
                 println!("  ❌ {}: {e:#}", project.id);
                 ok = false;
             }
@@ -484,12 +515,13 @@ fn doctor_repo_configs(cfg: &Config) -> bool {
 
 /// Doctor's preamble section (issue #149): for every project, every preamble
 /// path that could be injected for it — the top-level `[prompts]` overlaid by
-/// its own `[projects.prompts]` — must resolve to a real file inside the
-/// project's clone. Missing paths and symlink escapes are both reported as ❌
-/// (config validate already rejects absolute / `..` values, so those never
-/// reach here). Projects with no preambles configured print nothing.
-fn doctor_prompts(cfg: &Config) -> bool {
-    use meguri::config::{PreambleResolution, resolve_preamble_within};
+/// its own `[projects.prompts]` — must be a regular file on the default branch
+/// (ADR 0015). Missing paths and non-regular files (a symlink, which can't be
+/// followed in a blob read) are both reported as ❌ (config validate already
+/// rejects absolute / `..` / trailing-slash values, so those never reach here).
+/// Projects with no preambles configured print nothing.
+async fn doctor_prompts(cfg: &Config) -> bool {
+    use meguri::gitops::{self, DefaultBranchFile};
 
     let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
     if !has_any {
@@ -499,15 +531,32 @@ fn doctor_prompts(cfg: &Config) -> bool {
     println!("\npreambles:");
     for project in &cfg.projects {
         for (key, rel) in cfg.effective_prompts(project) {
-            let (mark, detail) = match resolve_preamble_within(&project.repo_path, &rel) {
-                PreambleResolution::Content(_) => ("✅", rel.to_string()),
-                PreambleResolution::Missing => {
+            // Verify against the default branch (ADR 0015), reading the blob
+            // directly. A symlink can't be followed here, so it is reported as
+            // unverifiable rather than silently passing (its target string
+            // would otherwise read as content).
+            let (mark, detail) = match gitops::read_file_at_default_branch(
+                &project.repo_path,
+                &project.default_branch,
+                &rel,
+            )
+            .await
+            {
+                Ok(DefaultBranchFile::Content(_)) => ("✅", rel.to_string()),
+                Ok(DefaultBranchFile::Absent) => {
                     ok = false;
-                    ("❌", format!("{rel} not found in clone"))
+                    ("❌", format!("{rel} not on default branch"))
                 }
-                PreambleResolution::Escapes => {
+                Ok(DefaultBranchFile::NotRegularFile) => {
                     ok = false;
-                    ("❌", format!("{rel} escapes the clone (symlink)"))
+                    (
+                        "❌",
+                        format!("{rel} is not a regular file on default branch (symlink/dir)"),
+                    )
+                }
+                Err(e) => {
+                    ok = false;
+                    ("❌", format!("{rel}: {e:#}"))
                 }
             };
             println!("  {mark} {}/{key} — {detail}", project.id);

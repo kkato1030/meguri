@@ -1180,9 +1180,16 @@ impl RepoConfig {
                 return Err(e).with_context(|| format!("cannot read {}", path.display()));
             }
         };
-        let cfg: RepoConfig = toml::from_str(&raw)
-            .with_context(|| format!("invalid repo config at {}", path.display()))?;
-        Ok(Some(cfg))
+        Self::parse_str(&raw)
+            .map(Some)
+            .with_context(|| format!("invalid repo config at {}", path.display()))
+    }
+
+    /// Parse repo config from raw TOML text — the shared core of
+    /// [`load_from_worktree`] and the default-branch read path (`meguri doctor`
+    /// lints the on-default-branch bytes, which have no filesystem home).
+    pub fn parse_str(raw: &str) -> Result<Self> {
+        toml::from_str(raw).context("invalid repo config")
     }
 
     /// Whether this repo config actually carries an override worth folding in
@@ -1370,7 +1377,13 @@ impl Config {
                     p.id,
                     s.name
                 ),
-                _ => {}
+                // `body_file` is read from the default branch at fire time
+                // (ADR 0015); reject `..`/absolute/trailing-slash here so the
+                // read can trust the path is a repo-relative regular file.
+                (None, Some(rel)) => validate_repo_relative(rel).with_context(|| {
+                    format!("project {:?} schedule {:?} body_file", p.id, s.name)
+                })?,
+                (Some(_), None) => {}
             }
             if p.mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
                 anyhow::bail!(
@@ -1598,6 +1611,12 @@ pub fn validate_repo_relative(rel: &str) -> Result<()> {
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         anyhow::bail!("preamble path {rel:?} must not contain `..`");
+    }
+    // A trailing slash would make `git ls-tree` list a directory's children
+    // instead of the entry itself, letting a directory pass as a regular file
+    // in the default-branch read (ADR 0015).
+    if rel.ends_with('/') {
+        anyhow::bail!("path {rel:?} must not end with `/`");
     }
     Ok(())
 }
@@ -2708,6 +2727,22 @@ allow_overlap = true
     }
 
     #[test]
+    fn schedule_body_file_must_be_repo_relative() {
+        // body_file is read from the default branch (ADR 0015); `..`/absolute/
+        // trailing-slash are rejected at load like preamble paths.
+        for bad in ["../escape.md", "/etc/passwd", "ops/"] {
+            let raw = format!(
+                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
+                 [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
+                 body_file = \"{bad}\"\n"
+            );
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("body_file"), "path {bad:?}: {err}");
+        }
+    }
+
+    #[test]
     fn schedule_with_neither_body_nor_body_file_is_rejected() {
         let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
                    [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n";
@@ -2943,6 +2978,9 @@ allow_overlap = true
         assert!(validate_repo_relative("/etc/passwd").is_err());
         assert!(validate_repo_relative("../escape").is_err());
         assert!(validate_repo_relative("a/../../escape").is_err());
+        // A trailing slash would make the default-branch read list a
+        // directory's children (ADR 0015).
+        assert!(validate_repo_relative("ops/").is_err());
     }
 
     #[test]
