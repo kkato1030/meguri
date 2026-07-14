@@ -22,6 +22,11 @@ pub const LANE_PR_REVIEW: &str = "pr-review";
 /// pre-publish self-review runs here, under the `self-reviewer` profile, so
 /// it stays a separate session/model from the author lane doing the fixes.
 pub const LANE_SELF_REVIEW: &str = "self-review";
+/// The collab advisor lane (issue #111, ADR 0006 collab-advisor): the
+/// plan-author advisor pane a worker consults over agmsg. Ephemeral — spawned
+/// at worker execute, reaped at run end regardless of `keep_pane`, never
+/// adopted/resumed, and never carries a saved `agent_session_id`.
+pub const LANE_ADVISOR: &str = "advisor";
 
 #[derive(Debug, Clone)]
 pub struct PaneRecord {

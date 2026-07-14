@@ -568,6 +568,21 @@ planner = "ops/agents/planner.md"
 - **Missing is non-fatal** — a path that doesn't exist (or a symlink that escapes the worktree) is skipped with a warning and a `prompt.preamble_missing` event; the turn still runs. `meguri doctor` reports configured paths that don't resolve inside the clone.
 - **When to reach for it vs. `CLAUDE.md`**: if the same always-on context suffices for every role and only Claude runs, [agent instructions (apm)](#agent-instructions-apm) / `CLAUDE.md` already covers it — use `[prompts]` when you need per-role text or CLI-independent delivery, and keep the files short (bulky context belongs in `CLAUDE.md`).
 
+### Collab advisor (`[collab]`, optional)
+
+Routing decides *which model does which role*. The collab advisor is the next step: it lets the assigned role-models **talk to each other while a run is in flight**. During a worker run, meguri re-embodies the plan author (the `planner` role) as an *advisor* on the same issue, and the worker may consult it over [agmsg](https://github.com/fujibee/agmsg) — "does this approach meet the spec? am I drifting?" — before the drift ever reaches a PR. It complements the pre-publish self-review and the pr-reviewer (a cheap, synchronous drift check up front; the reviews stay the thorough pass); see [ADR 0006 (collab-advisor)](docs/adr/0006-collab-advisor-role-reembodiment.md).
+
+```toml
+[collab]
+mode = "advisor"          # "off" (default) | "advisor"
+advisor_role = "planner"  # the routing role whose profile the advisor borrows
+```
+
+- **`[collab]` is the switch, `mode = "advisor"` is the on.** No section (or `mode = "off"`) is byte-for-byte the historical behavior — no advisor pane, the worker prompt unchanged. Only `mode = "advisor"` activates it.
+- **Loud at startup.** With `mode = "advisor"`, `meguri watch` / `meguri run` aborts at startup if the agmsg skill isn't installed (`~/.agents/skills/agmsg/scripts/version.sh` must run) — never a silent fallback, mirroring `[routing]`. `[collab]` is process-bound: edit it and restart to apply (a hot reload warns and keeps the startup value).
+- **The advisor is ephemeral.** It spawns when the worker starts implementing, reaps when the run ends (independent of `keep_pane`), is never resumed or adopted (a restart re-embodies it), and has no writable checkout — it advises, it never writes code. Its profile inherits the exact one the plan author ran under. A collab-active worker run books two scheduler slots (worker + advisor).
+- **Consultation is advice, not a completion condition.** meguri never reads, waits on, or validates the agmsg conversation — the run's success is still governed only by `result.json` + git verification. The protocol lives entirely in the two agents' prompts. v1 covers the `worker` and `spec-worker` loops.
+
 ## Development
 
 ```bash

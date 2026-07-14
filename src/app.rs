@@ -102,6 +102,7 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     crate::launch::validate(&cfg)?;
+    crate::collab::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
     if project.mode == ProjectMode::Local {
         bail!(
@@ -185,6 +186,7 @@ pub async fn cmd_watch() -> Result<()> {
     let cfg = reloader.current().clone();
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     crate::launch::validate(&cfg)?;
+    crate::collab::validate(&cfg, &crate::routing::detect_command)?;
     if cfg.projects.is_empty() {
         bail!(
             "no projects configured — edit {}",
