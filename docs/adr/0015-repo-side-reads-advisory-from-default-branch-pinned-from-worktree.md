@@ -17,15 +17,21 @@ bare clone 化では working tree 自体が無くなる。
 
 ## 決定
 
-repo 側ファイルの読み取りを**用途で二分**し、出所を分ける。
+repo 側ファイルの読み取りを、**run に紐付くか / 完了契約に効くか**で分ける。
 
-> **完了契約に効く「pin」読み取りは run の worktree から読み claim 時に固定する(ADR 0011)。
-> 完了契約に効かない「助言 / 発見」読み取りは default branch から読む(`git show`)。**
+> **run に紐付く読み取りはその run の worktree から読む(その run のブランチが権威)。うち完了契約に
+> 効く値だけは claim 時に checkpoint へ pin する(ADR 0011)。run に紐付かない「助言 / 発見」読み取りは
+> default branch から読む(`git show`)。**
 
 | 用途 | 例 | 出所 | 理由 |
 |---|---|---|---|
-| pin(完了契約) | run flow の repo `meguri.toml`(`flow.rs:442`)、実行時 preamble(`flow.rs:1323`) | run の **worktree**(claim 時 pin) | ADR 0011。改竄が PR diff に現れ監査可能。ref 分離が無い現行アーキで「default から読む」は偽の安心 |
+| pin(完了契約) | run flow の repo `meguri.toml`(`flow.rs:442`) | run の **worktree**、claim 時 checkpoint に pin | ADR 0011。`check_command` 等を run 中に自己改竄させない。改竄が PR diff に現れ監査可能で、ref 分離が無い現行アーキで「default から読む」は偽の安心 |
+| run worktree ライブ(pin ではない) | 実行時 preamble(`flow.rs:1323`) | run の **worktree**、各 turn prompt 生成時にその都度読む | 完了契約に効かない standing-discipline のテキスト。その run が作業中のブランチの preamble を映すのが正しく、checkpoint pin は不要(**本 issue の対象外・別枠**) |
 | 助言 / 発見 | schedule の `body_file`(`scheduler_fire`)、`doctor` の repo config / preamble / body_file 検証 | **default branch**(`git show origin/<default>:<rel>`、remote 無しは local `<default>`) | run に紐付かず、完了契約にも効かない。宣言セマンティクスどおり「マージ済みの内容」を映すのが正しい |
+
+> 注記(誤読防止): 実行時 preamble は「claim 時 pin」ではない。turn prompt を作るたびに run の worktree
+> から live に読む。本 issue はこれを変えない(default branch にも寄せない)。pin しているのは repo
+> `meguri.toml` だけである。
 
 ADR 0011 が `git show` を却下したのは、**敵対的 agent が共有 git dir 越しに `update-ref` で
 trusted ref を改竄でき、それが完了契約の検証を素通りする**という一点に対してだった。助言 / 発見
@@ -45,8 +51,8 @@ trusted ref を改竄でき、それが完了契約の検証を素通りする**
   working tree でだけ編集した値は反映されない(それが意図)。
 - managed bare clone 化(後続 issue)で working tree が消えても、これらの読み取りは blob 直読なので
   そのまま動く。本 ADR がその前提を整える。
-- 「repo 側の読み取り」を将来増やすときは、まず本表で用途を判定する。完了契約に効くなら worktree +
-  claim 時 pin、効かないなら default branch。
+- 「repo 側の読み取り」を将来増やすときは、まず本表で用途を判定する。run に紐付くなら worktree
+  (完了契約に効く値だけ claim 時 pin)、run に紐付かない助言 / 発見なら default branch。
 
 ## 却下した代替案
 
