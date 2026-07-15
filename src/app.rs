@@ -1247,6 +1247,67 @@ pub fn cmd_stats_collab(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `meguri stats review`: self-review cap-escalation / needs-human / correction
+/// rates and the round-to-clean distribution per `(role, profile)`, read from
+/// the durable `self_review.*` events (issue #213, ADR 0020). Same sqlite
+/// direct-read as `stats routing`/`collab` (works with the watch stopped).
+/// `project = None` spans every project; `Some(id)` restricts to one. The
+/// profile column is the **authoring** run's profile, not the reviewer's.
+pub fn cmd_stats_review(project: Option<&str>) -> Result<()> {
+    let store = open_store()?;
+    let rows = store.review_stats(project)?;
+    if rows.is_empty() {
+        match project {
+            Some(p) => println!("no review stats yet for project {p}"),
+            None => println!("no review stats yet"),
+        }
+        return Ok(());
+    }
+    println!("self-review stats — all completed phases per (role, profile)\n");
+    println!(
+        "{:<8} {:<12} {:<16} {:>7} {:>7} {:>9} {:>8}",
+        "PROJECT", "ROLE", "PROFILE", "PHASES", "CAP", "NEEDHUMAN", "CORRECT"
+    );
+    for r in &rows {
+        let profile = if r.agent_profile.is_empty() {
+            "(unrouted)"
+        } else {
+            &r.agent_profile
+        };
+        println!(
+            "{:<8} {:<12} {:<16} {:>7} {:>6.0}% {:>8.0}% {:>7.0}%",
+            r.project_id,
+            r.loop_kind,
+            profile,
+            r.phases,
+            r.cap_rate,
+            r.needs_human_rate,
+            r.correction_rate,
+        );
+    }
+
+    // Round-to-clean distribution, one line per group that reached clean.
+    let with_hist: Vec<_> = rows.iter().filter(|r| !r.rounds_hist.is_empty()).collect();
+    if !with_hist.is_empty() {
+        println!("\nround-to-clean distribution (clean phases):");
+        for r in with_hist {
+            let profile = if r.agent_profile.is_empty() {
+                "(unrouted)"
+            } else {
+                &r.agent_profile
+            };
+            let hist = r
+                .rounds_hist
+                .iter()
+                .map(|(round, count)| format!("r{round}×{count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  {} {} {}: {}", r.project_id, r.loop_kind, profile, hist);
+        }
+    }
+    Ok(())
+}
+
 /// local-mode capture: queue a task in the sqlite `tasks` table for the watch
 /// to pick up (issue #148 / ADR 0003). The project is already resolved and
 /// mode-checked by [`cmd_add`]. Always `TaskKind::Work` — `--plan` is rejected
