@@ -2289,7 +2289,7 @@ async fn open_pr(
     Ok(pr_url)
 }
 
-/// Escalate-time fallback (issue #209, ADR 0020): when self-review cannot
+/// Escalate-time fallback (issue #209, ADR 0021): when self-review cannot
 /// converge and the branch is ahead of base, push it and open a draft PR
 /// labeled `meguri:needs-human` so the half-finished artifact is visible on the
 /// forge instead of trapped in the worktree. The label rides PR creation (a
@@ -2502,7 +2502,7 @@ fn self_review_details_with_outcome(cp: &Checkpoint, lenses: &[String], outcome:
     )
 }
 
-/// The PR body for an escalate-time needs-human draft (issue #209, ADR 0020).
+/// The PR body for an escalate-time needs-human draft (issue #209, ADR 0021).
 /// Unlike [`compose_pr_body`], this is NOT a verified deliverable: self-review
 /// did not converge, so the tree carries no green guarantee. The body says so
 /// plainly, links the issue without closing it (`Refs #N`), and folds in the
@@ -3499,6 +3499,7 @@ mod tests {
             prompts: Default::default(),
             triage: None,
             autonomy: None,
+            notify: None,
         };
         let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
         let deps = Deps::with_label_source(

@@ -95,7 +95,7 @@ pub struct SelfReviewFile {
 ///
 /// On a genuine escalation ([`NeedsHuman`] — a `needs_human` verdict, the
 /// rounds cap, or a failed review/fix turn) the escalate-time fallback runs
-/// (issue #209, ADR 0020): if the branch is ahead of base, the committed work
+/// (issue #209, ADR 0021): if the branch is ahead of base, the committed work
 /// is published as a needs-human draft PR before the error propagates. This is
 /// the one place self-review touches the forge, and only when escalating —
 /// `Stopped`/`Interrupted` (user stop, pane death) return `Ok(..)` and never

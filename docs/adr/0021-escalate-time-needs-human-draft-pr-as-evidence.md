@@ -1,4 +1,4 @@
-# ADR 0020: self-review エスカレート時、commit 済みなら needs-human draft PR を証拠物件として publish する
+# ADR 0021: self-review エスカレート時、commit 済みなら needs-human draft PR を証拠物件として publish する
 
 - Status: proposed
 - Date: 2026-07-15
