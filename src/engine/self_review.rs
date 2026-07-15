@@ -279,6 +279,13 @@ async fn self_review_inner(
         persist(deps, run, cp)?;
     }
 
+    // Resume-safety (issue #212): the phase already committed to the cap→final-fix
+    // path. Route straight back to it — don't fall into the loop's ping-pong
+    // check, which the interrupted final fix's `fix_attempts` bump would trip.
+    if cp.self_review_final_fix_started {
+        return final_fix_and_publish(deps, run, cp, worktree, language).await;
+    }
+
     loop {
         // Ping-pong is a property of the persisted ledger, so re-check it on
         // resume too: a crash right after a round persist must not downgrade a
@@ -409,6 +416,12 @@ async fn final_fix_and_publish(
         )?;
         return Ok(flow::StepFlow::Continue);
     }
+
+    // Commit to this path atomically, before the fix turn bumps `fix_attempts`:
+    // a resume then routes back here (phase entry) instead of mis-reading the
+    // bump as a ping-pong (issue #212).
+    cp.self_review_final_fix_started = true;
+    persist(deps, run, cp)?;
 
     match fix_turn(deps, run, cp, worktree, language).await? {
         flow::StepFlow::Continue => {}
@@ -620,6 +633,20 @@ fn validate_fix_file(cp: &Checkpoint, fix: &SelfReviewFixFile) -> std::result::R
             {
                 return Err(format!(
                     "- finding `{}` is waived but has no `reason`; a waive must say why you disagree",
+                    e.id
+                ));
+            }
+            // A `decision` marked `fixed` must record the chosen option in
+            // `reason` — the ledger keeps the decision, and the next review
+            // confirms it was recorded (issue #212, ADR 0022).
+            Some(d)
+                if e.kind == FindingKind::Decision
+                    && d.action == Disposition::Fixed
+                    && d.reason.as_deref().map(str::trim).unwrap_or("").is_empty() =>
+            {
+                return Err(format!(
+                    "- decision finding `{}` is marked fixed but has no `reason`; record the \
+                     option you chose in `reason` so it lands in the ledger",
                     e.id
                 ));
             }
@@ -1633,6 +1660,55 @@ mod tests {
         assert!(err.contains("reason"), "{err}");
     }
 
+    /// A `decision` marked `fixed` must record the chosen option in `reason`, so
+    /// the ledger keeps the decision (issue #212).
+    #[test]
+    fn decision_fixed_requires_a_recorded_reason() {
+        let mut cp = cp_with_title();
+        cp.self_review_ledger = vec![entry("f2", FindingKind::Decision, FindingStatus::Open)];
+        // `fixed` with no reason is rejected for a decision.
+        let err = validate_fix_file(
+            &cp,
+            &SelfReviewFixFile {
+                dispositions: vec![DispositionEntry {
+                    id: "f2".into(),
+                    action: Disposition::Fixed,
+                    reason: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("decision") && err.contains("`f2`"), "{err}");
+        // A blank reason is just as bad.
+        assert!(
+            validate_fix_file(
+                &cp,
+                &SelfReviewFixFile {
+                    dispositions: vec![DispositionEntry {
+                        id: "f2".into(),
+                        action: Disposition::Fixed,
+                        reason: Some("   ".into()),
+                    }],
+                },
+            )
+            .is_err()
+        );
+        // With the chosen option recorded it passes, and apply keeps it.
+        let fix = SelfReviewFixFile {
+            dispositions: vec![DispositionEntry {
+                id: "f2".into(),
+                action: Disposition::Fixed,
+                reason: Some("chose B".into()),
+            }],
+        };
+        assert!(validate_fix_file(&cp, &fix).is_ok());
+        apply_dispositions(&mut cp, &fix);
+        assert_eq!(
+            cp.self_review_ledger[0].waive_reason.as_deref(),
+            Some("chose B")
+        );
+    }
+
     /// The ledger — with all its status — round-trips through the checkpoint
     /// JSON (acceptance: the ledger persists and survives resume). The open
     /// entries are mirrored into `self_review_pending` (rollback safety valve).
@@ -1649,6 +1725,9 @@ mod tests {
             },
             entry("f2", FindingKind::Decision, FindingStatus::Fixed),
         ];
+        // The final-fix-in-progress marker persists too (issue #212): the resume
+        // route back to the final-fix path depends on it surviving a crash.
+        cp.self_review_final_fix_started = true;
         mirror_open_to_pending(&mut cp);
         // Only the open entry is mirrored, and it keeps its id.
         assert_eq!(cp.self_review_pending.len(), 1);
@@ -1663,6 +1742,7 @@ mod tests {
         assert_eq!(f1.waive_reason.as_deref(), Some("dup"));
         assert_eq!(f1.fix_attempts, 1);
         assert_eq!(back.self_review_ledger[1].status, FindingStatus::Fixed);
+        assert!(back.self_review_final_fix_started);
     }
 
     /// Forward migration (issue #212): a pre-ledger checkpoint carrying only

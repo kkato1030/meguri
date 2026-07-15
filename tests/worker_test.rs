@@ -1270,6 +1270,107 @@ async fn self_review_ping_pong_escalates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn final_fix_resumes_into_publish_not_ping_pong() {
+    use meguri::engine::flow::{Checkpoint, STEP_SELF_REVIEW};
+    use meguri::engine::self_review::FindingStatus;
+
+    // The resume race (issue #212): a run interrupted mid-final-fix, with a
+    // finding already at fix_attempts == 2, must resume back INTO the final-fix
+    // publish — the persisted `self_review_final_fix_started` marker routes it
+    // past the ping-pong check, so it does not mis-escalate. Built by running the
+    // cap→final-fix scenario, then rewinding the checkpoint to the interrupted
+    // state and resuming on the same worktree.
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    env.deps.config.review.max_rounds = 2;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                write_review(
+                    &wt,
+                    "fixable",
+                    serde_json::json!([{"path": "greeting.txt", "line": 1, "body": "one more nit"}]),
+                );
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    // First pass: run to completion so a real worktree/branch/PR exist.
+    tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("first pass timed out")
+        .unwrap();
+
+    // Rewind to the interrupted mid-final-fix state: committed to the final-fix
+    // path, one finding open at two fix attempts, not yet re-reviewed.
+    let rec = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    let mut cp: Checkpoint = serde_json::from_str(&rec.checkpoint_json).unwrap();
+    cp.self_review_final_fix_started = true;
+    cp.self_review_final_fix_unreviewed = false;
+    cp.self_review_converged = false;
+    cp.self_review_rounds = env.deps.config.review.max_rounds;
+    for e in cp.self_review_ledger.iter_mut() {
+        e.status = FindingStatus::Open;
+        e.fix_attempts = 2;
+    }
+    assert!(
+        cp.self_review_ledger
+            .iter()
+            .any(|e| e.status == FindingStatus::Open && e.fix_attempts >= 2),
+        "the rewound state must look like a ping-pong to prove it is not treated as one"
+    );
+    env.deps
+        .store
+        .update_run_step(
+            &run.id,
+            STEP_SELF_REVIEW,
+            &serde_json::to_string(&cp).unwrap(),
+        )
+        .unwrap();
+
+    // Resume: it must publish via the final-fix path, never escalate a ping-pong.
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("resume timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "resume must publish, not escalate: {outcome:?}"
+    );
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 400)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    // Had the fix been absent, the phase would have escalated a ping-pong and
+    // `run_worker` above would have returned Err (unwrap would panic). The
+    // absence of the event is the belt-and-braces check.
+    assert!(
+        !kinds.contains(&"self_review.pingpong".to_string()),
+        "the interrupted final fix must not be mis-read as a ping-pong: {kinds:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn self_review_needs_human_escalates_immediately() {
     let mut env = setup(None).await;
     env.deps.config.review.enabled = true;

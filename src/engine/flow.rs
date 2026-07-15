@@ -320,6 +320,15 @@ pub struct Checkpoint {
     /// resume short-circuit alongside `self_review_converged`.
     #[serde(default)]
     pub self_review_final_fix_unreviewed: bool,
+    /// Set (and persisted) the moment the phase commits to the cap→final-fix path,
+    /// before the final fix turn runs (issue #212). It makes the branch decision
+    /// crash-safe: a resume mid-final-fix routes straight back to the final-fix
+    /// path instead of re-running ping-pong detection — the final fix bumps a
+    /// finding's `fix_attempts`, which would otherwise look like a ping-pong and
+    /// wrongly escalate. Cleared implicitly once
+    /// [`self_review_final_fix_unreviewed`] is set (the phase is done).
+    #[serde(default)]
+    pub self_review_final_fix_started: bool,
     /// How many times this run has escalated its launch profile (routing 3/3,
     /// issue #66) — a counter for observability (it rides the `run.escalated`
     /// event's `level`), not a chain index: the next target is derived from the
