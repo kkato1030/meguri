@@ -795,6 +795,14 @@ pub async fn diff_against_base(worktree: &Path, default_branch: &str) -> Result<
     run_git(worktree, &["diff", &format!("{base}...HEAD")]).await
 }
 
+/// Diff between two commits in a worktree (issue #212): the incremental diff the
+/// self-review passes on round 2+, from the HEAD it reviewed last time (`from`)
+/// to the current one (`to`, usually `HEAD`). `from..to` shows exactly what the
+/// fix turns added since the previous review.
+pub async fn diff_between(worktree: &Path, from: &str, to: &str) -> Result<String> {
+    run_git(worktree, &["diff", &format!("{from}..{to}")]).await
+}
+
 pub async fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
     run_git(worktree, &["push", "-u", "origin", branch]).await?;
     Ok(())

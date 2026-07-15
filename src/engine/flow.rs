@@ -279,22 +279,47 @@ pub struct Checkpoint {
     /// this counter, not a forge marker.
     #[serde(default)]
     pub self_review_rounds: u32,
-    /// Findings from the latest review turn that the next fix turn must
-    /// address; carried in-memory (via the checkpoint) rather than as forge
-    /// threads.
+    /// Open findings from the ledger, mirrored here every persist (issue #212).
+    /// The ledger ([`self_review_ledger`]) is the source of truth; this vec is
+    /// kept as a **rollback safety valve** — a binary rolled back past #212 reads
+    /// only this field, so an old binary resuming still sees unresolved findings.
+    /// Retire the mirror once the rollback target includes #212.
     #[serde(default)]
     pub self_review_pending: Vec<super::self_review::Finding>,
+    /// The cumulative self-review findings ledger (issue #212, ADR 0022): one
+    /// entry per finding across all rounds, each with its reviewer-confirmed
+    /// status (open/fixed/waived), the author's latest disposition, and how many
+    /// fix turns it has been through. Convergence is "no open entry left"; a real
+    /// ping-pong is an entry still open after two fix turns.
+    #[serde(default)]
+    pub self_review_ledger: Vec<super::self_review::LedgerEntry>,
+    /// The HEAD the last review turn looked at (issue #212). Round 2+ passes the
+    /// incremental diff `self_review_last_head..HEAD` on top of the full base
+    /// diff, so the reviewer sees exactly what the fix turns changed.
+    #[serde(default)]
+    pub self_review_last_head: Option<String>,
     /// One entry per self-review round (ADR 0008): what the folded PR-body
     /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
     /// the history it already built.
     #[serde(default)]
     pub self_review_log: Vec<super::self_review::RoundRecord>,
-    /// Set once self-review reached a clean verdict: the phase converged and the
-    /// PR may open. Persisted so a resume distinguishes a clean-at-cap checkpoint
-    /// (rounds == max but done) from a genuinely unconverged one — without it the
-    /// cap backstop would re-escalate an already-clean diff (issue #176).
+    /// Set once self-review reached a **clean** verdict: the phase converged and
+    /// the PR may open. Persisted so a resume distinguishes a clean-at-cap
+    /// checkpoint (rounds == max but done) from a genuinely unconverged one
+    /// (issue #176). Kept clean-only on purpose: the cap→final-fix path
+    /// (issue #212) does NOT set this, so a binary rolled back past #212 sees
+    /// `converged == false` and escalates the unreviewed fix instead of
+    /// publishing it as clean.
     #[serde(default)]
     pub self_review_converged: bool,
+    /// Set once the cap→final-fix path published (issue #212, ADR 0022): the last
+    /// fix turn was not re-reviewed (check_command + tree verification passed).
+    /// Distinct from [`self_review_converged`] on purpose (rollback safety valve,
+    /// above). Read by `compose_pr_body` / `post_self_review_status` to record
+    /// the non-re-review in the PR footer and commit status, and by the phase's
+    /// resume short-circuit alongside `self_review_converged`.
+    #[serde(default)]
+    pub self_review_final_fix_unreviewed: bool,
     /// How many times this run has escalated its launch profile (routing 3/3,
     /// issue #66) — a counter for observability (it rides the `run.escalated`
     /// event's `level`), not a chain index: the next target is derived from the
@@ -2437,12 +2462,20 @@ pub(crate) fn compose_pr_body(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
-    // A published PR always cleared self-review: a non-converging (or
-    // needs-human) review escalates and never reaches open-pr (ADR 0012).
+    // A published PR either converged clean, or took the cap→final-fix path
+    // (issue #212): in the latter the last fix was not re-reviewed, so the body
+    // says so plainly and the human merge gate is the backstop.
+    let final_fix_note = if cp.self_review_final_fix_unreviewed {
+        "> ⚠️ 最終ラウンドの fix は未再レビューです(check_command と tree 検証は通過)。\
+         human merge gate で確認してください。\n\n"
+    } else {
+        ""
+    };
     format!(
-        "{}.\n\n{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
         issue_reference(run.issue_number, close),
+        final_fix_note,
         description,
         self_review_details(cp, lenses),
         run.id
@@ -2466,12 +2499,14 @@ pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
 /// no self-review ran (loops without it, or `review.enabled = false`), so the
 /// body stays clean.
 fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
-    // A published PR always converged (a non-clean review escalates, ADR 0012).
-    self_review_details_with_outcome(
-        cp,
-        lenses,
-        &format!("clean after {} rounds", cp.self_review_rounds),
-    )
+    // A published PR either converged clean or took the cap→final-fix path
+    // (issue #212); the outcome headline distinguishes the two.
+    let outcome = if cp.self_review_final_fix_unreviewed {
+        format!("最終 fix 未再レビュー · {} rounds", cp.self_review_rounds)
+    } else {
+        format!("clean after {} rounds", cp.self_review_rounds)
+    };
+    self_review_details_with_outcome(cp, lenses, &outcome)
 }
 
 /// Shared renderer for the folded self-review `<details>`: the `outcome`
@@ -2548,12 +2583,15 @@ async fn post_self_review_status(deps: &Deps, run: &RunRecord, cp: &Checkpoint, 
         return;
     };
     let head = head.trim();
-    // A published PR always cleared self-review (a non-clean review escalates
-    // and never reaches this point, ADR 0012).
-    let (state, desc) = (
-        crate::forge::CommitStatusState::Success,
-        format!("clean · {} rounds", cp.self_review_rounds),
-    );
+    // A published PR either converged clean or took the cap→final-fix path
+    // (issue #212); the status is Success either way (check_command + tree
+    // passed), but the description records a non-re-reviewed final fix.
+    let desc = if cp.self_review_final_fix_unreviewed {
+        format!("final fix unreviewed · {} rounds", cp.self_review_rounds)
+    } else {
+        format!("clean · {} rounds", cp.self_review_rounds)
+    };
+    let (state, desc) = (crate::forge::CommitStatusState::Success, desc);
     if let Err(e) = deps
         .forge()
         .set_commit_status(head, "meguri/self-review", state, &desc)
@@ -2996,6 +3034,40 @@ mod tests {
             default_pr_title(&run, &cp),
             "Cache API responses in memory (#7)"
         );
+    }
+
+    /// The cap→final-fix publish (issue #212) records the non-re-review in the
+    /// PR body; a clean convergence does not.
+    #[test]
+    fn compose_pr_body_marks_final_fix_unreviewed() {
+        use super::super::self_review::RoundRecord;
+        let run = fake_run(7);
+        let lenses = vec!["correctness".to_string()];
+        let base = Checkpoint {
+            issue_title: "Add caching".into(),
+            summary: "done".into(),
+            self_review_rounds: 3,
+            self_review_log: vec![RoundRecord {
+                round: 3,
+                findings: 1,
+            }],
+            ..Default::default()
+        };
+
+        // Clean convergence: no final-fix warning, "clean after N rounds".
+        let clean = compose_pr_body(&run, &base, &lenses, true);
+        assert!(!clean.contains("未再レビュー"), "{clean}");
+        assert!(clean.contains("clean after 3 rounds"), "{clean}");
+
+        // Final-fix publish: the warning line and the "最終 fix 未再レビュー"
+        // outcome both appear.
+        let final_fix = Checkpoint {
+            self_review_final_fix_unreviewed: true,
+            ..base
+        };
+        let body = compose_pr_body(&run, &final_fix, &lenses, true);
+        assert!(body.contains("最終ラウンドの fix は未再レビュー"), "{body}");
+        assert!(body.contains("最終 fix 未再レビュー · 3 rounds"), "{body}");
     }
 
     #[test]

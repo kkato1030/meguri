@@ -182,6 +182,12 @@ impl Flavor for PlannerFlavor {
              # Instructions\n\
              - Investigate the repository first: what the issue needs, which \
                files/modules it touches, and which decisions have to be made.\n\
+             - Surface every open decision up front: wherever the issue could go \
+               A or B (a schema shape, an escalation rule, a naming/placement \
+               call), decide it in this first pass and write the choice into the \
+               spec. Do not defer an A-or-B to \"later\" — unresolved decisions \
+               that surface in a late review round are the main reason self-review \
+               fails to converge.\n\
              - Write the spec to `{spec}` (create parent directories as needed). \
                Keep it lightweight — it exists to converge review on the approach \
                before implementation: acceptance criteria, files to touch, and \

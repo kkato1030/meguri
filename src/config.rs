@@ -204,8 +204,12 @@ pub struct ReviewConfig {
     #[serde(default = "default_self_review_enabled", alias = "impl_enabled")]
     pub enabled: bool,
     /// Max self-review rounds per run — the cap that keeps the internal
-    /// review→fix loop finite. Once reached, the PR is published as-is (the
-    /// human merge gate is the backstop, ADR 0006).
+    /// review→fix loop finite. On reaching it the behavior branches (ADR 0022,
+    /// issue #212): a genuine ping-pong (a finding still open after two fix
+    /// turns), a needs_human verdict, or a disputed recorded decision escalate
+    /// to a human; anything else (only minor blocking findings left) runs one
+    /// final fix + validate and publishes, with a PR footer noting the last fix
+    /// was not re-reviewed (the human merge gate is the backstop).
     #[serde(default = "default_self_review_max_rounds", alias = "impl_max_rounds")]
     pub max_rounds: u32,
     /// The review lenses the self-review turn applies each round (ADR 0008):
