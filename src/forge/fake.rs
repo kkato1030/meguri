@@ -105,6 +105,9 @@ pub struct FakeForge {
     pub update_body_errors: Mutex<HashSet<i64>>,
     /// Issues whose update_issue_title fails (same, title side).
     pub update_title_errors: Mutex<HashSet<i64>>,
+    /// Issues whose `comment` fails (forge-hiccup scenarios, e.g. triage
+    /// auto-promote rolling a label back when the reason comment can't post).
+    pub comment_errors: Mutex<HashSet<i64>>,
     /// Commit statuses meguri wrote: (head_sha, context) → latest state
     /// (ADR 0008 inspection history). Re-posting a context overwrites it.
     pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
@@ -181,6 +184,11 @@ impl FakeForge {
     /// Make blocked_by lookups for `issue` fail (unreadable blockers).
     pub fn fail_blocked_by(&self, issue: i64) {
         self.blocked_by_errors.lock().unwrap().insert(issue);
+    }
+
+    /// Make `comment` on `issue` fail (forge hiccup mid-write).
+    pub fn fail_comment(&self, issue: i64) {
+        self.comment_errors.lock().unwrap().insert(issue);
     }
 
     /// Make pr_for_branch lookups for `branch` fail (forge outage).
@@ -918,6 +926,9 @@ impl Forge for FakeForge {
     }
 
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
+        if self.comment_errors.lock().unwrap().contains(&issue) {
+            bail!("simulated comment failure on issue #{issue}");
+        }
         self.comments.lock().unwrap().push((issue, body.into()));
         Ok(())
     }
