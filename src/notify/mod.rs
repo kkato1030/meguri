@@ -53,6 +53,13 @@ pub struct Notification {
     pub body: String,
     /// A URL the human should open (PR / issue), when there is one.
     pub url: Option<String>,
+    /// Structured, event-specific fields merged into the **generic JSON**
+    /// webhook payload only (Slack/ntfy stay text-only — "text 1本"). This is
+    /// where the pre-#205 `webhook_url` contract lives on: for `awaiting_human`
+    /// it carries `run_id` / `issue_number` / `issue_title` / `reason` /
+    /// `attach` / `attach_cli`, so an existing JSON consumer keeps working.
+    /// Always a JSON object.
+    pub fields: serde_json::Value,
 }
 
 impl Notification {
@@ -76,15 +83,29 @@ impl Notification {
         .to_string();
         let target = url
             .clone()
-            .or(attach)
+            .or(attach.clone())
             .unwrap_or_else(|| format!("meguri attach {dedup_key}"));
         let body = format!("{} — {target}", reason_label(reason));
+        // The pre-#205 `webhook_url` JSON contract, preserved so an existing
+        // consumer still finds run_id / issue / reason / attach. `dedup_key` is
+        // the run id (or the synthetic key for the run-less parked/budget page).
+        let mut fields = json!({
+            "run_id": dedup_key,
+            "issue_number": issue_number,
+            "issue_title": issue_title,
+            "reason": reason,
+            "attach": attach,
+        });
+        if attach.is_some() {
+            fields["attach_cli"] = json!(format!("meguri attach {dedup_key}"));
+        }
         Self {
             event: "awaiting_human".into(),
             dedup_key,
             title,
             body,
             url,
+            fields,
         }
     }
 
@@ -97,6 +118,7 @@ impl Notification {
             title: format!("meguri #{id} → needs-human"),
             body: format!("#{id} ({target}) を needs-human にしました: {reason}"),
             url: None,
+            fields: json!({ "target": target, "id": id, "reason": reason }),
         }
     }
 
@@ -108,6 +130,7 @@ impl Notification {
             title: format!("meguri PR #{pr} → needs-human"),
             body: format!("PR #{pr} を needs-human にしました(人間のレビュー待ち)"),
             url: None,
+            fields: json!({ "target": "pr", "pr": pr }),
         }
     }
 
@@ -119,6 +142,7 @@ impl Notification {
             title: format!("meguri schedule {schedule} 失敗"),
             body: format!("schedule \"{schedule}\" ({project}) の発火に失敗しました: {error}"),
             url: None,
+            fields: json!({ "project": project, "schedule": schedule, "error": error }),
         }
     }
 
@@ -132,6 +156,7 @@ impl Notification {
                 "schedule \"{schedule}\" ({project}) を overlap でスキップ(#{open_key} が open)"
             ),
             url: None,
+            fields: json!({ "project": project, "schedule": schedule, "open_key": open_key }),
         }
     }
 
@@ -146,6 +171,7 @@ impl Notification {
                 .to_string(),
             body: format!("#{issue_number}「{issue_title}」に {label} が付きました"),
             url,
+            fields: json!({ "issue_number": issue_number, "label": label }),
         }
     }
 }
@@ -344,16 +370,25 @@ fn webhook_request(kind: WebhookKind, n: &Notification) -> WebhookRequest {
                 body: n.body.clone(),
             }
         }
-        WebhookKind::Json => WebhookRequest {
-            headers: vec![("Content-Type", "application/json".into())],
-            body: json!({
+        WebhookKind::Json => {
+            // Base envelope plus the event-specific structured `fields` — this
+            // is where the pre-#205 `webhook_url` contract survives (issue #205).
+            let mut payload = json!({
                 "event": n.event,
                 "title": n.title,
                 "text": n.body,
                 "url": n.url,
-            })
-            .to_string(),
-        },
+            });
+            if let (Some(obj), Some(extra)) = (payload.as_object_mut(), n.fields.as_object()) {
+                for (k, v) in extra {
+                    obj.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            WebhookRequest {
+                headers: vec![("Content-Type", "application/json".into())],
+                body: payload.to_string(),
+            }
+        }
     }
 }
 
@@ -388,6 +423,7 @@ pub async fn probe_webhook(cfg: &NotificationsConfig, url: &str) -> Result<()> {
         title: "meguri doctor".into(),
         body: "通知シンクのテスト送信です".into(),
         url: None,
+        fields: json!({}),
     };
     post_webhook(url, resolve_kind(cfg, url), &n).await
 }
@@ -512,13 +548,58 @@ mod tests {
     }
 
     #[test]
-    fn json_payload_carries_event_title_text() {
+    fn json_payload_carries_event_title_text_and_fields() {
         let n = Notification::schedule_failed("proj", "nightly", "boom");
         let req = webhook_request(WebhookKind::Json, &n);
         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(v["event"], "schedule.failed");
         assert!(v["text"].as_str().unwrap().contains("boom"));
         assert!(v["url"].is_null());
+        // Structured fields are merged in for JSON consumers.
+        assert_eq!(v["project"], "proj");
+        assert_eq!(v["schedule"], "nightly");
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn json_awaiting_human_preserves_pre_205_webhook_fields() {
+        // Backward-compat: a generic-JSON `webhook_url` consumer still receives
+        // run_id / issue_number / issue_title / reason / attach / attach_cli.
+        let n = Notification::awaiting_human(
+            "run-1".into(),
+            7,
+            Some("caching".into()),
+            "agent_blocked",
+            Some("tmux attach -t meguri".into()),
+            None,
+        );
+        let req = webhook_request(WebhookKind::Json, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(v["event"], "awaiting_human");
+        assert_eq!(v["run_id"], "run-1");
+        assert_eq!(v["issue_number"], 7);
+        assert_eq!(v["issue_title"], "caching");
+        assert_eq!(v["reason"], "agent_blocked");
+        assert_eq!(v["attach"], "tmux attach -t meguri");
+        assert_eq!(v["attach_cli"], "meguri attach run-1");
+    }
+
+    #[test]
+    fn json_awaiting_human_omits_attach_cli_when_no_pane() {
+        // A parked review has a url but no pane: no `meguri attach` dead end.
+        let n = Notification::awaiting_human(
+            "run-9".into(),
+            7,
+            None,
+            "spec_review_parked",
+            None,
+            Some("https://example.test/pr/12".into()),
+        );
+        let req = webhook_request(WebhookKind::Json, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(v["url"], "https://example.test/pr/12");
+        assert!(v["attach"].is_null());
+        assert!(v.get("attach_cli").is_none());
     }
 
     #[test]
