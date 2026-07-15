@@ -18,7 +18,7 @@
 | ファイル | 変更 |
 |---|---|
 | `src/engine/self_review.rs` | `Finding` に `kind`/`id`。台帳(`LedgerEntry`)導入。review turn を round 1 / round 2+ で分岐。fix turn に per-finding 申告(`.meguri/self-review-fix.json`)。ping-pong / decision 異議 / cap→最終fix の分岐。`read_review` の双方向強制。 |
-| `src/engine/flow.rs` | `Checkpoint`: `self_review_pending` を `self_review_ledger: Vec<LedgerEntry>` に。`self_review_last_head: Option<String>` を追加。`escalate_unconverged` 経路の見直し(cap→最終fix)。PR footer に「最終 fix 未再レビュー」行。`compose_pr_body` / `self_review_details` の分岐追加。 |
+| `src/engine/flow.rs` | `Checkpoint`: `self_review_pending` を `self_review_ledger: Vec<LedgerEntry>` に。`self_review_last_head: Option<String>` と `self_review_final_fix_unreviewed: bool` を追加。`escalate_unconverged` 経路の見直し(cap→最終fix)。`compose_pr_body` / `self_review_details` / `post_self_review_status` を final-fix フラグで分岐(footer / commit status)。 |
 | `src/gitops.rs` | 増分 diff 用に `diff_between(worktree, from_sha, "HEAD")` を追加(git 操作は全部ここ)。 |
 | `src/config.rs` | `ReviewConfig::max_rounds` の doc comment を実挙動に修正(下記「ついで修正」)。 |
 | `src/engine/planner.rs` | `execute_prompt` に「未決定(A か B か)を初回に出し切る」観点を1段落追加。 |
@@ -43,8 +43,13 @@ pub struct Finding {
 
 ### 台帳(checkpoint に永続)
 
+**status は reviewer が確定した真実であり、作者の申告(disposition)とは別に持つ**(下記
+「status 遷移表」で finding #2 の曖昧さを潰す)。作者の「直した/waive する」は次の review へ渡す
+入力であって、それ自体では open を閉じない。
+
 ```rust
-pub enum FindingStatus { Open, Fixed, Waived }
+pub enum FindingStatus { Open, Fixed, Waived }   // reviewer 確定
+pub enum Disposition { Fixed, Waived }           // 作者の最新申告(transient)
 
 pub struct LedgerEntry {
     pub id: String,           // orchestrator が採番した安定 id(例: "f1","f2",…)
@@ -53,9 +58,10 @@ pub struct LedgerEntry {
     pub line: u64,
     pub body: String,
     pub lens: Option<String>,
-    pub status: FindingStatus,
-    pub fix_attempts: u32,    // このエントリを何回 fix turn が触ったか
-    pub waive_reason: Option<String>,  // waived の理由 / decision の決定内容
+    pub status: FindingStatus,          // reviewer が確定した状態(omit=解消 / 再掲=open のまま)
+    pub author_disposition: Option<Disposition>,  // 直近 fix turn の作者申告。次 review の入力
+    pub fix_attempts: u32,    // このエントリを何回 fix turn が「触った(disposition を書いた)」か
+    pub waive_reason: Option<String>,  // waive の理由 / decision の決定内容
     pub origin_round: u32,
 }
 ```
@@ -70,8 +76,10 @@ pub struct LedgerEntry {
 ] }
 ```
 
-- `action ∈ {fixed, waived}`。`waived` は `reason` 必須。decision 型は「決定して spec に記録」を
-  `fixed` として申告し、`reason` に決定内容を書く(台帳の `waive_reason` に格納)。
+- `action ∈ {fixed, waived}` は台帳の `author_disposition` になる(reviewer 確定の `status` とは別)。
+  `waived` は `reason` 必須。decision 型は「決定して spec に記録」を `fixed` として申告し、`reason` に
+  決定内容を書く(台帳の `waive_reason` に格納)。**この申告は open を閉じない** — 次 review が
+  omit して初めて `fixed`/`waived` に落ちる(上記「status 遷移表」)。
 - 検証(fix turn 後、orchestrator 側):open な全 id に disposition があること、waived に reason が
   あること、`.meguri/` は git 除外なので tree は clean のまま。欠けたら1回だけ corrective turn。
 
@@ -84,9 +92,10 @@ loop:
     round 2+    → 台帳(open + waive 理由 + 決定内容)と「base 全 diff + 前回HEADからの増分 diff」を渡す。
                   役割 = 前回指摘の解消確認 + blocking 新規のみ。still-open を同 id で再掲、resolved は omit、
                   新規は id 空。decision は記録確認のみ・再審禁止。
-  台帳更新:
-    - review が再掲しなかった open → status=fixed(reviewer が解消を確認)
-    - review が同 id で再掲した → status=open のまま
+  台帳更新(reviewer 確定のみ status を動かす。下記「status 遷移表」参照):
+    - review が再掲しなかった open → 解消。author_disposition==waived なら status=waived、
+      それ以外は status=fixed(reviewer が omit=確認)
+    - review が同 id で再掲した open → status=open のまま(作者の申告は却下された)
     - 新規 finding → 採番して open で追加
   verdict==needs_human           → escalate(理由 1 / decision 異議 = 3。同じ経路)
   ping-pong: 台帳に fix_attempts>=2 かつ status=open あり → escalate(理由 2)
@@ -95,12 +104,33 @@ loop:
     残りは軽微な blocking のみ(ping-pong/decision 異議は上で捌け済み)
       → 最終 fix turn + validate → publish(footer に「最終ラウンドの fix は未再レビュー」)
   それ以外:
-    fix turn(作者が per-finding 申告)→ 台帳へ反映(fixed/waived、fix_attempts++)→ validate → next round
+    fix turn(作者が per-finding 申告)→ open な各エントリに author_disposition を記録し fix_attempts++
+      (status は open のまま。閉じるのは次 review)→ validate → next round
 ```
 
 - `self_review_last_head` を review turn 直前の HEAD で更新し、次ラウンドの増分 diff の起点にする。
 - **id 採番は orchestrator が持つ**(reviewer/作者に任せない)。round 1 の findings に順に採番、
   round 2+ の新規にも採番。reviewer は round 2+ で既存 id を**再利用**して再掲する(同一性の担保)。
+
+### status 遷移表(finding #2 の曖昧さ解消)
+
+作者の申告だけでは open は閉じない。**fix_attempts は fix turn で加算、status 遷移は review turn だけ**で起きる。
+
+| いつ | 起きること | status | author_disposition | fix_attempts |
+|---|---|---|---|---|
+| round 1 review が F を出す | 台帳に追加 | `open` | `None` | 0 |
+| fix turn が open F を直したと申告 | 申告を記録 | `open`(据え置き) | `Fixed` | +1 |
+| fix turn が open F に不同意(waive) | 理由を `waive_reason` へ | `open`(据え置き) | `Waived` | +1 |
+| 次 review が F を omit(disposition=Fixed) | reviewer が解消を確認 | `fixed` | — | 据え置き |
+| 次 review が F を omit(disposition=Waived) | reviewer が waive を受理 | `waived` | — | 据え置き |
+| 次 review が F を同 id で再掲 | 作者の申告を却下 | `open`(継続) | 次 fix で上書き | 次 fix で +1 |
+| open F が fix_attempts>=2 のまま再掲 | 本当の ping-pong | `open` → escalate | — | — |
+
+- **waive の再掲が ping-pong で測れる:** 作者が waive → reviewer が同 id で再掲(却下)→ open 継続。
+  作者がまた waive(fix_attempts++)→ reviewer がまた再掲 → fix_attempts==2 & open → escalate。
+  「同意しない指摘」の水掛け論も回数で人間に渡る。
+- **decision の解消:** fix turn は `Fixed`(決定を spec に記録)を申告し `waive_reason` に決定内容を書く。
+  次 review が omit すれば `fixed`。異議があるなら再掲ではなく `needs_human` verdict(理由 3)。
 
 ## read_review の検証(双方向強制)
 
@@ -113,8 +143,28 @@ loop:
 
 - `escalate_unconverged` は「reviewer verdict / ping-pong / decision 異議」専用に残す。
 - cap 到達で残りが軽微 → 新関数 `final_fix_and_publish`(最終 fix + validate + footer)へ。
-- footer: `compose_pr_body` に「最終 fix 未再レビュー」の1行を差し込む分岐(converged と区別)。
-  `self_review_details_with_outcome` に "最終 fix 未再レビュー · N rounds" の outcome を通す。
+
+### 最終 fix outcome を checkpoint に永続する(finding #1 の解消)
+
+最終 fix→publish 経路は `self_review` を抜けて `open-pr` へ**戻る**。そこから呼ぶ
+`compose_pr_body` / `post_self_review_status` は checkpoint しか読めないので、clean 収束と
+「最終 fix 未再レビュー」を checkpoint 上で区別できないと footer/commit status が落ちる。
+resume でこの段から再開した時も同じ。だから outcome を永続フラグで持つ:
+
+- `Checkpoint` に `self_review_final_fix_unreviewed: bool`(`#[serde(default)]`)を追加する。
+  既存の `self_review_converged: bool` と並置する(enum に畳まないのは #176 の resume 短絡が
+  `self_review_converged` に依存しており、置換の blast radius を避けるため。両フラグの意味は直交:
+  converged=フェーズ完了・publish 可、final_fix_unreviewed=その publish が未再レビュー fix 込み)。
+- `final_fix_and_publish` は最終 fix + validate 後に `self_review_converged = true` と
+  `self_review_final_fix_unreviewed = true` を**両方**立てて persist する。converged を立てるので
+  ループ冒頭の `if cp.self_review_converged` 短絡が resume を正しく拾い、再レビューしない。
+- `compose_pr_body` / `self_review_details` / `post_self_review_status` は
+  `self_review_final_fix_unreviewed` を読んで分岐する:
+  - footer: `self_review_details_with_outcome` に "最終 fix 未再レビュー · N rounds" を渡す
+    (通常は "clean after N rounds")。加えて本文に「最終ラウンドの fix は未再レビュー」の1行を出す。
+  - commit status: state は Success のまま、desc を "final fix unreviewed · N rounds" にする
+    (通常は "clean · N rounds")。
+- **PR body と commit status の期待値をテスト対象にする**(下記テスト戦略 §4 参照)。
 
 ## ついで修正
 
@@ -161,6 +211,9 @@ loop:
   self-review 中だった run も台帳へ移行して継続できる。次 slice で pending を撤去してよい。
 - **決定(採用):** 上記昇格を入れる。self-review は短いフェーズで衝突窓は小さいが、
   「resume でゼロからやり直し」は cap 落ち削減の趣旨に反するため昇格で守る。
+- **追加フィールドはすべて `#[serde(default)]`:** `self_review_ledger` / `self_review_last_head` /
+  `self_review_final_fix_unreviewed`。旧 checkpoint は既定値(空・None・false)で読め、
+  false は「clean 収束扱い」= 従来の footer に落ちるので安全側。
 - **rollback:** 本 slice を revert しても、新フィールドは `#[serde(default)]` なので旧バイナリは
   未知キーを無視して読める(serde 既定)。危険な不可逆操作は無い。forge 側の状態は増えない
   (self-review は forge を触らない。escalate 時の draft は ADR 0021 の既存経路)。
@@ -180,15 +233,26 @@ loop:
 `self_review.rs` の unit tests(`FakeMux`/`FakeForge` + in-memory store)を主に、受け入れ観点を写す:
 
 1. **台帳の永続と resume**:台帳を積んだ checkpoint を serialize→deserialize しても status・
-   fix_attempts・waive 理由・決定内容が維持される(+ 旧 `self_review_pending` からの昇格)。
-2. **round 2+ プロンプト**:台帳(open + waive 理由 + 決定内容)と増分 diff が prompt に含まれ、
+   author_disposition・fix_attempts・waive 理由・決定内容が維持される(+ 旧 `self_review_pending`
+   からの昇格)。`self_review_final_fix_unreviewed` も serialize round-trip で維持されることを確認。
+2. **status 遷移**(finding #2):open→fix turn 申告(status 据え置き・fix_attempts++)→ 次 review が
+   omit で `fixed`/`waived`、再掲で `open` 継続、を遷移表どおり検証。waive 再掲で fix_attempts が
+   積まれ ping-pong に届くことも。
+3. **round 2+ プロンプト**:台帳(open + waive 理由 + 決定内容)と増分 diff が prompt に含まれ、
    「解消確認 + 新規のみ」「decision は再審禁止」の文言が入る。
-3. **ping-pong で escalate**:同一 id が fix を2回経てなお open → `NeedsHuman` + `pingpong` event。
-4. **cap + 軽微残 → 最終 fix → publish**:ping-pong/decision 異議が無く cap 到達 → 最終 fix +
-   validate → publish、footer に「最終 fix 未再レビュー」、`final_fix` event。escalate しない。
-5. **decision finding**:記録(fixed 申告 + spec 反映)で解消される経路と、reviewer が
+4. **ping-pong で escalate**:同一 id が fix を2回経てなお open → `NeedsHuman` + `pingpong` event。
+5. **cap + 軽微残 → 最終 fix → publish**(finding #1 込み):ping-pong/decision 異議が無く cap 到達
+   → 最終 fix + validate → publish、`final_fix` event、escalate しない。かつ:
+   - `self_review_final_fix_unreviewed==true` が checkpoint に persist される。
+   - `compose_pr_body` の**出力**に「最終 fix 未再レビュー」footer/本文行が入る(clean 収束の
+     出力には入らない、を対で確認)。
+   - `post_self_review_status` が渡す desc が "final fix unreviewed · N rounds"(clean は
+     "clean · N rounds")である。FakeForge の記録に対してアサートする。
+   - 最終 fix 済み checkpoint(converged=true & final_fix_unreviewed=true)で resume すると
+     再レビューせず Continue(footer 判定が resume 後も生きる)。
+6. **decision finding**:記録(fixed 申告 + spec 反映)で解消される経路と、reviewer が
    `needs_human`(記録済み decision への異議)で escalate する経路。
-6. **read_review 双方向**:`fixable`+findings 空、`needs_human`+findings 非空 が reject。kind 既定。
+7. **read_review 双方向**:`fixable`+findings 空、`needs_human`+findings 非空 が reject。kind 既定。
 
 統合テスト(`tests/*.rs` + `fake_agent.sh`)は本 slice では必須にしない(unit で受け入れ観点を
 被覆できる)。既存 self-review 統合テストがあれば台帳導入で壊れないことだけ確認する。
