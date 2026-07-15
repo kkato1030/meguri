@@ -18,7 +18,7 @@ fn deps_for(store: &Store, project: &str, window: usize) -> Deps {
     config.drift.window = window;
     let project_cfg = ProjectConfig {
         id: project.into(),
-        repo_path: std::path::PathBuf::from("/tmp/none"),
+        repo_path: Some(std::path::PathBuf::from("/tmp/none")),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,

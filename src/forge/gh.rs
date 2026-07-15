@@ -62,6 +62,33 @@ fn is_dependency_exists(stderr: &str) -> bool {
     lower.contains("already") && (lower.contains("depend") || lower.contains("block"))
 }
 
+/// Create a GitHub repository from scratch, initial commit included
+/// (`--add-readme`), so it has a default branch the moment it exists — a
+/// commit-0 repo has no default branch and breaks `worktree add` / the PR base
+/// (issue #196, ADR 0019). The one place meguri shells out to `gh repo create`.
+///
+/// A free function, not a [`Forge`] method: `GhForge` is built per existing slug
+/// and all its methods operate on a repo that already exists, whereas creation
+/// runs before any such repo — the same shape as [`crate::gitops::ensure_bare_clone`]
+/// being a free function. **Irreversible**: meguri never deletes a repo it
+/// created, so the caller (not this function) owns recovery on later failure.
+pub async fn create_repo(slug: &str, public: bool) -> Result<()> {
+    let visibility = if public { "--public" } else { "--private" };
+    let out = tokio::process::Command::new("gh")
+        .args(["repo", "create", slug, visibility, "--add-readme"])
+        .output()
+        .await
+        .context("spawning gh (is the GitHub CLI installed?)")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "gh repo create {slug} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
 pub struct GhForge {
     /// "owner/repo"
     repo: String,

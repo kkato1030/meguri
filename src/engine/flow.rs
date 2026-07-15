@@ -1068,7 +1068,7 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
         .unwrap_or_else(crate::config::worktrees_root);
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
     gitops::create_worktree(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         &wt,
         &branch,
         &deps.project.default_branch,
@@ -1104,7 +1104,7 @@ pub(crate) async fn attach_pr_worktree(
         .unwrap_or_else(crate::config::worktrees_root);
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
     gitops::attach_worktree(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         &wt,
         &branch,
         &deps.project.worktree_setup.exclude,
@@ -2487,7 +2487,7 @@ mod tests {
         };
         let project = ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,
@@ -2987,7 +2987,7 @@ mod tests {
         ));
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path,
+            repo_path: Some(repo_path),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

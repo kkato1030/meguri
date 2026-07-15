@@ -84,7 +84,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -236,7 +236,7 @@ async fn fixer_happy_path_pushes_fix_to_pr_branch_and_replies() {
     // The check command also proves validation runs inside the fix worktree.
     let env = setup(Some("test -f feature.txt")).await;
     let run = create_fixer_run(&env);
-    let tip_before = origin_tip(&env.deps.project.repo_path).await;
+    let tip_before = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         let wt = wt.to_path_buf();
@@ -266,7 +266,7 @@ async fn fixer_happy_path_pushes_fix_to_pr_branch_and_replies() {
     assert_eq!(record.branch.as_deref(), Some(PR_BRANCH));
 
     // The fix commit landed on the PR's branch on origin.
-    let tip_after = origin_tip(&env.deps.project.repo_path).await;
+    let tip_after = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
     assert_ne!(tip_before, tip_after, "origin tip must advance");
 
     // The thread is parked: meguri replied last, asking for re-review.
@@ -322,7 +322,7 @@ async fn fixer_reviewer_ping_pong_converges() {
         .expect("fixer round 1 timed out")
         .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
-    let tip_round1 = origin_tip(&env.deps.project.repo_path).await;
+    let tip_round1 = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
 
     // Parked: awaiting re-review, discovery stays quiet.
     assert!(FixerLoop.discover(&env.deps).await.unwrap().is_empty());
@@ -342,7 +342,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
     agent.abort();
 
-    let tip_round2 = origin_tip(&env.deps.project.repo_path).await;
+    let tip_round2 = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
     assert_ne!(tip_round1, tip_round2, "round 2 must push a new fix");
 
     // The reviewer accepts: the thread resolves and the loop converges.

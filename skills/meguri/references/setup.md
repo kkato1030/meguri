@@ -13,20 +13,27 @@ don't decide these for them, ask explicitly and wait for an answer before moving
    the fastest command that still gives real confidence — unit tests, not a slow full E2E
    suite, unless that's genuinely all there is.
 
-3. **Draft the project config.** `meguri init` writes `~/.meguri/config.toml` with a minimal
-   stub if it doesn't exist yet. Show the user a `[[projects]]` entry for this repo:
+3. **Add the project with one command.** `meguri init` writes `~/.meguri/config.toml` if it
+   doesn't exist yet (with zero live projects — the `[[projects]]` stub is commented out). Then
+   add this repo in one step instead of hand-editing the file:
 
-   ```toml
-   [[projects]]
-   id = "..."
-   repo_path = "/abs/path/to/this/checkout"
-   repo_slug = "owner/repo"       # omit if mode = "local"
-   check_command = "..."          # from step 2
+   ```
+   meguri add-project owner/repo            # appends a [[projects]] entry and materializes the clone
+   meguri add-project owner/repo --create   # also `gh repo create`s a brand-new repo (initial commit incl.)
    ```
 
+   `add-project` appends to the config (comments and hand edits are preserved), clones the repo
+   into `~/.meguri/repos/<id>`, and runs the environment checks in-line. Add `--id <id>` to
+   override the derived id. The `check_command` from step 2 is optional (meguri still verifies
+   the git conditions without it) — add it to the `[[projects]]` entry afterwards if you want it.
+
    If this repo has no GitHub remote, or the user doesn't want an agent touching issue labels,
-   propose `mode = "local"` instead — `repo_slug` becomes optional, `gh` isn't required, and
-   work is queued with `meguri add` instead of labels (see the README's "Local mode" section).
+   use `meguri add-project --local /abs/path/to/this/checkout` instead — a local-mode project:
+   `repo_slug` isn't needed, `gh` isn't required, and work is queued with `meguri add` instead of
+   labels (see the README's "Local mode" section).
+
+   `--create` creates a real GitHub repo and **cannot be rolled back automatically** — meguri
+   never deletes a repo it created. Only use it when the user actually wants a new repo.
 
 4. **STOP — confirm with the user: yolo mode vs. gated permissions.** The default `[agent]`
    profile runs `--dangerously-skip-permissions` (fully unattended). Ask explicitly whether

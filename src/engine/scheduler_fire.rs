@@ -178,7 +178,7 @@ async fn render_body(deps: &Deps, sched: &ScheduleConfig) -> Result<String> {
         (Some(inline), _) => inline.clone(),
         (None, Some(rel)) => {
             let read = crate::gitops::read_file_at_default_branch(
-                &deps.project.repo_path,
+                &deps.repo_path(),
                 &deps.project.default_branch,
                 rel,
             )
