@@ -29,9 +29,10 @@ migration/rollback 節は不要(veto ルール非該当)。未決事項は「終
   `Failure` / `NeedsHuman` / `NeedsPlan` / `Decompose` を返す、2回目の契約違反(review turn が tree を汚す/
   レビューファイル欠落・fix turn が tree を汚したまま)で `NeedsHuman` に抜ける、pane 死・中断。これらは
   「フェーズが完走しなかった」ケースであって cap 落ちとは別物なので、分母には入れない(下の決定1)。
-- `self_review.reviewed` `{round, verdict, findings}` は毎 round、
-  `self_review.correction` `{problem}` は review turn の契約違反(tree を汚す/ファイル欠落)
-  1回につき1つ出る。いずれも既存。
+- `self_review.reviewed` `{round, verdict, findings}` は verdict が `clean` / `fixable` の round でだけ出る。
+  `needs_human` verdict の round は、その手前で `self_review.needs_human` を出して即抜けるので `reviewed` は
+  出ない(`self_review.rs:136` 以降 → emit は `:157`)。`self_review.correction` `{problem}` は review turn の
+  契約違反(tree を汚す/ファイル欠落)1回につき1つ。いずれも既存イベント。
 - events は `run_id` を持ち、`runs(id)` に `project_id` / `loop_kind` / `agent_profile` がある。
   集計はこの join でやる。自己レビューのイベントは **著者 run の `run_id`** で出る
   (review turn は `self-reviewer` profile の別レーンで走るが run は同じ)。したがって
