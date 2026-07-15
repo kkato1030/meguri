@@ -11,7 +11,7 @@
 //! production [`SystemGateway`] shells out to `osascript` and `curl` — the
 //! codebase embeds no HTTP client (GitHub goes through the `gh` CLI too).
 //! Every channel is best-effort: a delivery failure is logged, never fails a
-//! turn (issue #205 invariant, ADR 0018).
+//! turn (issue #205 invariant, ADR 0020).
 
 pub mod fake;
 
@@ -28,7 +28,7 @@ use crate::config::{NotificationsConfig, WebhookKind};
 /// The public `events` allowlist tokens (config-facing names). One token can
 /// bundle several internal store event kinds — notably `awaiting_human` covers
 /// `turn.awaiting_human` / `review.awaiting_human` / `spec_fixer.budget_exhausted`
-/// (ADR 0018). `label` is intentionally absent: label watching is authorized
+/// (ADR 0020). `label` is intentionally absent: label watching is authorized
 /// per-project via `[projects.notify]`, not through this global list.
 pub const NOTIFY_EVENT_TOKENS: &[&str] = &[
     "awaiting_human",

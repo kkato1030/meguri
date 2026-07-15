@@ -1,4 +1,4 @@
-# ADR 0018: 通知シンクはイベント駆動の best-effort — 完了契約から切り離す
+# ADR 0020: 通知シンクはイベント駆動の best-effort — 完了契約から切り離す
 
 - Status: accepted
 - Date: 2026-07-14
