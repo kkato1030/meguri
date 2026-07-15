@@ -38,7 +38,7 @@ fn make_project(
 ) -> ProjectConfig {
     ProjectConfig {
         id: "proj".into(),
-        repo_path,
+        repo_path: Some(repo_path),
         repo_slug: if mode == ProjectMode::Local {
             None
         } else {

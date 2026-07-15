@@ -148,7 +148,7 @@ async fn real_claude_implements_issue_in_tmux() {
 
     let project = ProjectConfig {
         id: "sandbox".into(),
-        repo_path: clone.clone(),
+        repo_path: Some(clone.clone()),
         repo_slug: Some("local/sandbox".into()),
         mode: Default::default(),
         deliver: None,

@@ -63,9 +63,10 @@ Prereqs: `git`, [`gh`](https://cli.github.com) (authenticated), an agent CLI (`c
 Platform: core meguri (CLI, `watch`, all loops) runs on macOS and Linux; `meguri daemon install` (the `launchd` supervisor, see [Keep it running](#keep-it-running-daemon)) is macOS-only.
 
 ```bash
-cargo install --path .   # or: cargo build --release
-meguri init              # writes ~/.meguri/config.toml, creates the db
-meguri doctor            # checks gh auth, mux, agent CLI
+cargo install --path .            # or: cargo build --release
+meguri init                       # writes ~/.meguri/config.toml (no live projects yet), creates the db
+meguri add-project owner/repo     # appends a [[projects]] entry and clones the repo
+meguri doctor                     # checks gh auth, mux, agent CLI
 ```
 
 Other ways to get the binary:
@@ -73,18 +74,29 @@ Other ways to get the binary:
 - **Prebuilt binary** — download the archive for your platform (macOS arm64 / Linux x86_64) from the [latest GitHub Release](https://github.com/kkato1030/meguri/releases/latest), verify its `.sha256`, extract, and put `meguri` on your `PATH`.
 - **crates.io** — `cargo install meguri` (once the crate is published; see [Status / roadmap](#status--roadmap)).
 
-`meguri init` writes a minimal `~/.meguri/config.toml` with this project stub — fill it in:
+**Add a project with one command.** `meguri init` writes a minimal `~/.meguri/config.toml` with **no live projects** (the `[[projects]]` stub is commented out). `meguri add-project` is how you add one — it appends a `[[projects]]` entry (preserving your comments and hand edits), materializes the clone, and runs the environment checks in-line:
+
+```bash
+meguri add-project owner/repo              # existing GitHub repo
+meguri add-project owner/repo --create     # create a brand-new repo first (gh repo create, initial commit incl.)
+meguri add-project owner/repo --id myproj  # override the derived project id (default: the repo name)
+meguri add-project --local /abs/path       # a local-mode project (no GitHub; see Local mode)
+```
+
+`--create` makes a real GitHub repo with an initial commit (so it has a default branch immediately) and **cannot be rolled back automatically** — meguri never deletes a repo it created. It defaults to a private repo; add `--public` for a public one. You can still hand-write `[[projects]]` if you prefer — the entry `add-project` writes is a normal one:
 
 ```toml
 [[projects]]
 id = "myproj"
-repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
+# repo_path = "/abs/path/to/clone"  # omit to let meguri manage the clone (see below)
 # default_branch = "main"
 # check_command = "cargo test"   # recommended: meguri runs this itself
 ```
 
 Everything else is optional: write a section/key only to override its default (see [Configuration](#configuration)).
+
+**Managed clone.** Omit `repo_path` and meguri materializes a **bare** clone at `~/.meguri/repos/<id>` from `repo_slug` (via `gh`, inheriting its credentials) and owns it — you declare the slug, meguri handles the clone. It lives outside `~/.meguri/worktrees`, is never checked out, and is created (and re-created if missing) on the next `watch`/`run`; `meguri doctor` shows each project as *cloned*, *not cloned yet*, or *broken*, and flags a `gh` token that can't push. Set `repo_path` explicitly to point at a clone you maintain yourself (the previous behavior — meguri never clones over it). Note: with a managed clone there is no working copy for a `worktree_setup` step to `cp` secrets (`.env`, `.claude/settings.local.json`) *from* — supply those from a host-side source instead. **Local-mode projects still require `repo_path`** (there is no `repo_slug` to clone from).
 
 ### Let coding agents propose meguri
 

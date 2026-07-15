@@ -33,7 +33,7 @@ fn deps_with_store(forge: Arc<FakeForge>, store: meguri::store::Store) -> Deps {
     config.pr.auto_merge.enabled = true;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: "/tmp/unused".into(),
+        repo_path: Some("/tmp/unused".into()),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,

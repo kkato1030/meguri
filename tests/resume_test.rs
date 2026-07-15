@@ -74,7 +74,7 @@ async fn setup() -> TestEnv {
     config.agent.session_dir = Some(session_root.clone());
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,

@@ -41,7 +41,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let clone = init_origin_and_clone(root).await;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -76,9 +76,15 @@ async fn add_worktree(deps: &Deps, issue: i64, title: &str) -> (String, PathBuf)
     let branch = gitops::branch_name(issue, title, &format!("run-{issue}"));
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &branch);
-    gitops::create_worktree(&deps.project.repo_path, &wt, &branch, "main", &[])
-        .await
-        .unwrap();
+    gitops::create_worktree(
+        deps.project.repo_path.as_ref().unwrap(),
+        &wt,
+        &branch,
+        "main",
+        &[],
+    )
+    .await
+    .unwrap();
     std::fs::write(wt.join("work.txt"), format!("issue {issue}\n")).unwrap();
     run_git(&wt, &["add", "work.txt"]).await.unwrap();
     run_git(
@@ -108,12 +114,21 @@ async fn add_review_worktree(deps: &Deps, pr: i64) -> PathBuf {
         .unwrap();
     let root = deps.project.worktree_root.clone().unwrap();
     let wt = gitops::worktree_path(&root, &deps.project.id, &format!("review-{pr}-{}", run.id));
-    let head = run_git(&deps.project.repo_path, &["rev-parse", "HEAD"])
-        .await
-        .unwrap();
-    gitops::create_review_worktree(&deps.project.repo_path, &wt, "pr-head", head.trim(), &[])
-        .await
-        .unwrap();
+    let head = run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", "HEAD"],
+    )
+    .await
+    .unwrap();
+    gitops::create_review_worktree(
+        deps.project.repo_path.as_ref().unwrap(),
+        &wt,
+        "pr-head",
+        head.trim(),
+        &[],
+    )
+    .await
+    .unwrap();
     // A detached checkout reports no branch, so the run lookup goes by path;
     // store it canonicalized the way the reaper compares it.
     let wt = std::fs::canonicalize(&wt).unwrap();
@@ -165,7 +180,7 @@ async fn plan_classifies_closed_open_dirty_active_and_orphan() {
     // An orphan worktree under meguri's root with a non-meguri branch.
     let orphan_wt = root.path().join("worktrees/proj/manual-experiment");
     run_git(
-        &deps.project.repo_path,
+        deps.project.repo_path.as_ref().unwrap(),
         &[
             "worktree",
             "add",
@@ -203,12 +218,18 @@ async fn reclaim_removes_worktree_and_merged_branch() {
 
     let (branch, wt) = add_worktree(&deps, 5, "Shipped").await;
     // The PR merged: the branch's commits landed on origin/main.
-    run_git(&deps.project.repo_path, &["merge", &branch])
-        .await
-        .unwrap();
-    run_git(&deps.project.repo_path, &["push", "origin", "main"])
-        .await
-        .unwrap();
+    run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["merge", &branch],
+    )
+    .await
+    .unwrap();
+    run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["push", "origin", "main"],
+    )
+    .await
+    .unwrap();
     forge.close_issue(5);
 
     let candidates = reaper::plan(&deps).await.unwrap();
@@ -218,14 +239,17 @@ async fn reclaim_removes_worktree_and_merged_branch() {
     assert!(!wt.exists());
 
     // git worktree list is clean: only the primary checkout remains.
-    let listed = gitops::list_worktrees(&deps.project.repo_path)
+    let listed = gitops::list_worktrees(deps.project.repo_path.as_ref().unwrap())
         .await
         .unwrap();
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert!(
-        run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
-            .await
-            .is_err(),
+        run_git(
+            deps.project.repo_path.as_ref().unwrap(),
+            &["rev-parse", "--verify", &branch]
+        )
+        .await
+        .is_err(),
         "merged local branch is deleted"
     );
 }
@@ -244,15 +268,18 @@ async fn unmerged_branch_is_kept_without_force() {
     assert_eq!(reclaimed.len(), 1);
     assert!(!wt.exists(), "worktree goes even when the branch stays");
     assert!(!reclaimed[0].branch_deleted);
-    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
-        .await
-        .expect("unmerged branch survives without --force");
+    run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", "--verify", &branch],
+    )
+    .await
+    .expect("unmerged branch survives without --force");
 }
 
 /// Simulate a squash merge of `branch`: main gains an equivalent commit with
 /// a different sha, so the branch tip is *not* an ancestor of origin/main.
 async fn squash_merge_onto_main(deps: &Deps, issue: i64) {
-    let repo = &deps.project.repo_path;
+    let repo = deps.project.repo_path.as_ref().unwrap();
     std::fs::write(repo.join("work.txt"), format!("issue {issue}\n")).unwrap();
     run_git(repo, &["add", "work.txt"]).await.unwrap();
     run_git(
@@ -293,9 +320,12 @@ async fn squash_merged_branch_is_deleted_via_forge_pr_state() {
         "merged PR state deletes the squash-merged branch"
     );
     assert!(
-        run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
-            .await
-            .is_err(),
+        run_git(
+            deps.project.repo_path.as_ref().unwrap(),
+            &["rev-parse", "--verify", &branch]
+        )
+        .await
+        .is_err(),
         "squash-merged local branch is deleted"
     );
 }
@@ -315,9 +345,12 @@ async fn open_pr_branch_is_kept_without_force() {
     assert_eq!(reclaimed.len(), 1);
     assert!(!wt.exists());
     assert!(!reclaimed[0].branch_deleted);
-    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
-        .await
-        .expect("branch with an open PR survives without --force");
+    run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", "--verify", &branch],
+    )
+    .await
+    .expect("branch with an open PR survives without --force");
 }
 
 #[tokio::test]
@@ -337,9 +370,12 @@ async fn forge_lookup_failure_keeps_branch_but_reclaims_worktree() {
     assert_eq!(reclaimed.len(), 1, "worktree reclamation still succeeds");
     assert!(!wt.exists());
     assert!(!reclaimed[0].branch_deleted);
-    run_git(&deps.project.repo_path, &["rev-parse", "--verify", &branch])
-        .await
-        .expect("branch survives when the forge cannot answer");
+    run_git(
+        deps.project.repo_path.as_ref().unwrap(),
+        &["rev-parse", "--verify", &branch],
+    )
+    .await
+    .expect("branch survives when the forge cannot answer");
 }
 
 #[tokio::test]

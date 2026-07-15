@@ -22,7 +22,7 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
     config.autonomy = meguri::config::Autonomy::Full;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: "/tmp/unused".into(),
+        repo_path: Some("/tmp/unused".into()),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,

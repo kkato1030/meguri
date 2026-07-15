@@ -54,7 +54,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
 
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: None,
         mode: ProjectMode::Local,
         deliver: None, // local default is `branch`
@@ -236,7 +236,7 @@ async fn local_task_to_verified_branch() {
     // The run landed on the local branch; nothing was pushed (no remote at all).
     let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
     assert_eq!(record.status, RunStatus::Succeeded);
-    let clone = &env.deps.project.repo_path;
+    let clone = env.deps.project.repo_path.as_ref().unwrap();
     let branches = run_git(clone, &["branch", "--list"]).await.unwrap();
     assert!(
         branches.contains(&format!("meguri/t{}-", task.id)),

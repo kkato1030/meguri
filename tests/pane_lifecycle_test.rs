@@ -72,7 +72,7 @@ async fn setup() -> TestEnv {
     config.agent.session_dir = Some(session_root.clone());
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
@@ -131,8 +131,14 @@ impl Flavor for FixedBranchFlavor {
         let root = deps.project.worktree_root.clone().unwrap();
         let wt = gitops::worktree_path(&root, &deps.project.id, &self.branch);
         if !wt.exists() {
-            gitops::create_worktree(&deps.project.repo_path, &wt, &self.branch, "main", &[])
-                .await?;
+            gitops::create_worktree(
+                deps.project.repo_path.as_ref().unwrap(),
+                &wt,
+                &self.branch,
+                "main",
+                &[],
+            )
+            .await?;
         }
         deps.store
             .update_run_worktree(&run.id, &self.branch, &wt.to_string_lossy())?;

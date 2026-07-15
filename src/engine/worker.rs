@@ -527,7 +527,7 @@ mod tests {
         run.branch = Some("meguri/test".into());
         let project = ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

@@ -190,7 +190,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
     let mux = Arc::new(FakeMux::new(false));
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,
@@ -452,7 +452,7 @@ async fn drive_worker_scenario(
     let mux = Arc::new(FakeMux::new(false));
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         default_branch: "main".into(),
         language: None,

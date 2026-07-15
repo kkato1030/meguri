@@ -123,7 +123,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     config.review.enabled = false;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -420,7 +420,7 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     );
 
     // The implementation commit actually landed on the spec branch at origin.
-    let clone = &env.deps.project.repo_path;
+    let clone = env.deps.project.repo_path.as_ref().unwrap();
     run_git(clone, &["fetch", "origin", SPEC_BRANCH])
         .await
         .unwrap();

@@ -126,7 +126,7 @@ async fn setup_with(
     tweak(&mut config);
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: clone,
+        repo_path: Some(clone),
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
@@ -552,7 +552,7 @@ async fn needs_human_escalates_on_the_pr() {
 #[tokio::test(flavor = "multi_thread")]
 async fn second_round_reuses_pane_and_worktree() {
     let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let clone = env.deps.project.repo_path.clone();
+    let clone = env.deps.project.repo_path.clone().unwrap();
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         write_review(wt, "findings", "- still missing acceptance criteria");
