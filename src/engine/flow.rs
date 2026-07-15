@@ -921,14 +921,14 @@ pub(crate) async fn signal_review_parked(
         json!({ "pr": pr_number, "url": pr_url, "verdict": verdict, "head": head_sha }),
     );
     deps.notifier
-        .notify_awaiting_human(&Notification {
-            run_id: run.id.clone(),
-            issue_number: run.issue_number,
-            issue_title: run.issue_title.clone(),
-            reason: REASON_REVIEW_PARKED.to_string(),
-            attach: None,
-            url: Some(pr_url.to_string()),
-        })
+        .notify(&Notification::awaiting_human(
+            run.id.clone(),
+            run.issue_number,
+            run.issue_title.clone(),
+            REASON_REVIEW_PARKED,
+            None,
+            Some(pr_url.to_string()),
+        ))
         .await;
 }
 
@@ -2503,6 +2503,7 @@ mod tests {
             schedules: Vec::new(),
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
             triage: None,
             autonomy: None,
         };
@@ -3005,6 +3006,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         let deps = Deps::with_label_source(
             store,

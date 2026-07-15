@@ -711,6 +711,8 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) {
                     "clean.report_created",
                     json!({ "issue": number, "initializing": true }),
                 );
+                deps.notify_created_issue(number, REPORT_TITLE, &[forge::LABEL_CLEAN_REPORT])
+                    .await;
             }
             Err(e) => tracing::warn!("cannot create initializing report issue: {e:#}"),
         }
@@ -763,6 +765,8 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &CleanCheckpoint) -> Result<i6
             "clean.report_created",
             json!({ "issue": number }),
         )?;
+        deps.notify_created_issue(number, REPORT_TITLE, &[forge::LABEL_CLEAN_REPORT])
+            .await;
         number
     } else {
         deps.forge()

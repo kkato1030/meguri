@@ -51,6 +51,7 @@ fn deps_with_store(forge: Arc<FakeForge>, store: meguri::store::Store) -> Deps {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     Deps::with_label_source(
         store,

@@ -158,6 +158,24 @@ impl Deps {
             .as_ref()
             .expect("forge is required for this loop (github mode)")
     }
+
+    /// Push a notification for each watched label an issue meguri just created
+    /// in *this project's* repo (per-project `[projects.notify]`, issue #205).
+    /// The shared hook every own-repo `create_issue` site calls right after
+    /// creation — scheduler fire, cleaner/triage reports, planner children.
+    /// Cross-repo sibling children are excluded: this project's watch does not
+    /// govern another repo's issues. Best-effort.
+    pub async fn notify_created_issue(&self, number: i64, title: &str, labels: &[&str]) {
+        let watched = self
+            .project
+            .notify
+            .as_ref()
+            .map(|n| n.labels.as_slice())
+            .unwrap_or(&[]);
+        self.notifier
+            .notify_labels(number, title, watched, labels)
+            .await;
+    }
 }
 
 /// Materialize a project's managed bare clone if it is declared but missing —
@@ -487,19 +505,19 @@ impl TurnControl for StoreControl {
     async fn event(&self, kind: &str, data: serde_json::Value) {
         let awaiting = (kind == "turn.awaiting_human").then(|| {
             let run = self.store.get_run(&self.run_id).ok().flatten();
-            Notification {
-                run_id: self.run_id.clone(),
-                issue_number: run.as_ref().map_or(0, |r| r.issue_number),
-                issue_title: run.and_then(|r| r.issue_title),
-                reason: data["reason"].as_str().unwrap_or("unknown").to_string(),
+            Notification::awaiting_human(
+                self.run_id.clone(),
+                run.as_ref().map_or(0, |r| r.issue_number),
+                run.and_then(|r| r.issue_title),
+                data["reason"].as_str().unwrap_or("unknown"),
                 // Turn-scoped escalations point at the live pane, never a URL.
-                attach: Some(data["attach"].as_str().unwrap_or_default().to_string()),
-                url: None,
-            }
+                Some(data["attach"].as_str().unwrap_or_default().to_string()),
+                None,
+            )
         });
         let _ = self.store.emit(Some(&self.run_id), kind, data);
         if let Some(n) = awaiting {
-            self.notifier.notify_awaiting_human(&n).await;
+            self.notifier.notify(&n).await;
         }
     }
 }
@@ -678,6 +696,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         let deps = Deps::with_label_source(
             Store::open_in_memory().unwrap(),
