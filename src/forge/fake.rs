@@ -949,6 +949,7 @@ impl Forge for FakeForge {
         title: &str,
         body: &str,
         draft: bool,
+        labels: &[&str],
     ) -> Result<CreatedPr> {
         let mut prs = self.prs.lock().unwrap();
         let number = prs.len() as i64 + 1;
@@ -959,7 +960,7 @@ impl Forge for FakeForge {
             title: title.into(),
             body: body.into(),
             draft,
-            labels: Vec::new(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
             head_sha: String::new(),
             state: "open".into(),
         });

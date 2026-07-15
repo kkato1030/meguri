@@ -1052,6 +1052,8 @@ async fn settle_skip(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) {
                     "triage.report_created",
                     json!({ "issue": number, "initializing": true }),
                 );
+                deps.notify_created_issue(number, REPORT_TITLE, &[forge::LABEL_TRIAGE_REPORT])
+                    .await;
             }
             Err(e) => tracing::warn!("cannot create initializing triage report issue: {e:#}"),
         }
@@ -1126,6 +1128,8 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &TriageCheckpoint) -> Result<i
             "triage.report_created",
             json!({ "issue": number }),
         )?;
+        deps.notify_created_issue(number, REPORT_TITLE, &[forge::LABEL_TRIAGE_REPORT])
+            .await;
         number
     } else {
         deps.forge()

@@ -127,19 +127,21 @@ async fn reblock_inside_throttle_window_notifies_once() {
     );
     let delivered = s.gateway.delivered();
     assert_eq!(delivered.len(), 1, "second escalation must be throttled");
-    assert_eq!(delivered[0].run_id, s.run_id);
-    assert_eq!(delivered[0].issue_number, 7);
-    assert_eq!(
-        delivered[0].issue_title.as_deref(),
-        Some("awaiting_human 通知")
-    );
-    assert_eq!(delivered[0].reason, "agent_blocked");
+    assert_eq!(delivered[0].event, "awaiting_human");
+    assert_eq!(delivered[0].dedup_key, s.run_id);
+    assert!(delivered[0].title.contains("#7"));
+    assert!(delivered[0].title.contains("awaiting_human 通知"));
     assert!(
         delivered[0]
-            .attach
-            .as_deref()
-            .is_some_and(|a| a.contains("fake pane")),
-        "turn escalation points at the live pane"
+            .body
+            .contains("エージェントが人の入力を待っています"),
+        "reason surfaces in the body: {}",
+        delivered[0].body
+    );
+    assert!(
+        delivered[0].body.contains("fake pane"),
+        "turn escalation points at the live pane: {}",
+        delivered[0].body
     );
     assert!(
         delivered[0].url.is_none(),
@@ -186,5 +188,9 @@ async fn reblock_past_throttle_window_notifies_again() {
         2,
         "past the throttle window the human must be paged again"
     );
-    assert!(delivered.iter().all(|n| n.reason == "agent_blocked"));
+    assert!(
+        delivered
+            .iter()
+            .all(|n| n.body.contains("エージェントが人の入力を待っています"))
+    );
 }

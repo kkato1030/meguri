@@ -83,6 +83,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),

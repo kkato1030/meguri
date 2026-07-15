@@ -1127,13 +1127,25 @@ impl Forge for GhForge {
         title: &str,
         body: &str,
         draft: bool,
+        labels: &[&str],
     ) -> Result<CreatedPr> {
+        // `gh pr create --label` fails on labels that don't exist yet — create
+        // them first, same as `create_issue`. Applying labels here (not in a
+        // follow-up `add_pr_label`) keeps the PR from ever being observed
+        // unlabeled (issue #209).
+        for label in labels {
+            self.ensure_label(label).await;
+        }
         let mut args = vec![
             "pr", "create", "--repo", &self.repo, "--head", head, "--base", base, "--title", title,
             "--body", body,
         ];
         if draft {
             args.push("--draft");
+        }
+        for label in labels {
+            args.push("--label");
+            args.push(label);
         }
         let url = self.gh(&args).await?;
         let url = url

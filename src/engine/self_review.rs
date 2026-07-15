@@ -101,9 +101,36 @@ pub struct SelfReviewFile {
 }
 
 /// The worker's self-review phase: review→fix until clean or the rounds cap,
-/// then hand back to the flow to open the PR. Forge calls: zero. Interruption
-/// resumes from the checkpoint (rounds + pending findings persist).
+/// then hand back to the flow to open the PR. Forge calls: zero on the happy
+/// path. Interruption resumes from the checkpoint (rounds + pending findings
+/// persist).
+///
+/// On a genuine escalation ([`NeedsHuman`] — a `needs_human` verdict, the
+/// rounds cap, or a failed review/fix turn) the escalate-time fallback runs
+/// (issue #209, ADR 0021): if the branch is ahead of base, the committed work
+/// is published as a needs-human draft PR before the error propagates. This is
+/// the one place self-review touches the forge, and only when escalating —
+/// `Stopped`/`Interrupted` (user stop, pane death) return `Ok(..)` and never
+/// publish.
 pub(crate) async fn self_review(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &mut Checkpoint,
+    worktree: &Path,
+    flavor: &dyn Flavor,
+) -> Result<flow::StepFlow> {
+    match self_review_inner(deps, run, cp, worktree, flavor).await {
+        Err(e) if e.downcast_ref::<NeedsHuman>().is_some() => {
+            // Best-effort: the draft is a bonus for the human, never a reason to
+            // change the run's outcome — propagate the original NeedsHuman as-is.
+            flow::publish_needs_human_draft(deps, run, cp, worktree, flavor).await;
+            Err(e)
+        }
+        other => other,
+    }
+}
+
+async fn self_review_inner(
     deps: &Deps,
     run: &RunRecord,
     cp: &mut Checkpoint,
@@ -593,6 +620,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

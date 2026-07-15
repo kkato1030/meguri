@@ -99,6 +99,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -1089,9 +1090,11 @@ async fn self_review_escalates_when_rounds_run_out() {
         .expect("worker timed out");
     agent.abort();
 
-    // Non-convergence is a human gate now (issue #176, ADR 0012): the run fails
-    // and the issue is parked on needs-human — the PR is never opened (was
-    // "publish with a footer" before #176).
+    // Non-convergence is a human gate (issue #176, ADR 0012): the run fails and
+    // the issue is parked on needs-human. Since the branch is ahead of base, the
+    // committed work is also published as a needs-human draft PR — the evidence
+    // for the human (issue #209, ADR 0020) — instead of staying trapped in the
+    // worktree.
     assert!(result.is_err(), "unconverged self-review must fail the run");
     let kinds: Vec<String> = env
         .deps
@@ -1106,8 +1109,22 @@ async fn self_review_escalates_when_rounds_run_out() {
         "{kinds:?}"
     );
     assert!(
-        env.forge.prs().is_empty(),
-        "no PR is published when self-review does not converge"
+        kinds.contains(&"self_review.escalated_draft".to_string()),
+        "the committed work is published as evidence: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"pr.created".to_string()),
+        "an evidence draft is not a delivered PR: {kinds:?}"
+    );
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "exactly one needs-human draft");
+    assert!(prs[0].draft, "published as a draft");
+    assert!(
+        env.forge
+            .pr_labels_of(prs[0].number)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "draft is labeled needs-human at birth: {:?}",
+        prs[0].labels
     );
     let labels = env.forge.labels_of(7);
     assert!(
@@ -1163,12 +1180,28 @@ async fn self_review_needs_human_escalates_immediately() {
         kinds.contains(&"self_review.needs_human".to_string()),
         "{kinds:?}"
     );
-    // No fix round was spent, and no PR was published.
+    // No fix round was spent. The committed work is still published as a
+    // needs-human draft (issue #209, ADR 0020) — the diff is unverified evidence,
+    // not a delivered PR (`pr.created` is never emitted).
     assert!(
         !kinds.contains(&"self_review.fixed".to_string()),
         "needs_human must not spend a fix round: {kinds:?}"
     );
-    assert!(env.forge.prs().is_empty());
+    assert!(
+        kinds.contains(&"self_review.escalated_draft".to_string()),
+        "{kinds:?}"
+    );
+    assert!(!kinds.contains(&"pr.created".to_string()), "{kinds:?}");
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "exactly one needs-human draft");
+    assert!(prs[0].draft, "published as a draft");
+    assert!(
+        env.forge
+            .pr_labels_of(prs[0].number)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "draft is labeled needs-human at birth: {:?}",
+        prs[0].labels
+    );
     assert!(
         env.forge
             .labels_of(7)

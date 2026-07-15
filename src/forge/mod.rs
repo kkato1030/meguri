@@ -498,6 +498,11 @@ pub trait Forge: Send + Sync {
     async fn issue_comments(&self, issue: i64) -> Result<Vec<String>>;
     /// Comment on a pull request (same number space, different command).
     async fn pr_comment(&self, pr: i64, body: &str) -> Result<()>;
+    /// Open a pull request. `labels` are applied as part of creation (a single
+    /// forge operation), so the PR is never observable unlabeled — the
+    /// escalate-time needs-human draft (issue #209) relies on this to be
+    /// excluded by `pr_is_touchable` from its first moment. Pass `&[]` when the
+    /// PR needs no label at birth.
     async fn create_pr(
         &self,
         head: &str,
@@ -505,6 +510,7 @@ pub trait Forge: Send + Sync {
         title: &str,
         body: &str,
         draft: bool,
+        labels: &[&str],
     ) -> Result<CreatedPr>;
     async fn get_pr(&self, number: i64) -> Result<PullRequest>;
     /// The PR whose head is `branch`, if any — open PRs win over closed or

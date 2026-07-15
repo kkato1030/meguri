@@ -208,6 +208,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
@@ -469,6 +470,7 @@ async fn drive_worker_scenario(
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     let store = Store::open_in_memory().unwrap();
     let deps = Deps::with_label_source(store.clone(), mux.clone(), forge, config, project);

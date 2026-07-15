@@ -921,14 +921,14 @@ pub(crate) async fn signal_review_parked(
         json!({ "pr": pr_number, "url": pr_url, "verdict": verdict, "head": head_sha }),
     );
     deps.notifier
-        .notify_awaiting_human(&Notification {
-            run_id: run.id.clone(),
-            issue_number: run.issue_number,
-            issue_title: run.issue_title.clone(),
-            reason: REASON_REVIEW_PARKED.to_string(),
-            attach: None,
-            url: Some(pr_url.to_string()),
-        })
+        .notify(&Notification::awaiting_human(
+            run.id.clone(),
+            run.issue_number,
+            run.issue_title.clone(),
+            REASON_REVIEW_PARKED,
+            None,
+            Some(pr_url.to_string()),
+        ))
         .await;
 }
 
@@ -2258,7 +2258,14 @@ async fn open_pr(
         let draft = deps.config.pr_for(&deps.project).draft && !cp.automerge;
         let pr = deps
             .forge()
-            .create_pr(&branch, &deps.project.default_branch, &title, &body, draft)
+            .create_pr(
+                &branch,
+                &deps.project.default_branch,
+                &title,
+                &body,
+                draft,
+                &[],
+            )
             .await?;
         cp.pr_url = Some(pr.url.clone());
         cp.pr_number = Some(pr.number);
@@ -2280,6 +2287,124 @@ async fn open_pr(
     flavor.settle_presentation(deps, run, cp).await?;
     flavor.settle_labels(deps, run, cp).await?;
     Ok(pr_url)
+}
+
+/// Escalate-time fallback (issue #209, ADR 0021): when self-review cannot
+/// converge and the branch is ahead of base, push it and open a draft PR
+/// labeled `meguri:needs-human` so the half-finished artifact is visible on the
+/// forge instead of trapped in the worktree. The label rides PR creation (a
+/// single forge call), so the draft is never observable unlabeled and
+/// `pr_is_touchable` excludes it from the first moment.
+///
+/// Best-effort throughout: it never returns an error and never changes the
+/// run's terminal outcome — the caller still propagates the original
+/// `NeedsHuman` and escalates the issue with a comment (the draft is the
+/// evidence, the comment is the notification). No-op unless the project
+/// delivers via PR, a forge is present, and the branch has commits ahead of
+/// base. `pr.created` is deliberately NOT emitted (that event means "a verified
+/// deliverable shipped"); an escalate-time draft emits `self_review.escalated_draft`.
+///
+/// Resume-safe like `open_pr`: before creating it looks up any PR already on
+/// the branch (`pr_for_branch`) and adopts it, so a resume from
+/// `STEP_SELF_REVIEW` after a crash — or the same escalation re-running — never
+/// opens a duplicate.
+pub(crate) async fn publish_needs_human_draft(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &Checkpoint,
+    worktree: &Path,
+    flavor: &dyn Flavor,
+) {
+    if !matches!(deps.config.deliver_for(&deps.project), Deliver::Pr) || deps.forge.is_none() {
+        return;
+    }
+    let Some(branch) = run.branch.clone() else {
+        return;
+    };
+    let base = &deps.project.default_branch;
+
+    // Only publish when there is actually committed work to show; an
+    // unconverged run with an empty branch stays comment-only (the artifact
+    // never made it to a commit).
+    match gitops::commits_ahead(worktree, base).await {
+        Ok(0) => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                "issue #{}: cannot check commits ahead for needs-human draft: {e:#}",
+                run.issue_number
+            );
+            return;
+        }
+    }
+
+    // Resume-safety: self-review resumes at STEP_SELF_REVIEW, so a prior
+    // escalation of this run may have already opened the draft (a crash after
+    // create, or the same NeedsHuman path re-running on resume). Never open a
+    // second PR for the branch — adopt whatever exists, and don't resurrect one
+    // a human already closed (the "捨てる" recovery path). A lookup error is
+    // treated as "cannot confirm" and skips rather than risk a duplicate.
+    match deps.forge().pr_for_branch(&branch).await {
+        Ok(Some(pr)) => {
+            let _ = deps.store.emit(
+                Some(&run.id),
+                "self_review.escalated_draft_exists",
+                json!({ "pr": pr.number, "url": pr.url, "state": pr.state }),
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                "issue #{}: cannot check for an existing PR on {branch}: {e:#} — \
+                 skipping needs-human draft to avoid a duplicate",
+                run.issue_number
+            );
+            return;
+        }
+    }
+
+    if let Err(e) = gitops::push_branch(worktree, &branch).await {
+        let _ = deps.store.emit(
+            Some(&run.id),
+            "self_review.draft_push_failed",
+            json!({ "branch": branch, "error": format!("{e:#}") }),
+        );
+        return;
+    }
+
+    let title = flavor.pr_title(run, cp);
+    let lenses = &deps.config.review_for(&deps.project).lenses;
+    let body = compose_needs_human_draft_body(run, cp, lenses);
+    match deps
+        .forge()
+        .create_pr(
+            &branch,
+            base,
+            &title,
+            &body,
+            true,
+            &[forge::LABEL_NEEDS_HUMAN],
+        )
+        .await
+    {
+        Ok(pr) => {
+            let _ = deps.store.emit(
+                Some(&run.id),
+                "self_review.escalated_draft",
+                json!({ "pr": pr.number, "url": pr.url,
+                        "rounds": cp.self_review_rounds,
+                        "pending": cp.self_review_pending.len() }),
+            );
+        }
+        Err(e) => {
+            let _ = deps.store.emit(
+                Some(&run.id),
+                "self_review.draft_failed",
+                json!({ "branch": branch, "error": format!("{e:#}") }),
+            );
+        }
+    }
 }
 
 /// The PR-title formula every [`Flavor::pr_title`] shares (issue #136): the
@@ -2341,6 +2466,19 @@ pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
 /// no self-review ran (loops without it, or `review.enabled = false`), so the
 /// body stays clean.
 fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
+    // A published PR always converged (a non-clean review escalates, ADR 0012).
+    self_review_details_with_outcome(
+        cp,
+        lenses,
+        &format!("clean after {} rounds", cp.self_review_rounds),
+    )
+}
+
+/// Shared renderer for the folded self-review `<details>`: the `outcome`
+/// headline plus one line per round. Empty when no self-review round ran. The
+/// happy path passes a "clean after N rounds" outcome ([`self_review_details`]);
+/// the escalate-time evidence draft (issue #209) passes an "unconverged" one.
+fn self_review_details_with_outcome(cp: &Checkpoint, lenses: &[String], outcome: &str) -> String {
     if cp.self_review_log.is_empty() {
         return String::new();
     }
@@ -2357,12 +2495,45 @@ fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // A published PR always converged (a non-clean review escalates, ADR 0012).
-    let outcome = format!("clean after {} rounds", cp.self_review_rounds);
     format!(
         "\n\n<details>\n<summary>🔁 self-review — {outcome}</summary>\n\n\
          lenses: {lenses}\n\n{rounds}\n</details>",
         lenses = lenses.join(" / "),
+    )
+}
+
+/// The PR body for an escalate-time needs-human draft (issue #209, ADR 0021).
+/// Unlike [`compose_pr_body`], this is NOT a verified deliverable: self-review
+/// did not converge, so the tree carries no green guarantee. The body says so
+/// plainly, links the issue without closing it (`Refs #N`), and folds in the
+/// self-review round history for context.
+pub(crate) fn compose_needs_human_draft_body(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    lenses: &[String],
+) -> String {
+    let description = cp
+        .pr_body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cp.summary.trim());
+    let outcome = format!(
+        "未収束 · {} rounds · {} 件未解決",
+        cp.self_review_rounds,
+        cp.self_review_pending.len()
+    );
+    format!(
+        "{}.\n\n\
+         > ⚠️ **未収束の証拠物件です(グリーン保証なし)。** self-review が収束しなかったため、\
+         meguri が `meguri:needs-human` を付けて draft のまま公開しました。中身を見て活かすなら\
+         手で直して ready + `meguri:spec-ready` に、捨てるならこの PR を閉じてください。\n\n\
+         {}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+         as a needs-human draft from an interactive agent session (run `{}`).",
+        issue_reference(run.issue_number, false),
+        description,
+        self_review_details_with_outcome(cp, lenses, &outcome),
+        run.id
     )
 }
 
@@ -2503,6 +2674,7 @@ mod tests {
             schedules: Vec::new(),
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
             triage: None,
             autonomy: None,
         };
@@ -3005,6 +3177,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         let deps = Deps::with_label_source(
             store,
@@ -3205,5 +3378,271 @@ mod tests {
         attach_pr_worktree(&deps, &run, &cp).await.unwrap();
 
         assert!(wt.join("marker.txt").exists());
+    }
+
+    /// A minimal worker flavor whose only meaningful method is `pr_title` —
+    /// enough to exercise `publish_needs_human_draft` (issue #209).
+    struct DraftFlavor;
+
+    #[async_trait::async_trait]
+    impl Flavor for DraftFlavor {
+        fn trigger_label(&self) -> &'static str {
+            ""
+        }
+        fn execute_prompt(&self, _: &Deps, _: &RunRecord, _: &Checkpoint, _: &Path) -> String {
+            String::new()
+        }
+        fn verify_work(
+            &self,
+            _: &RunRecord,
+            _: &Checkpoint,
+            _: &Path,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
+            format!("draft: {} (#{})", cp.issue_title, run.issue_number)
+        }
+        async fn settle_labels(&self, _: &Deps, _: &RunRecord, _: &Checkpoint) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a real repo + worktree (optionally ahead of base, optionally wired
+    /// to a bare origin) plus a Deps over a FakeForge, and a run whose
+    /// branch/worktree point at it. The returned TempDirs must be kept alive by
+    /// the caller for the duration of the test.
+    async fn draft_env(
+        ahead: bool,
+        with_origin: bool,
+    ) -> (
+        Deps,
+        std::sync::Arc<crate::forge::fake::FakeForge>,
+        String,
+        PathBuf,
+        Vec<tempfile::TempDir>,
+    ) {
+        use crate::config::{Config, ProjectConfig};
+        use crate::gitops;
+        use crate::store::Store;
+
+        let repo = tempfile::tempdir().unwrap();
+        gitops::run_git(repo.path(), &["init", "-b", "main"])
+            .await
+            .unwrap();
+        gitops::run_git(repo.path(), &["config", "user.email", "t@example.com"])
+            .await
+            .unwrap();
+        gitops::run_git(repo.path(), &["config", "user.name", "t"])
+            .await
+            .unwrap();
+        std::fs::write(repo.path().join("seed.txt"), "seed").unwrap();
+        gitops::run_git(repo.path(), &["add", "."]).await.unwrap();
+        gitops::run_git(repo.path(), &["commit", "-m", "init"])
+            .await
+            .unwrap();
+
+        let origin = tempfile::tempdir().unwrap();
+        if with_origin {
+            let origin_str = origin.path().to_string_lossy().to_string();
+            gitops::run_git(repo.path(), &["clone", "--bare", ".", &origin_str])
+                .await
+                .unwrap();
+            gitops::run_git(repo.path(), &["remote", "add", "origin", &origin_str])
+                .await
+                .unwrap();
+            gitops::run_git(repo.path(), &["fetch", "origin"])
+                .await
+                .unwrap();
+        }
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let branch = "meguri/209-draft-test".to_string();
+        let wt = gitops::worktree_path(wt_root.path(), "proj", &branch);
+        gitops::create_worktree(repo.path(), &wt, &branch, "main", &[])
+            .await
+            .unwrap();
+        if ahead {
+            std::fs::write(wt.join("work.txt"), "wip").unwrap();
+            gitops::run_git(&wt, &["add", "."]).await.unwrap();
+            gitops::run_git(&wt, &["commit", "-m", "wip"])
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::worker::KIND, 209, "Add caching")
+            .unwrap();
+        let run_id = run.id.clone();
+        store
+            .update_run_worktree(&run_id, &branch, &wt.to_string_lossy())
+            .unwrap();
+
+        let project = ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some(repo.path().to_path_buf()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: Some(wt_root.path().to_path_buf()),
+            pr: None,
+            clean: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            triage: None,
+            autonomy: None,
+            notify: None,
+        };
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            Config::default(),
+            project,
+        );
+        (deps, forge, run_id, wt, vec![repo, origin, wt_root])
+    }
+
+    /// Escalating with committed work ahead of base opens exactly one draft PR
+    /// labeled `meguri:needs-human` — at creation, not via a follow-up call —
+    /// and emits `self_review.escalated_draft` (never `pr.created`).
+    #[tokio::test]
+    async fn escalate_publishes_needs_human_draft_when_ahead() {
+        let (deps, forge, run_id, wt, _tmp) = draft_env(true, true).await;
+        let run = deps.store.get_run(&run_id).unwrap().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            summary: "書きかけの要約".into(),
+            ..Default::default()
+        };
+
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+
+        let prs = forge.prs();
+        assert_eq!(prs.len(), 1, "exactly one draft opened");
+        let pr = &prs[0];
+        assert!(pr.draft, "opened as a draft");
+        assert!(
+            pr.labels
+                .iter()
+                .any(|l| l == crate::forge::LABEL_NEEDS_HUMAN),
+            "labeled needs-human at creation (not a separate add_pr_label): {:?}",
+            pr.labels
+        );
+        assert_eq!(pr.head, "meguri/209-draft-test");
+        assert_eq!(pr.base, "main");
+        assert!(pr.body.contains("Refs #209"), "links without closing");
+        assert!(
+            pr.body.contains("証拠物件"),
+            "body flags it as unconverged evidence: {}",
+            pr.body
+        );
+
+        let kinds: Vec<String> = deps
+            .store
+            .events_for_run(&run_id, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "self_review.escalated_draft"),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "pr.created"),
+            "an evidence draft must not count as a delivered PR: {kinds:?}"
+        );
+    }
+
+    /// Resume-safety: a second escalation of the same run (a crash after create,
+    /// or the same NeedsHuman path re-running on resume from STEP_SELF_REVIEW)
+    /// must NOT open a duplicate draft — it adopts the existing one.
+    #[tokio::test]
+    async fn escalate_is_idempotent_across_reruns() {
+        let (deps, forge, run_id, wt, _tmp) = draft_env(true, true).await;
+        let run = deps.store.get_run(&run_id).unwrap().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+
+        assert_eq!(
+            forge.prs().len(),
+            1,
+            "second run must not duplicate the draft"
+        );
+        let kinds: Vec<String> = deps
+            .store
+            .events_for_run(&run_id, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| *k == "self_review.escalated_draft")
+                .count(),
+            1,
+            "only the first run creates: {kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k == "self_review.escalated_draft_exists"),
+            "the re-run adopts the existing draft: {kinds:?}"
+        );
+    }
+
+    /// No commits ahead → nothing to show → comment-only (no PR).
+    #[tokio::test]
+    async fn escalate_stays_comment_only_when_not_ahead() {
+        let (deps, forge, run_id, wt, _tmp) = draft_env(false, true).await;
+        let run = deps.store.get_run(&run_id).unwrap().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+        assert!(forge.prs().is_empty(), "nothing committed → no draft");
+    }
+
+    /// A failed push falls back to comment-only (best-effort): no PR, and the
+    /// failure is recorded rather than silently swallowed.
+    #[tokio::test]
+    async fn escalate_falls_back_to_comment_only_on_push_failure() {
+        // No origin remote wired → `git push origin` fails.
+        let (deps, forge, run_id, wt, _tmp) = draft_env(true, false).await;
+        let run = deps.store.get_run(&run_id).unwrap().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+        assert!(forge.prs().is_empty(), "push failed → no draft");
+        let kinds: Vec<String> = deps
+            .store
+            .events_for_run(&run_id, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "self_review.draft_push_failed"),
+            "{kinds:?}"
+        );
     }
 }

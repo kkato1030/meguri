@@ -945,6 +945,7 @@ mod tests {
                 autonomy: None,
                 cadence: Vec::new(),
                 prompts: Default::default(),
+                notify: None,
             };
             let deps = Deps::with_label_source(
                 crate::store::Store::open_in_memory().unwrap(),
@@ -1025,6 +1026,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         let deps = Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),
@@ -1132,6 +1134,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         let deps = Deps::with_label_source(
             store,

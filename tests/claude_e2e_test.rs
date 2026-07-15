@@ -166,6 +166,7 @@ async fn real_claude_implements_issue_in_tmux() {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),

@@ -297,6 +297,9 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // Role preambles (issue #149): each configured path must resolve to
             // a regular file on the default branch (ADR 0015).
             ok &= doctor_prompts(cfg).await;
+            // Notify sink (issue #205): validate the webhook config, and with
+            // --probe send a real test message.
+            ok &= doctor_notify(cfg, probe).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -554,6 +557,34 @@ async fn doctor_schedules(cfg: &Config) -> bool {
         }
     }
     ok
+}
+
+/// Doctor's notify section (issue #205): if a webhook is configured, show the
+/// resolved flavor (Slack / ntfy / json), and with `--probe` send a real test
+/// message. Prints nothing when no webhook is set. The `events` allowlist is
+/// already validated at config load, so it is not re-checked here.
+async fn doctor_notify(cfg: &Config, probe: bool) -> bool {
+    let n = &cfg.notifications;
+    let Some(url) = &n.webhook_url else {
+        return true;
+    };
+    println!("\nnotify:");
+    let kind = meguri::notify::resolve_kind(n, url);
+    println!("  ✅ webhook: {kind:?}, events {:?}", n.events);
+    if !probe {
+        println!("  (pass --probe to send a test message)");
+        return true;
+    }
+    match meguri::notify::probe_webhook(n, url).await {
+        Ok(()) => {
+            println!("  ✅ probe: test message delivered");
+            true
+        }
+        Err(e) => {
+            println!("  ❌ probe: {e:#}");
+            false
+        }
+    }
 }
 
 /// Doctor's cadence section (issue #148): the config shape (label uniqueness,
