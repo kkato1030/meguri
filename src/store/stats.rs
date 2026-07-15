@@ -128,20 +128,38 @@ pub struct ReviewStatRow {
     /// Profile name, or [`UNROUTED`] (empty) for runs with no pinned profile.
     pub agent_profile: String,
     /// Completed phases = terminal-event total (clean + unconverged +
-    /// needs_human). Phases that escalate to a human without a terminal event
-    /// (agent failure, second contract violation, interruption) are not counted
-    /// — the denominator is "phases the review machinery ran to a conclusion".
+    /// needs_human + ping_pong + final_fix). Phases that escalate to a human
+    /// without a terminal event (agent failure, second contract violation,
+    /// interruption) are not counted — the denominator is "phases the review
+    /// machinery ran to a conclusion".
     pub phases: usize,
     pub clean: usize,
+    /// Legacy cap-escalation terminal (`self_review.unconverged`), pre-#212. No
+    /// longer emitted — the cap now runs a final fix (see `final_fix`) — but kept
+    /// so historical phases still count.
     pub unconverged: usize,
+    /// `self_review.needs_human` verdicts (the reviewer sent it to a human).
     pub needs_human: usize,
+    /// `self_review.pingpong` escalations (issue #212): a finding still open
+    /// after two fix turns. A human-gate terminal, folded into
+    /// `needs_human_rate`.
+    pub ping_pong: usize,
+    /// `self_review.final_fix` publishes (issue #212): the cap was reached with
+    /// only minor blocking left, so a final un-re-reviewed fix shipped. A
+    /// successful terminal (the PR opened) — counts toward `phases`.
+    pub final_fix: usize,
     /// `self_review.correction` events (a review turn's contract violation) in
     /// this group. Not a phase — a cost counted against `phases`.
     pub corrections: usize,
-    /// cap-escalation rate in percentage points: `unconverged / phases * 100`.
+    /// legacy cap-escalation rate in percentage points: `unconverged / phases
+    /// * 100` (historical; `final_fix_rate` is the live cap outcome).
     pub cap_rate: f64,
-    /// needs-human rate in percentage points: `needs_human / phases * 100`.
+    /// human-gate rate in percentage points: `(needs_human + ping_pong) / phases
+    /// * 100` — every terminal that put the ball on a person.
     pub needs_human_rate: f64,
+    /// final-fix publish rate in percentage points: `final_fix / phases * 100`
+    /// (issue #212) — how often the cap shipped an un-re-reviewed fix.
+    pub final_fix_rate: f64,
     /// correction rate in percentage points: `corrections / phases * 100` (may
     /// exceed 100 — a phase can take more than one corrective turn).
     pub correction_rate: f64,
@@ -371,7 +389,8 @@ impl Store {
     /// role, profile) for stable display.
     pub fn review_stats(&self, project: Option<&str>) -> Result<Vec<ReviewStatRow>> {
         use crate::engine::self_review::{
-            EVENT_CLEAN, EVENT_CORRECTION, EVENT_NEEDS_HUMAN, EVENT_UNCONVERGED,
+            EVENT_CLEAN, EVENT_CORRECTION, EVENT_FINAL_FIX, EVENT_NEEDS_HUMAN, EVENT_PINGPONG,
+            EVENT_UNCONVERGED,
         };
 
         // One self-review event joined to its authoring run.
@@ -389,8 +408,8 @@ impl Store {
                         e.kind, e.data_json
                  FROM events e
                  JOIN runs r ON r.id = e.run_id
-                 WHERE e.kind IN (?1, ?2, ?3, ?4)
-                   AND (?5 IS NULL OR r.project_id = ?5)
+                 WHERE e.kind IN (?1, ?2, ?3, ?4, ?5, ?6)
+                   AND (?7 IS NULL OR r.project_id = ?7)
                  ORDER BY e.id ASC",
             )?;
             let rows = stmt
@@ -400,6 +419,8 @@ impl Store {
                         EVENT_UNCONVERGED,
                         EVENT_NEEDS_HUMAN,
                         EVENT_CORRECTION,
+                        EVENT_PINGPONG,
+                        EVENT_FINAL_FIX,
                         project,
                     ],
                     |row| {
@@ -424,6 +445,8 @@ impl Store {
             clean: usize,
             unconverged: usize,
             needs_human: usize,
+            ping_pong: usize,
+            final_fix: usize,
             corrections: usize,
             rounds_hist: std::collections::BTreeMap<u32, usize>,
         }
@@ -452,6 +475,8 @@ impl Store {
                 }
                 k if k == EVENT_UNCONVERGED => acc.unconverged += 1,
                 k if k == EVENT_NEEDS_HUMAN => acc.needs_human += 1,
+                k if k == EVENT_PINGPONG => acc.ping_pong += 1,
+                k if k == EVENT_FINAL_FIX => acc.final_fix += 1,
                 k if k == EVENT_CORRECTION => acc.corrections += 1,
                 _ => {}
             }
@@ -461,7 +486,10 @@ impl Store {
         let mut rows = Vec::new();
         for key in order {
             let acc = &groups[&key];
-            let phases = acc.clean + acc.unconverged + acc.needs_human;
+            // Every terminal event is a completed phase (a phase emits exactly
+            // one). ping-pong and final-fix (issue #212) join the legacy triple.
+            let phases =
+                acc.clean + acc.unconverged + acc.needs_human + acc.ping_pong + acc.final_fix;
             // A group with corrections but no completed phase has an undefined
             // denominator — drop it (its phases never converged to a signal).
             if phases == 0 {
@@ -476,9 +504,14 @@ impl Store {
                 clean: acc.clean,
                 unconverged: acc.unconverged,
                 needs_human: acc.needs_human,
+                ping_pong: acc.ping_pong,
+                final_fix: acc.final_fix,
                 corrections: acc.corrections,
                 cap_rate: pct(acc.unconverged),
-                needs_human_rate: pct(acc.needs_human),
+                // Both a needs_human verdict and a ping-pong put the ball on a
+                // person — count them together as the human-gate rate.
+                needs_human_rate: pct(acc.needs_human + acc.ping_pong),
+                final_fix_rate: pct(acc.final_fix),
                 correction_rate: pct(acc.corrections),
                 rounds_hist: acc.rounds_hist.iter().map(|(&r, &c)| (r, c)).collect(),
             });
@@ -1330,6 +1363,64 @@ mod tests {
         assert_eq!(r.needs_human, 1);
         assert!((r.cap_rate - 100.0 / 3.0).abs() < 1e-9);
         assert!((r.needs_human_rate - 100.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn review_stats_counts_final_fix_and_ping_pong() {
+        use crate::engine::self_review::{EVENT_FINAL_FIX, EVENT_PINGPONG};
+        let store = Store::open_in_memory().unwrap();
+        // One group: 2 clean, 1 final_fix (success), 1 ping_pong (human gate) →
+        // 4 phases. final_fix is a completed phase (in the denominator, 25%);
+        // ping_pong folds into the human-gate rate (25%).
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 2}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            EVENT_FINAL_FIX,
+            json!({"rounds": 3, "pending": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            4,
+            "worker",
+            Some("sonnet"),
+            EVENT_PINGPONG,
+            json!({"id": "f1", "fix_attempts": 2}),
+        );
+
+        let rows = store.review_stats(Some("demo")).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.phases, 4, "final_fix and ping_pong count toward phases");
+        assert_eq!(r.clean, 2);
+        assert_eq!(r.final_fix, 1);
+        assert_eq!(r.ping_pong, 1);
+        assert!((r.final_fix_rate - 25.0).abs() < 1e-9);
+        // The human-gate rate is (needs_human + ping_pong) / phases.
+        assert!((r.needs_human_rate - 25.0).abs() < 1e-9);
+        assert_eq!(r.needs_human, 0);
+        assert!((r.cap_rate - 0.0).abs() < 1e-9, "no legacy unconverged");
     }
 
     #[test]

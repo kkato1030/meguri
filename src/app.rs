@@ -1247,9 +1247,10 @@ pub fn cmd_stats_collab(project: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `meguri stats review`: self-review cap-escalation / needs-human / correction
-/// rates and the round-to-clean distribution per `(role, profile)`, read from
-/// the durable `self_review.*` events (issue #213, ADR 0020). Same sqlite
+/// `meguri stats review`: self-review cap-escalation / needs-human (verdict +
+/// ping-pong) / final-fix / correction rates and the round-to-clean distribution
+/// per `(role, profile)`, read from the durable `self_review.*` events
+/// (issue #213/#212, ADR 0020). Same sqlite
 /// direct-read as `stats routing`/`collab` (works with the watch stopped).
 /// `project = None` spans every project; `Some(id)` restricts to one. The
 /// profile column is the **authoring** run's profile, not the reviewer's.
@@ -1265,8 +1266,8 @@ pub fn cmd_stats_review(project: Option<&str>) -> Result<()> {
     }
     println!("self-review stats — all completed phases per (role, profile)\n");
     println!(
-        "{:<8} {:<12} {:<16} {:>7} {:>7} {:>9} {:>8}",
-        "PROJECT", "ROLE", "PROFILE", "PHASES", "CAP", "NEEDHUMAN", "CORRECT"
+        "{:<8} {:<12} {:<16} {:>7} {:>7} {:>9} {:>8} {:>8}",
+        "PROJECT", "ROLE", "PROFILE", "PHASES", "CAP", "NEEDHUMAN", "FINALFIX", "CORRECT"
     );
     for r in &rows {
         let profile = if r.agent_profile.is_empty() {
@@ -1275,13 +1276,14 @@ pub fn cmd_stats_review(project: Option<&str>) -> Result<()> {
             &r.agent_profile
         };
         println!(
-            "{:<8} {:<12} {:<16} {:>7} {:>6.0}% {:>8.0}% {:>7.0}%",
+            "{:<8} {:<12} {:<16} {:>7} {:>6.0}% {:>8.0}% {:>7.0}% {:>7.0}%",
             r.project_id,
             r.loop_kind,
             profile,
             r.phases,
             r.cap_rate,
             r.needs_human_rate,
+            r.final_fix_rate,
             r.correction_rate,
         );
     }
