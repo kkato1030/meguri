@@ -40,6 +40,7 @@ fn managed_project(id: &str, repo_path: Option<PathBuf>, mode: ProjectMode) -> P
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     }
 }
 
