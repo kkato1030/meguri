@@ -1555,6 +1555,17 @@ impl Config {
             self.validate_cadence(p)?;
             self.validate_triage(p)?;
         }
+        // Reject unknown notify event tokens so a typo fails fast at load
+        // instead of silently never delivering (issue #205). Global config, so
+        // it runs regardless of whether any project is defined.
+        for e in &self.notifications.events {
+            if !crate::notify::NOTIFY_EVENT_TOKENS.contains(&e.as_str()) {
+                anyhow::bail!(
+                    "notifications.events has unknown token {e:?} (valid: {:?})",
+                    crate::notify::NOTIFY_EVENT_TOKENS
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1571,16 +1582,6 @@ impl Config {
                 p.id,
                 t.confidence_threshold
             );
-        }
-        // Reject unknown notify event tokens so a typo fails fast at load
-        // instead of silently never delivering (issue #205).
-        for e in &self.notifications.events {
-            if !crate::notify::NOTIFY_EVENT_TOKENS.contains(&e.as_str()) {
-                anyhow::bail!(
-                    "notifications.events has unknown token {e:?} (valid: {:?})",
-                    crate::notify::NOTIFY_EVENT_TOKENS
-                );
-            }
         }
         Ok(())
     }
