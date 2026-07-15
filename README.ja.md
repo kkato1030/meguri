@@ -62,9 +62,10 @@ meguri 自体の脆弱性を見つけた場合は [SECURITY.md](SECURITY.md) を
 対応プラットフォーム: meguri のコア（CLI・`watch`・全ループ）は macOS / Linux で動作します。`meguri daemon install`（`launchd` supervisor、「[常駐させる（daemon）](#常駐させるdaemon)」参照）は macOS 専用です。
 
 ```bash
-cargo install --path .   # or: cargo build --release
-meguri init              # writes ~/.meguri/config.toml, creates the db
-meguri doctor            # checks gh auth, mux, agent CLI
+cargo install --path .            # or: cargo build --release
+meguri init                       # ~/.meguri/config.toml を作成（プロジェクトは 0 件）、db も作成
+meguri add-project owner/repo     # [[projects]] を追記し、clone を実体化
+meguri doctor                     # gh 認証・mux・agent CLI を検査
 ```
 
 バイナリの入手方法（その他）:
@@ -72,18 +73,29 @@ meguri doctor            # checks gh auth, mux, agent CLI
 - **配布バイナリ** — [最新の GitHub Release](https://github.com/kkato1030/meguri/releases/latest) から自分のプラットフォーム（macOS arm64 / Linux x86_64）のアーカイブをダウンロードし、`.sha256` で検証・展開して `meguri` を `PATH` に置きます。
 - **crates.io** — `cargo install meguri`（crate の publish 後。[ステータス / ロードマップ](#ステータス--ロードマップ) を参照）。
 
-`meguri init` は次のプロジェクトスタブ入りの最小 `~/.meguri/config.toml` を書き出すので、値を埋めます:
+**プロジェクト追加は 1 コマンド。** `meguri init` は **プロジェクト 0 件**の最小 `~/.meguri/config.toml` を書きます（`[[projects]]` スタブはコメントアウト済み）。追加は `meguri add-project` で行います — `[[projects]]` を追記し（コメントや手編集は保持）、clone を実体化し、環境検査をその場で流します:
+
+```bash
+meguri add-project owner/repo              # 既存の GitHub repo
+meguri add-project owner/repo --create     # repo 新規作成から（gh repo create、初期コミット込み）
+meguri add-project owner/repo --id myproj  # 導出される id を上書き（既定: repo 名）
+meguri add-project --local /abs/path       # local mode プロジェクト（GitHub 不要。下記参照）
+```
+
+`--create` は初期コミット付きの実 GitHub repo を作る（= default branch が即座に存在する）ため、**自動ロールバックはできません** — meguri は自分が作った repo を削除しません。既定は private で、`--public` で public になります。`[[projects]]` を手書きしても構いません（`add-project` が書くのは普通のエントリです）:
 
 ```toml
 [[projects]]
 id = "myproj"
-repo_path = "/abs/path/to/clone"
 repo_slug = "owner/repo"
+# repo_path = "/abs/path/to/clone"  # 省略すると meguri が clone を管理します（下記参照）
 # default_branch = "main"
 # check_command = "cargo test"   # 推奨: meguri 自身がこれを実行して検証します
 ```
 
 それ以外はすべて任意です。既定値を上書きしたいセクション/キーだけを書きます（[設定](#設定) を参照）。
+
+**managed clone（管理 clone）。** `repo_path` を省略すると、meguri が `repo_slug` から `~/.meguri/repos/<id>` に **bare** clone を実体化して所有します（`gh` 経由で認証を継承）。slug を宣言すれば clone は meguri が面倒を見ます。置き場所は `~/.meguri/worktrees` の外で、checkout は持たず、次の `watch`/`run` で(無ければ)作られます。`meguri doctor` は各プロジェクトを *clone 済み* / *未 clone* / *壊れている* で表示し、push できない `gh` トークンも検出します。自分で維持する clone を使いたいときは `repo_path` を明示します（従来どおり。meguri が上書き clone することはありません)。なお managed clone では、`worktree_setup` が secrets（`.env` や `.claude/settings.local.json`）を `cp` する元の working copy が無いので、host 側の供給源から渡してください。**local mode は従来どおり `repo_path` 必須**です（clone 元の `repo_slug` が無いため)。
 
 ### コーディングエージェントに meguri を勧めさせる
 

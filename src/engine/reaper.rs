@@ -139,10 +139,10 @@ pub async fn plan(deps: &Deps) -> Result<Vec<Candidate>> {
 
 /// [`plan`] sharing an issue-state cache with a pane sweep of the same tick.
 pub async fn plan_with(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Candidate>> {
-    gitops::prune_worktrees(&deps.project.repo_path).await.ok();
+    gitops::prune_worktrees(&deps.repo_path()).await.ok();
     let root = project_worktree_root(deps);
     let mut candidates = Vec::new();
-    for wt in gitops::list_worktrees(&deps.project.repo_path).await? {
+    for wt in gitops::list_worktrees(&deps.repo_path()).await? {
         let path = std::fs::canonicalize(&wt.path).unwrap_or(wt.path);
         if !path.starts_with(&root) {
             continue; // not managed by meguri (e.g. the primary checkout)
@@ -255,13 +255,13 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
         if !fetched {
             fetched = true;
             gitops::run_git(
-                &deps.project.repo_path,
+                &deps.repo_path(),
                 &["fetch", "origin", &deps.project.default_branch],
             )
             .await
             .ok();
         }
-        if let Err(e) = gitops::remove_worktree(&deps.project.repo_path, &c.path).await {
+        if let Err(e) = gitops::remove_worktree(&deps.repo_path(), &c.path).await {
             tracing::warn!("cannot remove worktree {}: {e:#}", c.path.display());
             continue;
         }
@@ -288,7 +288,7 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
         });
     }
     if !reclaimed.is_empty() {
-        gitops::prune_worktrees(&deps.project.repo_path).await.ok();
+        gitops::prune_worktrees(&deps.repo_path()).await.ok();
     }
     Ok(reclaimed)
 }
@@ -302,7 +302,7 @@ pub async fn reclaim(deps: &Deps, candidates: &[Candidate], force: bool) -> Resu
 /// or a failed forge lookup keeps the branch, as before.
 async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool {
     let ancestor_err = match gitops::delete_branch(
-        &deps.project.repo_path,
+        &deps.repo_path(),
         branch,
         &deps.project.default_branch,
         force,
@@ -326,7 +326,7 @@ async fn delete_branch_if_merged(deps: &Deps, branch: &str, force: bool) -> bool
     match forge.pr_for_branch(branch).await {
         Ok(Some(pr)) if pr.state == "merged" => {
             match gitops::delete_branch(
-                &deps.project.repo_path,
+                &deps.repo_path(),
                 branch,
                 &deps.project.default_branch,
                 true,

@@ -27,6 +27,11 @@ pub const UNROUTED: &str = "";
 /// issue #66) — the ordinary pick, as opposed to `explore` / `escalated`.
 pub const ARM_MAIN: &str = "main";
 
+/// The read-side default for a run that was never stamped with a collab plane
+/// (feature off / ineligible loop / pre-migration run). Only `"advisor"` is
+/// ever written; NULL collapses to this (issue #121).
+pub const COLLAB_OFF: &str = "off";
+
 /// One terminal, scored run reduced to just the columns aggregation needs.
 struct RunOutcome {
     project_id: String,
@@ -34,6 +39,12 @@ struct RunOutcome {
     agent_profile: String,
     /// Routing arm: [`ARM_MAIN`], `"explore"`, or `"escalated"` (issue #66).
     routing_arm: String,
+    /// Collab plane: [`COLLAB_OFF`] or `"advisor"` (issue #121). NULL rows read
+    /// as `off`.
+    collab_mode: String,
+    /// The github issue number, or `None` for a local-task run. `collab_stats`
+    /// keeps only issue-backed runs (local tasks never get an advisor).
+    issue_number: Option<i64>,
     succeeded: bool,
     turn_no: i64,
     duration_secs: Option<i64>,
@@ -84,6 +95,26 @@ pub struct RoutingStatRow {
     pub avg_duration_secs: Option<f64>,
 }
 
+/// One row of `meguri stats collab` (issue #121): a `(role, profile, arm,
+/// collab_mode)` group over the most recent N scored runs. Same shape as
+/// [`RoutingStatRow`] with the collab plane added, so the CLI can put an `off`
+/// and an `advisor` row side by side for the same routing.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollabStatRow {
+    pub project_id: String,
+    pub loop_kind: String,
+    /// Profile name, or [`UNROUTED`] (empty) for runs with no pinned profile.
+    pub agent_profile: String,
+    /// Routing arm: [`ARM_MAIN`], `"explore"`, or `"escalated"` (issue #66).
+    pub routing_arm: String,
+    /// Collab plane: [`COLLAB_OFF`] or `"advisor"` (issue #121).
+    pub collab_mode: String,
+    pub runs: usize,
+    pub success_rate: f64,
+    pub avg_turns: f64,
+    pub avg_duration_secs: Option<f64>,
+}
+
 /// A group that has enough history to compare a recent window against the one
 /// before it — the input to drift detection.
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +158,7 @@ impl Store {
             let sql = format!(
                 "SELECT project_id, loop_kind, COALESCE(agent_profile, '') AS profile,
                         COALESCE(routing_arm, '{ARM_MAIN}') AS arm,
+                        COALESCE(collab_mode, '{COLLAB_OFF}') AS collab, issue_number,
                         status, turn_no, started_at, finished_at
                  FROM runs
                  WHERE status IN {SCORED_STATUSES}
@@ -153,6 +185,8 @@ impl Store {
                         loop_kind: row.get("loop_kind")?,
                         agent_profile: row.get("profile")?,
                         routing_arm: row.get("arm")?,
+                        collab_mode: row.get("collab")?,
+                        issue_number: row.get("issue_number")?,
                         succeeded: status == "succeeded",
                         turn_no: row.get("turn_no")?,
                         duration_secs,
@@ -212,6 +246,73 @@ impl Store {
                 loop_kind: key.1,
                 agent_profile: key.2,
                 routing_arm: key.3,
+                runs: agg.runs,
+                success_rate: agg.success_rate,
+                avg_turns: agg.avg_turns,
+                avg_duration_secs,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// `(role, profile, arm, collab_mode)` metrics over the most recent
+    /// `window` scored runs — `meguri stats collab` (issue #121). This is
+    /// `routing_stats` with the collab plane added to the key, so an `off` and
+    /// an `advisor` row for the same `(role, profile, arm)` sit next to each
+    /// other and the routing is held constant while only the collab plane
+    /// varies (ADR 0017).
+    ///
+    /// Only runs that could have received an advisor are counted: an
+    /// advisor-eligible loop kind (worker / spec-worker) AND a github issue
+    /// backing (local tasks never get an advisor — the agmsg team is
+    /// issue-scoped, ADR 0006). Everything else is dropped so it can't pollute
+    /// the `off` baseline. This narrowing lives here, not in the shared
+    /// `scored_outcomes` (routing stats count every run).
+    pub fn collab_stats(&self, project: Option<&str>, window: usize) -> Result<Vec<CollabStatRow>> {
+        let outcomes = self.scored_outcomes(project)?;
+        type Key = (String, String, String, String, String);
+        let mut order: Vec<Key> = Vec::new();
+        let mut groups: std::collections::HashMap<Key, Vec<&RunOutcome>> =
+            std::collections::HashMap::new();
+        for o in &outcomes {
+            // Keep only runs an advisor could have joined; the rest would skew
+            // the off/advisor comparison.
+            if !crate::collab::supports_advisor_loop_kind(&o.loop_kind) || o.issue_number.is_none()
+            {
+                continue;
+            }
+            let key = (
+                o.project_id.clone(),
+                o.loop_kind.clone(),
+                o.agent_profile.clone(),
+                o.routing_arm.clone(),
+                o.collab_mode.clone(),
+            );
+            let bucket = groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            });
+            if bucket.len() < window {
+                bucket.push(o);
+            }
+        }
+        order.sort();
+        let mut rows = Vec::with_capacity(order.len());
+        for key in order {
+            let bucket = &groups[&key];
+            let agg = WindowAgg::of(bucket);
+            let durations: Vec<i64> = bucket.iter().filter_map(|r| r.duration_secs).collect();
+            let avg_duration_secs = if durations.is_empty() {
+                None
+            } else {
+                Some(durations.iter().sum::<i64>() as f64 / durations.len() as f64)
+            };
+            rows.push(CollabStatRow {
+                project_id: key.0,
+                loop_kind: key.1,
+                agent_profile: key.2,
+                routing_arm: key.3,
+                collab_mode: key.4,
                 runs: agg.runs,
                 success_rate: agg.success_rate,
                 avg_turns: agg.avg_turns,
@@ -728,5 +829,270 @@ mod tests {
             store.get_cli_version("claude").unwrap(),
             Some(("2.0.0".to_string(), Some(2)))
         );
+    }
+
+    // --- collab stats (issue #121) -----------------------------------------
+
+    use crate::collab::COLLAB_MODE_ADVISOR;
+
+    /// Insert a scored issue-backed run with an explicit collab plane (and
+    /// optional routing arm), then close it. `collab = None` leaves the column
+    /// NULL (the read-side `off`).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_collab_run(
+        store: &Store,
+        project: &str,
+        issue: i64,
+        loop_kind: &str,
+        profile: Option<&str>,
+        arm: Option<&str>,
+        collab: Option<&str>,
+        turns: i64,
+        status: RunStatus,
+    ) {
+        let run = store
+            .create_run_for_loop(project, loop_kind, issue, "t")
+            .unwrap();
+        if let Some(p) = profile {
+            store.update_run_agent_profile(&run.id, p).unwrap();
+        }
+        if let Some(a) = arm {
+            store.update_run_routing_arm(&run.id, Some(a)).unwrap();
+        }
+        if let Some(c) = collab {
+            store.update_run_collab_mode(&run.id, c).unwrap();
+        }
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE runs SET turn_no = ?2 WHERE id = ?1",
+                    params![run.id, turns],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .update_run_status(&run.id, RunStatus::Running, None)
+            .unwrap();
+        store.update_run_status(&run.id, status, None).unwrap();
+    }
+
+    #[test]
+    fn collab_stats_splits_off_and_advisor_holding_routing_constant() {
+        // Same (worker, sonnet, main): 2 unstamped (off) runs and 2 advisor
+        // runs → two rows, distinguished only by the collab plane. Success
+        // rates are computed within each plane.
+        let store = Store::open_in_memory().unwrap();
+        // off: 1 succeeded, 1 failed → 50%.
+        seed_collab_run(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            None,
+            None,
+            4,
+            RunStatus::Succeeded,
+        );
+        seed_collab_run(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("sonnet"),
+            None,
+            None,
+            8,
+            RunStatus::Failed,
+        );
+        // advisor: 2 succeeded → 100%.
+        seed_collab_run(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            None,
+            Some(COLLAB_MODE_ADVISOR),
+            2,
+            RunStatus::Succeeded,
+        );
+        seed_collab_run(
+            &store,
+            "demo",
+            4,
+            "worker",
+            Some("sonnet"),
+            None,
+            Some(COLLAB_MODE_ADVISOR),
+            2,
+            RunStatus::Succeeded,
+        );
+
+        let rows = store.collab_stats(Some("demo"), 20).unwrap();
+        assert_eq!(rows.len(), 2, "one off row and one advisor row");
+        let off = rows.iter().find(|r| r.collab_mode == COLLAB_OFF).unwrap();
+        let adv = rows
+            .iter()
+            .find(|r| r.collab_mode == COLLAB_MODE_ADVISOR)
+            .unwrap();
+        // Both share the same routing (profile, arm) — collab is the only diff.
+        assert_eq!(off.agent_profile, "sonnet");
+        assert_eq!(adv.agent_profile, "sonnet");
+        assert_eq!(off.routing_arm, ARM_MAIN);
+        assert_eq!(adv.routing_arm, ARM_MAIN);
+        assert!((off.success_rate - 50.0).abs() < 1e-9);
+        assert!((adv.success_rate - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn collab_stats_reads_null_as_off() {
+        let store = Store::open_in_memory().unwrap();
+        seed_collab_run(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            None,
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        let rows = store.collab_stats(None, 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].collab_mode, COLLAB_OFF);
+    }
+
+    #[test]
+    fn collab_stats_keeps_routing_axes_separate() {
+        // Different profile or different arm must not collapse into one row,
+        // even at the same collab plane — otherwise collab and routing mix.
+        let store = Store::open_in_memory().unwrap();
+        seed_collab_run(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            None,
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        seed_collab_run(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("opus"),
+            None,
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        seed_collab_run(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            Some("escalated"),
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        let rows = store.collab_stats(Some("demo"), 20).unwrap();
+        // (sonnet, main), (opus, main), (sonnet, escalated) → 3 distinct rows.
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|r| r.agent_profile == "opus" && r.routing_arm == ARM_MAIN)
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.agent_profile == "sonnet" && r.routing_arm == "escalated")
+        );
+    }
+
+    #[test]
+    fn collab_stats_excludes_ineligible_loops_and_local_tasks() {
+        let store = Store::open_in_memory().unwrap();
+        // An advisor-eligible, issue-backed worker → included.
+        seed_collab_run(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            None,
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        // A planner run (not advisor-eligible) → excluded.
+        seed_collab_run(
+            &store,
+            "demo",
+            2,
+            "planner",
+            Some("sonnet"),
+            None,
+            None,
+            3,
+            RunStatus::Succeeded,
+        );
+        // A local-task worker (no issue backing) → excluded.
+        let local = store
+            .create_run_for_task("demo", crate::engine::worker::KIND, 42, "t")
+            .unwrap();
+        store
+            .update_run_status(&local.id, RunStatus::Running, None)
+            .unwrap();
+        store
+            .update_run_status(&local.id, RunStatus::Succeeded, None)
+            .unwrap();
+
+        let rows = store.collab_stats(Some("demo"), 20).unwrap();
+        assert_eq!(rows.len(), 1, "only the issue-backed worker survives");
+        assert_eq!(rows[0].loop_kind, "worker");
+    }
+
+    #[test]
+    fn collab_stats_window_keeps_only_recent() {
+        let store = Store::open_in_memory().unwrap();
+        // 3 older failures, then 2 newer successes, all same group; window=2
+        // keeps the 2 newest → 100%.
+        for i in 0..3 {
+            seed_collab_run(
+                &store,
+                "demo",
+                i,
+                "worker",
+                Some("sonnet"),
+                None,
+                None,
+                1,
+                RunStatus::Failed,
+            );
+        }
+        for i in 3..5 {
+            seed_collab_run(
+                &store,
+                "demo",
+                i,
+                "worker",
+                Some("sonnet"),
+                None,
+                None,
+                1,
+                RunStatus::Succeeded,
+            );
+        }
+        let rows = store.collab_stats(Some("demo"), 2).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runs, 2);
+        assert!((rows[0].success_rate - 100.0).abs() < 1e-9);
     }
 }

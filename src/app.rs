@@ -227,11 +227,12 @@ async fn add_github(
         }))
     };
 
+    let repo_path = cfg.repo_path_for(project);
     let params = AddParams {
         text,
         labels: &labels,
         repo_slug,
-        repo_path: &project.repo_path,
+        repo_path: &repo_path,
         language: cfg.language_for(project),
     };
     add_core(&forge, params, refiner_source).await?;
@@ -398,10 +399,11 @@ pub fn infer_project<'a>(
         .projects
         .iter()
         .filter(|p| {
-            let rp = p
-                .repo_path
-                .canonicalize()
-                .unwrap_or_else(|_| p.repo_path.clone());
+            // A managed clone is bare (no working tree the cwd could sit under),
+            // so this cwd-based match only ever hits explicit-`repo_path`
+            // projects — which is the intended pre-managed-clone behavior.
+            let effective = cfg.repo_path_for(p);
+            let rp = effective.canonicalize().unwrap_or(effective);
             // starts_with is component-wise, so `/repo` never matches `/repo2`.
             cwd_c.starts_with(&rp)
         })
@@ -464,6 +466,336 @@ pub fn compose_refined_body(refined_body: &str, original: &str) -> String {
     format!("{}\n\n---\n## 原文メモ\n{}", refined_body.trim(), original)
 }
 
+// ---- meguri add-project (issue #196, ADR 0019) ----
+
+/// A validated `meguri add-project` plan, produced by pure logic (no disk, no
+/// network) so it is unit-testable: the `[[projects]]` draft to append, and —
+/// for github — the slug (repo to clone / optionally create) and the mode.
+pub struct AddProjectPlan {
+    pub draft: config::ProjectDraft,
+    /// `Some(slug)` for github mode; `None` for local mode.
+    pub slug: Option<String>,
+    pub is_local: bool,
+}
+
+/// Turn the raw CLI arguments into a validated [`AddProjectPlan`], or explain
+/// why they are rejected. Pure: validates the slug/id/path, derives the id, and
+/// checks for a collision against the already-loaded `cfg` — no side effects, so
+/// it carries the whole "reject before touching config" contract (spec issue-196
+/// steps 1–2). clap already enforces flag exclusivity, so this does not re-check
+/// `--create`×`--local`; a caller that hands in both simply gets the local plan.
+pub fn plan_add_project(
+    cfg: &Config,
+    slug: Option<&str>,
+    id: Option<&str>,
+    local: Option<&str>,
+) -> Result<AddProjectPlan> {
+    let plan = match local {
+        Some(path) => {
+            let path_buf = PathBuf::from(path);
+            if !path_buf.is_absolute() {
+                bail!("--local path {path:?} must be absolute");
+            }
+            let id = resolve_project_id(id, config::default_id_from_path(&path_buf))?;
+            AddProjectPlan {
+                draft: config::ProjectDraft {
+                    id,
+                    repo_slug: None,
+                    repo_path: Some(path.to_string()),
+                    mode: Some("local".to_string()),
+                },
+                slug: None,
+                is_local: true,
+            }
+        }
+        None => {
+            let slug = slug.context("github mode needs an owner/repo (or use --local)")?;
+            config::validate_repo_slug(slug)?;
+            let id = resolve_project_id(id, Some(config::default_id_from_slug(slug)))?;
+            AddProjectPlan {
+                draft: config::ProjectDraft {
+                    id,
+                    repo_slug: Some(slug.to_string()),
+                    repo_path: None,
+                    mode: None,
+                },
+                slug: Some(slug.to_string()),
+                is_local: false,
+            }
+        }
+    };
+    check_project_collision(cfg, &plan.draft)?;
+    Ok(plan)
+}
+
+/// Resolve the effective project id: an explicit `--id` wins, else the derived
+/// default. Either way it must pass [`config::validate_project_id`]; a derived id
+/// that fails (a repo name that is not a safe path component) asks for `--id`.
+fn resolve_project_id(explicit: Option<&str>, derived: Option<&str>) -> Result<String> {
+    match explicit {
+        Some(id) => {
+            config::validate_project_id(id)?;
+            Ok(id.to_string())
+        }
+        None => {
+            let d = derived.context("could not derive a project id — pass --id <id>")?;
+            config::validate_project_id(d).with_context(|| {
+                format!("derived project id {d:?} is not usable — pass --id <id>")
+            })?;
+            Ok(d.to_string())
+        }
+    }
+}
+
+/// Reject a draft whose id (or, for github, repo_slug) already names an existing
+/// project — add-project only ever *adds*, never overwrites.
+fn check_project_collision(cfg: &Config, draft: &config::ProjectDraft) -> Result<()> {
+    if cfg.projects.iter().any(|p| p.id == draft.id) {
+        bail!("project id {:?} already exists in config", draft.id);
+    }
+    // GitHub slugs are case-insensitive: `Owner/Repo` and `owner/repo` are the
+    // same repository. Compare case-insensitively (as `gitops::clone_health`
+    // does) so the same repo can't be watched as two projects racing for the
+    // same issues/labels.
+    if let Some(slug) = &draft.repo_slug
+        && cfg.projects.iter().any(|p| {
+            p.repo_slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(slug))
+        })
+    {
+        bail!("repo_slug {slug:?} is already configured (project exists)");
+    }
+    Ok(())
+}
+
+/// `meguri add-project` — append a project to config.toml in one command
+/// (issue #196, ADR 0019). github: validate the slug, optionally `--create` the
+/// repo (initial commit included), append the `[[projects]]` block, materialize
+/// the managed clone, and run a scoped environment check. local: append a
+/// local-mode entry rooted at `--local <path>`. clap enforces the flag shapes;
+/// everything past parsing lives here.
+pub async fn cmd_add_project(
+    slug: Option<&str>,
+    create: bool,
+    public: bool,
+    id: Option<&str>,
+    local: Option<&str>,
+) -> Result<()> {
+    let cfg_path = config::config_path();
+    if !cfg_path.exists() {
+        bail!(
+            "no config at {} — run `meguri init` first",
+            cfg_path.display()
+        );
+    }
+    let cfg = Config::load()?;
+    let plan = plan_add_project(&cfg, slug, id, local)?;
+
+    // Best-effort audit trail; a missing/broken store must not block onboarding.
+    let store = open_store().ok();
+
+    // (3) Irreversible first, alone, loudly. meguri never deletes what it made,
+    // so if a later step fails the repo simply stays (reported below).
+    if create {
+        let slug = plan
+            .slug
+            .as_deref()
+            .context("--create needs an owner/repo slug")?;
+        println!(
+            "creating GitHub repo {slug} ({}) …",
+            if public { "public" } else { "private" }
+        );
+        crate::forge::gh::create_repo(slug, public)
+            .await
+            .with_context(|| format!("could not create repo {slug}"))?;
+        println!("✅ created {slug} (initial commit + default branch)");
+        if let Some(store) = &store {
+            let _ = store.emit(None, "repo.created", serde_json::json!({ "slug": slug }));
+        }
+    }
+
+    // (4–5) Append atomically, then reparse; restore the original bytes on
+    // failure so a created repo is never paired with a corrupt config.
+    let original = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("cannot read config at {}", cfg_path.display()))?;
+    config::append_project(&cfg_path, &plan.draft)?;
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            config::write_atomic(&cfg_path, &original)?;
+            return Err(e).context("appended config failed to reparse — rolled back");
+        }
+    };
+    println!(
+        "✅ added project {:?} to {}",
+        plan.draft.id,
+        cfg_path.display()
+    );
+    if let Some(store) = &store {
+        let _ = store.emit(
+            None,
+            "project.added",
+            serde_json::json!({
+                "id": plan.draft.id,
+                "mode": if plan.is_local { "local" } else { "github" },
+                "slug": plan.slug,
+            }),
+        );
+    }
+
+    let project = cfg
+        .project(&plan.draft.id)
+        .context("just-added project not found after reload (should not happen)")?;
+
+    // (6) Materialize the managed clone now so doctor is green immediately; a
+    // failure self-heals on the next watch tick (ADR 0018), so it never fails
+    // the command.
+    if let Some(slug) = &plan.slug
+        && cfg.is_managed_clone(project)
+    {
+        let dest = cfg.repo_path_for(project);
+        print!("cloning {slug} → {} … ", dest.display());
+        match crate::gitops::ensure_bare_clone(&dest, slug).await {
+            Ok(()) => println!("✅"),
+            Err(e) => println!("⚠️  {e:#} (will retry on the next `meguri watch` tick)"),
+        }
+    }
+
+    // (7) Scoped environment check — surface reds now, not at first run.
+    add_project_preflight(&cfg, project).await;
+
+    println!();
+    match project.mode {
+        ProjectMode::Github => {
+            println!("Next: `meguri watch`, then label an issue `meguri:ready` (or `meguri:plan`).")
+        }
+        ProjectMode::Local => {
+            println!("Next: `meguri add \"タスク\"` to queue work, then `meguri watch`.")
+        }
+    }
+    Ok(())
+}
+
+/// A focused, add-project-scoped rerun of the checks `meguri doctor` does for
+/// one project: git / gh / gh-auth / gh write permission (github) / a usable
+/// multiplexer / the default agent CLI. Advisory — it prints ✅/❌ and never
+/// fails the command (doctor stays the full surface). Shares the write-scope
+/// decision with doctor via [`can_push`] / [`gh_viewer_permission`].
+pub async fn add_project_preflight(cfg: &Config, project: &ProjectConfig) {
+    let mark = |ok: bool| if ok { "✅" } else { "❌" };
+    println!("\nenvironment:");
+
+    let git = version_line("git", &["--version"]);
+    println!("  {} git: {}", mark(git.is_ok()), git.unwrap_or_else(|e| e));
+
+    if project.mode != ProjectMode::Local {
+        let gh = version_line("gh", &["--version"]);
+        println!(
+            "  {} gh: {}",
+            mark(gh.is_ok()),
+            gh.map(|v| v.lines().next().unwrap_or_default().to_string())
+                .unwrap_or_else(|e| e)
+        );
+        let auth = version_line("gh", &["auth", "status"]);
+        println!(
+            "  {} gh auth: {}",
+            mark(auth.is_ok()),
+            auth.map(|_| "authenticated".to_string())
+                .unwrap_or_else(|e| e)
+        );
+        if let Some(slug) = &project.repo_slug {
+            match gh_viewer_permission(slug).await {
+                Ok(perm) if can_push(&perm) => println!("  ✅ gh token can push ({perm})"),
+                Ok(perm) => {
+                    println!("  ❌ gh token cannot push (permission {perm}) — need write access")
+                }
+                Err(e) => println!("  ⚠️  gh push-permission check inconclusive: {e:#}"),
+            }
+        }
+    }
+
+    // A usable multiplexer: a live herdr socket or an installed tmux.
+    let herdr_sock = std::env::var("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".config/herdr/herdr.sock")
+        });
+    let tmux_ok = version_line("tmux", &["-V"]).is_ok();
+    let mux_ok = herdr_sock.exists() || tmux_ok;
+    println!(
+        "  {} multiplexer: {}",
+        mark(mux_ok),
+        if herdr_sock.exists() {
+            "herdr socket live"
+        } else if tmux_ok {
+            "tmux installed"
+        } else {
+            "none (start herdr or install tmux)"
+        }
+    );
+
+    let agent = version_line(&cfg.agent.command, &["--version"]);
+    println!(
+        "  {} agent CLI ({}): {}",
+        mark(agent.is_ok()),
+        cfg.agent.command,
+        agent
+            .map(|v| v.lines().next().unwrap_or_default().to_string())
+            .unwrap_or_else(|e| e)
+    );
+}
+
+/// Run `cmd args` and return its trimmed stdout, or a human-readable error
+/// string. A small mirror of doctor's capture helper — add-project needs only a
+/// handful of version probes.
+fn version_line(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(format!(
+            "exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("not found ({e})")),
+    }
+}
+
+/// Whether a GitHub `viewerPermission` string allows pushing. Shared with
+/// `meguri doctor`; split from the gh call so it is unit-tested without the
+/// network.
+pub fn can_push(viewer_permission: &str) -> bool {
+    matches!(viewer_permission, "ADMIN" | "MAINTAIN" | "WRITE")
+}
+
+/// The caller's permission on a repo, via `gh repo view`. `Err` means the check
+/// was inconclusive (gh missing, network, private-repo visibility) — callers
+/// treat that as a warning, not a failure. Shared with `meguri doctor`.
+pub async fn gh_viewer_permission(slug: &str) -> Result<String> {
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            slug,
+            "--json",
+            "viewerPermission",
+            "-q",
+            ".viewerPermission",
+        ])
+        .output()
+        .await
+        .context("spawning gh")?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+}
+
 pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
@@ -477,6 +809,10 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
         );
     }
     let deps = build_deps(&cfg, project, mux_override)?;
+
+    // Materialize the managed bare clone before anything touches `repo_path`
+    // (ADR 0018) — the one-shot counterpart of the scheduler's tick-top hook.
+    engine::ensure_project_clone(&deps).await?;
 
     let gh_issue = deps.forge().get_issue(issue).await?;
     // Manual run bypasses the cadence gate (it is a human's explicit override —
@@ -841,6 +1177,56 @@ pub fn cmd_stats_routing(project: Option<&str>) -> Result<()> {
         for d in &drifts {
             println!("  ⚠️  {}", drift_label(d));
         }
+    }
+    Ok(())
+}
+
+/// `meguri stats collab`: compare the collab planes (off vs advisor) of
+/// advisor-eligible runs while holding routing (profile, arm) constant, so the
+/// effect of the collab layer shows in durable orchestration-plane signals
+/// (issue #121). Same sqlite direct-read as `stats routing` (works with watch
+/// stopped). Rows are already sorted by (role, profile, arm), so an `off` and
+/// an `advisor` row for the same routing sit next to each other.
+pub fn cmd_stats_collab(project: Option<&str>) -> Result<()> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let window = cfg.drift.window;
+
+    let rows = store.collab_stats(project, window)?;
+    if rows.is_empty() {
+        match project {
+            Some(p) => println!("no collab stats yet for project {p}"),
+            None => println!("no collab stats yet"),
+        }
+        return Ok(());
+    }
+    println!("collab stats — last {window} scored run(s) per (role, profile, arm, collab)\n");
+    println!(
+        "{:<8} {:<12} {:<16} {:<10} {:<8} {:>5} {:>8} {:>9} {:>9}",
+        "PROJECT", "ROLE", "PROFILE", "ARM", "COLLAB", "RUNS", "SUCCESS", "AVGTURNS", "AVGDUR"
+    );
+    for r in &rows {
+        let profile = if r.agent_profile.is_empty() {
+            "(unrouted)"
+        } else {
+            &r.agent_profile
+        };
+        let dur = r
+            .avg_duration_secs
+            .map(|s| format!("{s:.0}s"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<8} {:<12} {:<16} {:<10} {:<8} {:>5} {:>7.0}% {:>9.1} {:>9}",
+            r.project_id,
+            r.loop_kind,
+            profile,
+            r.routing_arm,
+            r.collab_mode,
+            r.runs,
+            r.success_rate,
+            r.avg_turns,
+            dur,
+        );
     }
     Ok(())
 }

@@ -172,7 +172,7 @@ impl Flavor for ConflictResolverFlavor {
         // Pin the merge target before claiming: the exact commit the agent
         // must bring in, immune to the base moving mid-run.
         let base_sha =
-            gitops::fetch_base_tip(&deps.project.repo_path, &deps.project.default_branch).await?;
+            gitops::fetch_base_tip(&deps.repo_path(), &deps.project.default_branch).await?;
 
         deps.forge()
             .add_pr_label(pr.number, forge::LABEL_WORKING)
@@ -486,7 +486,7 @@ mod tests {
         use std::sync::Arc;
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path: "/tmp/unused".into(),
+            repo_path: Some("/tmp/unused".into()),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,

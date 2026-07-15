@@ -698,6 +698,20 @@ impl Store {
         })
     }
 
+    /// Record the collab plane the run ran under (issue #121 measurement):
+    /// `"advisor"` for a run meant to get an advisor. Called only in that case;
+    /// a run with no advisor is never stamped and stays NULL (read as `off` by
+    /// [`Store::collab_stats`]). Same shape as [`Store::update_run_routing_arm`].
+    pub fn update_run_collab_mode(&self, id: &str, mode: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE runs SET collab_mode = ?2 WHERE id = ?1",
+                params![id, mode],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Record (or clear, with None) the run's native agent session id.
     pub fn update_run_agent_session(&self, id: &str, session: Option<&str>) -> Result<()> {
         self.with_conn(|c| {

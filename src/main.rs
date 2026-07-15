@@ -5,7 +5,7 @@ use clap::Parser;
 use meguri::agent_skills;
 use meguri::app;
 use meguri::cli::{AgentSkillsCommand, Cli, Command, DaemonCommand, StatsCommand};
-use meguri::config::{self, Config};
+use meguri::config::{self, Config, ProjectConfig};
 use meguri::daemon;
 use meguri::store::Store;
 
@@ -23,6 +23,22 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => cmd_init(),
         Command::Doctor { probe } => cmd_doctor(probe).await,
+        Command::AddProject {
+            slug,
+            create,
+            public,
+            id,
+            local,
+        } => {
+            app::cmd_add_project(
+                slug.as_deref(),
+                create,
+                public,
+                id.as_deref(),
+                local.as_deref(),
+            )
+            .await
+        }
         Command::Watch => app::cmd_watch().await,
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon::cmd_start(),
@@ -63,6 +79,7 @@ async fn main() -> Result<()> {
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
             StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
+            StatsCommand::Collab { project } => app::cmd_stats_collab(project.as_deref()),
         },
         Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
         Command::TopStatus {
@@ -114,7 +131,8 @@ fn cmd_init() -> Result<()> {
     println!("db ready: {}", db.display());
     std::fs::create_dir_all(config::worktrees_root())?;
     println!(
-        "\nNext: edit {} — fill in the [[projects]] stub (repo_path, repo_slug).",
+        "\nNext: `meguri add-project owner/repo` to add your first project \
+         (or `--local <path>` for a local-mode project). It appends to {}.",
         cfg_path.display()
     );
     offer_agent_skills_install();
@@ -258,6 +276,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
                 doctor_drift(store);
             }
             doctor_workspaces(cfg);
+            // Managed clones (issue #195): show each project's clone state
+            // (present / not cloned yet / broken) and whether the gh token can
+            // push. "Not cloned" is a normal, self-healing state, not a failure.
+            ok &= doctor_clones(cfg).await;
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
             ok &= check_auto_merge(cfg).await;
@@ -362,6 +384,103 @@ async fn check_auto_merge(cfg: &Config) -> bool {
     ok
 }
 
+/// Whether a project's effective clone is usable for the git-backed doctor
+/// reads (schedules / repo config / preambles). For a managed clone (derived
+/// `repo_path`), "not cloned yet" is a normal state that must not fail those
+/// sections; a broken remnant is a real problem.
+enum ProjectCloneState {
+    /// A usable git repo at the effective path (proceed with git reads).
+    Present,
+    /// A managed clone that hasn't been materialized yet — normal, self-healing.
+    NotCloned,
+    /// A managed clone directory that exists but is broken (reason).
+    Broken(String),
+}
+
+/// Classify a project's effective clone for doctor. An explicit `repo_path` is
+/// always treated as `Present` (a missing path surfaces through the git reads
+/// exactly as before); a managed clone is probed with [`gitops::clone_health`].
+async fn project_clone_state(cfg: &Config, project: &ProjectConfig) -> ProjectCloneState {
+    use meguri::gitops::{self, CloneHealth};
+    if !cfg.is_managed_clone(project) {
+        return ProjectCloneState::Present;
+    }
+    // A managed clone is always github mode, so a slug is present (validate
+    // guarantees it); default to "" so a somehow-missing slug reads as broken.
+    let slug = project.repo_slug.as_deref().unwrap_or_default();
+    match gitops::clone_health(&cfg.repo_path_for(project), slug).await {
+        CloneHealth::Healthy => ProjectCloneState::Present,
+        CloneHealth::Absent => ProjectCloneState::NotCloned,
+        CloneHealth::Broken(why) => ProjectCloneState::Broken(why),
+    }
+}
+
+/// Doctor's managed-clone section (issue #195): per github project, show the
+/// clone state and whether the gh token can push. "Not cloned" is ✅ (it will be
+/// materialized on the next watch tick); a broken clone fails; a read-only token
+/// fails (it would only surface at `push_branch`/`create_pr` otherwise). A gh
+/// call that can't reach the API is a warning, never a doctor failure.
+async fn doctor_clones(cfg: &Config) -> bool {
+    let github: Vec<&ProjectConfig> = cfg
+        .projects
+        .iter()
+        .filter(|p| p.mode != meguri::config::ProjectMode::Local)
+        .collect();
+    if github.is_empty() {
+        return true;
+    }
+    let mut ok = true;
+    println!("\nmanaged clones:");
+    for project in github {
+        let managed = cfg.is_managed_clone(project);
+        let dest = cfg.repo_path_for(project);
+        let kind = if managed { "managed" } else { "explicit" };
+        match project_clone_state(cfg, project).await {
+            ProjectCloneState::Present => {
+                println!(
+                    "  ✅ {} ({kind}) — clone present at {}",
+                    project.id,
+                    dest.display()
+                );
+            }
+            ProjectCloneState::NotCloned => {
+                println!(
+                    "  ✅ {} ({kind}) — not cloned yet (will materialize at {} on next tick)",
+                    project.id,
+                    dest.display()
+                );
+            }
+            ProjectCloneState::Broken(why) => {
+                println!(
+                    "  ❌ {} ({kind}) — clone at {} is broken ({why}); remove it and re-run",
+                    project.id,
+                    dest.display()
+                );
+                ok = false;
+            }
+        }
+        // gh push permission — the write-scope check (a read-only token passes
+        // discovery but fails at push/PR, so surface it here).
+        if let Some(slug) = project.repo_slug.as_deref() {
+            match app::gh_viewer_permission(slug).await {
+                Ok(perm) if app::can_push(&perm) => {
+                    println!("     ✅ gh token can push ({perm})");
+                }
+                Ok(perm) => {
+                    println!(
+                        "     ❌ gh token cannot push (permission {perm}) — need write access"
+                    );
+                    ok = false;
+                }
+                Err(e) => {
+                    println!("     ⚠️  gh push-permission check inconclusive: {e:#}");
+                }
+            }
+        }
+    }
+    ok
+}
+
 /// Doctor's schedules section (issue #146): the cron expression, name
 /// uniqueness, body exclusivity, and local-mode `plan` rejection are already
 /// enforced at config load (so a loaded `cfg` has passed them). What load does
@@ -382,6 +501,17 @@ async fn doctor_schedules(cfg: &Config) -> bool {
     let mut ok = true;
     println!("\nschedules:");
     for project in &cfg.projects {
+        if project.schedules.is_empty() {
+            continue;
+        }
+        // A managed clone that isn't materialized yet can't be read from; that
+        // is normal (doctor_clones reports it), so skip the body_file check here
+        // rather than failing on a missing path.
+        let repo_path = cfg.repo_path_for(project);
+        let cloned = matches!(
+            project_clone_state(cfg, project).await,
+            ProjectCloneState::Present
+        );
         for s in &project.schedules {
             let next = Cron::parse(&s.cron)
                 .ok()
@@ -391,8 +521,9 @@ async fn doctor_schedules(cfg: &Config) -> bool {
             // body_file must be a regular file on the default branch (ADR
             // 0015); inline body is always fine.
             let (line_ok, body_detail) = match &s.body_file {
+                _ if !cloned => (true, "body_file check skipped (clone pending)".to_string()),
                 Some(rel) => match gitops::read_file_at_default_branch(
-                    &project.repo_path,
+                    &repo_path,
                     &project.default_branch,
                     rel,
                 )
@@ -482,10 +613,18 @@ async fn doctor_repo_configs(cfg: &Config) -> bool {
         }
     };
     for project in &cfg.projects {
+        // A managed clone not materialized yet can't be read; that's normal
+        // (doctor_clones reports it), so skip rather than fail on a missing path.
+        if !matches!(
+            project_clone_state(cfg, project).await,
+            ProjectCloneState::Present
+        ) {
+            continue;
+        }
         // Lint the default branch's `meguri.toml` (ADR 0015), not the working
         // tree. An absent file is the silent, valid opt-out.
         let read = gitops::read_file_at_default_branch(
-            &project.repo_path,
+            &cfg.repo_path_for(project),
             &project.default_branch,
             "meguri.toml",
         )
@@ -537,13 +676,25 @@ async fn doctor_prompts(cfg: &Config) -> bool {
     let mut ok = true;
     println!("\npreambles:");
     for project in &cfg.projects {
+        if cfg.effective_prompts(project).is_empty() {
+            continue;
+        }
+        // A managed clone not materialized yet can't be read; that's normal
+        // (doctor_clones reports it), so skip rather than fail on a missing path.
+        if !matches!(
+            project_clone_state(cfg, project).await,
+            ProjectCloneState::Present
+        ) {
+            continue;
+        }
+        let repo_path = cfg.repo_path_for(project);
         for (key, rel) in cfg.effective_prompts(project) {
             // Verify against the default branch (ADR 0015), reading the blob
             // directly. A symlink can't be followed here, so it is reported as
             // unverifiable rather than silently passing (its target string
             // would otherwise read as content).
             let (mark, detail) = match gitops::read_file_at_default_branch(
-                &project.repo_path,
+                &repo_path,
                 &project.default_branch,
                 &rel,
             )
@@ -904,6 +1055,18 @@ mod tests {
         let p = fake_profile();
         let bad = |_: &config::AgentProfile| ProbeOutcome::ModelInvalid;
         assert!(!doctor_probe("default", &p, &bad));
+    }
+
+    #[test]
+    fn can_push_accepts_write_and_up_only() {
+        // The write-scope decision is pure and now shared with add-project
+        // (`meguri::app::can_push`), so doctor can test it without gh.
+        for perm in ["ADMIN", "MAINTAIN", "WRITE"] {
+            assert!(app::can_push(perm), "{perm} should be able to push");
+        }
+        for perm in ["READ", "TRIAGE", "NONE", ""] {
+            assert!(!app::can_push(perm), "{perm} must not be able to push");
+        }
     }
 
     #[test]

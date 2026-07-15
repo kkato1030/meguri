@@ -16,6 +16,11 @@
 //! - **The protocol lives in the prompts.** meguri seeds both peers with the
 //!   team name, the counterpart's agmsg id, and the exact scripts to call; it
 //!   does not exec agmsg beyond the startup `--version` probe.
+//!
+//! The collab plane is invisible to meguri by design, so its effect is measured
+//! only through orchestration-plane durable signals: each advisor-eligible run
+//! is stamped with [`COLLAB_MODE_ADVISOR`], and `meguri stats collab` compares
+//! the off vs advisor planes per `(role, profile, arm)` (issue #121, ADR 0017).
 
 use std::path::PathBuf;
 
@@ -38,6 +43,13 @@ pub const AGMSG_INBOX: &str = "~/.agents/skills/agmsg/scripts/inbox.sh";
 
 /// The default advisor role — the model that wrote the spec.
 pub const DEFAULT_ADVISOR_ROLE: &str = "planner";
+
+/// The `runs.collab_mode` value stamped on a run that was meant to get an
+/// advisor (issue #121 measurement). Runs with no advisor leave the column
+/// NULL, which aggregation reads as `off` — so `meguri stats collab` can
+/// compare advisor-on vs advisor-off. Only this value is ever written; `off`
+/// is a read-side default, never stamped (keeps the inert regime, ADR 0006).
+pub const COLLAB_MODE_ADVISOR: &str = "advisor";
 
 /// Whether the advisor layer is active (`[collab] mode = "advisor"`). Absent
 /// section or `mode = "off"` → false (feature off).
