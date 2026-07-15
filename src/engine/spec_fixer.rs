@@ -172,14 +172,14 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
     // re-fire before a human clears the label does not re-page. Best-effort like
     // the rest of this escalation — a delivery failure never blocks the sweep.
     deps.notifier
-        .notify_awaiting_human(&crate::notify::Notification {
-            run_id: format!("spec-fixer-budget-{}", pr.number),
-            issue_number: issue,
-            issue_title: Some(pr.title.clone()),
-            reason: flow::REASON_REVIEW_PARKED.to_string(),
-            attach: None,
-            url: Some(pr.url.clone()),
-        })
+        .notify(&crate::notify::Notification::awaiting_human(
+            format!("spec-fixer-budget-{}", pr.number),
+            issue,
+            Some(pr.title.clone()),
+            flow::REASON_REVIEW_PARKED,
+            None,
+            Some(pr.url.clone()),
+        ))
         .await;
 }
 
@@ -466,6 +466,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),
@@ -607,10 +608,21 @@ mod tests {
         // pointing at the PR (not a pane — no turn runs at discovery time).
         let delivered = gw.delivered();
         assert_eq!(delivered.len(), 1, "the round-limit park pages once");
-        assert_eq!(delivered[0].reason, "spec_review_parked");
-        assert_eq!(delivered[0].issue_number, 7, "keyed by the canonical issue");
+        assert_eq!(delivered[0].event, "awaiting_human");
+        assert_eq!(
+            delivered[0].dedup_key, "spec-fixer-budget-42",
+            "keyed by the PR so a re-fire before a human clears it does not re-page"
+        );
+        assert!(
+            delivered[0].title.contains("#7"),
+            "keyed by the canonical issue"
+        );
         assert!(delivered[0].url.is_some(), "the page points at the PR");
-        assert!(delivered[0].attach.is_none(), "no pane to attach to");
+        assert!(
+            delivered[0].body.contains("spec レビュー"),
+            "reason surfaces in the body: {}",
+            delivered[0].body
+        );
     }
 
     #[tokio::test]

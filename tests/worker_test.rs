@@ -99,6 +99,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));

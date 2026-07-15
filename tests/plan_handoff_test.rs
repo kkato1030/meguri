@@ -33,6 +33,7 @@ fn deps_with(forge: Arc<FakeForge>, delivery: PlanDelivery) -> Deps {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),

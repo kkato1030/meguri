@@ -517,9 +517,18 @@ async fn finalize(
     // actionable before its blocker edge is in place (idempotent; `human`
     // children carry no trigger label). A crash mid-labeling is safe: any child
     // already labeled already has its blockers, so discovery gates it correctly.
+    let own_slug = deps.project.repo_slug.as_deref();
     for (child, f) in children.iter().zip(filed) {
         if let Some(label) = planner::child_label(child) {
             f.forge.add_label(f.number, label).await?;
+            // Watched-label notify (issue #205): children are filed label-less
+            // for safety, so the label lands here, not at create_issue time —
+            // this is the notify hook for the materialize path. Own-repo only:
+            // a sibling's child is governed by the sibling project's config.
+            if own_slug == Some(f.slug.as_str()) {
+                deps.notify_created_issue(f.number, &child.title, &[label])
+                    .await;
+            }
         }
     }
 
@@ -783,6 +792,7 @@ mod tests {
             autonomy: None,
             cadence: Vec::new(),
             prompts: Default::default(),
+            notify: None,
         }
     }
 
@@ -849,6 +859,36 @@ mod tests {
         assert!(forge.labels_of(1).is_empty());
         // The proposal PR is closed unmerged.
         assert_eq!(forge.get_pr(10).await.unwrap().state, "closed");
+    }
+
+    #[tokio::test]
+    async fn materialize_notifies_watched_labels_after_finalize_applies_them() {
+        // Children are filed label-less and labeled only in finalize, so the
+        // watched-label notify must fire there — not at create_issue (#205).
+        let (forge, mut deps) = setup();
+        deps.project.notify = Some(crate::config::ProjectNotifyConfig {
+            labels: vec![
+                crate::forge::LABEL_READY.to_string(),
+                crate::forge::LABEL_PLAN.to_string(),
+            ],
+        });
+        let (notifier, gw) = crate::notify::fake::recording_notifier();
+        deps.notifier = notifier;
+        let pr = pr_of(&forge).await;
+
+        materialize(&deps, &pr, 1, "me/proj", &two_children())
+            .await
+            .unwrap();
+
+        let mut labels: Vec<_> = gw
+            .delivered()
+            .into_iter()
+            .filter(|n| n.event == "label")
+            .map(|n| n.dedup_key)
+            .collect();
+        labels.sort();
+        // Child A (#2, ready) and child B (#3, plan) both notified.
+        assert_eq!(labels, vec!["issue:2".to_string(), "issue:3".to_string()]);
     }
 
     #[tokio::test]

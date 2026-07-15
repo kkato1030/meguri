@@ -20,6 +20,7 @@ use super::Deps;
 use crate::config::{ScheduleConfig, ScheduleKind};
 use crate::cron::{self, Cron};
 use crate::forge::{IssueState, LABEL_PLAN, LABEL_READY};
+use crate::notify::Notification;
 use crate::store::{format_epoch, parse_ts};
 
 /// Hidden provenance marker embedded in a fired issue/task body — the same
@@ -54,11 +55,27 @@ fn is_due(cron: &Cron, first_seen: u64, last_fired: Option<u64>, now: u64) -> bo
 pub async fn sweep(deps: &Deps, now: u64) -> Result<()> {
     for sched in &deps.project.schedules {
         if let Err(e) = fire_one(deps, sched, now).await {
+            let detail = format!("{e:#}");
             tracing::warn!(
-                "schedule {:?} failed for {}: {e:#}",
+                "schedule {:?} failed for {}: {detail}",
                 sched.name,
                 deps.project.id
             );
+            // Surface the failure as an event (it had none before, issue #205)
+            // and page a human if `schedule.failed` is subscribed. Best-effort:
+            // a failed notification must not abort the sweep.
+            let _ = deps.store.emit(
+                None,
+                "schedule.failed",
+                json!({ "project": deps.project.id, "schedule": sched.name, "error": detail }),
+            );
+            deps.notifier
+                .notify(&Notification::schedule_failed(
+                    &deps.project.id,
+                    &sched.name,
+                    &detail,
+                ))
+                .await;
         }
     }
     Ok(())
@@ -101,6 +118,13 @@ async fn fire_one(deps: &Deps, sched: &ScheduleConfig, now: u64) -> Result<()> {
             "schedule.skipped",
             json!({ "project": deps.project.id, "schedule": sched.name, "open_key": key }),
         )?;
+        deps.notifier
+            .notify(&Notification::schedule_skipped(
+                &deps.project.id,
+                &sched.name,
+                key,
+            ))
+            .await;
         return Ok(());
     }
 
@@ -150,7 +174,9 @@ async fn enqueue(deps: &Deps, sched: &ScheduleConfig, title: &str, body: &str) -
                 ScheduleKind::Ready => LABEL_READY,
                 ScheduleKind::Plan => LABEL_PLAN,
             };
-            forge.create_issue(title, body, &[label]).await
+            let number = forge.create_issue(title, body, &[label]).await?;
+            deps.notify_created_issue(number, title, &[label]).await;
+            Ok(number)
         }
         None => {
             // local mode: `kind = "plan"` is rejected at config load, so this

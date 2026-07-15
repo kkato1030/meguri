@@ -132,6 +132,7 @@ async fn setup_with_clean(clean: CleanConfig) -> TestEnv {
         autonomy: None,
         cadence: Vec::new(),
         prompts: Default::default(),
+        notify: None,
     };
 
     let deps = Deps::with_label_source(
@@ -651,4 +652,37 @@ async fn machine_checks_report_phase_label_anomalies() {
         vec![LABEL_SPECCING.to_string(), LABEL_IMPLEMENTING.to_string()]
     );
     assert_eq!(env.forge.labels_of(21), vec![LABEL_WORKING.to_string()]);
+}
+
+/// Issue #205: a non-schedule create path — the cleaner's report issue — also
+/// reaches the notify sink when its label is watched. Proves the label hook is
+/// shared across create_issue sites, not scheduler-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn report_issue_creation_notifies_watched_label() {
+    let mut env = setup().await;
+    env.deps.project.notify = Some(meguri::config::ProjectNotifyConfig {
+        labels: vec![LABEL_CLEAN_REPORT.to_string()],
+    });
+    let (notifier, gw) = meguri::notify::fake::recording_notifier();
+    env.deps.notifier = notifier;
+
+    let run = create_cleaner_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(wt, SWEEP_FINDING);
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    let labels: Vec<_> = gw
+        .delivered()
+        .into_iter()
+        .filter(|n| n.event == "label")
+        .collect();
+    assert_eq!(labels.len(), 1, "the clean-report issue is a watched label");
+    assert!(labels[0].body.contains(LABEL_CLEAN_REPORT));
 }
