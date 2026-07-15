@@ -19,10 +19,14 @@ ADR 0017 が collab 面で確立した思想(不可視な面は統率面の dura
 
 **自己レビューの効き目は、`self_review.*` イベント(統率面に既に落ちている durable 信号)だけで測る。**
 
-- フェーズは run につき高々1回、**終端イベントちょうど1つ**で終わる:
-  `self_review.clean` / `self_review.unconverged` / `self_review.needs_human`。よって
-  「フェーズ総数」= この三つ組の件数、cap-escalation 率 = `unconverged` / フェーズ総数 と定義する。
-  中断・pane 死は終端イベントを出さない(未完了フェーズは分母に入らない)。
+- レビュー機構が**結論まで走り切った**フェーズは、**終端イベントちょうど1つ**を出す:
+  `self_review.clean` / `self_review.unconverged` / `self_review.needs_human`。「フェーズ総数」は
+  この三つ組の件数と定義し、cap-escalation 率 = `unconverged` / フェーズ総数 とする。
+  ただし機構自体が途中で人間へ抜ける経路は終端イベントを出さない:agent が review/fix turn で
+  `Failure`/`NeedsHuman`/`NeedsPlan`/`Decompose` を返す、2回目の契約違反で `NeedsHuman` に抜ける、
+  pane 死・中断。これらは分母に入らない。つまり分母は「self-review に入った run 総数」ではなく
+  「レビューが完走したフェーズ数」という明示的な観測境界である。この計測は read-only なので、
+  これらの経路に終端イベントを足すことはしない(足すのは self_review.rs の挙動変更で別 issue)。
 - 集計は event を `runs` に join し、`(project, loop_kind, agent_profile)` 別に読む
   (`meguri stats review`、`stats routing`/`collab` と同じ sqlite 直読み)。ここでの
   `agent_profile` は **自己レビューを回した著者 run(worker/spec-worker/planner)の profile** で
@@ -42,6 +46,9 @@ ADR 0017 が collab 面で確立した思想(不可視な面は統率面の dura
   編成の入れ替え(モデルの採否)を durable 信号の分布で比較できる。回すだけでなく評価できる。
 - 自己レビューの不変条件は無傷。measurement は run 行と event の観測用メタデータを読む派生ビューで、
   完了契約・検証・scheduler には食い込まない。実行時の挙動(union merge)も変えない。
+- cap 落ち率は「レビューが完走したフェーズ」を条件とする率であって、self-review に入った run 全体に
+  対する率ではない。機構が途中で人間へ抜けた率(agent failure・契約違反再失敗)は別種の運用コストで、
+  終端イベントが無い今は測らない — 必要になれば後続スライスで別指標として足す。
 - reviewer profile 別の指標は `runs.agent_profile` からは出せない。それは著者 profile だからだ。
   slice 3 で台帳イベントが finding ごとに reviewer を持って初めて出せる — この境界を明示しておく。
 - 観察データであって無作為化実験ではない(issue 難易度などの交絡は残る)。これは「群を固定した
