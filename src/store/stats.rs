@@ -115,6 +115,41 @@ pub struct CollabStatRow {
     pub avg_duration_secs: Option<f64>,
 }
 
+/// One row of `meguri stats review` (issue #213): the self-review outcome
+/// counts for one `(project, loop_kind, agent_profile)` group over **every**
+/// completed self-review phase (no window — this is a cumulative snapshot for
+/// offline ensemble decisions, not a recent-behavior gauge). `agent_profile` is
+/// the **authoring** run's profile (worker/spec-worker/planner), not the
+/// reviewer's — the events ride the author run's `run_id` (ADR 0020).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewStatRow {
+    pub project_id: String,
+    pub loop_kind: String,
+    /// Profile name, or [`UNROUTED`] (empty) for runs with no pinned profile.
+    pub agent_profile: String,
+    /// Completed phases = terminal-event total (clean + unconverged +
+    /// needs_human). Phases that escalate to a human without a terminal event
+    /// (agent failure, second contract violation, interruption) are not counted
+    /// — the denominator is "phases the review machinery ran to a conclusion".
+    pub phases: usize,
+    pub clean: usize,
+    pub unconverged: usize,
+    pub needs_human: usize,
+    /// `self_review.correction` events (a review turn's contract violation) in
+    /// this group. Not a phase — a cost counted against `phases`.
+    pub corrections: usize,
+    /// cap-escalation rate in percentage points: `unconverged / phases * 100`.
+    pub cap_rate: f64,
+    /// needs-human rate in percentage points: `needs_human / phases * 100`.
+    pub needs_human_rate: f64,
+    /// correction rate in percentage points: `corrections / phases * 100` (may
+    /// exceed 100 — a phase can take more than one corrective turn).
+    pub correction_rate: f64,
+    /// Histogram of rounds-to-clean, sorted by round: `(round, count)` where
+    /// `count` clean phases reached a clean verdict at that round.
+    pub rounds_hist: Vec<(u32, usize)>,
+}
+
 /// A group that has enough history to compare a recent window against the one
 /// before it — the input to drift detection.
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +352,135 @@ impl Store {
                 success_rate: agg.success_rate,
                 avg_turns: agg.avg_turns,
                 avg_duration_secs,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// `(project, loop_kind, agent_profile)` self-review metrics over every
+    /// recorded self-review phase — `meguri stats review` (issue #213, ADR
+    /// 0020). Reads only the durable `self_review.*` events joined to `runs`
+    /// (same sqlite direct-read as `stats routing`/`collab`; works with the
+    /// watch stopped), so the baseline needs no schema change.
+    ///
+    /// The denominator (`phases`) is the terminal-event triple — a phase that
+    /// escalates to a human without a terminal event is excluded (ADR 0020).
+    /// Groups with no completed phase are dropped, so every rate has a non-zero
+    /// denominator. `project = None` spans every project (each row keeps its
+    /// `project_id`); `Some(id)` restricts to one. Rows are sorted (project,
+    /// role, profile) for stable display.
+    pub fn review_stats(&self, project: Option<&str>) -> Result<Vec<ReviewStatRow>> {
+        use crate::engine::self_review::{
+            EVENT_CLEAN, EVENT_CORRECTION, EVENT_NEEDS_HUMAN, EVENT_UNCONVERGED,
+        };
+
+        // One self-review event joined to its authoring run.
+        struct ReviewEvent {
+            project_id: String,
+            loop_kind: String,
+            agent_profile: String,
+            kind: String,
+            data: serde_json::Value,
+        }
+
+        let events = self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT r.project_id, r.loop_kind, COALESCE(r.agent_profile, '') AS profile,
+                        e.kind, e.data_json
+                 FROM events e
+                 JOIN runs r ON r.id = e.run_id
+                 WHERE e.kind IN (?1, ?2, ?3, ?4)
+                   AND (?5 IS NULL OR r.project_id = ?5)
+                 ORDER BY e.id ASC",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        EVENT_CLEAN,
+                        EVENT_UNCONVERGED,
+                        EVENT_NEEDS_HUMAN,
+                        EVENT_CORRECTION,
+                        project,
+                    ],
+                    |row| {
+                        let data_json: String = row.get("data_json")?;
+                        Ok(ReviewEvent {
+                            project_id: row.get("project_id")?,
+                            loop_kind: row.get("loop_kind")?,
+                            agent_profile: row.get("profile")?,
+                            kind: row.get("kind")?,
+                            data: serde_json::from_str(&data_json)
+                                .unwrap_or(serde_json::Value::Null),
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+
+        // Bucket the raw counts and the rounds-to-clean histogram per group.
+        #[derive(Default)]
+        struct Acc {
+            clean: usize,
+            unconverged: usize,
+            needs_human: usize,
+            corrections: usize,
+            rounds_hist: std::collections::BTreeMap<u32, usize>,
+        }
+        type Key = (String, String, String);
+        let mut order: Vec<Key> = Vec::new();
+        let mut groups: std::collections::HashMap<Key, Acc> = std::collections::HashMap::new();
+        for e in &events {
+            let key = (
+                e.project_id.clone(),
+                e.loop_kind.clone(),
+                e.agent_profile.clone(),
+            );
+            let acc = groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key);
+                Acc::default()
+            });
+            match e.kind.as_str() {
+                k if k == EVENT_CLEAN => {
+                    acc.clean += 1;
+                    // Bucket by the round the clean verdict landed on. A clean
+                    // event missing `rounds` (shouldn't happen) is counted but
+                    // left out of the histogram.
+                    if let Some(round) = e.data.get("rounds").and_then(|v| v.as_u64()) {
+                        *acc.rounds_hist.entry(round as u32).or_insert(0) += 1;
+                    }
+                }
+                k if k == EVENT_UNCONVERGED => acc.unconverged += 1,
+                k if k == EVENT_NEEDS_HUMAN => acc.needs_human += 1,
+                k if k == EVENT_CORRECTION => acc.corrections += 1,
+                _ => {}
+            }
+        }
+
+        order.sort();
+        let mut rows = Vec::new();
+        for key in order {
+            let acc = &groups[&key];
+            let phases = acc.clean + acc.unconverged + acc.needs_human;
+            // A group with corrections but no completed phase has an undefined
+            // denominator — drop it (its phases never converged to a signal).
+            if phases == 0 {
+                continue;
+            }
+            let pct = |n: usize| n as f64 / phases as f64 * 100.0;
+            rows.push(ReviewStatRow {
+                project_id: key.0,
+                loop_kind: key.1,
+                agent_profile: key.2,
+                phases,
+                clean: acc.clean,
+                unconverged: acc.unconverged,
+                needs_human: acc.needs_human,
+                corrections: acc.corrections,
+                cap_rate: pct(acc.unconverged),
+                needs_human_rate: pct(acc.needs_human),
+                correction_rate: pct(acc.corrections),
+                rounds_hist: acc.rounds_hist.iter().map(|(&r, &c)| (r, c)).collect(),
             });
         }
         Ok(rows)
@@ -1094,5 +1258,279 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].runs, 2);
         assert!((rows[0].success_rate - 100.0).abs() < 1e-9);
+    }
+
+    // --- review stats (issue #213) -----------------------------------------
+
+    use crate::engine::self_review::{
+        EVENT_CLEAN, EVENT_CORRECTION, EVENT_NEEDS_HUMAN, EVENT_UNCONVERGED,
+    };
+    use serde_json::json;
+
+    /// Create a fresh run in a group and emit one self-review event on it. Each
+    /// call is its own run (distinct issue number), mirroring reality: one
+    /// self-review phase per run.
+    fn seed_review_event(
+        store: &Store,
+        project: &str,
+        issue: i64,
+        loop_kind: &str,
+        profile: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+    ) {
+        let run = store
+            .create_run_for_loop(project, loop_kind, issue, "t")
+            .unwrap();
+        if let Some(p) = profile {
+            store.update_run_agent_profile(&run.id, p).unwrap();
+        }
+        store.emit(Some(&run.id), kind, data).unwrap();
+    }
+
+    #[test]
+    fn review_stats_counts_phases_and_rates() {
+        let store = Store::open_in_memory().unwrap();
+        // One group (worker/sonnet): 1 clean, 1 unconverged, 1 needs_human →
+        // 3 phases, cap 33%, needs_human 33%.
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("sonnet"),
+            EVENT_UNCONVERGED,
+            json!({"rounds": 3, "pending": 2}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            EVENT_NEEDS_HUMAN,
+            json!({"round": 2}),
+        );
+
+        let rows = store.review_stats(Some("demo")).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.phases, 3);
+        assert_eq!(r.clean, 1);
+        assert_eq!(r.unconverged, 1);
+        assert_eq!(r.needs_human, 1);
+        assert!((r.cap_rate - 100.0 / 3.0).abs() < 1e-9);
+        assert!((r.needs_human_rate - 100.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn review_stats_correction_rate_and_terminal_less_phases_excluded() {
+        let store = Store::open_in_memory().unwrap();
+        // Two completed phases (2 clean) + one correction event on a completed
+        // phase's group, plus a correction-only run (no terminal). The denominator
+        // is the terminal triple (2), not 3 — the correction-only phase never
+        // converged to a signal, so it isn't a phase. corrections = 2 → 100%.
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 2}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            EVENT_CORRECTION,
+            json!({"problem": "dirty tree"}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            4,
+            "worker",
+            Some("sonnet"),
+            EVENT_CORRECTION,
+            json!({"problem": "no file"}),
+        );
+
+        let rows = store.review_stats(Some("demo")).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.phases, 2, "only terminal events count toward phases");
+        assert_eq!(r.corrections, 2);
+        assert!((r.correction_rate - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn review_stats_group_with_no_terminal_event_is_dropped() {
+        let store = Store::open_in_memory().unwrap();
+        // A group whose only event is a correction (the phase escalated to a
+        // human without a terminal event) has an undefined denominator → no row.
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CORRECTION,
+            json!({"problem": "x"}),
+        );
+        assert!(store.review_stats(Some("demo")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_stats_splits_by_loop_kind_and_profile() {
+        let store = Store::open_in_memory().unwrap();
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("opus"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            3,
+            "planner",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        // A run with no pinned profile → the unrouted sentinel.
+        seed_review_event(
+            &store,
+            "demo",
+            4,
+            "spec-worker",
+            None,
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+
+        let rows = store.review_stats(Some("demo")).unwrap();
+        assert_eq!(rows.len(), 4, "one row per (loop_kind, profile)");
+        assert!(
+            rows.iter()
+                .any(|r| r.loop_kind == "worker" && r.agent_profile == "opus")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.loop_kind == "planner" && r.agent_profile == "sonnet")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.loop_kind == "spec-worker" && r.agent_profile == UNROUTED)
+        );
+    }
+
+    #[test]
+    fn review_stats_round_histogram() {
+        let store = Store::open_in_memory().unwrap();
+        // clean at rounds 1,1,2,3 → histogram {1:2, 2:1, 3:1}, sorted by round.
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            2,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            3,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 2}),
+        );
+        seed_review_event(
+            &store,
+            "demo",
+            4,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 3}),
+        );
+
+        let rows = store.review_stats(Some("demo")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rounds_hist, vec![(1, 2), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn review_stats_scopes_by_project() {
+        let store = Store::open_in_memory().unwrap();
+        seed_review_event(
+            &store,
+            "demo",
+            1,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+        seed_review_event(
+            &store,
+            "other",
+            2,
+            "worker",
+            Some("sonnet"),
+            EVENT_CLEAN,
+            json!({"rounds": 1}),
+        );
+
+        assert_eq!(store.review_stats(Some("demo")).unwrap().len(), 1);
+        assert_eq!(
+            store.review_stats(None).unwrap().len(),
+            2,
+            "no scope spans every project"
+        );
     }
 }

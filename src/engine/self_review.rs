@@ -32,6 +32,18 @@ use crate::store::RunRecord;
 use crate::turn::prompts::MEGURI_DIR;
 use crate::turn::{TurnOutcome, TurnStatus};
 
+/// Event kinds the self-review phase emits. `meguri stats review` (issue #213)
+/// reads exactly these, so the emit sites and the measurement query share one
+/// source of truth (a renamed event can't silently drop out of the stats).
+/// [`EVENT_CLEAN`] / [`EVENT_UNCONVERGED`] / [`EVENT_NEEDS_HUMAN`] are the three
+/// **terminal** events — a phase that ran the review machinery to a conclusion
+/// emits exactly one. [`EVENT_CORRECTION`] is a mid-phase contract violation on
+/// a review turn (not terminal).
+pub const EVENT_CLEAN: &str = "self_review.clean";
+pub const EVENT_UNCONVERGED: &str = "self_review.unconverged";
+pub const EVENT_NEEDS_HUMAN: &str = "self_review.needs_human";
+pub const EVENT_CORRECTION: &str = "self_review.correction";
+
 /// Where the orchestrator drops the local diff for the review turn to read
 /// (worktree-relative; `.meguri/` is git-excluded, so it never dirties the
 /// tree).
@@ -136,7 +148,7 @@ pub(crate) async fn self_review(
         if review.verdict == ReviewVerdict::NeedsHuman {
             deps.store.emit(
                 Some(&run.id),
-                "self_review.needs_human",
+                EVENT_NEEDS_HUMAN,
                 json!({ "round": cp.self_review_rounds + 1 }),
             )?;
             return Err(NeedsHuman(format!(
@@ -167,7 +179,7 @@ pub(crate) async fn self_review(
             persist(deps, run, cp)?;
             deps.store.emit(
                 Some(&run.id),
-                "self_review.clean",
+                EVENT_CLEAN,
                 json!({ "rounds": cp.self_review_rounds }),
             )?;
             return Ok(flow::StepFlow::Continue);
@@ -213,7 +225,7 @@ fn escalate_unconverged(
     persist(deps, run, cp)?;
     deps.store.emit(
         Some(&run.id),
-        "self_review.unconverged",
+        EVENT_UNCONVERGED,
         json!({ "rounds": cp.self_review_rounds,
                 "pending": cp.self_review_pending.len() }),
     )?;
@@ -317,7 +329,7 @@ async fn review_turn(
         }
         deps.store.emit(
             Some(&run.id),
-            "self_review.correction",
+            EVENT_CORRECTION,
             json!({ "problem": problem }),
         )?;
         prompt = format!(

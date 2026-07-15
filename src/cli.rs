@@ -245,6 +245,14 @@ pub enum StatsCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Self-review cap-escalation / needs-human / correction rates and the
+    /// round-to-clean distribution per (role, profile), from self_review.*
+    /// events (#213)
+    Review {
+        /// Restrict to one project id (default: all projects, project column)
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
