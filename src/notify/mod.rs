@@ -309,15 +309,18 @@ impl NotifyGateway for SystemGateway {
     }
 }
 
-/// The host portion of a webhook URL — the non-secret part safe to log. A
-/// webhook URL's *path* carries the token (Slack `.../services/T/B/XXXX`), so
-/// only the host is logged on failure.
+/// The host portion of a webhook URL — the non-secret part safe to log. Both
+/// secret-bearing parts are dropped: the *path* (Slack `.../services/T/B/XXXX`)
+/// and any *userinfo* (`user:pass@` credentials). Leaves `host[:port]`.
 fn webhook_host(url: &str) -> &str {
+    // scheme://[userinfo@]host[:port]/path?query#frag
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    after_scheme
+    let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
-        .unwrap_or(after_scheme)
+        .unwrap_or(after_scheme);
+    // Userinfo (which may hold a password) precedes the last '@'.
+    authority.rsplit('@').next().unwrap_or(authority)
 }
 
 /// Resolve the webhook flavor: the explicit `kind`, else auto-detect from the
@@ -619,6 +622,15 @@ mod tests {
         );
         assert_eq!(webhook_host("https://ntfy.sh/mytopic?x=1"), "ntfy.sh");
         assert_eq!(webhook_host("weird"), "weird");
+        // Userinfo (credentials) must be dropped too — never log user:pass@.
+        assert_eq!(
+            webhook_host("https://user:pass@example.com/hook"),
+            "example.com"
+        );
+        assert_eq!(
+            webhook_host("https://token@ntfy.example.com:8443/t"),
+            "ntfy.example.com:8443"
+        );
     }
 
     #[test]
