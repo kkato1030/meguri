@@ -2303,6 +2303,11 @@ async fn open_pr(
 /// delivers via PR, a forge is present, and the branch has commits ahead of
 /// base. `pr.created` is deliberately NOT emitted (that event means "a verified
 /// deliverable shipped"); an escalate-time draft emits `self_review.escalated_draft`.
+///
+/// Resume-safe like `open_pr`: before creating it looks up any PR already on
+/// the branch (`pr_for_branch`) and adopts it, so a resume from
+/// `STEP_SELF_REVIEW` after a crash — or the same escalation re-running — never
+/// opens a duplicate.
 pub(crate) async fn publish_needs_human_draft(
     deps: &Deps,
     run: &RunRecord,
@@ -2327,6 +2332,32 @@ pub(crate) async fn publish_needs_human_draft(
         Err(e) => {
             tracing::warn!(
                 "issue #{}: cannot check commits ahead for needs-human draft: {e:#}",
+                run.issue_number
+            );
+            return;
+        }
+    }
+
+    // Resume-safety: self-review resumes at STEP_SELF_REVIEW, so a prior
+    // escalation of this run may have already opened the draft (a crash after
+    // create, or the same NeedsHuman path re-running on resume). Never open a
+    // second PR for the branch — adopt whatever exists, and don't resurrect one
+    // a human already closed (the "捨てる" recovery path). A lookup error is
+    // treated as "cannot confirm" and skips rather than risk a duplicate.
+    match deps.forge().pr_for_branch(&branch).await {
+        Ok(Some(pr)) => {
+            let _ = deps.store.emit(
+                Some(&run.id),
+                "self_review.escalated_draft_exists",
+                json!({ "pr": pr.number, "url": pr.url, "state": pr.state }),
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                "issue #{}: cannot check for an existing PR on {branch}: {e:#} — \
+                 skipping needs-human draft to avoid a duplicate",
                 run.issue_number
             );
             return;
@@ -3527,6 +3558,49 @@ mod tests {
         assert!(
             !kinds.iter().any(|k| k == "pr.created"),
             "an evidence draft must not count as a delivered PR: {kinds:?}"
+        );
+    }
+
+    /// Resume-safety: a second escalation of the same run (a crash after create,
+    /// or the same NeedsHuman path re-running on resume from STEP_SELF_REVIEW)
+    /// must NOT open a duplicate draft — it adopts the existing one.
+    #[tokio::test]
+    async fn escalate_is_idempotent_across_reruns() {
+        let (deps, forge, run_id, wt, _tmp) = draft_env(true, true).await;
+        let run = deps.store.get_run(&run_id).unwrap().unwrap();
+        let cp = Checkpoint {
+            issue_title: "Add caching".into(),
+            ..Default::default()
+        };
+
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
+
+        assert_eq!(
+            forge.prs().len(),
+            1,
+            "second run must not duplicate the draft"
+        );
+        let kinds: Vec<String> = deps
+            .store
+            .events_for_run(&run_id, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| *k == "self_review.escalated_draft")
+                .count(),
+            1,
+            "only the first run creates: {kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k == "self_review.escalated_draft_exists"),
+            "the re-run adopts the existing draft: {kinds:?}"
         );
     }
 
