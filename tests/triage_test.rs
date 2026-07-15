@@ -1386,6 +1386,90 @@ async fn auto_mode_records_decline_for_ignored_pending_proposal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_records_decline_when_edited_proposal_stays_non_promotable() {
+    // A v1 `plan` proposal, edited under auto's default apply = ["ready"], is
+    // re-triaged on content drift and comes back `plan` again — a non-promotable
+    // kind, so promote_one no-ops it. Without recording the decline at the new
+    // content, the stale-hash marker keeps drift-signalling the sweep forever.
+    let mut env = setup_with_triage(TriageConfig {
+        mode: TriageMode::Advise,
+        interval_hours: 0,
+        ..TriageConfig::default()
+    })
+    .await;
+
+    // Sweep 1 (advise): propose `plan`.
+    let run1 = create_triage_run(&env, 0);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "plan", "confidence": 0.9,
+                "estimated_complexity": "large", "rationale": "needs a spec", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run1.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    let report = report_issue(&env).await.unwrap();
+    assert_eq!(
+        env.forge.get_issue(CANDIDATE).await.unwrap().labels,
+        vec![LABEL_TRIAGE_PLAN.to_string()]
+    );
+
+    // Switch to auto (apply defaults to ["ready"]) and edit the issue so its
+    // marker drifts from the content.
+    env.deps.config.triage.mode = TriageMode::Auto;
+    env.forge
+        .update_issue_body(CANDIDATE, "reworded but still a big spec-first ask")
+        .await
+        .unwrap();
+    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+
+    // Sweep 2 (auto): the agent still returns `plan` (not in apply) → no-op, but
+    // the decline is recorded at the new content.
+    let run2 = create_triage_run(&env, report.number);
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_report(
+            wt,
+            r#"[{"issue": 60, "recommendation": "plan", "confidence": 0.9,
+                "estimated_complexity": "large", "rationale": "still needs a spec", "missing_info": null}]"#,
+        );
+        write_result(wt, turn_id, "success");
+    });
+    let outcome = run_to_outcome(&env, &run2.id).await;
+    agent.abort();
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    let c60 = env.forge.get_issue(CANDIDATE).await.unwrap();
+    assert!(
+        !c60.has_label(LABEL_READY) && !c60.has_label(LABEL_PLAN),
+        "a non-promotable kind must not promote: {:?}",
+        c60.labels
+    );
+    assert!(
+        env.forge
+            .comments_of(CANDIDATE)
+            .iter()
+            .any(|c| c.contains("applied=declined")),
+        "{:?}",
+        env.forge.comments_of(CANDIDATE)
+    );
+
+    // The drift signal is closed.
+    assert!(
+        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        "an edited-but-still-non-promotable proposal must not keep re-triggering the sweep"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auto_mode_throttles_promotions_by_max_actions_per_tick() {
     let env = setup_with_triage(TriageConfig {
         mode: TriageMode::Auto,

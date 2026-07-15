@@ -1310,9 +1310,6 @@ async fn promote_one(
     cfg: &TriageConfig,
     ignore: &[String],
 ) -> Result<bool> {
-    let Some(label) = promote_label(item.recommendation, &cfg.apply) else {
-        return Ok(false); // needs-human/hold/skip, or not listed in `apply`
-    };
     let issue = deps.forge().get_issue(item.issue).await?;
     if issue.labels.iter().any(|l| is_engaged_label(l)) {
         return Ok(false); // a real label already, or held — never override a human
@@ -1336,28 +1333,33 @@ async fn promote_one(
             AppliedLevel::Proposal => {}
         }
     }
-    // Would auto actually promote this? Below the confidence bar or silenced by
-    // `triage.ignore` → no. When the issue already carries a triage marker it is
-    // a standing re-scan signal (a pending proposal, or drift from a stale-hash
-    // marker), so record the decline at the current content — otherwise the
-    // sweep re-triages it every interval. A fresh issue with no marker is not a
-    // re-scan signal, so a below-threshold no-op there needs nothing recorded.
-    if item.confidence < cfg.confidence_threshold
-        || ignored(
-            ignore,
-            &[
-                &format!("#{}", item.issue),
-                item.recommendation.as_str(),
-                &item.rationale,
-                item.missing_info.as_deref().unwrap_or(""),
-            ],
-        )
-    {
+    // Would auto promote this? It must be a promotable kind listed in `apply`,
+    // clear the confidence bar, and not be silenced by `triage.ignore`. Every
+    // other outcome (kind not in `apply`, needs-human/hold/skip, below
+    // threshold, ignored) is a no-op — and when the issue already carries a
+    // triage marker it is a standing re-scan signal (a pending proposal, or
+    // drift from a stale-hash marker whose content just changed), so the no-op
+    // has to be recorded at the current content or the sweep re-triages it every
+    // interval. A fresh issue with no marker is not a re-scan signal, so its
+    // no-op records nothing.
+    let promotable = promote_label(item.recommendation, &cfg.apply).filter(|_| {
+        item.confidence >= cfg.confidence_threshold
+            && !ignored(
+                ignore,
+                &[
+                    &format!("#{}", item.issue),
+                    item.recommendation.as_str(),
+                    &item.rationale,
+                    item.missing_info.as_deref().unwrap_or(""),
+                ],
+            )
+    });
+    let Some(label) = promotable else {
         if prev.is_some() {
             record_decline(deps, item, &hash).await;
         }
         return Ok(false);
-    }
+    };
     // Apply the real label, then the reason comment, then (only on success)
     // supersede the proposal labels. Ordering guards auto's "reason comment
     // mandatory / removable to revert" invariant against a partial write: a
@@ -1576,12 +1578,15 @@ fn render_promote_comment(item: &TriageItem, label: &str, hash: &str) -> String 
     body
 }
 
-/// Record that `auto` evaluated a pending proposal at this content and chose not
-/// to promote it (below `confidence_threshold`, or silenced by `triage.ignore`),
-/// so the next sweep treats the decision as settled and stops re-triaging it
-/// until the content changes. Best-effort — a failed write just means the next
-/// interval retries. The proposal label is left in place (a human can still
-/// promote it by hand); this only silences auto's own re-evaluation.
+/// Record that `auto` evaluated an issue that already carried a triage marker
+/// (a pending proposal, or a stale-hash marker whose content changed) and chose
+/// not to promote it — because the recommendation is not a promotable kind in
+/// `apply`, is below `confidence_threshold`, or is silenced by `triage.ignore`.
+/// The `applied=declined` marker at the current content lets the next sweep
+/// treat the decision as settled and stop re-triaging until the content changes.
+/// Best-effort — a failed write just means the next interval retries. Any
+/// proposal label is left in place (a human can still promote by hand); this
+/// only silences auto's own re-evaluation.
 async fn record_decline(deps: &Deps, item: &TriageItem, hash: &str) {
     if let Err(e) = deps
         .forge()
@@ -1592,15 +1597,14 @@ async fn record_decline(deps: &Deps, item: &TriageItem, hash: &str) {
     }
 }
 
-/// The note recorded when `auto` declines a pending proposal: a hidden
-/// `applied=declined` marker over the current content, plus a short reason.
+/// The note recorded when `auto` declines an issue: a hidden `applied=declined`
+/// marker over the current content, plus a short reason.
 fn render_decline_comment(item: &TriageItem, hash: &str) -> String {
     format!(
-        "{marker}\n🔀 **meguri triage** — この内容では自動昇格しません(確信度 {confidence:.2} が \
-         `triage.confidence_threshold` 未満、または `triage.ignore` に該当)。内容が変われば再評価\
-         します。人手での昇格は引き続き可能です。\n",
+        "{marker}\n🔀 **meguri triage** — この内容では auto は本ラベルを付けません(`apply` 対象外、\
+         確信度不足、または `triage.ignore` 該当)。内容が変われば再評価します。人手での昇格は引き続き \
+         可能です。\n",
         marker = advise_marker(hash, item.recommendation, AppliedLevel::Declined),
-        confidence = item.confidence,
     )
 }
 
