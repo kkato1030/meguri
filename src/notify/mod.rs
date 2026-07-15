@@ -89,7 +89,11 @@ impl Notification {
         // The pre-#205 `webhook_url` JSON contract, preserved so an existing
         // consumer still finds run_id / issue / reason / attach. `dedup_key` is
         // the run id (or the synthetic key for the run-less parked/budget page).
+        // The old payload's `event` was always the literal "turn.awaiting_human"
+        // (all three page-a-human paths shared it), so keep that value in the
+        // JSON `event` — a consumer filtering on it must not lose notifications.
         let mut fields = json!({
+            "event": "turn.awaiting_human",
             "run_id": dedup_key,
             "issue_number": issue_number,
             "issue_title": issue_title,
@@ -376,14 +380,25 @@ fn webhook_request(kind: WebhookKind, n: &Notification) -> WebhookRequest {
         WebhookKind::Json => {
             // Base envelope plus the event-specific structured `fields` — this
             // is where the pre-#205 `webhook_url` contract survives (issue #205).
+            // The payload `event` is the config token by default, but `fields`
+            // may override it: awaiting_human keeps the old "turn.awaiting_human"
+            // value so an existing consumer's filter still matches.
+            let event = n
+                .fields
+                .get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or(n.event.as_str());
             let mut payload = json!({
-                "event": n.event,
+                "event": event,
                 "title": n.title,
                 "text": n.body,
                 "url": n.url,
             });
             if let (Some(obj), Some(extra)) = (payload.as_object_mut(), n.fields.as_object()) {
                 for (k, v) in extra {
+                    if k == "event" {
+                        continue; // already applied as the envelope event
+                    }
                     obj.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
@@ -578,7 +593,9 @@ mod tests {
         );
         let req = webhook_request(WebhookKind::Json, &n);
         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
-        assert_eq!(v["event"], "awaiting_human");
+        // `event` keeps the pre-#205 literal so an existing filter still matches
+        // (the config token `awaiting_human` is a config-side concept only).
+        assert_eq!(v["event"], "turn.awaiting_human");
         assert_eq!(v["run_id"], "run-1");
         assert_eq!(v["issue_number"], 7);
         assert_eq!(v["issue_title"], "caching");
