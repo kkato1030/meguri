@@ -88,10 +88,13 @@ pub struct LedgerEntry {
 ```
 loop:
   review turn:
+    (a) 増分 diff を先に作る: round 2+ は 保存済み self_review_last_head..HEAD を取る
+        (round 1 は last_head 未設定なので base 全 diff のみ)
     round 1     → 従来の全 diff レビュー(kind 付き findings を出す)
-    round 2+    → 台帳(open + waive 理由 + 決定内容)と「base 全 diff + 前回HEADからの増分 diff」を渡す。
+    round 2+    → 台帳(open + waive 理由 + 決定内容)と「base 全 diff + (a) の増分 diff」を渡す。
                   役割 = 前回指摘の解消確認 + blocking 新規のみ。still-open を同 id で再掲、resolved は omit、
                   新規は id 空。decision は記録確認のみ・再審禁止。
+    (b) review turn を回し終えたら self_review_last_head = 現在の HEAD を保存(次ラウンドの起点)
   台帳更新(reviewer 確定のみ status を動かす。下記「status 遷移表」参照):
     - review が再掲しなかった open → 解消。author_disposition==waived なら status=waived、
       それ以外は status=fixed(reviewer が omit=確認)
@@ -108,7 +111,12 @@ loop:
       (status は open のまま。閉じるのは次 review)→ validate → next round
 ```
 
-- `self_review_last_head` を review turn 直前の HEAD で更新し、次ラウンドの増分 diff の起点にする。
+- **`self_review_last_head` の更新順**(上の (a)/(b)):増分 diff は「**保存済み**
+  `self_review_last_head`..現在の HEAD」で作り、**その review turn を回した後に** `self_review_last_head`
+  を現在の HEAD へ進める。先に更新すると diff が `HEAD..HEAD` になり増分が空になる。round 1 では
+  `last_head` が未設定(None)なので増分 diff は付けず base 全 diff だけを渡し、round 1 の review 後に
+  初めて `last_head` を立てる。fix turn が新しい commit を積むので、次 round の増分は
+  「前回 review 時点 → 直近 fix 後」の差分になる。
 - **id 採番は orchestrator が持つ**(reviewer/作者に任せない)。round 1 の findings に順に採番、
   round 2+ の新規にも採番。reviewer は round 2+ で既存 id を**再利用**して再掲する(同一性の担保)。
 
