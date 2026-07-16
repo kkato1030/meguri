@@ -27,6 +27,10 @@ fix prompt に列挙される(`fix_prompt`)。
 - **injection 面の明示。** 外部 reviewer の finding body は author の fix prompt に無検閲で
   入る。これは `[[review.reviewers]]` に非 self-reviewer profile を置いた時にのみ開く面で、
   未設定なら存在しない。
+- **`[[review.reviewers]]` は host-only。** どの外部モデルを reviewer に据えるかは信頼の宣言なので、
+  ADR 0011(二層 config)の「信頼の宣言は host 専用」に従い host `config.toml` にのみ書ける
+  (repo `meguri.toml` からは指定不可 = `RepoConfig` に入れない)。run 中の agent が自分の
+  worktree から reviewer 編成を書き換えて、より緩い/悪意ある外部モデルを注入することを防ぐ。
 - **緩衝は fix turn の waive 裁量。** ADR 0022 の「同意しない finding は直さなくてよい
   (waive・理由必須)」は、author が finding を**無条件では実行しない**ことを意味する。
   author は finding を「直す指示」ではなく「検討対象の指摘」として扱い、同意できなければ
