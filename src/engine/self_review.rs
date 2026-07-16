@@ -580,11 +580,46 @@ fn update_ledger_from_review(cp: &mut Checkpoint, review: &SelfReviewFile, round
     }
 }
 
+/// Validate a round 2+ review's finding ids against the ledger (issue #212):
+/// every non-null id must match a prior finding. An unmatched id is a typo — if
+/// it fell through to [`update_ledger_from_review`] it would resolve the finding
+/// the reviewer meant to re-list and reset its ping-pong count. The Err text
+/// feeds a corrective prompt. (Round 1 has an empty ledger and all-null ids, so
+/// this is a no-op there.)
+fn validate_review_ids(
+    cp: &Checkpoint,
+    review: &SelfReviewFile,
+) -> std::result::Result<(), String> {
+    let known: HashSet<&str> = cp
+        .self_review_ledger
+        .iter()
+        .map(|e| e.id.as_str())
+        .collect();
+    for f in &review.findings {
+        if let Some(id) = &f.id
+            && !known.contains(id.as_str())
+        {
+            return Err(format!(
+                "- finding id `{id}` in `{REVIEW_FILE}` matches no prior finding; \
+                 re-list an unresolved finding by repeating its exact `id`, or leave \
+                 `id` null for a genuinely new finding"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply a fix turn's dispositions to the ledger (issue #212): record the
 /// author's claim and bump the fix-attempt counter for each open finding. Status
-/// stays open — only the next review resolves it.
+/// stays open — only the next review resolves it. Each id is applied at most
+/// once, so a duplicated disposition can't bump `fix_attempts` twice (belt and
+/// braces — [`validate_fix_file`] already rejects duplicates).
 fn apply_dispositions(cp: &mut Checkpoint, fix: &SelfReviewFixFile) {
+    let mut seen: HashSet<&str> = HashSet::new();
     for d in &fix.dispositions {
+        if !seen.insert(d.id.as_str()) {
+            continue;
+        }
         if let Some(e) = cp
             .self_review_ledger
             .iter_mut()
@@ -609,6 +644,19 @@ fn apply_dispositions(cp: &mut Checkpoint, fix: &SelfReviewFixFile) {
 /// needs a disposition, and a waive needs a reason. The Err text feeds a
 /// corrective prompt.
 fn validate_fix_file(cp: &Checkpoint, fix: &SelfReviewFixFile) -> std::result::Result<(), String> {
+    // A duplicated id would bump `fix_attempts` more than once per turn (and is
+    // ambiguous) — reject it so the author writes exactly one disposition per
+    // finding.
+    let mut seen: HashSet<&str> = HashSet::new();
+    for d in &fix.dispositions {
+        if !seen.insert(d.id.as_str()) {
+            return Err(format!(
+                "- finding `{}` has more than one disposition in `{FIX_FILE}`; \
+                 write exactly one entry per finding",
+                d.id
+            ));
+        }
+    }
     let provided: HashMap<&str, &DispositionEntry> = fix
         .dispositions
         .iter()
@@ -747,7 +795,15 @@ async fn review_turn(
                  discard any changes; write only your review to `{REVIEW_FILE}`"
             ))
         } else {
-            read_review(worktree).err()
+            match read_review(worktree) {
+                Err(e) => Some(e),
+                // A non-null finding id that matches no prior finding is a typo:
+                // left unchecked, `update_ledger_from_review` would treat it as a
+                // new finding while silently resolving the one the reviewer meant
+                // to re-list — and reset its ping-pong count. Reject it here so the
+                // reviewer corrects the id.
+                Ok(review) => validate_review_ids(cp, &review).err(),
+            }
         };
         let Some(problem) = problem else {
             return Ok(ReviewTurn::Reviewed(
@@ -1503,6 +1559,68 @@ mod tests {
         let f3 = cp.self_review_ledger.iter().find(|e| e.id == "f3").unwrap();
         assert_eq!(f3.status, FindingStatus::Open);
         assert_eq!(f3.origin_round, 2);
+    }
+
+    /// A non-null finding id that matches nothing is a typo — it must be
+    /// rejected, not silently resolve the finding the reviewer meant to re-list
+    /// (which would also reset ping-pong). Null ids (new findings) are fine.
+    #[test]
+    fn unknown_review_id_is_rejected() {
+        let mut cp = cp_with_title();
+        cp.self_review_ledger = vec![entry("f1", FindingKind::Defect, FindingStatus::Open)];
+
+        // Typo: `f2` doesn't exist.
+        let review = SelfReviewFile {
+            verdict: ReviewVerdict::Fixable,
+            review: "r".into(),
+            findings: vec![finding(Some("f2"), FindingKind::Defect)],
+        };
+        let err = validate_review_ids(&cp, &review).unwrap_err();
+        assert!(
+            err.contains("`f2`") && err.contains("no prior finding"),
+            "{err}"
+        );
+
+        // Re-listing the real id, or a null id, both pass.
+        let ok = SelfReviewFile {
+            verdict: ReviewVerdict::Fixable,
+            review: "r".into(),
+            findings: vec![
+                finding(Some("f1"), FindingKind::Defect),
+                finding(None, FindingKind::Defect),
+            ],
+        };
+        assert!(validate_review_ids(&cp, &ok).is_ok());
+    }
+
+    /// A duplicated disposition id is rejected, and even if it slips through,
+    /// `apply_dispositions` bumps `fix_attempts` at most once per id.
+    #[test]
+    fn duplicate_fix_disposition_is_rejected_and_idempotent() {
+        let mut cp = cp_with_title();
+        cp.self_review_ledger = vec![entry("f1", FindingKind::Defect, FindingStatus::Open)];
+        let dup = SelfReviewFixFile {
+            dispositions: vec![
+                DispositionEntry {
+                    id: "f1".into(),
+                    action: Disposition::Fixed,
+                    reason: None,
+                },
+                DispositionEntry {
+                    id: "f1".into(),
+                    action: Disposition::Fixed,
+                    reason: None,
+                },
+            ],
+        };
+        assert!(
+            validate_fix_file(&cp, &dup)
+                .unwrap_err()
+                .contains("more than one")
+        );
+        // Defense in depth: applying it anyway bumps fix_attempts only once.
+        apply_dispositions(&mut cp, &dup);
+        assert_eq!(cp.self_review_ledger[0].fix_attempts, 1);
     }
 
     #[test]
