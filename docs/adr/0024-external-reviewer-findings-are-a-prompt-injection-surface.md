@@ -3,7 +3,7 @@
 - Status: proposed
 - Date: 2026-07-16
 - Issue: #214(親: #211)
-- 関連: ADR 0023(round 1 並列 reviewer)・ADR 0022(findings 台帳・fix turn の waive)・ADR 0006(self-review は forge を触らない内部ループ)
+- 関連: ADR 0023(round 1 並列 reviewer)・ADR 0022(findings 台帳・fix turn の waive)・ADR 0021(escalate 時 needs-human draft を forge に publish)・ADR 0011(二層 config・信頼の宣言は host 専用)・ADR 0006(self-review は happy path で forge を触らない内部ループ)
 
 ## Context
 
@@ -35,10 +35,18 @@ fix prompt に列挙される(`fix_prompt`)。
   (waive・理由必須)」は、author が finding を**無条件では実行しない**ことを意味する。
   author は finding を「直す指示」ではなく「検討対象の指摘」として扱い、同意できなければ
   理由付きで却下する。これが injection に対する第一の緩衝である。
-- **爆発半径の限定。** self-review は forge を触らない内部ループ(ADR 0006)で、成果物は
-  worktree 内の commit のみ。最終的な公開は tree clean + base より進行 + `check_command`
-  + human merge gate を通る。外部 finding が author を誘導しても、これらの検証と人間の
-  merge を越えて公開されるわけではない。
+- **爆発半径の限定 — ただし forge に出ない訳ではない。** self-review は happy path では forge を
+  触らない内部ループ(ADR 0006)で、成果物は worktree 内の commit のみ。通常 PR として公開される
+  中身は tree clean + base より進行 + `check_command` + human merge gate を通る。
+  **例外は escalate-time の needs-human draft(ADR 0021)である。** self-review が `needs_human` で
+  エスカレートし branch が base より進んでいると、`publish_needs_human_draft` が**未再レビューの
+  commit を含む draft PR を forge に publish する**。外部 finding に誘導された author の commit も、
+  この経路なら merge 前に forge 上で可視になりうる。したがって「injection 起点の commit は forge に
+  一切出ない」とは言えない — これは残余リスクとして正直に記録する(下記 Consequences)。
+- **draft 経路でも守られている線。** それでも publish されるのは **draft**・**needs-human ラベル付き**で、
+  ADR 0021 が「人間が見るための証拠物件」と位置づけたものである。auto-merge されず、human merge gate を
+  越えない。injected commit は「人間の目の前に draft として置かれる」のであって「検証を抜けて本公開される」
+  のではない。可視化(exposure)は起きるが、無人での merge は起きない。
 - **sanitize は入れない(今回)。** finding body の機械的フィルタは、正当な指摘の表現も削り
   かねず(false positive)、recall を落とす。境界の存在を明示し緩衝を設計に組み込むことを
   優先し、能動的 sanitize は必要が実測されるまで持ち越す。
@@ -51,6 +59,9 @@ fix prompt に列挙される(`fix_prompt`)。
 - **waive 裁量が単なる同意機構でなく防御として位置づく。** ADR 0022 では「較正の緩衝」
   だった waive が、本 ADR で「injection の緩衝」でもあると二重に意味を持つ。fix prompt が
   finding を「指示」ではなく「指摘」として提示する語り口は、この防御の一部として維持する。
-- **残余リスクは受容する。** 緩衝は author の判断に依存し、決定的な遮断ではない。将来
-  外部 finding 起点の誘導が実測されたら、body の sanitize や信頼度別の扱いを後続で足せる
-  (ADR 0020 の「実行時は union、取捨は人間がオフライン」と同じく、まず観測してから絞る)。
+- **残余リスクは受容する。** 緩衝は author の判断に依存し、決定的な遮断ではない。加えて
+  escalate-time の needs-human draft(ADR 0021)経路では、injection に誘導された未再レビュー
+  commit が draft PR として forge 上に**可視化されうる**(auto-merge はされない)。この exposure を
+  隠さず残余リスクとして受容する。将来、外部 finding 起点の誘導が実測されたら、body の sanitize・
+  信頼度別の扱い・draft publish 前の追加ゲートなどを後続で足せる(ADR 0020 の「実行時は union、
+  取捨は人間がオフライン」と同じく、まず観測してから絞る)。
