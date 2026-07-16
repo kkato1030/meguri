@@ -76,7 +76,8 @@ union が肥大し、fix prompt(全 open finding を列挙)が膨らんで autho
 - **実装前提が広がる。** per-turn 完了コントラクト・スケジューラのスロット予約・doctor probe の
   非 claude 対応が必要(spec §実装前提整備)。これらは round 1 並列化の土台であって、
   単独では挙動を変えない。
-- **信頼境界が新設される。** 外部モデルの findings body が author の fix prompt に入る
-  prompt injection 面は ADR 0024 に分けて記録する。
+- **既存の信頼境界の露出が広がる。** reviewer の findings body が author の fix prompt に入る
+  prompt injection 面は単一 self-reviewer の現行実装にも既にあり、本設計は reviewer の本数と
+  信頼の幅(第三者モデル)を増やしてその露出を広げる。詳細は ADR 0024 に分けて記録する。
 - **round 2+ と ADR 0022 は無傷。** 台帳・挙動 escalation・cap→final-fix は不変。本 ADR は
   round 1 の finder 段だけを差し替える。

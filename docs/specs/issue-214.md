@@ -6,8 +6,8 @@
 ## spec 深度と選定理由
 
 **design spec(深い方)を選ぶ。** 未決定が多く(verdict 合成・スロット重み式・reviewer 命名)、
-爆発半径が広い(完了コントラクト・スケジューラ並行性・config schema・checkpoint 永続・新設の
-injection 面)。checkpoint 永続状態(台帳の reviewer 属性)と、per-turn 完了コントラクトという
+爆発半径が広い(完了コントラクト・スケジューラ並行性・config schema・checkpoint 永続・既存の
+injection 面の露出拡大)。checkpoint 永続状態(台帳の reviewer 属性)と、per-turn 完了コントラクトという
 コントラクトに触れるため、**veto ルールで migration & rollback は必須**。
 
 ## 何を作るか(概要)

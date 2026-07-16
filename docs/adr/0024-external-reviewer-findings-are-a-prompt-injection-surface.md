@@ -7,26 +7,33 @@
 
 ## Context
 
-ADR 0023 で `[[review.reviewers]]` に claude 以外の profile(codex / grok 等)を並べられる
-ようになる。self-review の findings は台帳に積まれ、その `body` は**そのまま** author の
-fix prompt に列挙される(`fix_prompt`)。
+**この信頼境界は今回新設されるものではない。既に存在する。** self-review の findings は
+台帳に積まれ、その `body` は**そのまま** author の fix prompt に列挙される(`fix_prompt`)。
+そして review turn は author lane とは別の `self-reviewer` routing profile で起動でき、
+ADR 0006 はモデル分離を明示的な機能としている。つまり `self-reviewer` が author と別モデルで
+ありさえすれば、**reviewer の finding body → author の fix prompt** という「reviewer が出力した
+テキストが author への指示として prompt に入る」経路は、単一 reviewer の現行実装にも既にある。
 
-これまで reviewer は self-reviewer profile 一択(多くは author と同系のモデル)だった。
-異種・外部モデルを混ぜると、**外部モデル → author** という新しい信頼境界が生まれる。
-外部 reviewer が出力する finding body は、実質 author への指示テキストとして prompt に入る。
-悪意ある、あるいは単に暴走した外部モデルが finding body に「これまでの指示を無視して
-〜せよ」の類を混ぜれば、author の fix turn を誘導しうる — prompt injection 面である。
+ADR 0023 で `[[review.reviewers]]` を入れると、この面が2方向に**広がる**:
 
-この面は明示しておかないと、モデルを1本足す設定変更の裏で静かに開く。
+- **本数**:round 1 が N 本の並列 reviewer になり、finding を出す reviewer が増える。
+- **信頼**:claude 以外の profile(codex / grok 等)を明示的に並べられるようになり、
+  author が信頼しにくい第三者モデルを reviewer に据える選択肢が増える。
+
+いずれの reviewer も、finding body に「これまでの指示を無視して〜せよ」の類を混ぜれば
+(悪意でも暴走でも)author の fix turn を誘導しうる — prompt injection 面である。
+本設計はこの面を**新設するのではなく、露出(reviewer の数と信頼の幅)を増やす**。
+だからこそ、既存にも同じ面があることと合わせて明示しておく必要がある。
 
 ## Decision
 
 **この信頼境界を存在するものとして明記し、既存の緩衝を設計上の防御と位置づける。実行時に
 外部 finding body を sanitize する機構は今回は入れない。**
 
-- **injection 面の明示。** 外部 reviewer の finding body は author の fix prompt に無検閲で
-  入る。これは `[[review.reviewers]]` に非 self-reviewer profile を置いた時にのみ開く面で、
-  未設定なら存在しない。
+- **injection 面の明示。** reviewer の finding body は author の fix prompt に無検閲で入る。
+  この面は `[[review.reviewers]]` 未設定でも、`self-reviewer` が author と別モデルなら既に存在する
+  (単一 reviewer の現行実装)。`[[review.reviewers]]` はこの面を新設するのではなく、reviewer の
+  **本数**と、据えられるモデルの**信頼の幅**(第三者モデルまで)を広げる。
 - **`[[review.reviewers]]` は host-only。** どの外部モデルを reviewer に据えるかは信頼の宣言なので、
   ADR 0011(二層 config)の「信頼の宣言は host 専用」に従い host `config.toml` にのみ書ける
   (repo `meguri.toml` からは指定不可 = `RepoConfig` に入れない)。run 中の agent が自分の
