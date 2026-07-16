@@ -82,9 +82,34 @@ pub struct PreparedTurn {
 /// spawns the pane with the trigger as the agent's initial prompt argument
 /// (turn 1) or sends the trigger line into the existing pane (later turns).
 pub fn prepare_turn(worktree: &Path, prompt_body: &str, preamble: &str) -> Result<PreparedTurn> {
+    prepare_turn_impl(worktree, prompt_body, preamble, false)
+}
+
+/// Like [`prepare_turn`] but the completion contract names a per-turn
+/// `result-<turn_id>.json` (issue #214), so parallel round-1 review turns never
+/// race on the single `result.json`. Everything else is identical.
+pub fn prepare_turn_isolated(
+    worktree: &Path,
+    prompt_body: &str,
+    preamble: &str,
+) -> Result<PreparedTurn> {
+    prepare_turn_impl(worktree, prompt_body, preamble, true)
+}
+
+fn prepare_turn_impl(
+    worktree: &Path,
+    prompt_body: &str,
+    preamble: &str,
+    isolated: bool,
+) -> Result<PreparedTurn> {
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let prompt_path = prompts::write_prompt_file(worktree, &turn_id, prompt_body, preamble)?;
-    prompts::clear_result(worktree)?;
+    let prompt_path =
+        prompts::write_prompt_file(worktree, &turn_id, prompt_body, preamble, isolated)?;
+    if isolated {
+        prompts::clear_isolated_result(worktree, &turn_id)?;
+    } else {
+        prompts::clear_result(worktree)?;
+    }
     Ok(PreparedTurn {
         trigger_line: prompts::trigger_line(&turn_id),
         turn_id,

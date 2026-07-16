@@ -84,6 +84,13 @@ pub fn result_path(worktree: &Path) -> PathBuf {
     meguri_dir(worktree).join(RESULT_FILE)
 }
 
+/// The per-turn result file for an isolated turn (issue #214):
+/// `.meguri/result-<turn_id>.json`. Parallel round-1 review turns each write
+/// their own so they never race on the single `result.json`.
+pub fn isolated_result_path(worktree: &Path, turn_id: &str) -> PathBuf {
+    meguri_dir(worktree).join(format!("result-{turn_id}.json"))
+}
+
 pub fn prompt_path(worktree: &Path, turn_id: &str) -> PathBuf {
     meguri_dir(worktree).join(format!("prompt-{turn_id}.md"))
 }
@@ -93,15 +100,23 @@ pub fn trigger_line(turn_id: &str) -> String {
     format!("Read the file {MEGURI_DIR}/prompt-{turn_id}.md and carry it out completely.")
 }
 
-/// Contract block appended to every prompt body.
-fn completion_contract(turn_id: &str) -> String {
+/// Contract block appended to every prompt body. `isolated` (issue #214) swaps
+/// the shared `result.json` for a per-turn `result-<turn_id>.json`, so parallel
+/// review turns never race on one file; `false` yields the historical wording
+/// byte-for-byte.
+fn completion_contract(turn_id: &str, isolated: bool) -> String {
+    let result_file = if isolated {
+        format!("result-{turn_id}.json")
+    } else {
+        RESULT_FILE.to_string()
+    };
     format!(
         r#"---
 
 ## Completion contract (mandatory)
 
 When you have FULLY completed the task above, write a JSON file at
-`{MEGURI_DIR}/{RESULT_FILE}` (relative to the repository root) containing exactly:
+`{MEGURI_DIR}/{result_file}` (relative to the repository root) containing exactly:
 
     {{"turn_id": "{turn_id}", "status": "success", "subject": "<imperative one-line description of the actual change>", "summary": "<one concise paragraph of what you did>", "pr_body": "<Markdown pull-request description>"}}
 
@@ -141,6 +156,7 @@ pub fn write_prompt_file(
     turn_id: &str,
     body: &str,
     preamble: &str,
+    isolated: bool,
 ) -> Result<PathBuf> {
     let dir = meguri_dir(worktree);
     std::fs::create_dir_all(&dir)?;
@@ -152,26 +168,43 @@ pub fn write_prompt_file(
     };
     let content = format!(
         "<!-- meguri prompt -->\nturn_id: {turn_id}\n\n{preamble_block}{body}\n\n{contract}\n",
-        contract = completion_contract(turn_id)
+        contract = completion_contract(turn_id, isolated)
     );
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
-/// Remove any stale result file before a new turn starts.
+/// Remove any stale shared result file before a new turn starts.
 pub fn clear_result(worktree: &Path) -> Result<()> {
-    let path = result_path(worktree);
-    match std::fs::remove_file(&path) {
+    remove_if_present(&result_path(worktree))
+}
+
+/// Remove any stale per-turn result file before an isolated turn starts
+/// (issue #214).
+pub fn clear_isolated_result(worktree: &Path, turn_id: &str) -> Result<()> {
+    remove_if_present(&isolated_result_path(worktree, turn_id))
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
 }
 
-/// Read the result file if it exists and belongs to `turn_id`.
-/// A file for another turn (stale) or unparseable content yields None.
+/// Read the result file if it exists and belongs to `turn_id`. Tries the
+/// per-turn `result-<turn_id>.json` first (issue #214 isolated turns), then the
+/// shared `result.json`; the per-turn name embeds the id, so the two never
+/// collide and the shared path stays byte-for-byte for ordinary turns. A file
+/// for another turn (stale) or unparseable content yields None.
 pub fn read_result(worktree: &Path, turn_id: &str) -> Option<TurnResultFile> {
-    let raw = std::fs::read_to_string(result_path(worktree)).ok()?;
+    read_result_at(&isolated_result_path(worktree, turn_id), turn_id)
+        .or_else(|| read_result_at(&result_path(worktree), turn_id))
+}
+
+fn read_result_at(path: &Path, turn_id: &str) -> Option<TurnResultFile> {
+    let raw = std::fs::read_to_string(path).ok()?;
     let parsed: TurnResultFile = serde_json::from_str(raw.trim()).ok()?;
     if parsed.turn_id == turn_id {
         Some(parsed)
@@ -194,7 +227,8 @@ mod tests {
     #[test]
     fn prompt_file_contains_contract_and_turn_id() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_prompt_file(dir.path(), "abc-123", "Implement the thing.", "").unwrap();
+        let path =
+            write_prompt_file(dir.path(), "abc-123", "Implement the thing.", "", false).unwrap();
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("turn_id: abc-123"));
         assert!(content.contains("Implement the thing."));
@@ -210,13 +244,13 @@ mod tests {
         // The whole point of the empty-preamble path: a project with no
         // `[prompts]` config gets byte-for-byte the historical prompt.
         let dir = tempfile::tempdir().unwrap();
-        let with = write_prompt_file(dir.path(), "t", "Body here.", "").unwrap();
+        let with = write_prompt_file(dir.path(), "t", "Body here.", "", false).unwrap();
         let content = std::fs::read_to_string(with).unwrap();
         assert_eq!(
             content,
             format!(
                 "<!-- meguri prompt -->\nturn_id: t\n\nBody here.\n\n{}\n",
-                completion_contract("t")
+                completion_contract("t", false)
             )
         );
     }
@@ -229,6 +263,7 @@ mod tests {
             "t",
             "ISSUE BODY",
             "## 恒常規律\nRead the guardrails.",
+            false,
         )
         .unwrap();
         let content = std::fs::read_to_string(path).unwrap();
@@ -255,6 +290,41 @@ mod tests {
 
         std::fs::write(result_path(dir.path()), "not json").unwrap();
         assert!(read_result(dir.path(), "t1").is_none());
+    }
+
+    #[test]
+    fn isolated_result_read_does_not_collide_with_shared() {
+        // Issue #214: a per-turn result file is read for its own turn, while a
+        // stale shared result.json (a different turn) does not satisfy it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(meguri_dir(dir.path())).unwrap();
+        // A stale shared result for some earlier turn.
+        std::fs::write(
+            result_path(dir.path()),
+            r#"{"turn_id":"execute","status":"success","summary":"prev"}"#,
+        )
+        .unwrap();
+        // The isolated turn hasn't written yet: the shared file's mismatched id
+        // must not be mistaken for this turn's result.
+        assert!(read_result(dir.path(), "rev0").is_none());
+        // Now the isolated turn writes its own per-turn file.
+        std::fs::write(
+            isolated_result_path(dir.path(), "rev0"),
+            r#"{"turn_id":"rev0","status":"success","summary":"reviewed"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_result(dir.path(), "rev0").unwrap().summary, "reviewed");
+        // The shared file still resolves its own (different) turn independently.
+        assert_eq!(read_result(dir.path(), "execute").unwrap().summary, "prev");
+    }
+
+    #[test]
+    fn isolated_contract_names_per_turn_result_file() {
+        // Issue #214: the isolated contract instructs writing result-<id>.json;
+        // the shared contract keeps result.json (byte-for-byte for other turns).
+        assert!(completion_contract("z", true).contains(".meguri/result-z.json"));
+        assert!(!completion_contract("z", true).contains(".meguri/result.json`"));
+        assert!(completion_contract("z", false).contains(".meguri/result.json"));
     }
 
     #[test]
