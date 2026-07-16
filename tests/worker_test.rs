@@ -897,6 +897,63 @@ async fn commit_fix(wt: &Path) {
 const REVIEW_MARK: &str = "self-review round";
 const FIX_MARK: &str = "# Findings";
 
+/// Pull the finding ids (`f1`, `f2`, …) out of the `# Findings` section of a fix
+/// prompt, so a scripted fix agent can declare a disposition for each (issue
+/// #212). Only the findings block is scanned, not the instruction bullets.
+fn fix_ids_from_prompt(prompt: &str) -> Vec<String> {
+    let start = prompt.find("# Findings").unwrap_or(0);
+    let end = prompt[start..]
+        .find("# Instructions")
+        .map(|i| start + i)
+        .unwrap_or(prompt.len());
+    prompt[start..end]
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("- `")?;
+            let e = rest.find('`')?;
+            Some(rest[..e].to_string())
+        })
+        .collect()
+}
+
+/// A fix turn (issue #212): make a unique commit (so back-to-back fix turns each
+/// have something to commit) and write a `fixed` disposition for every open
+/// finding named in the prompt.
+async fn commit_fix_and_dispositions(wt: &Path, turn_id: &str, prompt: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wt.join("greeting.txt"))
+        .unwrap();
+    f.write_all(format!("fix {turn_id}\n").as_bytes()).unwrap();
+    drop(f);
+    run_git(wt, &["add", "greeting.txt"]).await.unwrap();
+    run_git(
+        wt,
+        &[
+            "-c",
+            "user.email=a@example.com",
+            "-c",
+            "user.name=agent",
+            "commit",
+            "-m",
+            "Address self-review",
+        ],
+    )
+    .await
+    .unwrap();
+    let dispositions: Vec<_> = fix_ids_from_prompt(prompt)
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "action": "fixed" }))
+        .collect();
+    std::fs::write(
+        wt.join(meguri::engine::self_review::FIX_FILE),
+        serde_json::json!({ "dispositions": dispositions }).to_string(),
+    )
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn self_review_clean_publishes_without_touching_the_forge() {
     let mut env = setup(None).await;
@@ -1007,7 +1064,7 @@ async fn self_review_findings_then_fix_converge_in_one_run() {
                     write_review(&wt, "clean", serde_json::json!([]));
                 }
             } else if prompt.contains(FIX_MARK) {
-                commit_fix(&wt).await;
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
             } else {
                 commit_greeting(&wt).await;
             }
@@ -1052,7 +1109,7 @@ async fn self_review_findings_then_fix_converge_in_one_run() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn self_review_escalates_when_rounds_run_out() {
+async fn self_review_cap_runs_final_fix_and_publishes() {
     let mut env = setup(None).await;
     env.deps.config.review.enabled = true;
     env.deps.config.review.max_rounds = 2;
@@ -1062,7 +1119,9 @@ async fn self_review_escalates_when_rounds_run_out() {
         .create_run("proj", 7, "Add greeting file")
         .unwrap();
 
-    // The review never converges; the fix "addresses" it each round.
+    // Each review raises a fresh minor finding (no id) — never the same one, so
+    // it is not a ping-pong. On the cap, only minor blocking remains, so a final
+    // fix + validate publishes instead of escalating (issue #212, ADR 0022).
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
         let wt = wt.to_path_buf();
         let turn_id = turn_id.to_string();
@@ -1073,11 +1132,101 @@ async fn self_review_escalates_when_rounds_run_out() {
                     &wt,
                     "fixable",
                     serde_json::json!([
-                        {"path": "greeting.txt", "line": 1, "body": "still not right"}
+                        {"path": "greeting.txt", "line": 1, "body": "one more nit"}
                     ]),
                 );
             } else if prompt.contains(FIX_MARK) {
-                commit_fix(&wt).await;
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    // The run succeeds and publishes a real PR — not an escalation.
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 200)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.final_fix".to_string()),
+        "cap with minor remainder runs a final fix: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"self_review.unconverged".to_string()),
+        "the final-fix path must not escalate: {kinds:?}"
+    );
+    // A real delivery (`pr.created`), not an escalate-time evidence draft.
+    assert!(
+        kinds.contains(&"pr.created".to_string()),
+        "a delivered PR is created: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"self_review.escalated_draft".to_string()),
+        "the final-fix path delivers, it does not escalate a draft: {kinds:?}"
+    );
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "one delivered PR");
+    assert!(
+        prs[0].body.contains("最終ラウンドの fix は未再レビュー"),
+        "the PR body records the un-re-reviewed final fix: {}",
+        prs[0].body
+    );
+    assert!(
+        !env.forge
+            .pr_labels_of(prs[0].number)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "a delivered PR is not labeled needs-human"
+    );
+    assert!(
+        !env.forge
+            .labels_of(7)
+            .contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "the issue is not parked on a human"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_review_ping_pong_escalates() {
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    env.deps.config.review.max_rounds = 3;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    // The reviewer keeps re-raising the SAME finding (by id) even though the
+    // author "fixes" it each round — a genuine ping-pong. After two fix turns it
+    // is still open, so the run escalates to a human (issue #212, reason 2).
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                // Round 1 raises it fresh (no id); round 2+ re-lists `f1` by id.
+                let findings = if prompt.contains("self-review round 1") {
+                    serde_json::json!([{"path": "greeting.txt", "line": 1, "body": "still not right"}])
+                } else {
+                    serde_json::json!([{"id": "f1", "path": "greeting.txt", "line": 1, "body": "still not right"}])
+                };
+                write_review(&wt, "fixable", findings);
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
             } else {
                 commit_greeting(&wt).await;
             }
@@ -1090,12 +1239,7 @@ async fn self_review_escalates_when_rounds_run_out() {
         .expect("worker timed out");
     agent.abort();
 
-    // Non-convergence is a human gate (issue #176, ADR 0012): the run fails and
-    // the issue is parked on needs-human. Since the branch is ahead of base, the
-    // committed work is also published as a needs-human draft PR — the evidence
-    // for the human (issue #209, ADR 0020) — instead of staying trapped in the
-    // worktree.
-    assert!(result.is_err(), "unconverged self-review must fail the run");
+    assert!(result.is_err(), "a ping-pong must fail the run to a human");
     let kinds: Vec<String> = env
         .deps
         .store
@@ -1105,31 +1249,124 @@ async fn self_review_escalates_when_rounds_run_out() {
         .map(|e| e.kind.clone())
         .collect();
     assert!(
-        kinds.contains(&"self_review.unconverged".to_string()),
+        kinds.contains(&"self_review.pingpong".to_string()),
         "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"self_review.final_fix".to_string()),
+        "a ping-pong escalates, it does not final-fix: {kinds:?}"
     );
     assert!(
         kinds.contains(&"self_review.escalated_draft".to_string()),
         "the committed work is published as evidence: {kinds:?}"
     );
     assert!(
-        !kinds.contains(&"pr.created".to_string()),
-        "an evidence draft is not a delivered PR: {kinds:?}"
-    );
-    let prs = env.forge.prs();
-    assert_eq!(prs.len(), 1, "exactly one needs-human draft");
-    assert!(prs[0].draft, "published as a draft");
-    assert!(
         env.forge
-            .pr_labels_of(prs[0].number)
+            .labels_of(7)
             .contains(&LABEL_NEEDS_HUMAN.to_string()),
-        "draft is labeled needs-human at birth: {:?}",
-        prs[0].labels
+        "{:?}",
+        env.forge.labels_of(7)
     );
-    let labels = env.forge.labels_of(7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn final_fix_resumes_into_publish_not_ping_pong() {
+    use meguri::engine::flow::{Checkpoint, STEP_SELF_REVIEW};
+    use meguri::engine::self_review::FindingStatus;
+
+    // The resume race (issue #212): a run interrupted mid-final-fix, with a
+    // finding already at fix_attempts == 2, must resume back INTO the final-fix
+    // publish — the persisted `self_review_final_fix_started` marker routes it
+    // past the ping-pong check, so it does not mis-escalate. Built by running the
+    // cap→final-fix scenario, then rewinding the checkpoint to the interrupted
+    // state and resuming on the same worktree.
+    let mut env = setup(None).await;
+    env.deps.config.review.enabled = true;
+    env.deps.config.review.max_rounds = 2;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if prompt.contains(REVIEW_MARK) {
+                write_review(
+                    &wt,
+                    "fixable",
+                    serde_json::json!([{"path": "greeting.txt", "line": 1, "body": "one more nit"}]),
+                );
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
+            } else {
+                commit_greeting(&wt).await;
+            }
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    // First pass: run to completion so a real worktree/branch/PR exist.
+    tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("first pass timed out")
+        .unwrap();
+
+    // Rewind to the interrupted mid-final-fix state: committed to the final-fix
+    // path, one finding open at two fix attempts, not yet re-reviewed.
+    let rec = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    let mut cp: Checkpoint = serde_json::from_str(&rec.checkpoint_json).unwrap();
+    cp.self_review_final_fix_started = true;
+    cp.self_review_final_fix_unreviewed = false;
+    cp.self_review_converged = false;
+    cp.self_review_rounds = env.deps.config.review.max_rounds;
+    for e in cp.self_review_ledger.iter_mut() {
+        e.status = FindingStatus::Open;
+        e.fix_attempts = 2;
+    }
     assert!(
-        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
-        "{labels:?}"
+        cp.self_review_ledger
+            .iter()
+            .any(|e| e.status == FindingStatus::Open && e.fix_attempts >= 2),
+        "the rewound state must look like a ping-pong to prove it is not treated as one"
+    );
+    env.deps
+        .store
+        .update_run_step(
+            &run.id,
+            STEP_SELF_REVIEW,
+            &serde_json::to_string(&cp).unwrap(),
+        )
+        .unwrap();
+
+    // Resume: it must publish via the final-fix path, never escalate a ping-pong.
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("resume timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "resume must publish, not escalate: {outcome:?}"
+    );
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 400)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    // Had the fix been absent, the phase would have escalated a ping-pong and
+    // `run_worker` above would have returned Err (unwrap would panic). The
+    // absence of the event is the belt-and-braces check.
+    assert!(
+        !kinds.contains(&"self_review.pingpong".to_string()),
+        "the interrupted final fix must not be mis-read as a ping-pong: {kinds:?}"
     );
 }
 
