@@ -76,19 +76,50 @@ pub struct PreparedTurn {
     pub turn_id: String,
     pub prompt_path: PathBuf,
     pub trigger_line: String,
+    /// Whether the completion contract names a per-turn `result-<turn_id>.json`
+    /// (issue #214). Carried so the stagnation nudge names the same file the
+    /// contract did — a nudge to the shared `result.json` would make a stalled
+    /// isolated reviewer race its siblings.
+    pub isolated: bool,
 }
 
 /// Write the prompt file + clear stale results. The caller then either
 /// spawns the pane with the trigger as the agent's initial prompt argument
 /// (turn 1) or sends the trigger line into the existing pane (later turns).
 pub fn prepare_turn(worktree: &Path, prompt_body: &str, preamble: &str) -> Result<PreparedTurn> {
+    prepare_turn_impl(worktree, prompt_body, preamble, false)
+}
+
+/// Like [`prepare_turn`] but the completion contract names a per-turn
+/// `result-<turn_id>.json` (issue #214), so parallel round-1 review turns never
+/// race on the single `result.json`. Everything else is identical.
+pub fn prepare_turn_isolated(
+    worktree: &Path,
+    prompt_body: &str,
+    preamble: &str,
+) -> Result<PreparedTurn> {
+    prepare_turn_impl(worktree, prompt_body, preamble, true)
+}
+
+fn prepare_turn_impl(
+    worktree: &Path,
+    prompt_body: &str,
+    preamble: &str,
+    isolated: bool,
+) -> Result<PreparedTurn> {
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let prompt_path = prompts::write_prompt_file(worktree, &turn_id, prompt_body, preamble)?;
-    prompts::clear_result(worktree)?;
+    let prompt_path =
+        prompts::write_prompt_file(worktree, &turn_id, prompt_body, preamble, isolated)?;
+    if isolated {
+        prompts::clear_isolated_result(worktree, &turn_id)?;
+    } else {
+        prompts::clear_result(worktree)?;
+    }
     Ok(PreparedTurn {
         trigger_line: prompts::trigger_line(&turn_id),
         turn_id,
         prompt_path,
+        isolated,
     })
 }
 
@@ -103,11 +134,17 @@ impl TurnEngine {
     /// Never fails the turn because of silence or human activity: quiet
     /// agents get nudged then escalated to a human; the only exits are a
     /// matching result file, an explicit stop, or the pane dying.
+    ///
+    /// `isolated` (issue #214) must match the flag the turn was prepared with:
+    /// it selects which result file the stagnation nudge names, so a nudged
+    /// isolated reviewer is told to write its per-turn `result-<turn_id>.json`
+    /// rather than the shared `result.json` its siblings also use.
     pub async fn await_completion(
         &self,
         pane: &PaneId,
         worktree: &Path,
         turn_id: &str,
+        isolated: bool,
         control: &dyn TurnControl,
     ) -> Result<TurnOutcome> {
         let mut activity_clock = Duration::ZERO; // stagnation: time since last observed activity
@@ -258,7 +295,7 @@ impl TurnEngine {
                     // Only type into the pane when the agent is not mid-output
                     // and no human question is pending (checked above).
                     self.mux
-                        .send_line(pane, &prompts::nudge_line(turn_id))
+                        .send_line(pane, &prompts::nudge_line(turn_id, isolated))
                         .await?;
                     nudges_sent += 1;
                     activity_clock = Duration::ZERO;

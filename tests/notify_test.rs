@@ -114,7 +114,7 @@ async fn reblock_inside_throttle_window_notifies_once() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, &s.control)
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, &s.control)
         .await
         .unwrap();
     driver.await.unwrap();
@@ -175,7 +175,7 @@ async fn reblock_past_throttle_window_notifies_again() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, &s.control)
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, &s.control)
         .await
         .unwrap();
     driver.await.unwrap();

@@ -79,10 +79,14 @@ pub enum ProbeOutcome {
 }
 
 /// Production live-launch probe: fire a one-shot, ~1-token turn to check the
-/// profile's model alias is still valid. Only the `claude` CLI has a known
-/// probe form today; other commands report `Unavailable` (⚠️, non-fatal)
-/// rather than a false `ModelInvalid`. Injected as a closure in doctor so
-/// tests exercise the classification without spawning a real CLI.
+/// profile's model alias is still valid. Dispatches by the command's base name
+/// (issue #214): the `claude` CLI has a known model-rejection format, so it can
+/// return the actionable `ModelInvalid`; other CLIs that expose a headless
+/// one-shot (codex / grok / …, via [`effective_headless_args`]) get a real
+/// launch probe that only ever reports `Ok`/`Unavailable` — never a false
+/// `ModelInvalid`, since their rejection wording is not known. A command with
+/// no headless mode at all stays `Unavailable`. Injected as a closure in doctor
+/// so tests exercise the classification without spawning a real CLI.
 pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
     // Match the CLI by basename so an absolute path to a `claude` binary (or a
     // test fake) still counts.
@@ -90,11 +94,18 @@ pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(&profile.command);
-    if base != "claude" {
-        return ProbeOutcome::Unavailable;
+    if base == "claude" {
+        return probe_claude(profile);
     }
-    // Reuse the profile's own args (which carry `--model <alias>`) plus a
-    // trivial one-shot prompt.
+    probe_generic(profile)
+}
+
+/// The `claude` probe: reuse the profile's own args (which carry
+/// `--model <alias>`) plus a trivial one-shot prompt, and classify a
+/// model-rejection message (names the model and an invalidity) as the
+/// actionable `ModelInvalid`; everything else (auth, rate limit, network) as
+/// `Unavailable`.
+fn probe_claude(profile: &AgentProfile) -> ProbeOutcome {
     let mut args = profile.args.clone();
     args.push("-p".into());
     args.push("reply: ok".into());
@@ -110,8 +121,6 @@ pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
                 String::from_utf8_lossy(&out.stderr)
             )
             .to_lowercase();
-            // A model-rejection message names the model and an invalidity;
-            // everything else (auth, rate limit, network) is Unavailable.
             let model_rejected = text.contains("model")
                 && (text.contains("invalid")
                     || text.contains("unknown")
@@ -125,6 +134,27 @@ pub fn probe_profile(profile: &AgentProfile) -> ProbeOutcome {
             }
         }
         Err(_) => ProbeOutcome::Unavailable,
+    }
+}
+
+/// The generic probe for a non-`claude` CLI (issue #214): launch its headless
+/// one-shot ([`effective_headless_args`]) with a trivial prompt. A clean exit is
+/// `Ok` (the profile launches and its model resolves enough to reply); anything
+/// else is `Unavailable`. It deliberately never returns `ModelInvalid` — other
+/// CLIs' model-rejection wording is not known, so classifying a bad model would
+/// risk a false ❌. A command with no headless mode is `Unavailable` (nothing to
+/// fire).
+fn probe_generic(profile: &AgentProfile) -> ProbeOutcome {
+    let Some(mut args) = effective_headless_args(profile) else {
+        return ProbeOutcome::Unavailable;
+    };
+    args.push("reply: ok".into());
+    match std::process::Command::new(&profile.command)
+        .args(&args)
+        .output()
+    {
+        Ok(out) if out.status.success() => ProbeOutcome::Ok,
+        _ => ProbeOutcome::Unavailable,
     }
 }
 
@@ -642,6 +672,19 @@ mod tests {
     /// A detector that only "finds" the named commands.
     fn only(available: &'static [&'static str]) -> impl Fn(&str) -> bool {
         move |cmd: &str| available.contains(&cmd)
+    }
+
+    #[test]
+    fn probe_non_claude_without_headless_is_unavailable_not_model_invalid() {
+        // Issue #214: a codex/grok profile with no headless mode is Unavailable
+        // (⚠️, non-fatal) — never a false ModelInvalid (❌). This resolves via
+        // `effective_headless_args` returning None, so no process is spawned.
+        let profile = AgentProfile {
+            command: "codex".into(),
+            args: vec!["--model".into(), "gpt-5".into()],
+            ..Default::default()
+        };
+        assert_eq!(probe_profile(&profile), ProbeOutcome::Unavailable);
     }
 
     #[test]

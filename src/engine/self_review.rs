@@ -37,10 +37,38 @@ use serde_json::json;
 
 use super::Deps;
 use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
+use crate::config::{Config, ProjectConfig};
 use crate::gitops;
 use crate::store::RunRecord;
 use crate::turn::prompts::MEGURI_DIR;
 use crate::turn::{TurnOutcome, TurnStatus};
+
+/// Which loop kinds run the internal self-review phase (ADR 0006/0008): worker,
+/// planner, and spec-worker opt in via `Flavor::self_reviews()`. The scheduler
+/// needs this as a pure function of `loop_kind` (it holds only `RunRecord`, not
+/// the `Flavor`), mirroring `collab::supports_advisor_loop_kind`. Keep in sync
+/// with the flavors whose `self_reviews()` returns true.
+pub fn self_reviews_loop_kind(loop_kind: &str) -> bool {
+    loop_kind == crate::engine::worker::KIND
+        || loop_kind == crate::engine::planner::KIND
+        || loop_kind == crate::engine::spec_worker::KIND
+}
+
+/// How many parallel round-1 reviewers this run fans out (issue #214, ADR 0023),
+/// or 0 when it takes the single-reviewer path. The scheduler weights slots by
+/// this (peak concurrent reviewer agents), so it must agree with what
+/// [`self_review`] actually spawns: a self-reviewing loop kind, review enabled,
+/// and a non-empty `[[review.reviewers]]`.
+pub fn parallel_reviewer_count(cfg: &Config, project: &ProjectConfig, loop_kind: &str) -> usize {
+    if !self_reviews_loop_kind(loop_kind) {
+        return 0;
+    }
+    let review = cfg.review_for(project);
+    if !review.enabled {
+        return 0;
+    }
+    review.reviewers.len()
+}
 
 /// Event kinds the self-review phase emits. `meguri stats review` (issue #213)
 /// reads exactly these, so the emit sites and the measurement query share one
@@ -62,6 +90,17 @@ pub const EVENT_PINGPONG: &str = "self_review.pingpong";
 /// the last fix was not re-reviewed. Distinct from [`EVENT_UNCONVERGED`], which
 /// now means a genuine escalation only.
 pub const EVENT_FINAL_FIX: &str = "self_review.final_fix";
+/// A parallel round-1 reviewer reported (issue #214, ADR 0023): carries its
+/// profile, lenses, and finding count so `meguri stats review` (#213) can read
+/// per-profile unique contribution and waive rate.
+pub const EVENT_REVIEWER_REPORTED: &str = "self_review.reviewer_reported";
+/// A configured parallel reviewer was dropped (issue #214): its profile failed
+/// to detect/resolve or its output was unusable, so the fan-out continued
+/// without it (recall from the rest is preserved).
+pub const EVENT_REVIEWER_DROPPED: &str = "self_review.reviewer_dropped";
+/// The anchor confirmation turn's outcome for a parallel-round `needs_human`
+/// (issue #214, ADR 0023 §2): whether the anchor confirmed the escalation.
+pub const EVENT_ANCHOR_CONFIRM: &str = "self_review.anchor_confirm";
 
 /// Where the orchestrator drops the local diff for the review turn to read
 /// (worktree-relative; `.meguri/` is git-excluded, so it never dirties the
@@ -74,6 +113,19 @@ pub const INCREMENTAL_DIFF_FILE: &str = ".meguri/self-review-incremental.patch";
 pub const REVIEW_FILE: &str = ".meguri/self-review.json";
 /// Where the fix turn writes its per-finding dispositions (issue #212).
 pub const FIX_FILE: &str = ".meguri/self-review-fix.json";
+
+/// Where parallel round-1 reviewer `index` writes its verdict + findings
+/// (issue #214): `.meguri/self-review-r<index>.json`, distinct from
+/// [`REVIEW_FILE`] so N reviewers never race on one file.
+fn parallel_review_file(index: usize) -> String {
+    format!(".meguri/self-review-r{index}.json")
+}
+
+/// The per-reviewer findings cap injected into each parallel round-1 prompt
+/// (issue #214, ADR 0023 §4 / spec §decision 7): keeps the union — and the fix
+/// prompt that lists it — from bloating. A constant for now (config later if a
+/// wider union proves to dilute the fix turn).
+const PARALLEL_FINDINGS_CAP: usize = 5;
 
 /// The self-review disposition (issue #176, ADR 0012). Three-valued so the
 /// reviewer itself classifies whether the diff can be repaired automatically
@@ -149,6 +201,12 @@ pub struct Finding {
     /// Which review lens surfaced it (ADR 0008), if the reviewer tagged one.
     #[serde(default)]
     pub lens: Option<String>,
+    /// Which parallel round-1 reviewer profile produced it (issue #214). Never
+    /// written by the reviewer — the orchestrator stamps it at merge time. Absent
+    /// (and unserialized) on the single-reviewer path, so its checkpoint stays
+    /// byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_profile: Option<String>,
 }
 
 /// One cumulative ledger entry (issue #212, ADR 0022): a finding tracked across
@@ -180,6 +238,12 @@ pub struct LedgerEntry {
     /// The round this finding was first raised.
     #[serde(default)]
     pub origin_round: u32,
+    /// Which parallel round-1 reviewer profile first surfaced it (issue #214,
+    /// ADR 0020): lets `meguri stats review` (#213) attribute unique
+    /// contribution and waive rate per profile. `None` (and unserialized) on the
+    /// single-reviewer path, keeping that checkpoint byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_profile: Option<String>,
 }
 
 /// One self-review round's outcome, for the PR-body `<details>` (ADR 0008):
@@ -258,6 +322,9 @@ async fn self_review_inner(
     let review_cfg = deps.config.review_for(&deps.project);
     let max_rounds = review_cfg.max_rounds;
     let lenses = review_cfg.lenses.clone();
+    // Parallel round-1 reviewers (issue #214, ADR 0023). Empty → the historical
+    // single-reviewer path, byte-for-byte.
+    let reviewers = review_cfg.reviewers.clone();
     let kind = flavor.kind();
     let base = deps.project.default_branch.clone();
     let language = deps.config.language_for(&deps.project);
@@ -303,7 +370,16 @@ async fn self_review_inner(
         }
 
         // ---- review turn (in the self-review lane) ----
-        let review = match review_turn(deps, run, cp, worktree, &base, kind, &lenses).await? {
+        // Round 1 with `[[review.reviewers]]` fans out to parallel reviewers and
+        // union-merges (issue #214, ADR 0023); every other case (round 2+, or no
+        // reviewers configured) is the single-reviewer turn, unchanged.
+        let turn = if cp.self_review_rounds == 0 && !reviewers.is_empty() {
+            round1_parallel_review(deps, run, cp, worktree, &base, kind, &lenses, &reviewers)
+                .await?
+        } else {
+            review_turn(deps, run, cp, worktree, &base, kind, &lenses).await?
+        };
+        let review = match turn {
             ReviewTurn::Reviewed(review) => review,
             ReviewTurn::Stopped => return Ok(flow::StepFlow::Stopped),
             ReviewTurn::Interrupted(r) => return Ok(flow::StepFlow::Interrupted(r)),
@@ -499,6 +575,7 @@ fn promote_pending_to_ledger(cp: &mut Checkpoint) {
             fix_attempts: 0,
             waive_reason: None,
             origin_round: round,
+            reviewer_profile: f.reviewer_profile,
         });
     }
 }
@@ -518,6 +595,7 @@ fn mirror_open_to_pending(cp: &mut Checkpoint) {
             line: e.line,
             body: e.body.clone(),
             lens: e.lens.clone(),
+            reviewer_profile: e.reviewer_profile.clone(),
         })
         .collect();
 }
@@ -576,6 +654,9 @@ fn update_ledger_from_review(cp: &mut Checkpoint, review: &SelfReviewFile, round
             fix_attempts: 0,
             waive_reason: None,
             origin_round: round,
+            // Parallel round-1 findings carry the reviewer that surfaced them
+            // (issue #214); the single-reviewer path leaves this None.
+            reviewer_profile: f.reviewer_profile.clone(),
         });
     }
 }
@@ -831,6 +912,386 @@ async fn review_turn(
     }
 }
 
+/// A resolved parallel round-1 reviewer (issue #214): its concrete profile name
+/// (for attribution + launch) and the lenses it applies.
+struct ReviewerPlan {
+    index: usize,
+    profile_name: String,
+    lenses: Vec<String>,
+}
+
+/// One fanned-out reviewer's classified outcome, computed inside its task so the
+/// join stays a simple collection (issue #214).
+enum ReviewerTaskOutcome {
+    /// Completed with a parsed, valid review.
+    Reviewed(SelfReviewFile),
+    /// Unusable (turn failed, pane died, or output did not verify) — dropped so
+    /// the fan-out continues without it. Carries a reason for the event.
+    Dropped(String),
+    /// The user asked to stop mid-turn — the whole phase stops.
+    Stopped,
+}
+
+/// Round 1 with `[[review.reviewers]]` (issue #214, ADR 0023): fan out one
+/// review turn per configured reviewer — each under its own lane, per-turn
+/// result file, and review file — then union-merge the findings. `needs_human`
+/// is not OR'd: any parallel `needs_human` runs a single anchor confirmation
+/// turn (ADR 0023 §2). Every reviewer dropping falls back to the single anchor
+/// reviewer, so the phase always gets a round-1 review.
+#[allow(clippy::too_many_arguments)]
+async fn round1_parallel_review(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &Checkpoint,
+    worktree: &Path,
+    base: &str,
+    kind: Kind,
+    lenses: &[String],
+    reviewers: &[crate::config::ReviewerConfig],
+) -> Result<ReviewTurn> {
+    // Drop the base diff once for every reviewer to read; the incremental diff is
+    // a round-2+ concept, so there is none here.
+    let base_diff = gitops::diff_against_base(worktree, base).await?;
+    std::fs::create_dir_all(worktree.join(MEGURI_DIR))?;
+    std::fs::write(worktree.join(DIFF_FILE), &base_diff)?;
+    let _ = std::fs::remove_file(worktree.join(REVIEW_FILE));
+    let head_before = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
+    let language = deps.config.language_for(&deps.project).map(str::to_string);
+
+    // The anchor profile (the `self-reviewer` routing profile): the fallback for
+    // a reviewer with no `profile`, and the model that runs the needs_human
+    // confirmation — divergence heterogeneous, convergence homogeneous
+    // (ADR 0023 §3).
+    let anchor_profile = crate::routing::resolve(
+        &deps.config,
+        "self-reviewer",
+        &crate::routing::detect_command,
+    )?;
+
+    // Resolve each reviewer to a concrete, detectable profile. An undefined or
+    // undetectable profile drops that reviewer (event) and the fan-out continues
+    // (recall from the rest survives, spec §decision 9).
+    let mut plans: Vec<ReviewerPlan> = Vec::new();
+    for (index, rc) in reviewers.iter().enumerate() {
+        let profile_name = rc.profile.clone().unwrap_or_else(|| anchor_profile.clone());
+        let detectable = crate::routing::profile_by_name(&deps.config, &profile_name)
+            .map(|p| crate::routing::detect_command(&p.command))
+            .unwrap_or(false);
+        if !detectable {
+            deps.store.emit(
+                Some(&run.id),
+                EVENT_REVIEWER_DROPPED,
+                json!({ "profile": profile_name, "reason": "profile undefined or command not detected" }),
+            )?;
+            continue;
+        }
+        let rlenses = rc.lenses.clone().unwrap_or_else(|| lenses.to_vec());
+        plans.push(ReviewerPlan {
+            index,
+            profile_name,
+            lenses: rlenses,
+        });
+    }
+
+    // Every configured reviewer dropped → fall back to the single anchor reviewer
+    // (the historical path) so the phase still gets a round-1 review.
+    if plans.is_empty() {
+        deps.store.emit(
+            Some(&run.id),
+            EVENT_REVIEWER_DROPPED,
+            json!({ "reason": "all reviewers dropped; falling back to single anchor reviewer" }),
+        )?;
+        return review_turn(deps, run, cp, worktree, base, kind, lenses).await;
+    }
+
+    // Fan out: each reviewer runs concurrently under its own lane + isolated
+    // result file, writing its own review file. Prompts are built here (holding
+    // `cp`), then moved into the tasks.
+    let mut set: tokio::task::JoinSet<(usize, String, ReviewerTaskOutcome)> =
+        tokio::task::JoinSet::new();
+    for plan in &plans {
+        let review_file = parallel_review_file(plan.index);
+        let _ = std::fs::remove_file(worktree.join(&review_file));
+        let prompt = parallel_review_prompt(
+            run,
+            cp,
+            kind,
+            &plan.lenses,
+            language.as_deref(),
+            &review_file,
+        );
+        let deps = deps.clone();
+        let run = run.clone();
+        let worktree_buf = worktree.to_path_buf();
+        let profile_name = plan.profile_name.clone();
+        let index = plan.index;
+        let lane_key = format!("{}#{index}", crate::store::LANE_SELF_REVIEW);
+        set.spawn(async move {
+            let outcome = flow::run_parallel_review_turn(
+                &deps,
+                &run,
+                &worktree_buf,
+                Some(&profile_name),
+                lane_key,
+                "self-review",
+                &prompt,
+            )
+            .await;
+            let classified = classify_reviewer_outcome(&worktree_buf, &review_file, outcome);
+            (index, profile_name, classified)
+        });
+    }
+
+    // Collect, keyed by index for a deterministic union order.
+    let mut collected: Vec<(usize, String, ReviewerTaskOutcome)> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        collected.push(joined?);
+    }
+    collected.sort_by_key(|(index, _, _)| *index);
+
+    let mut reviews: Vec<(String, SelfReviewFile)> = Vec::new();
+    for (_index, profile_name, outcome) in collected {
+        match outcome {
+            ReviewerTaskOutcome::Stopped => return Ok(ReviewTurn::Stopped),
+            ReviewerTaskOutcome::Dropped(reason) => {
+                deps.store.emit(
+                    Some(&run.id),
+                    EVENT_REVIEWER_DROPPED,
+                    json!({ "profile": profile_name, "reason": reason }),
+                )?;
+            }
+            ReviewerTaskOutcome::Reviewed(review) => {
+                deps.store.emit(
+                    Some(&run.id),
+                    EVENT_REVIEWER_REPORTED,
+                    json!({
+                        "profile": profile_name,
+                        "verdict": review.verdict,
+                        "findings": review.findings.len(),
+                    }),
+                )?;
+                reviews.push((profile_name, review));
+            }
+        }
+    }
+
+    // Every reviewer that ran turned out unusable → fall back to single anchor.
+    if reviews.is_empty() {
+        return review_turn(deps, run, cp, worktree, base, kind, lenses).await;
+    }
+
+    // Trust but verify, once for the whole fan-out: reviews are read-only, so the
+    // tree must be pristine and HEAD unmoved. A violation means a reviewer
+    // committed/edited — escalate (rare; the read-only assumption is broken).
+    let clean = gitops::status_clean(worktree).await?;
+    let head_now = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
+    if !clean || head_now != head_before {
+        return Err(NeedsHuman(format!(
+            "parallel self-review on issue #{} left the tree dirty or HEAD moved \
+             (working tree clean: {clean}, HEAD {head_now} vs {head_before}) — a \
+             reviewer wrote to the checkout, which review turns must never do",
+            run.issue_number
+        ))
+        .into());
+    }
+
+    // `needs_human` is not OR'd (ADR 0023 §2): if any reviewer flagged it, one
+    // anchor confirmation turn decides.
+    let concerns: Vec<String> = reviews
+        .iter()
+        .filter(|(_, r)| r.verdict == ReviewVerdict::NeedsHuman)
+        .map(|(p, r)| format!("- ({p}) {}", r.review.trim()))
+        .collect();
+    if !concerns.is_empty() {
+        match anchor_confirm(
+            deps,
+            run,
+            cp,
+            worktree,
+            kind,
+            lenses,
+            language.as_deref(),
+            &concerns,
+        )
+        .await?
+        {
+            AnchorOutcome::Escalate(review) => return Ok(ReviewTurn::Reviewed(review)),
+            AnchorOutcome::Stopped => return Ok(ReviewTurn::Stopped),
+            AnchorOutcome::Interrupted(r) => return Ok(ReviewTurn::Interrupted(r)),
+            AnchorOutcome::Overruled(extra) => {
+                // The anchor overruled the escalation; its own findings (if any)
+                // join the union, attributed to the anchor profile.
+                return Ok(ReviewTurn::Reviewed(merge_reviews(
+                    &reviews,
+                    Some((anchor_profile.as_str(), extra)),
+                )));
+            }
+        }
+    }
+
+    Ok(ReviewTurn::Reviewed(merge_reviews(&reviews, None)))
+}
+
+/// Classify one reviewer's turn result inside its task (issue #214): a
+/// successful, verifying review is `Reviewed`; a user stop is `Stopped`;
+/// anything else (turn failure, pane death, unparseable output) is `Dropped`.
+fn classify_reviewer_outcome(
+    worktree: &Path,
+    review_file: &str,
+    outcome: Result<(TurnOutcome, String)>,
+) -> ReviewerTaskOutcome {
+    match outcome {
+        Ok((TurnOutcome::Completed(result), _)) => match result.status {
+            TurnStatus::Success => match read_review_at(worktree, review_file) {
+                Ok(review) => ReviewerTaskOutcome::Reviewed(review),
+                Err(problem) => ReviewerTaskOutcome::Dropped(problem),
+            },
+            other => ReviewerTaskOutcome::Dropped(format!("turn status {other:?}")),
+        },
+        Ok((TurnOutcome::Stopped, _)) => ReviewerTaskOutcome::Stopped,
+        Ok((TurnOutcome::PaneDied, _)) => {
+            ReviewerTaskOutcome::Dropped("pane died during review".into())
+        }
+        Err(e) => ReviewerTaskOutcome::Dropped(format!("review turn errored: {e}")),
+    }
+}
+
+/// The anchor confirmation turn's decision (issue #214, ADR 0023 §2).
+enum AnchorOutcome {
+    /// The anchor confirmed a human is needed — escalate with this review.
+    Escalate(SelfReviewFile),
+    /// The anchor overruled; its own review (clean or fixable findings) joins the
+    /// union and the phase continues.
+    Overruled(SelfReviewFile),
+    Stopped,
+    Interrupted(String),
+}
+
+/// Run the single anchor confirmation turn for a parallel-round `needs_human`
+/// (issue #214, ADR 0023 §2): the anchor model re-examines the flagged concerns
+/// and either confirms escalation (`needs_human`) or overrules it (clean /
+/// fixable). One turn regardless of how many reviewers flagged.
+#[allow(clippy::too_many_arguments)]
+async fn anchor_confirm(
+    deps: &Deps,
+    run: &RunRecord,
+    cp: &Checkpoint,
+    worktree: &Path,
+    kind: Kind,
+    lenses: &[String],
+    language: Option<&str>,
+    concerns: &[String],
+) -> Result<AnchorOutcome> {
+    let _ = std::fs::remove_file(worktree.join(REVIEW_FILE));
+    let head_before = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
+    let prompt = anchor_confirm_prompt(run, cp, kind, lenses, language, concerns);
+    let (outcome, _) =
+        flow::run_review_turn(deps, run, worktree, "self-review-anchor", &prompt).await?;
+    let result = match outcome {
+        TurnOutcome::Completed(r) => r,
+        TurnOutcome::Stopped => return Ok(AnchorOutcome::Stopped),
+        TurnOutcome::PaneDied => {
+            return Ok(AnchorOutcome::Interrupted(
+                "pane died during anchor confirmation".into(),
+            ));
+        }
+    };
+    // A turn that couldn't complete, touched the tree, or wrote an unusable
+    // review can't safely overrule an escalation — default to escalating (the
+    // needs_human was already flagged), the conservative choice.
+    let escalate = |review: String| {
+        AnchorOutcome::Escalate(SelfReviewFile {
+            verdict: ReviewVerdict::NeedsHuman,
+            review,
+            findings: Vec::new(),
+        })
+    };
+    if result.status != TurnStatus::Success {
+        deps.store.emit(
+            Some(&run.id),
+            EVENT_ANCHOR_CONFIRM,
+            json!({ "confirmed": true, "reason": "anchor turn did not complete" }),
+        )?;
+        return Ok(escalate(concerns.join("\n")));
+    }
+    let clean = gitops::status_clean(worktree).await?;
+    let head_now = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await?;
+    if !clean || head_now != head_before {
+        deps.store.emit(
+            Some(&run.id),
+            EVENT_ANCHOR_CONFIRM,
+            json!({ "confirmed": true, "reason": "anchor turn modified the tree" }),
+        )?;
+        return Ok(escalate(concerns.join("\n")));
+    }
+    let review = match read_review(worktree) {
+        Ok(r) => r,
+        Err(_) => {
+            deps.store.emit(
+                Some(&run.id),
+                EVENT_ANCHOR_CONFIRM,
+                json!({ "confirmed": true, "reason": "anchor review did not verify" }),
+            )?;
+            return Ok(escalate(concerns.join("\n")));
+        }
+    };
+    let confirmed = review.verdict == ReviewVerdict::NeedsHuman;
+    deps.store.emit(
+        Some(&run.id),
+        EVENT_ANCHOR_CONFIRM,
+        json!({ "confirmed": confirmed }),
+    )?;
+    if confirmed {
+        Ok(AnchorOutcome::Escalate(review))
+    } else {
+        Ok(AnchorOutcome::Overruled(review))
+    }
+}
+
+/// Union-merge parallel reviews into one `SelfReviewFile` (issue #214, ADR 0023
+/// §1): concatenate every non-`needs_human` reviewer's findings in index order,
+/// stamping each with the reviewer's profile for attribution (#213). `extra` is
+/// the anchor's overruling review, folded in last. Verdict is `fixable` iff the
+/// union is non-empty, else `clean`; ids are left null for the ledger to assign.
+fn merge_reviews(
+    reviews: &[(String, SelfReviewFile)],
+    extra: Option<(&str, SelfReviewFile)>,
+) -> SelfReviewFile {
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut prose: Vec<String> = Vec::new();
+    let mut fold = |profile: &str, review: &SelfReviewFile| {
+        if !review.review.trim().is_empty() {
+            prose.push(review.review.trim().to_string());
+        }
+        for f in &review.findings {
+            let mut f = f.clone();
+            f.id = None;
+            f.reviewer_profile = Some(profile.to_string());
+            findings.push(f);
+        }
+    };
+    for (profile, review) in reviews {
+        // A needs_human review carries no findings; overruled, its concern lives
+        // on only in prose — nothing to fold into the union.
+        if review.verdict != ReviewVerdict::NeedsHuman {
+            fold(profile, review);
+        }
+    }
+    if let Some((profile, review)) = &extra {
+        fold(profile, review);
+    }
+    let verdict = if findings.is_empty() {
+        ReviewVerdict::Clean
+    } else {
+        ReviewVerdict::Fixable
+    };
+    SelfReviewFile {
+        verdict,
+        review: prose.join("\n\n"),
+        findings,
+    }
+}
+
 /// One fix turn (plus at most one corrective turn) in the author lane: the
 /// author addresses the open findings, declares a disposition per finding in
 /// [`FIX_FILE`], and commits, leaving a clean tree. Applies the dispositions to
@@ -960,6 +1421,110 @@ fn review_schema() -> &'static str {
     "`{\"verdict\": \"clean\" | \"fixable\" | \"needs_human\", \"review\": \"<Markdown summary>\", \
      \"findings\": [{\"id\": null, \"kind\": \"defect\" | \"decision\", \"path\": \"src/x.rs\", \
      \"line\": 42, \"lens\": \"correctness\", \"body\": \"<what must change>\"}]}`"
+}
+
+/// The round-1 prompt for one parallel reviewer (issue #214, ADR 0023). Like the
+/// single round-1 review, but it writes to a per-reviewer `review_file` (not the
+/// shared [`REVIEW_FILE`]) and carries a per-reviewer findings cap so the union —
+/// and the fix prompt that lists it — stays bounded (§decision 7).
+fn parallel_review_prompt(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    kind: Kind,
+    lenses: &[String],
+    language: Option<&str>,
+    review_file: &str,
+) -> String {
+    let subject = match kind {
+        Kind::Plan => "spec/ADR",
+        Kind::Impl => "implementation",
+    };
+    format!(
+        "You are one of several reviewers self-reviewing this {subject} of issue #{number} in \
+         parallel before it is published as a pull request (self-review round 1). The worktree \
+         holds the committed work; `{diff}` is its full diff against the base branch.\n\n\
+         # Issue: {title}\n\n\
+         # Instructions\n\
+         - Read the diff at `{diff}`; browse the checked-out files for context as needed.\n\
+         {lens_section}\
+         - Review the {subject} for correctness, completeness (tests included where the change is \
+           code), and fit with the repository's conventions.\n\
+         - Report AT MOST {cap} findings — the most important blocking issues you see. Other \
+           reviewers cover other ground; a merged union is assembled from everyone.\n\
+         - Do NOT modify, commit, or push anything; the review file below is your only deliverable.\n\
+         - Write your review to `{review}` as JSON:\n  {schema}\n\
+           - \"clean\": nothing must change before this can be published (pure nitpicks do not \
+             block; mention them in `review` and leave `findings` empty).\n\
+           - \"fixable\": something must change and you can fix it. Every finding is blocking — there \
+             is no severity, so keep non-blocking remarks in `review` prose only. Anchor each finding \
+             to a line on the NEW side of the diff, leave `id` null (it is assigned for you), and set \
+             `kind`: \"defect\" for a bug/omission you fix in code, \"decision\" for an A-or-B you \
+             must settle and record in the {subject}.\n\
+           - \"needs_human\": something needs a person to decide — an ambiguous requirement, a risky \
+             trade-off, a product/design call you cannot make from the code. Explain it in `review` \
+             and leave `findings` empty.\n\
+         - A completed review is a success regardless of verdict; report \"failure\"/\"needs_human\" \
+           as the turn status only when you cannot review at all (the verdict above is the review's \
+           conclusion, not the turn's).\
+         {lang_section}",
+        number = run.issue_number,
+        title = cp.issue_title,
+        diff = DIFF_FILE,
+        review = review_file,
+        cap = PARALLEL_FINDINGS_CAP,
+        schema = review_schema(),
+        lens_section = lens_instruction(kind, lenses),
+        lang_section = flow::language_instruction(language),
+    )
+    // The completion contract is appended by prepare_turn.
+}
+
+/// The anchor confirmation prompt (issue #214, ADR 0023 §2): a parallel reviewer
+/// flagged `needs_human`; the anchor model re-examines the flagged concerns and
+/// decides whether a human is genuinely required, writing to [`REVIEW_FILE`].
+fn anchor_confirm_prompt(
+    run: &RunRecord,
+    cp: &Checkpoint,
+    kind: Kind,
+    lenses: &[String],
+    language: Option<&str>,
+    concerns: &[String],
+) -> String {
+    let subject = match kind {
+        Kind::Plan => "spec/ADR",
+        Kind::Impl => "implementation",
+    };
+    format!(
+        "You are the anchor reviewer confirming a parallel self-review escalation for issue \
+         #{number}. One or more parallel reviewers flagged this {subject} as needing a human \
+         decision. Your job is to judge whether a human is GENUINELY required, or whether the \
+         concern is something the author can just fix.\n\n\
+         # Issue: {title}\n\n\
+         # Flagged concerns\n{concerns}\n\n\
+         # The change\n\
+         - `{diff}` — the full diff against the base branch.\n\n\
+         # Instructions\n\
+         {lens_section}\
+         - Judge the flagged concerns against the diff.\n\
+         - Do NOT modify, commit, or push anything; the review file below is your only deliverable.\n\
+         - Write your review to `{review}` as JSON:\n  {schema}\n\
+           - \"needs_human\": you CONFIRM a person must decide — the concern is a real ambiguous \
+             requirement, risky trade-off, or product/design call. Explain in `review`, leave \
+             `findings` empty; this escalates.\n\
+           - \"fixable\": you OVERRULE the escalation — the concern (and anything else blocking) is \
+             fixable in code. List those findings (anchor to a NEW-side line, `id` null).\n\
+           - \"clean\": you OVERRULE and nothing blocks — publish as is.\
+         {lang_section}",
+        number = run.issue_number,
+        title = cp.issue_title,
+        concerns = concerns.join("\n"),
+        diff = DIFF_FILE,
+        review = REVIEW_FILE,
+        schema = review_schema(),
+        lens_section = lens_instruction(kind, lenses),
+        lang_section = flow::language_instruction(language),
+    )
+    // The completion contract is appended by prepare_turn.
 }
 
 fn review_prompt(
@@ -1161,12 +1726,18 @@ fn fix_prompt(open: &[LedgerEntry], language: Option<&str>) -> String {
 
 /// Parse and validate the review file. The Err text feeds a corrective prompt.
 fn read_review(worktree: &Path) -> std::result::Result<SelfReviewFile, String> {
-    let raw = std::fs::read_to_string(worktree.join(REVIEW_FILE)).map_err(|_| {
-        format!("- review file `{REVIEW_FILE}` does not exist (write it as instructed)")
-    })?;
+    read_review_at(worktree, REVIEW_FILE)
+}
+
+/// Parse and validate a review file at an arbitrary worktree-relative path
+/// (issue #214): the single review uses [`REVIEW_FILE`], each parallel round-1
+/// reviewer its own `self-review-r<i>.json`. Same invariants either way.
+fn read_review_at(worktree: &Path, rel: &str) -> std::result::Result<SelfReviewFile, String> {
+    let raw = std::fs::read_to_string(worktree.join(rel))
+        .map_err(|_| format!("- review file `{rel}` does not exist (write it as instructed)"))?;
     let review: SelfReviewFile = serde_json::from_str(raw.trim()).map_err(|e| {
         format!(
-            "- review file `{REVIEW_FILE}` is not valid JSON ({e}); expected \
+            "- review file `{rel}` is not valid JSON ({e}); expected \
              {{\"verdict\": \"clean\" | \"fixable\" | \"needs_human\", \"review\": \"<Markdown>\", \
              \"findings\": [{{\"id\": null, \"kind\": \"defect\"|\"decision\", \"path\": ..., \
              \"line\": ..., \"body\": ...}}]}}"
@@ -1174,7 +1745,7 @@ fn read_review(worktree: &Path) -> std::result::Result<SelfReviewFile, String> {
     })?;
     if review.verdict != ReviewVerdict::Clean && review.review.trim().is_empty() {
         return Err(format!(
-            "- verdict is \"{:?}\" but `review` in `{REVIEW_FILE}` is empty; \
+            "- verdict is \"{:?}\" but `review` in `{rel}` is empty; \
              a non-clean verdict must explain what must change",
             review.verdict
         ));
@@ -1183,21 +1754,21 @@ fn read_review(worktree: &Path) -> std::result::Result<SelfReviewFile, String> {
     match review.verdict {
         ReviewVerdict::Fixable if review.findings.is_empty() => {
             return Err(format!(
-                "- verdict is \"fixable\" but `findings` in `{REVIEW_FILE}` is empty; a fixable \
+                "- verdict is \"fixable\" but `findings` in `{rel}` is empty; a fixable \
                  review must carry at least one line-anchored finding (use \"clean\" if nothing \
                  blocks, or \"needs_human\" if a person must decide)"
             ));
         }
         ReviewVerdict::Clean if !review.findings.is_empty() => {
             return Err(format!(
-                "- verdict is \"clean\" but `findings` in `{REVIEW_FILE}` is not empty; \
+                "- verdict is \"clean\" but `findings` in `{rel}` is not empty; \
                  a clean review carries no findings — move the remarks into `review` \
                  or change the verdict"
             ));
         }
         ReviewVerdict::NeedsHuman if !review.findings.is_empty() => {
             return Err(format!(
-                "- verdict is \"needs_human\" but `findings` in `{REVIEW_FILE}` is not empty; \
+                "- verdict is \"needs_human\" but `findings` in `{rel}` is not empty; \
                  a needs_human review carries no findings — explain the decision in `review`"
             ));
         }
@@ -1206,7 +1777,7 @@ fn read_review(worktree: &Path) -> std::result::Result<SelfReviewFile, String> {
     for f in &review.findings {
         if f.path.trim().is_empty() || f.line == 0 || f.body.trim().is_empty() {
             return Err(format!(
-                "- every `findings` entry in `{REVIEW_FILE}` needs a non-empty \
+                "- every `findings` entry in `{rel}` needs a non-empty \
                  `path`, a `line` >= 1 on the NEW side of the diff, and a \
                  non-empty `body`"
             ));
@@ -1361,6 +1932,7 @@ mod tests {
             fix_attempts: 0,
             waive_reason: None,
             origin_round: 1,
+            reviewer_profile: None,
         }
     }
 
@@ -1372,6 +1944,7 @@ mod tests {
             line: 1,
             body: "x".into(),
             lens: None,
+            reviewer_profile: None,
         }
     }
 
@@ -1876,11 +2449,102 @@ mod tests {
             line: 3,
             body: "legacy".into(),
             lens: None,
+            reviewer_profile: None,
         }];
         promote_pending_to_ledger(&mut cp);
         assert_eq!(cp.self_review_ledger.len(), 1);
         assert_eq!(cp.self_review_ledger[0].status, FindingStatus::Open);
         assert_eq!(cp.self_review_ledger[0].id, "f1");
         assert_eq!(cp.self_review_ledger[0].origin_round, 1);
+    }
+
+    fn review(verdict: ReviewVerdict, findings: Vec<Finding>) -> SelfReviewFile {
+        SelfReviewFile {
+            verdict,
+            review: "prose".into(),
+            findings,
+        }
+    }
+
+    #[test]
+    fn merge_unions_findings_in_index_order_and_stamps_reviewer() {
+        // Two fixable reviewers + one clean: the union concatenates findings in
+        // reviewer order, nulls their ids (the ledger assigns them), and stamps
+        // each with the reviewer's profile for #213 attribution.
+        let reviews = vec![
+            (
+                "opus".to_string(),
+                review(
+                    ReviewVerdict::Fixable,
+                    vec![finding(Some("stale"), FindingKind::Defect)],
+                ),
+            ),
+            ("codex".to_string(), review(ReviewVerdict::Clean, vec![])),
+            (
+                "grok".to_string(),
+                review(
+                    ReviewVerdict::Fixable,
+                    vec![finding(None, FindingKind::Defect)],
+                ),
+            ),
+        ];
+        let merged = merge_reviews(&reviews, None);
+        assert_eq!(merged.verdict, ReviewVerdict::Fixable);
+        assert_eq!(merged.findings.len(), 2);
+        assert!(merged.findings.iter().all(|f| f.id.is_none()));
+        assert_eq!(merged.findings[0].reviewer_profile.as_deref(), Some("opus"));
+        assert_eq!(merged.findings[1].reviewer_profile.as_deref(), Some("grok"));
+    }
+
+    #[test]
+    fn merge_all_clean_is_clean() {
+        let reviews = vec![
+            ("a".to_string(), review(ReviewVerdict::Clean, vec![])),
+            ("b".to_string(), review(ReviewVerdict::Clean, vec![])),
+        ];
+        let merged = merge_reviews(&reviews, None);
+        assert_eq!(merged.verdict, ReviewVerdict::Clean);
+        assert!(merged.findings.is_empty());
+    }
+
+    #[test]
+    fn merge_drops_needs_human_findings_and_folds_anchor_override() {
+        // A needs_human reviewer contributes no findings; when the anchor
+        // overrules with its own fixable findings, those join the union under the
+        // anchor profile.
+        let reviews = vec![(
+            "opus".to_string(),
+            review(ReviewVerdict::NeedsHuman, vec![]),
+        )];
+        let extra = review(
+            ReviewVerdict::Fixable,
+            vec![finding(None, FindingKind::Defect)],
+        );
+        let merged = merge_reviews(&reviews, Some(("anchor", extra)));
+        assert_eq!(merged.verdict, ReviewVerdict::Fixable);
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(
+            merged.findings[0].reviewer_profile.as_deref(),
+            Some("anchor")
+        );
+    }
+
+    #[test]
+    fn parallel_count_zero_without_reviewers_and_for_non_review_loops() {
+        use crate::config::ReviewerConfig;
+        let deps = fake_deps();
+        let mut cfg = deps.config.clone();
+        let project = &deps.project;
+        // No reviewers → single path → weight contribution 0.
+        assert_eq!(parallel_reviewer_count(&cfg, project, "worker"), 0);
+        // Two reviewers on a self-reviewing loop → 2.
+        cfg.review.reviewers = vec![ReviewerConfig::default(), ReviewerConfig::default()];
+        assert_eq!(parallel_reviewer_count(&cfg, project, "worker"), 2);
+        assert_eq!(parallel_reviewer_count(&cfg, project, "planner"), 2);
+        // A loop that never self-reviews contributes 0 even with reviewers set.
+        assert_eq!(parallel_reviewer_count(&cfg, project, "fixer"), 0);
+        // Review disabled → 0.
+        cfg.review.enabled = false;
+        assert_eq!(parallel_reviewer_count(&cfg, project, "worker"), 0);
     }
 }

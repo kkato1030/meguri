@@ -23,7 +23,10 @@ use crate::notify::Notification;
 use crate::routing;
 use crate::store::{InteractionState, LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::{self, TaskKey};
-use crate::turn::{TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn};
+use crate::turn::{
+    TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn,
+    prepare_turn_isolated,
+};
 
 pub const STEP_PREPARE_WORK: &str = "prepare-work";
 pub const STEP_PREPARE_WORKTREE: &str = "prepare-worktree";
@@ -1291,7 +1294,7 @@ async fn ensure_pane(
     lane: &Lane,
     initial_trigger: &str,
 ) -> Result<EnsuredPane> {
-    let lane_name = lane.lane;
+    let lane_name = lane.lane.as_str();
     let worktree_str = worktree.to_string_lossy();
     if let Some(record) = deps
         .store
@@ -1391,7 +1394,7 @@ async fn spawn_agent_pane(
     initial_trigger: &str,
     resume_session: Option<&str>,
 ) -> Result<PaneId> {
-    let lane_name = lane.lane;
+    let lane_name = lane.lane.as_str();
     let profile_name = &lane.profile_name;
     let profile = &lane.profile;
     let worktree_str = worktree.to_string_lossy();
@@ -1630,7 +1633,11 @@ async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
 /// (ADR 0006). "Lane" now means "issue-scoped resumable context"; a pane is
 /// optional (`mode == Direct` never has one).
 pub(crate) struct Lane {
-    lane: &'static str,
+    /// The pane-registry lane key `(project, issue, lane)`. Owned (issue #214):
+    /// most lanes are the historical `&'static str` constants, but a parallel
+    /// round-1 reviewer uses a per-reviewer key like `self-review#0` so its
+    /// pane/session never collides with a sibling reviewer's.
+    lane: String,
     profile_name: String,
     profile: crate::config::AgentProfile,
     mode: LaunchMode,
@@ -1644,7 +1651,7 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
     let (profile_name, profile) = resolve_run_profile(deps, run)?;
     let mode = launch::resolve(&deps.config, routing::routing_role_for_loop(&run.loop_kind));
     Ok(Lane {
-        lane,
+        lane: lane.to_string(),
         profile_name,
         profile,
         mode,
@@ -1659,15 +1666,31 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
 /// symmetric). Its launch mode resolves independently too — recommended
 /// `direct` (ADR 0012): an internal loop no human ever attaches to.
 fn self_review_lane(deps: &Deps) -> Result<Lane> {
-    let profile_name = crate::routing::resolve(
-        &deps.config,
-        "self-reviewer",
-        &crate::routing::detect_command,
-    )?;
+    self_review_lane_for(deps, None, crate::store::LANE_SELF_REVIEW.to_string())
+}
+
+/// A self-review lane under a chosen profile and lane key (issue #214). A
+/// parallel round-1 reviewer passes `profile_override = Some(name)` from its
+/// `[[review.reviewers]].profile` and a distinct `lane` key (e.g.
+/// `self-review#0`) so its pane/session never collides with a sibling's. The
+/// **profile** comes from the reviewer config (falling back to the
+/// `self-reviewer` routing profile when `None`), while the **launch mode** is
+/// always resolved from the `self-reviewer` role — profile and mode are resolved
+/// separately (spec §decision 10). `profile_override` naming an undefined
+/// profile is an error the caller decides how to handle (drop-and-continue).
+fn self_review_lane_for(deps: &Deps, profile_override: Option<&str>, lane: String) -> Result<Lane> {
+    let profile_name = match profile_override {
+        Some(name) => name.to_string(),
+        None => crate::routing::resolve(
+            &deps.config,
+            "self-reviewer",
+            &crate::routing::detect_command,
+        )?,
+    };
     let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
     let mode = launch::resolve(&deps.config, "self-reviewer");
     Ok(Lane {
-        lane: crate::store::LANE_SELF_REVIEW,
+        lane,
         profile_name,
         profile,
         mode,
@@ -1740,7 +1763,17 @@ pub(crate) async fn run_turn(
 ) -> Result<(TurnOutcome, String)> {
     let lane = author_lane(deps, run)?;
     let role = crate::routing::routing_role_for_loop(&run.loop_kind);
-    run_turn_in(deps, run, worktree, &lane, role, purpose, prompt_body).await
+    run_turn_in(
+        deps,
+        run,
+        worktree,
+        &lane,
+        role,
+        purpose,
+        prompt_body,
+        false,
+    )
+    .await
 }
 
 /// Run one prompt-turn in the worker's self-review lane under the
@@ -1761,10 +1794,41 @@ pub(crate) async fn run_review_turn(
         "self-reviewer",
         purpose,
         prompt_body,
+        false,
     )
     .await
 }
 
+/// Run one parallel round-1 review turn (issue #214) under a specific reviewer
+/// `profile` and `lane` key, with an isolated per-turn result file so N of these
+/// can run concurrently without racing on `result.json`. The profile comes from
+/// the reviewer config; the launch mode is the `self-reviewer` role's (spec
+/// §decision 10). An undefined profile surfaces as an `Err` for the caller to
+/// drop-and-continue.
+pub(crate) async fn run_parallel_review_turn(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    profile_override: Option<&str>,
+    lane_key: String,
+    purpose: &str,
+    prompt_body: &str,
+) -> Result<(TurnOutcome, String)> {
+    let lane = self_review_lane_for(deps, profile_override, lane_key)?;
+    run_turn_in(
+        deps,
+        run,
+        worktree,
+        &lane,
+        "self-reviewer",
+        purpose,
+        prompt_body,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_in(
     deps: &Deps,
     run: &RunRecord,
@@ -1773,9 +1837,14 @@ async fn run_turn_in(
     role: &str,
     purpose: &str,
     prompt_body: &str,
+    isolated: bool,
 ) -> Result<(TurnOutcome, String)> {
     let preamble = resolve_preamble(deps, run, worktree, role)?;
-    let prepared = prepare_turn(worktree, prompt_body, &preamble)?;
+    let prepared = if isolated {
+        prepare_turn_isolated(worktree, prompt_body, &preamble)?
+    } else {
+        prepare_turn(worktree, prompt_body, &preamble)?
+    };
     deps.store.begin_turn(
         &run.id,
         &prepared.turn_id,
@@ -1798,7 +1867,13 @@ async fn run_turn_in(
                 deps.mux.send_line(&pane, &prepared.trigger_line).await?;
             }
             let outcome = engine
-                .await_completion(&pane, worktree, &prepared.turn_id, &control)
+                .await_completion(
+                    &pane,
+                    worktree,
+                    &prepared.turn_id,
+                    prepared.isolated,
+                    &control,
+                )
                 .await?;
             (outcome, Some(pane), ensured.resumed)
         }
@@ -1815,7 +1890,7 @@ async fn run_turn_in(
             super::reaper::release_pane(
                 deps,
                 run.issue_number,
-                lane.lane,
+                lane.lane.as_str(),
                 "lane switched to direct launch mode",
             )
             .await;
@@ -1839,7 +1914,7 @@ async fn run_turn_in(
         deps,
         run,
         worktree,
-        lane.lane,
+        lane.lane.as_str(),
         pane.as_ref(),
         resumed,
         &outcome,
@@ -1877,7 +1952,7 @@ async fn spawn_direct_process(
     turn_id: &str,
     initial_trigger: &str,
 ) -> Result<(tokio::process::Child, bool)> {
-    let lane_name = lane.lane;
+    let lane_name = lane.lane.as_str();
     let profile = &lane.profile;
 
     let session_id = deps

@@ -100,7 +100,13 @@ async fn full_turn_happy_path_in_tmux() {
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(60),
-        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+        engine.await_completion(
+            &pane,
+            dir.path(),
+            &prepared.turn_id,
+            false,
+            control.as_ref(),
+        ),
     )
     .await
     .expect("turn timed out")
@@ -154,7 +160,13 @@ async fn fake_agent_reports_session_id_through_result_contract() {
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(60),
-        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+        engine.await_completion(
+            &pane,
+            dir.path(),
+            &prepared.turn_id,
+            false,
+            control.as_ref(),
+        ),
     )
     .await
     .expect("turn timed out")
@@ -208,7 +220,13 @@ async fn fake_agent_resumed_with_session_argv_reports_it_back() {
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(60),
-        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+        engine.await_completion(
+            &pane,
+            dir.path(),
+            &prepared.turn_id,
+            false,
+            control.as_ref(),
+        ),
     )
     .await
     .expect("turn timed out")
@@ -281,7 +299,13 @@ async fn blocked_turn_waits_for_human_answer_in_tmux() {
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(90),
-        engine.await_completion(&pane, dir.path(), &prepared.turn_id, control.as_ref()),
+        engine.await_completion(
+            &pane,
+            dir.path(),
+            &prepared.turn_id,
+            false,
+            control.as_ref(),
+        ),
     )
     .await
     .expect("turn timed out")

@@ -897,6 +897,88 @@ async fn commit_fix(wt: &Path) {
 const REVIEW_MARK: &str = "self-review round";
 const FIX_MARK: &str = "# Findings";
 
+/// Write the per-turn result file for an isolated (parallel review) turn
+/// (issue #214): `.meguri/result-<turn_id>.json`.
+fn write_isolated_result(wt: &Path, turn_id: &str, status: &str) {
+    let result = serde_json::json!({
+        "turn_id": turn_id, "status": status, "summary": "scripted",
+    });
+    std::fs::write(
+        wt.join(format!(".meguri/result-{turn_id}.json")),
+        result.to_string(),
+    )
+    .unwrap();
+}
+
+/// The per-reviewer review file named in a parallel round-1 prompt (issue #214),
+/// e.g. `.meguri/self-review-r0.json`, or None for a non-parallel review prompt.
+fn parallel_review_file_in(prompt: &str) -> Option<String> {
+    let start = prompt.find(".meguri/self-review-r")?;
+    let rest = &prompt[start..];
+    let end = rest.find(".json")? + ".json".len();
+    Some(rest[..end].to_string())
+}
+
+/// Whether a turn's result is present (shared `result.json` or the per-turn
+/// `result-<id>.json`), matching by turn id.
+fn result_present(meguri: &Path, id: &str) -> bool {
+    let matches = |path: PathBuf| -> bool {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("turn_id")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(id)
+    };
+    matches(meguri.join(format!("result-{id}.json"))) || matches(meguri.join("result.json"))
+}
+
+/// Every prompt turn id without a matching result — surfaces CONCURRENT pending
+/// turns (issue #214 parallel review), unlike `pending_turn` which returns one.
+fn pending_turns(wt: &Path) -> Vec<String> {
+    let meguri = wt.join(".meguri");
+    let Ok(rd) = std::fs::read_dir(&meguri) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let id = name
+                .strip_prefix("prompt-")?
+                .strip_suffix(".md")?
+                .to_string();
+            (!result_present(&meguri, &id)).then_some(id)
+        })
+        .collect()
+}
+
+/// A scripted agent that services CONCURRENT pending turns (issue #214), firing
+/// `action` once per new turn id across all panes.
+fn spawn_multi_agent<F>(worktree_root: PathBuf, mut action: F) -> tokio::task::JoinHandle<u32>
+where
+    F: FnMut(&Path, &str) + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..900 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let Some(wt) = find_worktree(&worktree_root) else {
+                continue;
+            };
+            for turn_id in pending_turns(&wt) {
+                if seen.insert(turn_id.clone()) {
+                    action(&wt, &turn_id);
+                }
+            }
+        }
+        seen.len() as u32
+    })
+}
+
 /// Pull the finding ids (`f1`, `f2`, …) out of the `# Findings` section of a fix
 /// prompt, so a scripted fix agent can declare a disposition for each (issue
 /// #212). Only the findings block is scanned, not the instruction bullets.
@@ -1106,6 +1188,188 @@ async fn self_review_findings_then_fix_converge_in_one_run() {
     let pr = env.forge.prs()[0].number;
     assert!(env.forge.threads_of(pr).is_empty());
     assert!(env.forge.pr_comments_of(pr).is_empty());
+}
+
+/// Configure N parallel round-1 reviewers under detectable profiles (`git` is
+/// always present, so `detect_command` succeeds; FakeMux fakes the launch).
+fn enable_parallel_reviewers(env: &mut TestEnv, n: usize) {
+    use meguri::config::{AgentProfile, AgentsConfig, ReviewerConfig};
+    env.deps.config.review.enabled = true;
+    let mut profiles = std::collections::HashMap::new();
+    let mut reviewers = Vec::new();
+    for i in 0..n {
+        let name = format!("rev{i}");
+        profiles.insert(
+            name.clone(),
+            AgentProfile {
+                command: "git".into(),
+                ..Default::default()
+            },
+        );
+        reviewers.push(ReviewerConfig {
+            profile: Some(name),
+            lenses: None,
+        });
+    }
+    env.deps.config.agents = Some(AgentsConfig { profiles });
+    env.deps.config.review.reviewers = reviewers;
+}
+
+/// Issue #214: round 1 fans out to two parallel reviewers, their findings union-
+/// merge, a fix turn clears them, and round 2 (single anchor) converges. Both
+/// reviewers report, and the per-turn result files never collide.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_round1_reviewers_merge_then_converge() {
+    let mut env = setup(None).await;
+    enable_parallel_reviewers(&mut env, 2);
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_multi_agent(env.worktree_root.clone(), |wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if let Some(review_file) = parallel_review_file_in(&prompt) {
+                // r0 flags one finding; r1 is clean. Union → one finding.
+                let body = if review_file.contains("self-review-r0") {
+                    serde_json::json!({
+                        "verdict": "fixable", "review": "r0 note",
+                        "findings": [{"path": "greeting.txt", "line": 1, "kind": "defect", "body": "friendlier"}],
+                    })
+                } else {
+                    serde_json::json!({"verdict": "clean", "review": "", "findings": []})
+                };
+                std::fs::write(wt.join(&review_file), body.to_string()).unwrap();
+                write_isolated_result(&wt, &turn_id, "success");
+            } else if prompt.contains(REVIEW_MARK) {
+                // Round 2: single anchor reviewer, clean.
+                write_review(&wt, "clean", serde_json::json!([]));
+                write_result(&wt, &turn_id, "success");
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
+                write_result(&wt, &turn_id, "success");
+            } else {
+                commit_greeting(&wt).await;
+                write_result(&wt, &turn_id, "success");
+            }
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 300)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "self_review.reviewer_reported")
+            .count(),
+        2,
+        "both parallel reviewers reported: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"self_review.clean".to_string()),
+        "phase converged clean: {kinds:?}"
+    );
+    // Self-review stayed local — no forge threads.
+    let pr = env.forge.prs()[0].number;
+    assert!(env.forge.threads_of(pr).is_empty());
+}
+
+/// Issue #214, ADR 0023 §2: a parallel `needs_human` is NOT OR'd — an anchor
+/// confirmation turn runs, and when it overrules (clean) the phase continues to
+/// publish instead of escalating.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_needs_human_is_confirmed_by_anchor_then_overruled() {
+    let mut env = setup(None).await;
+    enable_parallel_reviewers(&mut env, 2);
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let anchor_turns = Arc::new(Mutex::new(0u32));
+    let anchor_seen = anchor_turns.clone();
+    let agent = spawn_multi_agent(env.worktree_root.clone(), move |wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        let anchor_seen = anchor_seen.clone();
+        tokio::spawn(async move {
+            let prompt = prompt_of(&wt, &turn_id);
+            if let Some(review_file) = parallel_review_file_in(&prompt) {
+                // r0 flags needs_human; r1 is clean.
+                let body = if review_file.contains("self-review-r0") {
+                    serde_json::json!({"verdict": "needs_human", "review": "is this in scope?", "findings": []})
+                } else {
+                    serde_json::json!({"verdict": "clean", "review": "", "findings": []})
+                };
+                std::fs::write(wt.join(&review_file), body.to_string()).unwrap();
+                write_isolated_result(&wt, &turn_id, "success");
+            } else if prompt.contains("anchor reviewer confirming") {
+                // The anchor overrules the escalation: clean, publish.
+                *anchor_seen.lock().unwrap() += 1;
+                write_review(&wt, "clean", serde_json::json!([]));
+                write_result(&wt, &turn_id, "success");
+            } else if prompt.contains(REVIEW_MARK) {
+                write_review(&wt, "clean", serde_json::json!([]));
+                write_result(&wt, &turn_id, "success");
+            } else if prompt.contains(FIX_MARK) {
+                commit_fix_and_dispositions(&wt, &turn_id, &prompt).await;
+                write_result(&wt, &turn_id, "success");
+            } else {
+                commit_greeting(&wt).await;
+                write_result(&wt, &turn_id, "success");
+            }
+        });
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(90), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out")
+        .unwrap();
+    agent.abort();
+
+    assert!(
+        matches!(outcome, WorkerOutcome::Succeeded { .. }),
+        "anchor overruled needs_human → publish, not escalate: {outcome:?}"
+    );
+    assert_eq!(
+        *anchor_turns.lock().unwrap(),
+        1,
+        "exactly one anchor confirmation turn ran"
+    );
+    let kinds: Vec<String> = env
+        .deps
+        .store
+        .events_for_run(&run.id, 300)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.contains(&"self_review.anchor_confirm".to_string()),
+        "anchor confirmation emitted an event: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"self_review.needs_human".to_string()),
+        "overruled → no escalation: {kinds:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

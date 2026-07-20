@@ -15,17 +15,32 @@ use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
 use crate::tasks::TaskKey;
 
-/// The slot budget is spent by *weight*, not run count (issue #111). A collab
-/// advisor is a real agent on the subscription quota, so a run that actually
-/// spawns one weighs 2; every other run weighs 1. This must use the same
-/// `run_gets_advisor` predicate flow's `ensure_advisor` does — a run that gets
-/// no advisor (e.g. a local task) must not book the extra slot.
+/// The slot budget is spent by *weight*, not run count (issue #111, #214). Two
+/// phases spawn extra concurrent agents:
+///
+/// - a collab advisor is a real agent on the subscription quota, so a run that
+///   actually spawns one weighs 2 (during execute); every other run weighs 1.
+///   This must use the same `run_gets_advisor` predicate flow's `ensure_advisor`
+///   does — a run that gets no advisor (e.g. a local task) must not book it.
+/// - parallel round-1 self-review (ADR 0023) fans out N reviewer agents at once
+///   (during self-review), so the run must reserve N slots then.
+///
+/// The two phases do not overlap in time (advisor runs during execute, reviewers
+/// during self-review), so the weight is the **max**, not the sum — the peak
+/// concurrent agent count. An empty `[[review.reviewers]]` leaves the weight at
+/// the historical advisor value (byte-for-byte).
 fn run_weight(deps: &Deps, run: &RunRecord) -> usize {
-    if crate::collab::run_gets_advisor(&deps.config, run) {
+    let advisor_weight = if crate::collab::run_gets_advisor(&deps.config, run) {
         2
     } else {
         1
-    }
+    };
+    let review_weight = crate::engine::self_review::parallel_reviewer_count(
+        &deps.config,
+        &deps.project,
+        &run.loop_kind,
+    );
+    advisor_weight.max(review_weight)
 }
 
 fn active_weight(active: &HashMap<String, usize>) -> usize {
@@ -526,6 +541,38 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn parallel_reviewers_book_max_of_advisor_and_reviewer_count() {
+        // Issue #214: a run with N parallel round-1 reviewers reserves N slots
+        // (peak concurrent reviewer agents), and the weight is max(advisor, N)
+        // since advisor and review phases don't overlap.
+        use crate::config::ReviewerConfig;
+        // Collab off: 3 reviewers → weight 3; empty reviewers → weight 1.
+        let mut deps = deps_with_collab(Some(CollabMode::Off));
+        deps.config.review.reviewers = vec![
+            ReviewerConfig::default(),
+            ReviewerConfig::default(),
+            ReviewerConfig::default(),
+        ];
+        assert_eq!(
+            run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
+            3
+        );
+        // A non-self-reviewing loop is unaffected (fixer never self-reviews).
+        assert_eq!(run_weight(&deps, &run_of_kind(&deps, "fixer")), 1);
+
+        // Advisor on: reuse one worker run (a second create on the same store
+        // would hit the (project, loop, issue) unique index) and vary reviewers.
+        let mut deps = deps_with_collab(Some(CollabMode::Advisor));
+        let worker = run_of_kind(&deps, crate::engine::worker::KIND);
+        // 1 reviewer → max(2, 1) = 2 (advisor dominates).
+        deps.config.review.reviewers = vec![ReviewerConfig::default()];
+        assert_eq!(run_weight(&deps, &worker), 2);
+        // 4 reviewers → max(2, 4) = 4 (reviewers dominate).
+        deps.config.review.reviewers = vec![ReviewerConfig::default(); 4];
+        assert_eq!(run_weight(&deps, &worker), 4);
     }
 
     #[test]

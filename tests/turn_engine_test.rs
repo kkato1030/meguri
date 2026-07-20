@@ -123,7 +123,7 @@ async fn happy_path_completes_on_result_file() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -159,7 +159,7 @@ async fn stale_turn_id_is_ignored() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -192,7 +192,7 @@ async fn result_acceptance_waits_for_working_to_settle() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.abort();
@@ -223,7 +223,7 @@ async fn blocked_escalates_to_awaiting_human_then_recovers() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -263,7 +263,7 @@ async fn quiet_agent_gets_nudged_then_escalates() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -278,6 +278,51 @@ async fn quiet_agent_gets_nudged_then_escalates() {
     let kinds = control.event_kinds();
     assert_eq!(kinds.iter().filter(|k| *k == "turn.nudged").count(), 2);
     assert!(kinds.contains(&"turn.awaiting_human".to_string()));
+}
+
+/// Issue #214: a stalled *isolated* (parallel round-1) reviewer in pane mode
+/// must be nudged to write its per-turn `result-<turn_id>.json`, not the shared
+/// `result.json` its siblings also use — otherwise the nudge re-introduces the
+/// very race the per-turn result file exists to prevent.
+#[tokio::test(start_paused = true)]
+async fn quiet_isolated_agent_is_nudged_to_its_per_turn_result() {
+    let s = setup().await;
+    let control = FakeControl::new();
+    s.mux.set_state(&s.pane, AgentState::Idle);
+
+    let driver = {
+        let dir = s.dir.path().to_path_buf();
+        let turn_id = s.turn_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // The isolated turn's completion authority is the per-turn file.
+            std::fs::write(
+                dir.join(format!(".meguri/result-{turn_id}.json")),
+                format!(r#"{{"turn_id":"{turn_id}","status":"needs_human","summary":"s"}}"#),
+            )
+            .unwrap();
+        })
+    };
+
+    let outcome = s
+        .engine
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, true, control.as_ref())
+        .await
+        .unwrap();
+    driver.await.unwrap();
+
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Completed(r) if r.status == TurnStatus::NeedsHuman
+    ));
+    let sent = s.mux.sent_lines(&s.pane);
+    assert!(!sent.is_empty(), "expected at least one nudge");
+    let want = format!("result-{}.json", s.turn_id);
+    assert!(
+        sent[0].contains(&want),
+        "isolated nudge must name the per-turn result file, got {:?}",
+        sent[0]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -304,7 +349,7 @@ async fn moving_screen_defers_nudges() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -339,7 +384,7 @@ async fn pause_suspends_then_resume_continues() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -361,7 +406,7 @@ async fn stop_exits_immediately() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     assert!(matches!(outcome, TurnOutcome::Stopped));
@@ -386,7 +431,7 @@ async fn takeover_goes_hands_off_but_honors_result() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -412,7 +457,7 @@ async fn dead_pane_ends_turn() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
@@ -440,7 +485,7 @@ async fn runtime_budget_escalates_without_killing() {
 
     let outcome = s
         .engine
-        .await_completion(&s.pane, s.dir.path(), &s.turn_id, control.as_ref())
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
     driver.await.unwrap();
