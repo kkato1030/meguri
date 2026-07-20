@@ -1,6 +1,6 @@
 # ADR 0012: loop はコード上の構造物ではなく実行時の軌道 — level-triggered reconciler(3 Kind + 純関数 next_step + workqueue)へ再構成する
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-20
 - Issue: #198
 
