@@ -28,8 +28,9 @@ migration & rollback を書く。
 4. schedule を repo ルート `meguri.toml` に置け、default branch の内容が効く（ADR 0026）。host 側の
    `[[projects.schedules]]` を書かない既存プロジェクトの挙動は完全に不変。
 5. **run を持たない managed clone でも、remote の default branch にマージした schedule が次の sweep で
-   発見・発火する**。sweep が read の前に `origin/<default_branch>` を best-effort fetch するため
-   （f1、decompose_materializer と同型）。古い clone を用意し remote 更新後に効くことを統合テストで確認。
+   発見（observe）される**。sweep が read の前に `origin/<default_branch>` を best-effort fetch するため
+   （f1、decompose_materializer と同型）。発見後は既存契約どおり、初回観測は state を seed し**発火しない**
+   （no-backfill）／その後最初の cron 窓で発火する（f4）。統合テスト手順は test strategy に明記。
 
 ## 触るファイル
 
@@ -42,10 +43,10 @@ migration & rollback を書く。
   と同じ `git fetch origin <branch>` 流儀）。sweep が repo schedule を読む前に `origin/<default_branch>` を
   更新するため（f1）。`read_file_at_default_branch` は fetch しないまま据え置く（doctor など hot path が
   無駄 fetch しないため、fetch は sweep 側が明示的に前段で行う）。
-- `src/config.rs` — `RepoConfig` に `schedules: Vec<ScheduleConfig>` を追加。per-schedule 検証
-  （cron / body xor body_file / body_file パス安全 / local×plan）を `Config::validate_schedules` の
-  インラインから**再利用可能な関数** `validate_schedule(mode, &ScheduleConfig)` に切り出す。collection 単位の
-  重複 name 検査も `validate_schedule_set(mode, &[ScheduleConfig])` に切り出し host / repo で共有する（f3）。
+- `src/config.rs` — `RepoConfig` に `schedules: Vec<ScheduleConfig>` を追加。`Config::validate_schedules` の
+  インラインを**独立した2関数** `validate_schedule(mode, &ScheduleConfig)`（per-schedule）と
+  `validate_schedule_set_names(&[ScheduleConfig])`（collection 単位の重複 name のみ）に切り出し、
+  host / repo / doctor で共有する（f3 / f5）。両者は戻り値を混ぜず、caller が disposition を区別できる（D7）。
 - `src/main.rs` の `doctor_schedules` — default branch 上の repo schedules も読んで lint し、
   host/repo shadow を報告。
 - `src/app.rs` の `cmd_schedules` — 表示を「有効 schedule 集合（host ∪ repo）」＋出所（host/repo）に拡張。
@@ -149,20 +150,28 @@ local mode で remote が無ければ fetch は no-op、`read_file_at_default_br
 
 いずれも host schedule はそのまま発火し、プロセスは殺さない（ADR 0011「壊れた設定でプロセスを殺さない」）。
 
-### D7. 検証ロジックの一本化
-`Config::validate_schedules` にインラインだった検証を2関数に切り出し、host config load・sweep 時の
-repo 読み・doctor の三者で共有する:
+### D7. 検証ロジックの一本化（2つの検証は別レイヤ・別戻り値）
+`Config::validate_schedules` にインラインだった検証を **2つの独立関数**に切り出す。D6 の「collection ごと
+drop / 1件だけ drop」を caller が区別できるよう、両者は**混ぜない**（f5）:
 
-- `validate_schedule(mode, &ScheduleConfig)` — per-schedule ルール（cron parse / body xor body_file /
-  body_file の repo-relative 安全性 / local mode × `kind=plan` 拒否）。
-- `validate_schedule_set(mode, &[ScheduleConfig])` — collection 単位（重複 `name`）＋各要素へ
-  `validate_schedule` を適用。
+- `validate_schedule(mode, &ScheduleConfig) -> Result<()>` — per-schedule ルールだけ（cron parse /
+  body xor body_file / body_file の repo-relative 安全性 / local mode × `kind=plan` 拒否）。要素の検査に
+  専念し、重複 name は見ない。
+- `validate_schedule_set_names(&[ScheduleConfig]) -> Result<()>` — collection 単位の重複 `name` 検査**だけ**。
+  per-schedule 検証は**含めない**。
 
-host は load 時に `validate_schedule_set` で hard-fail（既存挙動不変）。repo は sweep / doctor で
-`validate_schedule_set` を呼び、collection エラーは集合ごと drop、per-schedule エラーは1件 drop（D6）。
-host と repo の **cross-layer** 同名衝突は集合を作った後に D5 で解決する（host 勝ち + `schedule.shadowed`）。
-つまり同名衝突は「同一 repo 内 = collection エラーで repo 集合 drop（D6）」「host×repo 間 = host 勝ち（D5）」の
-2経路で漏れなく閉じる。
+caller はこの2つを**別々に**呼び分ける（単一 `Result` で2種のエラーを混ぜないので、どちらの disposition か
+一意に決まる）:
+
+- **host（config load）**: `validate_schedule_set_names` と各要素の `validate_schedule` を両方呼び、どちらの
+  エラーも hard-fail（既存挙動そのまま）。
+- **repo（sweep / doctor）**: まず `validate_schedule_set_names` を呼び、Err なら **repo 集合ごと drop**
+  （collection エラー、D6）。通れば各要素に `validate_schedule` を適用し、**Err の要素だけ drop** して残りを
+  活かす（per-schedule エラー、D6）。
+
+host と repo の **cross-layer** 同名衝突は、こうして得た repo 有効集合を host 集合に重ねるときに D5 で解決する
+（host 勝ち + `schedule.shadowed`）。つまり同名衝突は「同一 repo 内 = `validate_schedule_set_names` の
+collection エラーで repo 集合 drop（D6）」「host×repo 間 = host 勝ち（D5）」の2経路で漏れなく閉じる。
 
 ### D8. doctor を repo schedules に拡張
 `doctor_schedules` は host schedules に加え、default branch の repo schedules を読んで cron / body_file を
@@ -227,17 +236,23 @@ lint し、host/repo shadow を表示する。doctor が repo 側検証の人間
   - **crash-boundary（f2）**: enqueue 済み・record 前の state から再 sweep すると同じ窓で1回だけ再発火し
     （at-least-once）、record 済みなら再発火しないこと。
 - **config（`src/config.rs`）**: `RepoConfig` が `schedules` を受理し、host-only キー混入は依然
-  parse error（`deny_unknown_fields` 不変）。`validate_schedule` / `validate_schedule_set` の切り出しが
-  host 検証の既存テストを非回帰で通す。**host 内・repo 内の重複 name（f3）**: host は load 時 hard-fail、
-  repo は集合ごと drop されることをそれぞれ検証。
+  parse error（`deny_unknown_fields` 不変）。`validate_schedule`（per-schedule）と
+  `validate_schedule_set_names`（重複 name のみ）が別々に呼べ、混ざらないこと（f5）。host 検証の既存
+  テストを非回帰で通す。**host 内・repo 内の重複 name（f3）**: host は load 時 hard-fail、repo は集合ごと
+  drop されることをそれぞれ検証。**per-schedule エラー1件は1件だけ drop**（repo で cron 不正1件を混ぜ、
+  残りは活きる）ことも検証し、collection と per-schedule の disposition が別物であることを固める。
 - **統合（`tests/schedule_test.rs`）**:
   - 既存ケース（発火 / catch-up / backfill 抑止 / overlap guard / hot-reload 追加）を `schedule::sweep`
     経由で非回帰（芯1）。
-  - repo-side schedule: 実 git worktree の default branch に `meguri.toml` を commit → sweep が発火する
-    こと（芯4）。
-  - **stale clone freshness（f1、芯5）**: 古い clone を用意し、remote の default branch を schedule 入り
-    `meguri.toml` で更新 → 次 sweep が（前段の best-effort fetch を経て）それを発見・発火すること。
+  - repo-side schedule: 実 git worktree の default branch に `meguri.toml` を commit → 発見・seed 後、
+    最初の cron 窓（clock を進める）で発火すること（芯4）。
+  - **stale clone freshness（f1 / f4、芯5）**: 古い clone を用意し、remote の default branch を schedule 入り
+    `meguri.toml` で更新する。手順は no-backfill 契約に整合させる（f4）:
+    1. sweep-1 が（前段 best-effort fetch を経て）新 schedule を**発見・seed**し、まだ**発火しない**こと。
+    2. injected clock を最初の cron 窓の先へ進めた sweep-2 で**発火**すること。
+    freshness 単体だけを見たい場合は、事前に同名 state を seed してから remote 更新 → 1 回の sweep で
+    発火、と縮めてもよい（発見経路が生きていることの最小確認）。
   - host/repo 同名: host が勝ち `schedule.shadowed` が出ること（D5）。
   - 壊れた / 重複 name の `meguri.toml`: repo schedule 集合は無効化されるが host schedule は発火すること
-    （D6 / f3）。
+    （D6 / f3）。cron 不正が1件だけの repo `meguri.toml` では、その1件だけ落ちて残りは発火すること（f5）。
   - host ↔ repo 移設で name 一致なら取りこぼさないこと（芯3 / D10）。
