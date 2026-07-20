@@ -1,6 +1,6 @@
 # ADR 0007: merge-watch は fixer ループに委譲し、どのループも拾わない stall だけをエスカレーションする — watch はドリフト検出であってマージ権威ではない
 
-- Status: proposed
+- Status: superseded — [ADR 0012（level-triggered reconciler）](0012-loops-are-emergent-level-triggered-reconciler.md)（#198）が supersede する。merge-watch の「委譲か escalate か」の場合分けは `next_step` の arm に吸収され、全分類（Conflict / RedCI = fixer recipe、Stuck = Escalate、HumanDisabled = Wait、Transient = backoff）の行き先は 0012 決定3 が引き取る。
 - Date: 2026-07-12
 - Issue: #42
 
