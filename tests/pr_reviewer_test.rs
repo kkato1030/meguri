@@ -219,7 +219,15 @@ fn pending_turn(worktree: &Path) -> Option<String> {
 }
 
 fn write_review(worktree: &Path, verdict: &str, review: &str) {
-    let body = serde_json::json!({ "verdict": verdict, "review": review });
+    write_review_cats(worktree, verdict, review, &[]);
+}
+
+/// Like [`write_review`] but names blocking categories (ADR 0025): an impl
+/// blocking verdict must carry at least one.
+fn write_review_cats(worktree: &Path, verdict: &str, review: &str, categories: &[&str]) {
+    let body = serde_json::json!({
+        "verdict": verdict, "review": review, "blocking_categories": categories,
+    });
     std::fs::write(worktree.join(REVIEW_FILE), body.to_string()).unwrap();
 }
 
@@ -391,8 +399,9 @@ async fn plan_review_findings_defer_to_spec_fixer_without_escalating() {
 }
 
 /// pr-reviewer(Impl): reviews an implementation PR, writes the pr-review
-/// status + body summary, escalates findings to needs-human (issue #176), and
-/// NEVER touches spec-* labels (criterion 3a). No inline threads.
+/// status + body summary, escalates a blocking safety finding to needs-human
+/// (issue #176 / ADR 0025), and NEVER touches spec-* labels (criterion 3a). No
+/// inline threads.
 #[tokio::test(flavor = "multi_thread")]
 async fn impl_review_reviews_without_touching_spec_labels() {
     // An impl PR: no spec-reviewing label, impl review enabled.
@@ -400,7 +409,12 @@ async fn impl_review_reviews_without_touching_spec_labels() {
     let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
-        write_review(wt, "findings", "- edge case unhandled");
+        write_review_cats(
+            wt,
+            "blocking",
+            "- secret leaked in a log line",
+            &["security"],
+        );
         write_result(wt, turn_id, "success");
     });
 
@@ -441,6 +455,54 @@ async fn impl_review_reviews_without_touching_spec_labels() {
     assert!(env.forge.threads_of(PR).is_empty());
     // The escalation comment is a normal PR comment (not an inline review thread).
     assert_eq!(env.forge.comments_of(PR).len(), 1);
+}
+
+/// pr-reviewer(Impl) advisory (ADR 0025): the tripwire does NOT fire — the
+/// commit status stays success, the note folds into the PR body, no needs-human
+/// is added, and the working claim is released. auto-merge sees a green
+/// pr-review status and proceeds (acceptance criterion 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn impl_advisory_settles_green_and_does_not_escalate() {
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
+    let run = create_pr_reviewer_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        write_review(wt, "advisory", "- consider adding a comment here");
+        write_result(wt, turn_id, "success");
+    });
+
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
+            .await
+            .expect("pr-review timed out")
+            .unwrap();
+    agent.abort();
+    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
+
+    // Success status: auto-merge is not blocked by an advisory verdict.
+    assert_eq!(
+        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
+        Some(CommitStatusState::Success)
+    );
+    let labels = env.forge.pr_labels_of(PR);
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "advisory must not escalate: {labels:?}"
+    );
+    assert!(!labels.contains(&LABEL_WORKING.to_string()));
+    let pr = env
+        .forge
+        .prs()
+        .into_iter()
+        .find(|p| p.number == PR)
+        .unwrap();
+    assert!(
+        pr.body.contains("pr review (impl) — advisory"),
+        "body: {}",
+        pr.body
+    );
+    // Advisory is recorded, never escalated: no PR comment.
+    assert!(env.forge.comments_of(PR).is_empty());
 }
 
 /// pr-reviewer(Impl) OFF (the default): impl PRs are not discovered.
@@ -777,11 +839,21 @@ fn emitted_park_event(env: &TestEnv, run_id: &str) -> bool {
         .any(|e| e.kind == "review.awaiting_human")
 }
 
-/// Drive one plan review round to completion with the given verdict.
+/// Drive one review round to completion with the given verdict and (for an
+/// impl blocking verdict) categories.
 async fn run_review(env: &TestEnv, verdict: &'static str, run_id: &str) {
+    run_review_cats(env, verdict, &[], run_id).await
+}
+
+async fn run_review_cats(
+    env: &TestEnv,
+    verdict: &'static str,
+    categories: &'static [&'static str],
+    run_id: &str,
+) {
     let review = format!("- {verdict} note");
     let agent = spawn_scripted_agent(env.worktree_root.clone(), move |_, wt, turn_id| {
-        write_review(wt, verdict, &review);
+        write_review_cats(wt, verdict, &review, categories);
         write_result(wt, turn_id, "success");
     });
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, run_id))
@@ -863,11 +935,12 @@ async fn plan_clean_does_not_park_under_combined_delivery() {
     );
 }
 
-/// The impl review never raises the parked-review signal: impl findings
-/// escalate to `needs-human` (issue #176, base) instead — no interaction_state,
-/// no `review.awaiting_human`, no page (criterion 7, regression).
+/// The impl review never raises the parked-review signal: an impl blocking
+/// verdict escalates to `needs-human` (issue #176, base) instead — no
+/// interaction_state, no `review.awaiting_human`, no page (criterion 7,
+/// regression).
 #[tokio::test(flavor = "multi_thread")]
-async fn impl_findings_does_not_park() {
+async fn impl_blocking_does_not_park() {
     let mut env = setup(&[LABEL_IMPLEMENTING], true).await;
     // Subscribe only awaiting_human: this test asserts the absence of the
     // *parked-review* page, not the escalation notification the needs-human
@@ -876,7 +949,7 @@ async fn impl_findings_does_not_park() {
     env.deps.notifier = notifier;
     let run = create_pr_reviewer_run(&env);
 
-    run_review(&env, "findings", &run.id).await;
+    run_review_cats(&env, "blocking", &["security"], &run.id).await;
 
     let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
     assert_ne!(
