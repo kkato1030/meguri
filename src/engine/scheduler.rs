@@ -161,17 +161,14 @@ impl Scheduler {
                 if let Err(e) = super::reaper::sweep(deps).await {
                     tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
                 }
-                // Ride the poll: arm GitHub-native auto-merge on eligible PRs
-                // (auto-merge 1/3, #41). Like the reaper, a light API sweep —
+                // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
+                // informer-cache observe drives arm (ADR 0003) / orchestrator
+                // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the
+                // Stuck backstop in a single level-triggered pass — folding the
+                // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                if let Err(e) = super::auto_merger::sweep(deps).await {
-                    tracing::warn!("auto-merge sweep failed for {}: {e:#}", deps.project.id);
-                }
-                // Then watch the PRs it armed for drift GitHub silently stalled
-                // (auto-merge 2/3, #42). After the arm sweep so a freshly armed
-                // PR is seen once in the same tick.
-                if let Err(e) = super::merge_watch::sweep(deps).await {
-                    tracing::warn!("merge-watch sweep failed for {}: {e:#}", deps.project.id);
+                if let Err(e) = super::merge_tail::sweep(deps).await {
+                    tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
                 // flips its issue speccing → ready so the worker implements it.

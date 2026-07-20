@@ -131,15 +131,14 @@ worker (author lane)      │           │
                   │
                   │  ここから先は run/pane を持たない「帯域外 sweep」(§2)
                   ▼
-     auto_merger.sweep (opt-in, ADR 0003 / 0009)
-     native: 条件が揃った PR に GitHub-native auto-merge を arm
-     orchestrator: 同じ適格条件で meguri 自身が直接 merge
-     (private+Free 向けフォールバック、ADR 0009)
-                  │
-                  ▼
-     merge_watch.sweep (ADR 0007) — native の armed PR のみ監視
-     conflict/red CI は fixer 系に委譲(no-op)。
-     どのループも拾わない stall だけ meguri:needs-human で escalate
+     merge_tail.sweep (ADR 0012 slice 1, #221) — observe → next_step → act
+     一括 observe から純関数 next_step が PR ごとに 1 つの Op を選ぶ:
+       native: 適格 PR に GitHub-native auto-merge を arm (ADR 0003)
+       orchestrator: 同じ適格条件で meguri 自身が直接 merge (ADR 0009)
+       BEHIND(arm 済み × base 進行): Op(UpdateBranch) で base を取り込み
+         head を進める → 次 observe で未 arm と判定され自然に再 arm
+       conflict/red CI は fixer 系に委譲(no-op)。
+       どのループも拾わない stall だけ meguri:needs-human で escalate
                   │
                   ▼
         native: GitHub が branch protection + required checks で
@@ -188,11 +187,10 @@ conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → pr_r
 |---|---|---|
 | `scheduler_fire::sweep` | cron スケジュール(`[[projects.schedules]]`)を評価し、due なら issue/task を1件起票する(起票のみ、消化は既存ループ) | [0009-schedules-enqueue-only-not-a-cron-replacement](../adr/0009-schedules-enqueue-only-not-a-cron-replacement.md) |
 | `reaper::sweep` | close された issue の pane・worktree・マージ済みローカルブランチを回収 | [0004-issue-lane-pane-session-lifetime](../adr/0004-issue-lane-pane-session-lifetime.md) |
-| `auto_merger::sweep` | 適格な PR を `mode` で処理: `native` は GitHub-native auto-merge を arm、`orchestrator` は meguri 自身が `merge_pr` で直接マージ(opt-in、ADR 0009) | [0003-auto-merge-github-native-arm-only](../adr/0003-auto-merge-github-native-arm-only.md) |
-| `merge_watch::sweep` | native で arm 済みの PR のみドリフト検出(orchestrator の直接マージは監視対象外)。conflict/red CI は fixer 系ループに委譲(no-op)、拾われない stall だけ escalate | [0007-merge-watch-defers-to-fixer-loops-and-backstops-drift](../adr/0007-merge-watch-defers-to-fixer-loops-and-backstops-drift.md) |
+| `merge_tail::sweep` | 一括 observe(informer cache)→ 純関数 `next_step` → act で PR ごとに 1 つの `Op` を実行する level-triggered な合流点(旧 `auto_merger` / `merge_watch` を畳んだもの)。`native` は arm(ADR 0003)、`orchestrator` は直接 merge(ADR 0009)、BEHIND(arm 済み × base 進行)は `Op(UpdateBranch)` + 再 arm で閉じる、conflict/red CI は fixer 系に委譲(no-op)、拾われない stall だけ escalate | [0012-loops-are-emergent-level-triggered-reconciler](../adr/0012-loops-are-emergent-level-triggered-reconciler.md) |
 | `plan_handoff::sweep` | `plan_delivery = separate` 限定。spec PR が merge 済みの `speccing` issue を検知し `speccing`→`ready` に切替える(combined では no-op) | [0008-symmetric-plan-impl-review-loop](../adr/0008-symmetric-plan-impl-review-loop.md) |
 
-上表5つの実行順は固定(scheduler_fire → reaper → auto_merger → merge_watch → plan_handoff)。`scheduler_fire` が起票した issue/task はその tick の discovery を既に過ぎているため次 tick で拾われる(poll_interval 粒度なので実害なし)。auto_merger → merge_watch の順は、新しく arm した PR を同じ tick 内で merge_watch が一度観測できるようにするため。`scheduler_fire` の状態(最終発火時刻)は forge ではなく sqlite の `schedule_state` に置く — 定義は config 側(hot reload 対象)にあり、Authority 原則の「forge が唯一の永続状態」の例外として、これは純粋にローカルなスケジューラの進行管理だから(cleaner の interval と同種)。`plan_handoff` の後には `routing_drift` / `reconcile` という discovery 系の sweep がさらに続くが、いずれも loop パイプラインではなく discovery の鮮度・再着手検知が役割のため本 doc のスコープ外(表に含めない)。
+上表4つの実行順は固定(scheduler_fire → reaper → merge_tail → plan_handoff)。`scheduler_fire` が起票した issue/task はその tick の discovery を既に過ぎているため次 tick で拾われる(poll_interval 粒度なので実害なし)。`merge_tail` は arm と drift 監視を 1 パスに畳んだので(旧 auto_merger → merge_watch の 2 sweep 順は不要になった)、arm・BEHIND 修正・stall escalate が同じ observe から一貫して決まる。`scheduler_fire` の状態(最終発火時刻)は forge ではなく sqlite の `schedule_state` に置く — 定義は config 側(hot reload 対象)にあり、Authority 原則の「forge が唯一の永続状態」の例外として、これは純粋にローカルなスケジューラの進行管理だから(cleaner の interval と同種)。`plan_handoff` の後には `routing_drift` / `reconcile` という discovery 系の sweep がさらに続くが、いずれも loop パイプラインではなく discovery の鮮度・再着手検知が役割のため本 doc のスコープ外(表に含めない)。
 
 ## 3. loop 別ライフサイクル
 
@@ -214,7 +212,7 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 
 - **author lane** は同じ branch を編集する loop 全員(planner → spec_fixer → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。spec_fixer は run を PR の canonical issue で鍵るため、spec を書いた planner と同じ author pane・同一 session で修正が走り、planning の文脈を保つ(issue #92 の lane モデルどおり)。**self-review lane** は self-review が必須の3 loop(planner / worker / spec_worker、表の「+ self-review」)だけが使う、同じ issue に紐づく別の実行体(プロファイル `self-reviewer`)——author が積んだ diff を独立した目でレビューし、fix 指示を author lane へ戻す内部往復専用([ADR 0006](../adr/0006-ai-implementation-review-is-an-internal-loop.md) / [ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) / [ADR 0011](../adr/0011-combined-impl-diff-self-review.md))。lane = pane とは限らない — launch mode は role 単位で pane/direct を選べ、self-reviewer の既定は `direct`(pane を張らない、[ADR 0012](../adr/0012-launch-mode-role-pane-or-direct-keep-pane-subordinate.md))。**pr-review lane** は pr_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
 - pane・worktree はいずれも issue が寿命の単位で、issue が close されると `reaper::sweep` が回収する(watch 実行中はポーリングのたびに、一発実行では `meguri prune`)。
-- 表に無い `auto_merger.sweep` / `merge_watch.sweep` / `plan_handoff.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
+- 表に無い `merge_tail.sweep` / `plan_handoff.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
 
 ## 4. 横断原則
 

@@ -1013,7 +1013,7 @@ async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
         .merge_policy(&deps.project.default_branch, am.require_branch_protection)
         .await
         .with_context(|| format!("cannot read merge settings for {slug} to validate auto-merge"))?;
-    if let Err(problems) = crate::engine::auto_merger::validate_policy(am, &policy) {
+    if let Err(problems) = crate::engine::merge_tail::validate_policy(am, &policy) {
         bail!(
             "auto-merge is enabled for project `{}` ({}) but the repository cannot \
              honor it:\n  - {}",

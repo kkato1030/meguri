@@ -8,8 +8,9 @@ use async_trait::async_trait;
 
 use super::{
     ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
-    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
-    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy,
+    MergeTailObservation, MergeableState, ObserveCost, PrComment, PrObservation, PullRequest,
+    ReviewComment, ReviewCommentDraft, ReviewThread, UpdateBranchOutcome,
 };
 
 /// The FakeForge's default merge policy: everything allowed and the base
@@ -117,6 +118,17 @@ pub struct FakeForge {
     /// would return it) so `blocked_by` can surface a sibling child's repo/body
     /// for the materializer's graph adoption (issue #134).
     pub cross_blocker_meta: Mutex<HashMap<i64, (String, String)>>,
+    /// Recorded `update_branch` calls: (pr, expected_head_sha) — the BEHIND fix
+    /// (issue #221). A call whose expected head matches advances the recorded
+    /// head (base merged in); a stale expected head is rejected (HeadMoved).
+    pub update_branch_calls: Mutex<Vec<(i64, String)>>,
+    /// PRs whose `observe_merge_tail` reports its label set as clipped
+    /// (`labels_complete = false`) — exercises the engine's conservative
+    /// safety-gate fallback for a real forge's bounded label window.
+    pub incomplete_labels: Mutex<HashSet<i64>>,
+    /// PRs whose `observe_merge_tail` reports its thread set as clipped
+    /// (`review_threads_complete = false`).
+    pub incomplete_threads: Mutex<HashSet<i64>>,
 }
 
 impl FakeForge {
@@ -510,6 +522,28 @@ impl FakeForge {
     /// The armed (strategy, head_sha) for a PR, if any.
     pub fn armed_of(&self, pr: i64) -> Option<(MergeStrategy, String)> {
         self.armed.lock().unwrap().get(&pr).cloned()
+    }
+
+    /// Report a PR's observed label set as clipped (a real forge's bounded
+    /// label window dropped some), so the engine must treat the safety labels
+    /// conservatively.
+    pub fn mark_labels_incomplete(&self, pr: i64) {
+        self.incomplete_labels.lock().unwrap().insert(pr);
+    }
+
+    /// Report a PR's observed review-thread set as clipped.
+    pub fn mark_threads_incomplete(&self, pr: i64) {
+        self.incomplete_threads.lock().unwrap().insert(pr);
+    }
+
+    /// How many times `update_branch` was called for a PR (BEHIND fix tests).
+    pub fn update_branch_calls_of(&self, pr: i64) -> usize {
+        self.update_branch_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| *n == pr)
+            .count()
     }
 
     /// The head_sha a PR was finalized (merged) at, if any.
@@ -1033,6 +1067,123 @@ impl Forge for FakeForge {
         rec.state = "merged".into();
         self.merged.lock().unwrap().insert(pr, head_sha.to_string());
         Ok(())
+    }
+
+    async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<UpdateBranchOutcome> {
+        self.update_branch_calls
+            .lock()
+            .unwrap()
+            .push((pr, expected_head_sha.to_string()));
+        let mut prs = self.prs.lock().unwrap();
+        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
+            bail!("PR #{pr} not found");
+        };
+        // TOCTOU: a head that moved since the observation is rejected, mirroring
+        // GitHub's `expected_head_sha` guard.
+        if rec.head_sha != expected_head_sha {
+            return Ok(UpdateBranchOutcome::HeadMoved);
+        }
+        // Base merged into the branch → a new merge-commit head. Deterministic
+        // (no clock/rng): a predictable suffix the test reads back via `get_pr`.
+        // The old head's arm marker no longer matches this head, so the next
+        // observation reads the PR as unarmed and re-arms it (issue #221).
+        rec.head_sha = format!("{expected_head_sha}-u");
+        Ok(UpdateBranchOutcome::Updated)
+    }
+
+    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+        let open: Vec<RecordedPr> = self
+            .prs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.state == "open")
+            .cloned()
+            .collect();
+        let mut prs = Vec::with_capacity(open.len());
+        for rec in &open {
+            let number = rec.number;
+            // `None` mirrors the per-PR merge-state read failing (transient).
+            let merge = if self.merge_state_errors.lock().unwrap().contains(&number) {
+                None
+            } else {
+                let mergeable = self
+                    .mergeable
+                    .lock()
+                    .unwrap()
+                    .get(&number)
+                    .copied()
+                    .unwrap_or(MergeableState::Unknown);
+                let status = self
+                    .merge_status
+                    .lock()
+                    .unwrap()
+                    .get(&number)
+                    .copied()
+                    .unwrap_or(MergeStateStatus::Unknown);
+                let auto_merge_enabled = self
+                    .auto_merge_enabled
+                    .lock()
+                    .unwrap()
+                    .get(&number)
+                    .copied()
+                    .unwrap_or_else(|| self.armed.lock().unwrap().contains_key(&number));
+                Some(MergeState {
+                    mergeable,
+                    status,
+                    auto_merge_enabled,
+                })
+            };
+            let comments = self
+                .pr_comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _, _)| *n == number)
+                .map(|(_, body, created_at)| PrComment {
+                    body: body.clone(),
+                    created_at: created_at.clone(),
+                })
+                .collect();
+            let review_threads = self.threads_of(number);
+            let rollup = CheckRollup {
+                checks: self
+                    .checks
+                    .lock()
+                    .unwrap()
+                    .get(&number)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            let pr_review = self
+                .commit_statuses
+                .lock()
+                .unwrap()
+                .get(&(rec.head_sha.clone(), pr_review_context.to_string()))
+                .copied();
+            prs.push(PrObservation {
+                pr: Self::pr_to_public(rec),
+                merge,
+                comments,
+                review_threads,
+                rollup,
+                pr_review,
+                // The fake returns every label / thread, so both are complete —
+                // unless a test forced a clipped window to exercise the engine's
+                // conservative fallback.
+                labels_complete: !self.incomplete_labels.lock().unwrap().contains(&number),
+                review_threads_complete: !self.incomplete_threads.lock().unwrap().contains(&number),
+            });
+        }
+        // One bulk read regardless of PR count (issue #221): the informer-cache
+        // property the API-cost test asserts on.
+        Ok(MergeTailObservation {
+            prs,
+            cost: ObserveCost {
+                requests: 1,
+                graphql_cost: None,
+            },
+        })
     }
 
     async fn set_commit_status(

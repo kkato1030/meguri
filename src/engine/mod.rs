@@ -1,4 +1,3 @@
-pub mod auto_merger;
 pub mod ci_fixer;
 pub mod cleaner;
 pub mod conflict_resolver;
@@ -6,7 +5,7 @@ pub mod decompose_materializer;
 pub mod escalation;
 pub mod fixer;
 pub mod flow;
-pub mod merge_watch;
+pub mod merge_tail;
 pub mod plan_handoff;
 pub mod planner;
 pub mod pr_reviewer;

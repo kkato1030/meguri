@@ -9,8 +9,9 @@ use serde_json::Value;
 
 use super::{
     ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
-    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeableState,
-    PrComment, PullRequest, ReviewComment, ReviewCommentDraft, ReviewThread,
+    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy,
+    MergeTailObservation, MergeableState, ObserveCost, PrComment, PrObservation, PullRequest,
+    ReviewComment, ReviewCommentDraft, ReviewThread, UpdateBranchOutcome,
 };
 
 /// How much of each failed job log survives into the fix prompt (logs can be
@@ -395,6 +396,163 @@ impl GhForge {
                 }
             })
             .collect()
+    }
+
+    /// One PR node from the merge-tail bulk GraphQL into a [`PrObservation`]
+    /// (issue #221). Reduces the same signals the two old sweeps read per PR;
+    /// the pr-review status is pulled out of the rollup contexts by the caller's
+    /// `pr_review_context`, and the raw comments travel on so the engine can
+    /// extract the arm marker (an engine concept the forge stays free of).
+    fn pr_observation_from_node(node: &Value, pr_review_context: &str) -> Option<PrObservation> {
+        let str_of = |key: &str| {
+            node.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let pr = PullRequest {
+            number: node.get("number")?.as_i64()?,
+            title: str_of("title"),
+            body: str_of("body"),
+            url: str_of("url"),
+            head_branch: str_of("headRefName"),
+            head_sha: str_of("headRefOid"),
+            state: str_of("state").to_lowercase(),
+            is_draft: node
+                .get("isDraft")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            labels: node
+                .pointer("/labels/nodes")
+                .and_then(Value::as_array)
+                .map(|ls| {
+                    ls.iter()
+                        .filter_map(|l| l.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let mergeable = match str_of("mergeable").to_ascii_uppercase().as_str() {
+            "MERGEABLE" => MergeableState::Mergeable,
+            "CONFLICTING" => MergeableState::Conflicting,
+            _ => MergeableState::Unknown,
+        };
+        let merge = Some(MergeState {
+            mergeable,
+            status: MergeStateStatus::from_gh(&str_of("mergeStateStatus")),
+            auto_merge_enabled: node.get("autoMergeRequest").is_some_and(|a| !a.is_null()),
+        });
+        let comments = node
+            .pointer("/comments/nodes")
+            .and_then(Value::as_array)
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| {
+                        Some(PrComment {
+                            body: c.get("body").and_then(Value::as_str)?.to_string(),
+                            created_at: c
+                                .get("createdAt")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let review_threads: Vec<ReviewThread> = node
+            .pointer("/reviewThreads/nodes")
+            .and_then(Value::as_array)
+            .map(|ts| {
+                ts.iter()
+                    .map(|t| ReviewThread {
+                        id: String::new(),
+                        resolved: t
+                            .get("isResolved")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        path: None,
+                        line: None,
+                        comments: Vec::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A clipped window makes the safety gates unreliable — a `hold` /
+        // `needs-human` label or an unresolved thread hidden past it would be
+        // missed. `totalCount` vs the returned count flags that so the engine
+        // falls back conservatively (f1 sibling: labels / review threads).
+        let complete = |field: &str, got: usize| {
+            node.pointer(&format!("/{field}/totalCount"))
+                .and_then(Value::as_u64)
+                .is_none_or(|total| total as usize <= got)
+        };
+        let labels_complete = complete("labels", pr.labels.len());
+        let review_threads_complete = complete("reviewThreads", review_threads.len());
+        let rollup_nodes = node
+            .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let checks = Self::checks_from_rollup_nodes(&rollup_nodes);
+        // The pr-review status rides in the rollup as a StatusContext named by
+        // the caller's context; map its CheckState back to a CommitStatusState.
+        let pr_review = checks
+            .iter()
+            .find(|c| c.name == pr_review_context)
+            .map(|c| match c.state {
+                CheckState::Success => CommitStatusState::Success,
+                CheckState::Failure => CommitStatusState::Failure,
+                CheckState::Pending => CommitStatusState::Pending,
+            });
+        Some(PrObservation {
+            pr,
+            merge,
+            comments,
+            review_threads,
+            rollup: CheckRollup { checks },
+            pr_review,
+            labels_complete,
+            review_threads_complete,
+        })
+    }
+
+    /// Every conversation comment on a PR, fully paginated (REST issue
+    /// comments). Used only when the bulk observe's comment window clipped
+    /// older comments, so the arm marker (the durable idempotency /
+    /// human-override key) is never missed (f1). REST `created_at` is the same
+    /// RFC3339 shape as GraphQL `createdAt`, so `store::parse_ts` reads both.
+    async fn all_pr_comments(&self, number: i64) -> Result<Vec<PrComment>> {
+        let raw = self
+            .gh(&[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!("repos/{}/issues/{number}/comments", self.repo),
+            ])
+            .await?;
+        let pages: Value = serde_json::from_str(&raw).context("parsing paginated PR comments")?;
+        Ok(pages
+            .as_array()
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .filter_map(|c| {
+                        Some(PrComment {
+                            body: c.get("body").and_then(Value::as_str)?.to_string(),
+                            created_at: c
+                                .get("created_at")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// The workflow run id inside a check's details URL
@@ -1327,6 +1485,114 @@ impl Forge for GhForge {
         let args = Self::merge_args(&pr, &self.repo, strategy, head_sha, false);
         self.gh(&args).await?;
         Ok(())
+    }
+
+    async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<UpdateBranchOutcome> {
+        // `expected_head_sha` pins the update to the head we observed: GitHub
+        // rejects it with a 422 if the head moved (TOCTOU-safe, issue #221).
+        match self
+            .gh_try(&[
+                "api",
+                "--method",
+                "PUT",
+                &format!("repos/{}/pulls/{pr}/update-branch", self.repo),
+                "-f",
+                &format!("expected_head_sha={expected_head_sha}"),
+            ])
+            .await?
+        {
+            Ok(_) => Ok(UpdateBranchOutcome::Updated),
+            Err(stderr) => {
+                let lower = stderr.to_ascii_lowercase();
+                if lower.contains("expected head sha") || lower.contains("head branch was modified")
+                {
+                    Ok(UpdateBranchOutcome::HeadMoved)
+                } else if lower.contains("not behind")
+                    || lower.contains("up to date")
+                    || lower.contains("up-to-date")
+                {
+                    Ok(UpdateBranchOutcome::AlreadyUpToDate)
+                } else {
+                    bail!("gh update-branch failed for #{pr}: {stderr}");
+                }
+            }
+        }
+    }
+
+    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+        // Informer-cache observe (issue #221, ADR 0012 decision 3): one GraphQL
+        // query folds every signal the two old sweeps read per PR (merge state,
+        // arm-marker comments, review threads, the check rollup, the pr-review
+        // status) into a single round-trip. `rateLimit { cost }` rides along so
+        // the API cost is measured, not estimated.
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        // `comments(last:100)` covers all but the chattiest PRs in one shot;
+        // `totalCount` lets us detect when the window clipped older comments and
+        // paginate them in, so the arm marker (the durable idempotency /
+        // human-override key) is never missed — a clipped marker would let a
+        // human-disarmed head look unarmed and get wrongly re-armed (f1).
+        let query = "query($owner:String!,$name:String!){\
+             rateLimit{cost}\
+             repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
+             number title body url headRefName headRefOid isDraft state \
+             labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
+             autoMergeRequest{enabledAt} \
+             comments(last:100){totalCount nodes{body createdAt}} \
+             reviewThreads(first:100){totalCount nodes{isResolved}} \
+             commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
+             ... on CheckRun{name status conclusion detailsUrl} \
+             ... on StatusContext{context state targetUrl}}}}}}}}}}}}";
+        let raw = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing merge-tail GraphQL")?;
+        let graphql_cost = v
+            .pointer("/data/rateLimit/cost")
+            .and_then(Value::as_u64)
+            .map(|c| c as u32);
+        let nodes = v
+            .pointer("/data/repository/pullRequests/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut requests: u32 = 1;
+        let mut prs = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let Some(mut obs) = Self::pr_observation_from_node(node, pr_review_context) else {
+                continue;
+            };
+            // Window clipped older comments → paginate the full set so no arm
+            // marker is lost. Rare (a PR with >100 comments); the extra reads
+            // are counted so the cost stays honest.
+            let total = node
+                .pointer("/comments/totalCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if total > obs.comments.len() {
+                obs.comments = self.all_pr_comments(obs.pr.number).await?;
+                requests += 1;
+            }
+            prs.push(obs);
+        }
+        Ok(MergeTailObservation {
+            prs,
+            cost: ObserveCost {
+                requests,
+                graphql_cost,
+            },
+        })
     }
 
     async fn mark_pr_ready(&self, pr: i64) -> Result<()> {

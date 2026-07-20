@@ -12,8 +12,7 @@ use std::sync::Arc;
 
 use meguri::config::{Config, ProjectConfig};
 use meguri::engine::Deps;
-use meguri::engine::auto_merger::armed_marker;
-use meguri::engine::merge_watch::sweep;
+use meguri::engine::merge_tail::{armed_marker, sweep};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     CheckState, Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, MergeStateStatus, MergeableState,

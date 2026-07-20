@@ -320,7 +320,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
     use meguri::config::AutoMergeMode;
-    use meguri::engine::auto_merger::validate_policy;
+    use meguri::engine::merge_tail::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
 
