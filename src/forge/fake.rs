@@ -122,6 +122,13 @@ pub struct FakeForge {
     /// (issue #221). A call whose expected head matches advances the recorded
     /// head (base merged in); a stale expected head is rejected (HeadMoved).
     pub update_branch_calls: Mutex<Vec<(i64, String)>>,
+    /// PRs whose `observe_merge_tail` reports its label set as clipped
+    /// (`labels_complete = false`) — exercises the engine's conservative
+    /// safety-gate fallback for a real forge's bounded label window.
+    pub incomplete_labels: Mutex<HashSet<i64>>,
+    /// PRs whose `observe_merge_tail` reports its thread set as clipped
+    /// (`review_threads_complete = false`).
+    pub incomplete_threads: Mutex<HashSet<i64>>,
 }
 
 impl FakeForge {
@@ -515,6 +522,18 @@ impl FakeForge {
     /// The armed (strategy, head_sha) for a PR, if any.
     pub fn armed_of(&self, pr: i64) -> Option<(MergeStrategy, String)> {
         self.armed.lock().unwrap().get(&pr).cloned()
+    }
+
+    /// Report a PR's observed label set as clipped (a real forge's bounded
+    /// label window dropped some), so the engine must treat the safety labels
+    /// conservatively.
+    pub fn mark_labels_incomplete(&self, pr: i64) {
+        self.incomplete_labels.lock().unwrap().insert(pr);
+    }
+
+    /// Report a PR's observed review-thread set as clipped.
+    pub fn mark_threads_incomplete(&self, pr: i64) {
+        self.incomplete_threads.lock().unwrap().insert(pr);
     }
 
     /// How many times `update_branch` was called for a PR (BEHIND fix tests).
@@ -1149,6 +1168,11 @@ impl Forge for FakeForge {
                 review_threads,
                 rollup,
                 pr_review,
+                // The fake returns every label / thread, so both are complete —
+                // unless a test forced a clipped window to exercise the engine's
+                // conservative fallback.
+                labels_complete: !self.incomplete_labels.lock().unwrap().contains(&number),
+                review_threads_complete: !self.incomplete_threads.lock().unwrap().contains(&number),
             });
         }
         // One bulk read regardless of PR count (issue #221): the informer-cache

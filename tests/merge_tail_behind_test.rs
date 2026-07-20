@@ -191,6 +191,42 @@ async fn human_disarm_survives_more_comments_than_the_observe_window() {
 }
 
 #[tokio::test]
+async fn clipped_label_window_is_treated_as_a_human_stop() {
+    // pr-review finding: a bounded label window could hide a `hold` /
+    // `needs-human` label, letting a write slip the human stop. When the observe
+    // reports the label set as incomplete, the merge tail must not act.
+    let forge = Arc::new(FakeForge::default());
+    seed_armable(&forge, 1, "sha1");
+    forge.mark_labels_incomplete(1);
+    let deps = deps_with(forge.clone(), AutoMergeMode::Native);
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(1),
+        None,
+        "an incomplete label observation must not arm (a hidden stop label is assumed)"
+    );
+}
+
+#[tokio::test]
+async fn clipped_thread_window_is_treated_as_unresolved() {
+    // pr-review finding: a bounded review-thread window could hide an unresolved
+    // thread, letting an arm slip the review gate. An incomplete thread set must
+    // read as "has an unresolved thread" → the arm waits.
+    let forge = Arc::new(FakeForge::default());
+    seed_armable(&forge, 1, "sha1");
+    forge.mark_threads_incomplete(1);
+    let deps = deps_with(forge.clone(), AutoMergeMode::Native);
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(1),
+        None,
+        "an incomplete thread observation must not arm (a hidden unresolved thread is assumed)"
+    );
+}
+
+#[tokio::test]
 async fn observe_cost_is_constant_and_recorded() {
     // Acceptance 2: the informer-cache observe costs one request regardless of
     // PR count, and each sweep records the measured cost as an event.

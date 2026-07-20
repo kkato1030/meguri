@@ -358,16 +358,27 @@ async fn build_snapshot(
     };
     let stale = armed_since_any_head(&obs.comments)
         .is_some_and(|since| now.saturating_sub(since) > STALE_AFTER_SECS);
+    // Conservative fallback for a clipped observe window: a `hold` / `needs-human`
+    // label hidden past the label window must never be missed (it would let a
+    // write slip the human stop), and an unresolved thread hidden past the thread
+    // window must never be missed (it would let an arm slip the review gate). So
+    // an incomplete label set reads as a human stop, and an incomplete thread set
+    // reads as "has an unresolved thread".
+    let human_stop = pr.has_label(forge::LABEL_HOLD)
+        || pr.has_label(forge::LABEL_NEEDS_HUMAN)
+        || !obs.labels_complete;
+    let has_unresolved_thread =
+        obs.review_threads.iter().any(|t| !t.resolved) || !obs.review_threads_complete;
     Ok(Snapshot {
         open: pr.state == "open",
         is_meguri_branch: pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX),
-        human_stop: pr.has_label(forge::LABEL_HOLD) || pr.has_label(forge::LABEL_NEEDS_HUMAN),
+        human_stop,
         current_head_armed: head_already_armed(&obs.comments, &pr.head_sha),
         merge: obs.merge.clone(),
         stale,
         rollup_failure: obs.rollup.state() == CheckState::Failure,
         arm_candidate,
-        has_unresolved_thread: obs.review_threads.iter().any(|t| !t.resolved),
+        has_unresolved_thread,
         pr_review,
         autonomy_full: deps.config.autonomy_for(&deps.project) == Autonomy::Full,
         policy_ok,

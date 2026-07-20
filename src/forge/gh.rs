@@ -461,7 +461,7 @@ impl GhForge {
                     .collect()
             })
             .unwrap_or_default();
-        let review_threads = node
+        let review_threads: Vec<ReviewThread> = node
             .pointer("/reviewThreads/nodes")
             .and_then(Value::as_array)
             .map(|ts| {
@@ -479,6 +479,17 @@ impl GhForge {
                     .collect()
             })
             .unwrap_or_default();
+        // A clipped window makes the safety gates unreliable — a `hold` /
+        // `needs-human` label or an unresolved thread hidden past it would be
+        // missed. `totalCount` vs the returned count flags that so the engine
+        // falls back conservatively (f1 sibling: labels / review threads).
+        let complete = |field: &str, got: usize| {
+            node.pointer(&format!("/{field}/totalCount"))
+                .and_then(Value::as_u64)
+                .is_none_or(|total| total as usize <= got)
+        };
+        let labels_complete = complete("labels", pr.labels.len());
+        let review_threads_complete = complete("reviewThreads", review_threads.len());
         let rollup_nodes = node
             .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
             .and_then(Value::as_array)
@@ -502,6 +513,8 @@ impl GhForge {
             review_threads,
             rollup: CheckRollup { checks },
             pr_review,
+            labels_complete,
+            review_threads_complete,
         })
     }
 
@@ -1525,10 +1538,10 @@ impl Forge for GhForge {
              rateLimit{cost}\
              repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
              number title body url headRefName headRefOid isDraft state \
-             labels(first:20){nodes{name}} mergeable mergeStateStatus \
+             labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
              autoMergeRequest{enabledAt} \
              comments(last:100){totalCount nodes{body createdAt}} \
-             reviewThreads(first:50){nodes{isResolved}} \
+             reviewThreads(first:100){totalCount nodes{isResolved}} \
              commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
              ... on CheckRun{name status conclusion detailsUrl} \
              ... on StatusContext{context state targetUrl}}}}}}}}}}}}";

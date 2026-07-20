@@ -186,6 +186,16 @@ pub struct PrObservation {
     /// The `meguri/pr-review` commit status on the head (the gate context the
     /// caller requested), or `None` if meguri never wrote it.
     pub pr_review: Option<CommitStatusState>,
+    /// Whether [`Self::pr`]'s label set is the PR's *complete* set. A bulk query
+    /// with a bounded label window sets this false when it clipped some; the
+    /// engine then reads the safety labels (`hold` / `needs-human`) conservatively
+    /// so a stop label hidden past the window can never be missed (a wrongful
+    /// arm / update / merge). Always true for a lossless source.
+    pub labels_complete: bool,
+    /// Whether [`Self::review_threads`] is the PR's *complete* thread set. False
+    /// when a bounded window clipped some; the engine then assumes an unresolved
+    /// thread exists (arm waits) rather than arming past a hidden one.
+    pub review_threads_complete: bool,
 }
 
 /// The whole merge tail's observation for one sweep, plus the API cost it took
