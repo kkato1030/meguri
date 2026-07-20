@@ -1867,7 +1867,13 @@ async fn run_turn_in(
                 deps.mux.send_line(&pane, &prepared.trigger_line).await?;
             }
             let outcome = engine
-                .await_completion(&pane, worktree, &prepared.turn_id, &control)
+                .await_completion(
+                    &pane,
+                    worktree,
+                    &prepared.turn_id,
+                    prepared.isolated,
+                    &control,
+                )
                 .await?;
             (outcome, Some(pane), ensured.resumed)
         }

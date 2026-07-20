@@ -105,11 +105,7 @@ pub fn trigger_line(turn_id: &str) -> String {
 /// review turns never race on one file; `false` yields the historical wording
 /// byte-for-byte.
 fn completion_contract(turn_id: &str, isolated: bool) -> String {
-    let result_file = if isolated {
-        format!("result-{turn_id}.json")
-    } else {
-        RESULT_FILE.to_string()
-    };
+    let result_file = result_file_name(turn_id, isolated);
     format!(
         r#"---
 
@@ -213,10 +209,26 @@ fn read_result_at(path: &Path, turn_id: &str) -> Option<TurnResultFile> {
     }
 }
 
-/// One-line reminder sent when the agent goes quiet without a result.
-pub fn nudge_line(turn_id: &str) -> String {
+/// The result file an agent is told to write for a turn: the shared
+/// `result.json`, or (issue #214 isolated turns) the per-turn
+/// `result-<turn_id>.json`. The completion contract and the stagnation nudge
+/// must name the same file, or a nudged isolated reviewer would fall back to the
+/// shared `result.json` and race its siblings.
+fn result_file_name(turn_id: &str, isolated: bool) -> String {
+    if isolated {
+        format!("result-{turn_id}.json")
+    } else {
+        RESULT_FILE.to_string()
+    }
+}
+
+/// One-line reminder sent when the agent goes quiet without a result. `isolated`
+/// (issue #214) must match the value used to prepare the turn so the nudge names
+/// the same result file as the completion contract did.
+pub fn nudge_line(turn_id: &str, isolated: bool) -> String {
+    let result_file = result_file_name(turn_id, isolated);
     format!(
-        "If you finished the task from {MEGURI_DIR}/prompt-{turn_id}.md, write {MEGURI_DIR}/{RESULT_FILE} as instructed (turn_id {turn_id}); otherwise continue working on it."
+        "If you finished the task from {MEGURI_DIR}/prompt-{turn_id}.md, write {MEGURI_DIR}/{result_file} as instructed (turn_id {turn_id}); otherwise continue working on it."
     )
 }
 
@@ -325,6 +337,17 @@ mod tests {
         assert!(completion_contract("z", true).contains(".meguri/result-z.json"));
         assert!(!completion_contract("z", true).contains(".meguri/result.json`"));
         assert!(completion_contract("z", false).contains(".meguri/result.json"));
+    }
+
+    #[test]
+    fn nudge_names_same_result_file_as_contract() {
+        // Issue #214: the stagnation nudge must point a stalled isolated
+        // reviewer at its per-turn file, not the shared result.json its
+        // siblings write; the shared-turn nudge keeps the historical wording.
+        assert!(nudge_line("z", true).contains(".meguri/result-z.json"));
+        assert!(!nudge_line("z", true).contains(".meguri/result.json"));
+        assert!(nudge_line("z", false).contains(".meguri/result.json"));
+        assert!(!nudge_line("z", false).contains("result-z.json"));
     }
 
     #[test]

@@ -76,6 +76,11 @@ pub struct PreparedTurn {
     pub turn_id: String,
     pub prompt_path: PathBuf,
     pub trigger_line: String,
+    /// Whether the completion contract names a per-turn `result-<turn_id>.json`
+    /// (issue #214). Carried so the stagnation nudge names the same file the
+    /// contract did — a nudge to the shared `result.json` would make a stalled
+    /// isolated reviewer race its siblings.
+    pub isolated: bool,
 }
 
 /// Write the prompt file + clear stale results. The caller then either
@@ -114,6 +119,7 @@ fn prepare_turn_impl(
         trigger_line: prompts::trigger_line(&turn_id),
         turn_id,
         prompt_path,
+        isolated,
     })
 }
 
@@ -128,11 +134,17 @@ impl TurnEngine {
     /// Never fails the turn because of silence or human activity: quiet
     /// agents get nudged then escalated to a human; the only exits are a
     /// matching result file, an explicit stop, or the pane dying.
+    ///
+    /// `isolated` (issue #214) must match the flag the turn was prepared with:
+    /// it selects which result file the stagnation nudge names, so a nudged
+    /// isolated reviewer is told to write its per-turn `result-<turn_id>.json`
+    /// rather than the shared `result.json` its siblings also use.
     pub async fn await_completion(
         &self,
         pane: &PaneId,
         worktree: &Path,
         turn_id: &str,
+        isolated: bool,
         control: &dyn TurnControl,
     ) -> Result<TurnOutcome> {
         let mut activity_clock = Duration::ZERO; // stagnation: time since last observed activity
@@ -283,7 +295,7 @@ impl TurnEngine {
                     // Only type into the pane when the agent is not mid-output
                     // and no human question is pending (checked above).
                     self.mux
-                        .send_line(pane, &prompts::nudge_line(turn_id))
+                        .send_line(pane, &prompts::nudge_line(turn_id, isolated))
                         .await?;
                     nudges_sent += 1;
                     activity_clock = Duration::ZERO;
