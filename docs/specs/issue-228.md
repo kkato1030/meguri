@@ -85,7 +85,9 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
   - `execute_prompt` を kind で impl/plan に分岐(上記プロンプト)。
   - `settle`:verdict × kind の status/ラベル分岐(挙動表)。advisory は Success + `<details>` 記録。
   - `pr_review_details` の outcome 文字列に advisory / blocking(カテゴリ併記)を追加。
-  - `PrReviewCheckpoint` の `verdict`/新フィールドの持ち回り。
+  - `PrReviewCheckpoint` の `verdict`/新フィールドの持ち回り。checkpoint にカテゴリ配列を残すなら
+    そのフィールドに `#[serde(default)]` を付け、旧 JSON でフィールド欠落時は空配列へ default させる
+    (欠落で checkpoint 全体が捨てられ resume が振り出しに戻るのを防ぐ。migration 参照)。
 - `src/config.rs` … 変更なし想定(guard トグルは既存の `[review.guard]` を流用)。
 - `src/engine/auto_merger.rs` … **変更なし**(status ベース gate のまま)。
 - `src/engine/spec_fixer.rs` … **変更なし**(Plan の failure status 駆動のまま)。
@@ -105,6 +107,12 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
   `"findings"` として載りうる。`Blocking` に `#[serde(alias="findings")]` を付けることで、デプロイ
   直後に resume した in-flight run も旧値を `Blocking` として読める(deser 失敗→`unwrap_or_default`
   でのリセットを避ける)。
+- **checkpoint に足す新フィールドは欠落時 default にする。** `PrReviewCheckpoint` にカテゴリ配列を
+  持たせるなら(verdict と対で checkpoint に残す場合)、そのフィールドに `#[serde(default)]` を付け、
+  旧 checkpoint JSON に**フィールド自体が無い**ときは空配列へ default させる。これを怠ると、alias で
+  verdict を読めても新フィールドの欠落で `serde_json::from_str(...).unwrap_or_default()`(`drive` 冒頭)が
+  checkpoint 全体を捨て、resume が振り出しに戻る。既存フィールドが全て `#[serde(default)]` なのと同じ
+  扱いを新フィールドにも徹底する。
 - **rollback**: 挙動変更のみなので revert で戻る。戻した後に旧バイナリが読む checkpoint には
   新語彙 `"advisory"`/`"blocking"` が載りうるが、旧 `ReviewVerdict` は `#[serde]` で未知値を拒否する。
   そのため rollback 時は「in-flight run が settle 前で止まっていれば再 review される」ことを許容する
