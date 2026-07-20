@@ -138,6 +138,65 @@ pub enum ArmOutcome {
     AlreadyClean,
 }
 
+/// The result of merging the base branch into a PR's head (the BEHIND fix,
+/// issue #221). Mirrors [`ArmOutcome`]: a state distinction the caller acts on,
+/// not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateBranchOutcome {
+    /// The base was merged into the PR branch; the head advanced.
+    Updated,
+    /// The branch was already up to date — nothing to do.
+    AlreadyUpToDate,
+    /// The observed head no longer matches (`expected_head_sha` was stale) so
+    /// the forge refused, TOCTOU-safe. The next sweep re-derives from the new
+    /// head — a silent skip, not an error.
+    HeadMoved,
+}
+
+/// The API cost of one [`Forge::observe_merge_tail`] call — the measured value
+/// ADR 0012 (decision 3) wants observable (issue #221). `requests` counts the
+/// HTTP round-trips the observe took; `graphql_cost` is GitHub's own
+/// `rateLimit.cost` when the query returned it, `None` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObserveCost {
+    pub requests: u32,
+    pub graphql_cost: Option<u32>,
+}
+
+/// One open PR's raw merge-tail signals from the informer-cache bulk query
+/// (issue #221). The forge returns raw observations; the engine's pure
+/// `next_step` reduces them to its decision Snapshot. The arm marker and the
+/// pr-review context are engine vocabulary, so the forge stays free of them:
+/// the marker is read by the engine out of [`Self::comments`], and the
+/// pr-review status is the context the caller passed to `observe_merge_tail`.
+#[derive(Debug, Clone)]
+pub struct PrObservation {
+    pub pr: PullRequest,
+    /// GitHub's merge-readiness snapshot, or `None` when the per-PR read failed
+    /// (the TransientError signal — never escalate on it).
+    pub merge: Option<MergeState>,
+    /// PR conversation comments (body + `createdAt`) — the engine extracts the
+    /// head-keyed arm marker (idempotency / re-arm) and the head-independent
+    /// arm-since (staleness) from these.
+    pub comments: Vec<PrComment>,
+    /// The PR's review threads — the engine reduces to "any unresolved".
+    pub review_threads: Vec<ReviewThread>,
+    /// The head's CI check rollup (the required-vs-not split for a Blocked PR).
+    pub rollup: CheckRollup,
+    /// The `meguri/pr-review` commit status on the head (the gate context the
+    /// caller requested), or `None` if meguri never wrote it.
+    pub pr_review: Option<CommitStatusState>,
+}
+
+/// The whole merge tail's observation for one sweep, plus the API cost it took
+/// (issue #221, ADR 0012 decision 3 — one informer-cache query with a measured
+/// cost instead of per-loop individual reads).
+#[derive(Debug, Clone)]
+pub struct MergeTailObservation {
+    pub prs: Vec<PrObservation>,
+    pub cost: ObserveCost,
+}
+
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
 /// reclaimed.
@@ -562,6 +621,21 @@ pub trait Forge: Send + Sync {
     /// (`gh pr merge --match-head-commit`, no `--auto`). A moved head is
     /// rejected by GitHub, so no head other than the confirmed one merges.
     async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
+
+    /// Merge the base branch into a PR's head branch — the BEHIND fix
+    /// (issue #221): `PUT /repos/{repo}/pulls/{n}/update-branch`, pinned to
+    /// `expected_head_sha` so a head that moved since the observation is
+    /// rejected by GitHub (TOCTOU-safe, the `--match-head-commit` of updates).
+    async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<UpdateBranchOutcome>;
+
+    /// Observe every open PR's merge-tail signals in one bulk query — the
+    /// informer-cache observe (issue #221, ADR 0012 decision 3). Returns the
+    /// per-PR raw observation plus the API cost the query took.
+    /// `pr_review_context` is the commit-status context whose state gates
+    /// arming (`meguri/pr-review`, ADR 0008); the caller supplies it so the
+    /// forge stays free of engine vocabulary, exactly as [`Forge::commit_status`]
+    /// takes its context.
+    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
     /// Close a pull request **without merging** (`gh pr close`). The decompose

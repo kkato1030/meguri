@@ -745,7 +745,7 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
         // #153) only once its round budget runs out. Adding `needs-human` here
         // would starve that discover query (it skips escalated PRs) before
         // spec_fixer ever runs — the same lockout ADR 0007 avoids by having
-        // merge_watch defer to fixer loops instead of escalating first. Drop the
+        // the merge tail defer to fixer loops instead of escalating first. Drop the
         // working claim (this settle's turn is done) but leave the label/status
         // as-is; the parked-review page moves to spec_fixer's round limit.
         (Kind::Plan, ReviewVerdict::Findings) => {

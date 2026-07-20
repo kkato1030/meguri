@@ -1,5 +1,5 @@
 //! Time-driven enqueue (issue #146): the `[[projects.schedules]]` sweep. Like
-//! `reaper::sweep` / `auto_merger::sweep`, this is an out-of-band poll-tick
+//! `reaper::sweep` / `merge_tail::sweep`, this is an out-of-band poll-tick
 //! sweep, not a `Loop` — firing a schedule only *creates one issue/task*
 //! (github: `forge.create_issue`; local: `store.create_task`), which the
 //! existing worker/planner discovery then consumes (ADR 0009). No pane, no run

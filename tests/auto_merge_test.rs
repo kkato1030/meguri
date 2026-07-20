@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use meguri::config::{AutoMergeMode, AutoMergeOptIn, Config, ProjectConfig};
 use meguri::engine::Deps;
-use meguri::engine::auto_merger::{ARMED_MARKER_PREFIX, armed_marker, sweep};
+use meguri::engine::merge_tail::{ARMED_MARKER_PREFIX, armed_marker, sweep};
 use meguri::engine::pr_reviewer::PR_REVIEW_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
