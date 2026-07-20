@@ -210,5 +210,24 @@ dispatch は workqueue と定期 resync の合成にする:
 
 ### 承認後の動き
 
-本 ADR 承認後、移行スライス 1〜5 を個別 issue として起票する。ADR 0013 / 0014 / 0015 /
-0016(#197)の実装はスライスに合流する。
+本 ADR 承認後、移行スライス 1〜5 を個別 issue として起票する。切り方と依存順も本 issue #198 の
+決定物なので、起票 payload(kind・blocked_by・受け入れの芯)をここに残す:
+
+1. **merge tail(Op のみ)** — kind: plan / blocked_by: なし。auto_merger / merge_watch を `Op`
+   に載せ替え、BEHIND を `Op(UpdateBranch)` + 再 arm で閉じる。observe 一括クエリの API コストを
+   実測。芯: BEHIND が回帰テストで閉じ、API コスト実測値が記録される。
+2. **Schedule Kind + repo-side config(#165)** — kind: plan / blocked_by: [1]。scheduler_fire を
+   Schedule Kind に。芯: cron 起票が Schedule Kind 経由で動き、既存の消化ループと非回帰。
+3. **queue + fixer 家族** — kind: plan / blocked_by: [1]。workqueue(activeQ / backoffQ /
+   parked)を導入し、fixer / ci_fixer / conflict_resolver を Issue Kind の arm に畳む。芯:
+   3 fixer が arm 化され、「ちょうど1つの所有 arm」property test が緑。
+4. **planner / worker / spec_worker / guard + Repo Kind** — kind: plan / blocked_by: [2, 3]。
+   残りの重い agent 起動系と cleaner / triage / routing_drift を吸収し、旧 `Loop` trait を撤去。
+   `reaper`(→ `Op(Finalize)`)・`decompose_materializer`(→ 分解提案への act)・body-edit
+   `reconcile`(→ `reconcile_body_edits` へ退避)・tick 最上段の `ensure_project_clone`
+   (→ Repo Kind の `Op(EnsureClone)`)もここで畳む。芯: default_loops・全 poll-tick sweep・
+   bootstrap reconcile が消え、全 Kind が reconciler 経由。
+5. **config 键粒度(ADR 0013)** — kind: plan / blocked_by: [4]。設定粒度を新構造に整える。芯:
+   config が新構造に追随し hot reload 非回帰。
+
+ADR 0013 / 0014 / 0015 / 0016(#197)の実装は上記スライスに合流する(独立起票しない)。
