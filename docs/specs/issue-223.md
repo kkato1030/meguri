@@ -162,13 +162,24 @@ finding f4 のとおり、当初案は backoff テーブルを「読む」だけ
 
 - **`next_step` は純粋・`Step` のみ。`RequeueAfter` は導入しない**(壁時計依存を pure 関数に持ち込まない)。
   backoff の「時間」は `next_step` の外、act 側と resync 側で扱う。
-- **作る = act 側、run の結果駆動**。Agent arm の run が**リトライ可能な終わり方**をしたとき
-  reconciler が `store.advance_backoff(project, item_key, arm)` を呼ぶ。対象は 2 種:
-  1. transient / interrupted の失敗(agent が落ちた・pane 死)。
-  2. **成功したのに症状が残る**ラウンド(ci-fixer が push したが CI なお赤 / conflict-resolver が
-     resolve したが base なお衝突)—— fixer 家族の ping-pong。これを毎 tick 空打ちさせないための間隔。
-  `advance` は attempt を +1 し、`next_visible_at = now + min(cap, base * 2^attempt)` を置く
+- **作る = act 側、run の結果駆動。対象は「成功したのに症状が残るラウンド」だけ(f7 の決定)**。
+  Agent arm の run が**成功したのに症状が残った**とき(ci-fixer が push したが CI なお赤 /
+  conflict-resolver が resolve したが base なお衝突)—— fixer 家族の ping-pong —— に限り reconciler が
+  `store.advance_backoff(project, item_key, arm)` を呼び、次ラウンドの間隔を空ける。`advance` は
+  attempt を +1 し、`next_visible_at = now + min(cap, base * 2^attempt)` を置く
   (config `[reconciler]` の base / cap)。
+  - **`Interrupted`(pane 死・中断)は backoff の対象にしない(f7)**。`RunStatus::Interrupted` は
+    終端結果ではなく、既存の `redispatch_interrupted` が毎 tick チェックポイントからそのまま再開する
+    (crash recovery、#183)。ここに backoff を被せると、(a) 結果駆動の `advance_backoff` にそもそも
+    到達せず、(b) 新規 run 向けの enqueue ゲートも通らない —— 「pane 死が毎 tick 再試行」になる。
+    よって Interrupted の回復は**従来どおり redispatch に委ね**、backoff は触らない(crash-loop の
+    抑制は本スライスの対象外。既存挙動を変えない)。
+  - **transient(observe の `merge==None` 等)も persistent backoff にしない**。それは `next_step` が
+    `Wait`/`Skip` を返し、次 resync が `poll_interval` の間隔で再観測して追いつく —— poll そのものが
+    pacing なので、専用の backoff 行は要らない。
+  - **genuine な失敗(agent が直せず escalate)は backoff ではなく parked(needs-human)昇格**。
+  つまり `advance_backoff` の唯一の呼び手は「成功したが症状が残る」ラウンドで、Interrupted / transient /
+  失敗はそれぞれ redispatch / 再観測 / parked が引き取る。
 - **enqueue ゲート = 読む側**。resync の act(c) 前に backoff を引き、`next_visible_at` が未来の
   PR×arm はこの resync では **run を作らない**(activeQ に入れない)。
 - **消す = resync 側、症状の「積極的な解消」を観測したときだけ(f5 の決定)**。毎 resync、その
@@ -313,23 +324,30 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    一致(seam が挙動保存)。
 3. **step policy(芯3)**: 全 snapshot × policy で、無効 arm は `Agent` を返さず `Wait(PolicyDisabled)`。
    フィルタ後も所有の全域性が保たれる。
-4. **claim / no-steal(芯3・f3 / f6)**: (a) *自分が書いた*(`viewerDidAuthor==true`)他 instance の
+4. **claim / no-steal(芯3・f3)**: (a) *自分が書いた*(`viewerDidAuthor==true`)他 instance の
    マーカーがある観測は dispatch されない(skip)。(b) *第三者が書いた*(`viewerDidAuthor==false`)
    偽マーカーは**無視され dispatch は進む**(偽装で凍結できない)。(c) 自分の instance / マーカー無しは
-   dispatch 可。(d) release で claim comment が `id` 指定で tombstone に編集される。(e) **100 件超の
-   comment を持つ PR(f6)**でも、pagination で全 comment の `viewerDidAuthor`/`id` が保たれ、
-   自分の claim が第三者扱いされず、tombstone 編集も node id で成立する。FakeForge に author 付き
-   マーカーコメント(100 件超のページを含む)を積んで連結検証。
-5. **backoff(f4 / f5)**: (a) リトライ可能な run 結果(transient 失敗 / 症状残存の成功)で
-   `advance_backoff` が呼ばれ `next_visible_at = base*2^attempt` を指数で置く。(b) due 前の PR×arm は
-   enqueue されない(run が作られない)。(c) **arm 自身の成功 push(= head 前進)では clear されず
-   attempt が育つ**、**transient(`Pending`/`Unknown`)でも clear されない**、**positive 解決
-   (CI 緑 / mergeable / awaiting スレッド無し)を観測した resync でだけ `clear_backoff` される**
-   (f5)。(d) sqlite なので restart をまたいで生存。`next_step` に `RequeueAfter` は無い。
-6. **thread 観測(f2)**: bulk observe が各スレッドの最終 comment を載せ、`thread_awaits_fixer` が
+   dispatch 可。(d) release で claim comment が `id` 指定で tombstone に編集される。engine 側の
+   これらは FakeForge に `viewerDidAuthor`/`id` 付きの観測コメントを積んで連結検証。
+5. **comment pagination の真正性(f6 / f8)**: **これは FakeForge では検証にならない**(FakeForge は
+   全 comment を1度に返し、`last:100` clip も cursor pagination も通らないので、pagination が
+   `viewerDidAuthor`/`id` を落としても緑になる)。よって **GhForge のページ畳み込みを純関数
+   `fold_comment_pages(&[Value]) -> Vec<PrComment>` に切り出し、`pageInfo{hasNextPage,endCursor}` を
+   持つ複数ページの scripted JSON(2 ページ目は `endCursor` を辿って初めて届く)を食わせて**、
+   全ページで `viewerDidAuthor`/`id` が保たれること・2 ページ目に置いた claim マーカーが自著判定と
+   node id で拾えることを assert する(GhForge-level test)。
+6. **backoff(f4 / f5 / f7)**: (a) **成功したのに症状が残る**ラウンドで `advance_backoff` が呼ばれ
+   `next_visible_at = base*2^attempt` を指数で置く。(b) due 前の PR×arm は enqueue されない
+   (run が作られない)。(c) **arm 自身の成功 push(= head 前進)では clear されず attempt が育つ**、
+   **transient(`Pending`/`Unknown`)でも clear されない**、**positive 解決(CI 緑 / mergeable /
+   awaiting スレッド無し)を観測した resync でだけ `clear_backoff` される**(f5)。(d) sqlite なので
+   restart をまたいで生存。(e) **`Interrupted` の run は `advance_backoff` を呼ばず、`redispatch_
+   interrupted` がそのまま再開する**(f7 —— pane 死が backoff で毎 tick 化しないこと)。`next_step` に
+   `RequeueAfter` は無い。
+7. **thread 観測(f2)**: bulk observe が各スレッドの最終 comment を載せ、`thread_awaits_fixer` が
    計算できる(最終が fixer 返信マーカーなら Fixer arm は発火しない)ことを FakeForge で検証。
-7. **優先度順 dispatch**: `queued` run が conflict > ci > fixer、同クラスは issue 番号昇順で出る。
-8. **非回帰**: 既存 `tests/*fixer*` の discovery テストは reconciler の arm 判定へ書き換え。
+8. **優先度順 dispatch**: `queued` run が conflict > ci > fixer、同クラスは issue 番号昇順で出る。
+9. **非回帰**: 既存 `tests/*fixer*` の discovery テストは reconciler の arm 判定へ書き換え。
    `scheduler_test.rs` / `issue_reconciler`(旧 merge_tail)の property は破壊しない。統合テスト
    (`tests/fixtures/fake_agent.sh`)で fixer arm が実 tmux / 実 worktree で回ることを確認。
 
@@ -352,9 +370,12 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
   carrier 束縛(既定 labels)、instance 名)
 - `src/forge/mod.rs` / `gh.rs` / `fake.rs`(`observe_merge_tail` → `observe_open_prs` 改名 +
   §1.5 の observe 拡張: `ReviewThread` の最終 comment、`PrComment` の `viewerDidAuthor` + `id`、
-  **comment overflow の fallback を REST → GraphQL pagination に変更(f6)**、claim comment 編集用の write)
+  **comment overflow の fallback を REST → GraphQL cursor pagination に変更(f6)**——
+  ページ畳み込みは純関数 `fold_comment_pages(&[Value]) -> Vec<PrComment>` に切り出し
+  GhForge-level test(f8)可能にする、claim comment 編集用の write)
 - `README.md` / `README.ja.md`(dispatch = workqueue + resync、fixer は arm、claim marker の一段)
-- `tests/`(property test 拡張、claim no-steal / backoff の FakeForge 連結、既存 fixer テスト書換)
+- `tests/` + `src/forge/gh.rs`(next_step の property test 拡張、claim no-steal / backoff の
+  FakeForge 連結、**`fold_comment_pages` の複数ページ scripted JSON test(f8)**、既存 fixer テスト書換)
 - 実装時に新規 ADR: **0026**(signal binding / step policy)/ **0027**(claim identity / no-steal、
   parked 非永続の精緻化を含む)
 
@@ -369,19 +390,22 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    `Agent(Fixer)`。予算超過はいずれも parked(needs-human)へ昇格。bulk observe が各スレッドの最終
    comment を載せ `thread_awaits_fixer` を計算できる(f2)。
 4. dispatch が workqueue + resync で動く: `queued` run が優先度順(マージ近接)に出る、parked は run を
-   作らない。**backoff(f4 / f5)**: リトライ可能な run 結果が `advance_backoff` を呼んで
-   `next_visible_at` を指数で置き、due 前は enqueue されず、restart をまたいで生存する。**arm 自身の
-   成功 push(head 前進)や transient(`Pending`/`Unknown`)では clear されず attempt が育ち**、
+   作らない。**backoff(f4 / f5 / f7)**: **成功したのに症状が残るラウンド**が `advance_backoff` を
+   呼んで `next_visible_at` を指数で置き、due 前は enqueue されず、restart をまたいで生存する。**arm
+   自身の成功 push(head 前進)や transient(`Pending`/`Unknown`)では clear されず attempt が育ち**、
    positive 解決(緑 / mergeable / スレッド無し)を観測したときだけ `clear_backoff` される(head SHA は
-   持たない)。
+   持たない)。**`Interrupted` の run は backoff を作らず既存の `redispatch_interrupted` が再開する**
+   (f7 —— pane 死が毎 tick 化しない)。
 5. signal binding: `Labels` 担体 seam が入り、seam 経由の `Snapshot` が baseline と一致する
    property test が緑。
 6. step policy: `apply_policy` が入り、無効 arm が `Wait(PolicyDisabled)` になる property test が緑。
-7. claim marker(f3 / f6): 他 instance の**自分が書いた**claim を dispatch しない(no-steal)一方、
+7. claim marker(f3 / f6 / f8): 他 instance の**自分が書いた**claim を dispatch しない(no-steal)一方、
    **第三者の偽マーカーは無視して dispatch を止めない**property test が緑。release で claim comment が
-   `id` 指定で無効化される。`meguri:working` は表示射影として付け外しされる。**100 件超の comment を
-   持つ PR でも**、pagination で `viewerDidAuthor`/`id` が保たれ真正性判定と tombstone 編集が成立する
-   (f6)。
+   `id` 指定で無効化される。`meguri:working` は表示射影として付け外しされる。**100 件超 comment の
+   pagination は FakeForge ではなく `fold_comment_pages` の GhForge-level test で担保**する ——
+   `pageInfo`/`endCursor` を持つ複数ページの scripted JSON を実際に辿り、全ページで
+   `viewerDidAuthor`/`id` が保たれ、2 ページ目の claim マーカーが自著判定と node id で拾えること
+   (f8)。
 8. 既存テスト(特に `issue_reconciler`(旧 `merge_tail`)property / `scheduler_test.rs` / 統合テスト)が
    全て緑。`cargo fmt` / `clippy -D warnings` / `nextest` / `test --doc` が通る。
 
