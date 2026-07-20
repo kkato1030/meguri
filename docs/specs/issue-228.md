@@ -59,6 +59,12 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
 }
 ```
 
+`blocking_categories` は `ReviewFile` 側でも `#[serde(default)]` にし、欠落時は空配列として読む
+(先例:`SelfReviewFile.findings` も `#[serde(default)] Vec`)。理由:既存 prompt で走り始めた
+in-flight turn は `{"verdict":..., "review":...}` だけを書くので、必須フィールドにすると新バイナリが
+その旧結果を JSON parse の時点で落とす(`Blocking` への `findings` alias は verdict しか救わない)。
+欠落=空配列として読んだ上で、下記の非空検証は `blocking` かつ `kind == Impl` のときだけかける。
+
 検証(`read_review`、kind を渡す):
 
 - `clean`: `review` 空でも可(nitpick は review に流す)。`blocking_categories` は空でなければ拒否。
@@ -82,7 +88,9 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
 
 - `src/engine/pr_reviewer.rs`
   - `ReviewVerdict` を三値化(`#[serde(alias="findings")]` on `Blocking`)、`BlockingCategory` 追加。
-  - `ReviewFile` に `blocking_categories` 追加。`read_review` を kind 付き検証に。
+  - `ReviewFile` に `blocking_categories` を `#[serde(default)]` 付きで追加(欠落=空配列。旧語彙で
+    書く in-flight turn を parse で落とさないため。`SelfReviewFile.findings` と同じ扱い)。`read_review`
+    を kind 付き検証にし、非空検証は `blocking` かつ `kind == Impl` のときだけかける。
   - `execute_prompt` を kind で impl/plan に分岐(上記プロンプト)。
   - `settle`:verdict × kind の status/ラベル分岐(挙動表)。advisory は Success + `<details>` 記録。
   - `pr_review_details` の outcome 文字列に advisory / blocking(カテゴリ併記)を追加。
@@ -108,6 +116,9 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
 
 - **持続 DB schema 変更なし。** `.meguri/review.json` は実行時に毎回生成される制御ファイルで、
   デフォルトブランチにもコミットしない。
+- **in-flight review.json 互換。** デプロイをまたいで走る turn は旧 prompt のまま
+  `{"verdict":..., "review":...}`(新フィールド無し)を書く。`ReviewFile.blocking_categories` を
+  `#[serde(default)]` にすることで、新バイナリがその旧結果を空配列として読める(schema 参照)。
 - **実行中 run の checkpoint 互換。** `PrReviewCheckpoint.verdict` は run step の永続 JSON に
   `"findings"` として載りうる。`Blocking` に `#[serde(alias="findings")]` を付けることで、デプロイ
   直後に resume した in-flight run も旧値を `Blocking` として読める(deser 失敗→`unwrap_or_default`
