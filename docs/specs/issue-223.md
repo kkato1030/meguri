@@ -163,20 +163,26 @@ finding f4 のとおり、当初案は backoff テーブルを「読む」だけ
 
 - **`next_step` は純粋・`Step` のみ。`RequeueAfter` は導入しない**(壁時計依存を pure 関数に持ち込まない)。
   backoff の「時間」は `next_step` の外、resync 側で扱う。
-- **作る = resync 側、観測駆動。「成功済み run 数」を高水位マークにして 1 ラウンド 1 回だけ進める
-  (finding 1 の決定)**。run 完了の瞬間に書かない —— push 直後の CI は普通 `Pending` で「症状が残る」か
-  まだ分からないからだ。判定は**後の resync** が赤を観測して初めて確定する。ただし同じ成功 run を毎
-  tick 数えて `attempt` を膨らませてはいけない。そこで **`succeeded_run_count`(runs 表に既に永続。
-  arm×issue の成功ラウンド数)を唯一の attempt 源にし、backoff 行にはそれを「どの成功数まで間隔を
-  引いたか」の高水位マーク `scheduled_attempt` として持つ**。resync ごと、症状が残る PR×arm について:
-  - `n = succeeded_run_count(project, arm, issue)` を読む。
-  - **`n > scheduled_attempt`(前回スケジュール後に新しい成功ラウンドが1本増えた)ときだけ** 1 回進める:
-    `next_visible_at = now + min(cap, base * 2^n)`、`scheduled_attempt = n` を書く(config `[reconciler]`
-    の base / cap)。
-  - `n == scheduled_attempt`(この成功ラウンドは既に間隔化済み)なら `next_visible_at` は**触らない**
+- **作る = resync 側、観測駆動。指数は「この症状 episode の中で費やした修復ラウンド数」で決める
+  (finding 1 の決定 —— episode 単位でリセット)**。run 完了の瞬間に書かない —— push 直後の CI は普通
+  `Pending` で「症状が残る」かまだ分からないからだ。判定は**後の resync** が赤を観測して初めて確定する。
+  ただし `succeeded_run_count` は**全期間の成功 run 数**で、行を消しても減らない(`runs.rs:513-528`)。
+  これを指数にそのまま使うと、一度緑にして再発した第2 episode が第1 episode 分の待ちを引き継いでしまう
+  (Fixer なら新しい review thread 1 本で過去ラウンド分の待ちが入る)。**episode ごとに 0 から数え直す**
+  ため、backoff 行に 2 つの目盛りを持たせる:
+  - `baseline_attempt`: この episode を開いた瞬間の `succeeded_run_count`(= episode 開始前の全期間数)。
+  - `scheduled_attempt`: どの `succeeded_run_count` まで間隔を引いたかの高水位マーク(同じ成功 run を
+    二度数えないため)。
+  resync ごと、症状が残る PR×arm について `n = succeeded_run_count(project, arm, issue)` を読み:
+  - **行が無い = episode 開始**: `baseline_attempt = n`、`scheduled_attempt = n`、`next_visible_at = now`
+    (即可視 = 最初の修復は待たせない)で行を作る。
+  - **行があり `n > scheduled_attempt`(episode 内で新しい成功ラウンドが1本増えた)ときだけ** 1 回進める:
+    指数は **episode 相対** `k = n - baseline_attempt`、`next_visible_at = now + min(cap, base * 2^k)`、
+    `scheduled_attempt = n`(config `[reconciler]` の base / cap)。
+  - `n == scheduled_attempt`(このラウンドは既に間隔化済み)なら `next_visible_at` は**触らない**
     —— 毎 tick 押し戻して無限延期する事故を防ぐ。
-  こうして各成功ラウンドはちょうど 1 回だけ `attempt` を進め、`n=0`(まだ 1 度も直していない初回赤)は
-  行が無い=即 enqueue、以降のラウンドだけ `2^n` で間隔が開く。
+  こうして各成功ラウンドはちょうど 1 回だけ間隔を進め、episode の最初の修復は即・以降だけ `2^k` で開く。
+  clear で行が消えると次の症状は**新しい episode**として `baseline` を取り直すので、指数は 0 に戻る。
   - **`Interrupted`(pane 死・中断)は backoff の対象にしない(f7)**。`RunStatus::Interrupted` は
     終端結果ではなく、既存の `redispatch_interrupted` が毎 tick チェックポイントからそのまま再開する
     (crash recovery、#183)。backoff を被せると新規 run 向けゲートも通らず「pane 死が毎 tick 再試行」に
@@ -195,18 +201,18 @@ finding f4 のとおり、当初案は backoff テーブルを「読む」だけ
     抑えられない。加えて現 schema には比較元の head SHA が無く、arm 自身の push と外部前進を
     区別できない。よって **head SHA は持たず、head 前進も clear に使わない**。
   - **transient(`Pending` / `Unknown` / `merge==None`)は「解消」ではない**。ここで clear すると
-    CI 再実行中の谷間で行が消え `scheduled_attempt` がリセットされ、やはりバックオフが育たない。
-    positive 解決の信号(緑 / mergeable / スレッド無し)だけを clear のトリガにする。
-  - 結果、`2^n` の間隔は赤→赤のラウンドをまたいで**単調に開く**(`n = succeeded_run_count` が単調)。
-    PR がこの arm を本当に通過したときだけ行が消えて 0 に戻る。row は PR が閉じ/merge されれば孤児化
+    CI 再実行中の谷間で行が消え、次の赤で episode が誤って開き直り指数が育たない。positive 解決の信号
+    (緑 / mergeable / スレッド無し)だけを clear のトリガにする。
+  - 結果、指数 `2^k` は**同じ episode の中で**赤→赤をまたいで単調に開き、positive 解決で行が消えると
+    次の症状は新しい episode として 0 から数え直す(finding 1)。row は PR が閉じ/merge されれば孤児化
     (finalize/reaper が回収、S4)。
 - 予算超過(`MAX_*_RUNS`)は backoff ではなく **parked(needs-human)への昇格**で、別物 —— バックオフが
   間隔を広げ、budget がラウンド総数を打ち切る、の二段構え(どちらも `succeeded_run_count` を読む)。
 
-つまり **backoff は「成功ラウンドの観測が高水位マークで 1 回ずつ間隔を開け、positive 解決の観測だけが
-消す」**。これで同じ成功 run を二度数えず、`next_visible_at` が arm 自身の push で誤って reset されず、
-症状が本当に解けたときだけ
-clear される —— 受け入れ基準で検証可能になる。
+つまり **backoff は「症状 episode の中で成功ラウンドを 1 回ずつ間隔化し、positive 解決で episode ごと
+消して指数を 0 に戻す」**。これで同じ成功 run を二度数えず、`next_visible_at` が arm 自身の push で誤って
+reset されず、解決済み episode の待ちを再発時に引き継がず、症状が本当に解けたときだけ clear される ——
+受け入れ基準で検証可能になる。
 
 ### 5. 優先度関数 = マージ近接(ADR 0001 の移設先)—— 全 loop を含む rank(finding 4 の決定)
 
@@ -313,15 +319,28 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
 **追加のみ・破壊なし。**
 
 - **schema**: migration `0016_reconciler_backoff.sql` を新設。
-  `reconciler_backoff(project_id TEXT, item_key INTEGER, arm TEXT, scheduled_attempt INTEGER,
-  next_visible_at TEXT, PRIMARY KEY(project_id, item_key, arm))`。`scheduled_attempt` は
-  「どの `succeeded_run_count` まで間隔を引いたか」の高水位マーク(finding 1)。**head SHA 列は
-  持たない**(f5: head 前進を clear 条件にしないため不要)。`schedules.rs` に倣ったアクセサ
-  `src/store/reconciler.rs`(read / advance / clear)。
+  `reconciler_backoff(project_id TEXT, item_key INTEGER, arm TEXT, baseline_attempt INTEGER,
+  scheduled_attempt INTEGER, next_visible_at TEXT, PRIMARY KEY(project_id, item_key, arm))`。
+  `baseline_attempt` = episode 開始時の `succeeded_run_count`、`scheduled_attempt` = 間隔化済みの高水位
+  マーク(finding 1)。指数は `scheduled_attempt - baseline_attempt`。**head SHA 列は持たない**
+  (f5)。`schedules.rs` に倣ったアクセサ `src/store/reconciler.rs`(read / advance / clear)。
 - **同 migration に fixer 家族横断の部分ユニークインデックス `runs_active_fixer_family` を足す
-  (finding 2、§7)**。`runs(project_id, issue_number) WHERE loop_kind IN
-  ('conflict-resolver','ci-fixer','fixer') AND status IN ('queued','running','interrupted')`。
-  既存の `runs_active_issue`(loop 単位)はそのまま残る(併存・後方互換)。ALTER なし・追加のみ。
+  (finding 2、§7)。ただし CREATE の前に既存重複を畳む前進クリーンアップが必須(finding 2 の決定)**。
+  `execute_batch`(`mod.rs:128-148`)は複数文を1トランザクションで流せるので、migration 0016 は
+  **①データクリーンアップ → ②CREATE UNIQUE INDEX** の順で書く:
+  1. **① 既存重複の畳み込み**: 現行 schema は `loop_kind` が違えば同じ issue に Fixer と CiFixer を
+     同時に持てる(`0007_tasks.sql:74-76` は loop 単位)。upgrade 時点でその組み合わせや arm 違いの
+     複数 `interrupted` が残っていると、そのまま `CREATE UNIQUE INDEX` すると **migration 全体が失敗し
+     store 起動が止まる**(`mod.rs:142-143`)。よって index を張る前に、各 `(project_id, issue_number)`
+     群の active な fixer 家族 run を **1 本だけ残して残りを terminal 化**する UPDATE を先に流す。
+     残す 1 本は「生きているものを優先」(`running` > `interrupted` > `queued`、同格は新しい方=最大 id)。
+     残りは `status='stopped'`, `reason='superseded by reconciler family exclusion (migration 0016)'`
+     にする —— **`succeeded` にはしない**(予算 `succeeded_run_count` を汚さない)。既存の
+     `runs_active_issue`(loop 単位)により arm ごとには元々 1 本なので、1 群の候補は最大 3(各 arm 1 本)。
+  2. **② CREATE UNIQUE INDEX** `runs(project_id, issue_number) WHERE loop_kind IN
+     ('conflict-resolver','ci-fixer','fixer') AND status IN ('queued','running','interrupted')
+     AND issue_number IS NOT NULL`。①のあとなので違反ゼロで必ず通る。
+  既存の `runs_active_issue` はそのまま残る(併存・後方互換)。テーブルの ALTER は無し(追加のみ)。
 - **claim marker**: 追加コメント + release 時の**自分のコメント編集**(tombstone 化、§7)。
   correctness は tombstone 成否に依存せず、生存判定(run 状態)が本線。`working` label は射影として
   付け外しを続けるので、旧バイナリ・人間の目には後方互換。
@@ -333,6 +352,8 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
   (gh/fake の read が広がるだけ)。
 - **前進(forward)**: activeQ / parked は**再導出**なので状態移行データは不要。初回 resync が
   observe から全部組み直す(level-triggered の利点)。backoff テーブルは空から始まって自然に埋まる。
+  上記①のクリーンアップで terminal 化された余剰 run も、症状が残っていれば次 resync が index を尊重して
+  1 本だけ再 enqueue する(level-triggered なので取りこぼさない)。migration test で担保(§test strategy)。
 - **rollback**(この PR を revert): 3 loop の `discover` が戻り、`reconciler_backoff` は**孤児化
   するだけ**(誰も読まない・害なし)。claim マーカーは無害なコメントとして残る(cleaner が拾うか
   無視)。`working` label は本スライスでも射影として付け外しを続けているので、旧 `pr_is_touchable` が
@@ -385,15 +406,17 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    持つ複数ページの scripted JSON(2 ページ目は `endCursor` を辿って初めて届く)を食わせて**、
    全ページで `viewerDidAuthor`/`id` が保たれること・2 ページ目に置いた claim マーカーが自著判定と
    node id で拾えることを assert する(GhForge-level test)。
-6. **backoff(f4 / f5 / f7 / finding 1)**: (a) 症状が残る PR×arm で、`succeeded_run_count` が
-   `scheduled_attempt` を超えたときだけ `next_visible_at = now + min(cap, base * 2^n)` を置き
-   `scheduled_attempt = n` に更新する(**式は §4.5 と同一**)。(b) **同じ成功 run を毎 tick 二度数えない**:
-   `n == scheduled_attempt` の resync では `next_visible_at` を変えない(無限延期しないことを assert)。
-   (c) `n=0`(初回赤・成功 run 無し)は行が無く即 enqueue、以降のラウンドだけ間隔が開く。(d) due 前の
-   PR×arm は enqueue されない。(e) **arm 自身の成功 push(= head 前進)/ transient(`Pending`/`Unknown`)
-   では clear されず**、positive 解決(緑 / mergeable / スレッド無し)を観測した resync でだけ
-   `clear_backoff`(f5)。(f) sqlite なので restart をまたいで生存。(g) **`Interrupted` は `advance_backoff`
-   を呼ばず `redispatch_interrupted` が再開**(f7)。`next_step` に `RequeueAfter` は無い。
+6. **backoff(f4 / f5 / f7 / finding 1)**: (a) episode 開始(症状あり・行なし)で `baseline_attempt = n`、
+   `next_visible_at = now`(即可視)の行が作られる。(b) 症状が残り `n > scheduled_attempt` のときだけ
+   `next_visible_at = now + min(cap, base * 2^(n - baseline_attempt))` を置き `scheduled_attempt = n` に
+   更新する(**式は §4.5 と同一**)。(c) **同じ成功 run を毎 tick 二度数えない**: `n == scheduled_attempt`
+   の resync では `next_visible_at` を変えない(無限延期しないことを assert)。(d) due 前の PR×arm は
+   enqueue されない。(e) **arm 自身の成功 push / transient(`Pending`/`Unknown`)では clear されず**、
+   positive 解決でだけ `clear_backoff`(f5)。(f) **`clear → 症状再発` の episode リセット(finding 1)**:
+   緑にして row を消したあと別 commit で再び赤になると、指数は過去 `n` を引き継がず **0 から**開き直る
+   (Fixer も新スレッド 1 本で過去待ちを負わない)—— `succeeded_run_count` が全期間値でも待ちが正しいことを
+   assert。(g) sqlite なので restart をまたいで生存。(h) **`Interrupted` は `advance_backoff` を呼ばず
+   `redispatch_interrupted` が再開**(f7)。`next_step` に `RequeueAfter` は無い。
 7. **thread 観測(f2)**: bulk observe が各スレッドの最終 comment を載せ、`thread_awaits_fixer` が
    計算できる(最終が fixer 返信マーカーなら Fixer arm は発火しない)ことを FakeForge で検証。
 8. **優先度順 dispatch(finding 4)**: `dispatch_rank` が全 loop_kind に対し
@@ -401,7 +424,12 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    planner=7 < cleaner=8 < triage=9 を返す(純粋・全順序)。`queued` run がこの rank 順・同 rank は
    issue 番号昇順で dispatch され、**`spec_fixer` の相対順(fixer の直後 / worker より前)が今日と一致**
    することを assert(既存の `spec_fixer_sits_in_the_fixer_family_above_new_work` を rank ベースへ移植)。
-9. **非回帰**: 既存 `tests/*fixer*` の discovery テストは reconciler の arm 判定へ書き換え。
+9. **migration の前進安全性(finding 2)**: **既存重複を含む DB を fixture にした migration test** ——
+   upgrade 前に `(project, issue)` へ Fixer と CiFixer を同時 active、かつ arm 違いの `interrupted` を
+   複数仕込んだ store を開き、(a) migration 0016 が**失敗せず適用**され store 起動が通る、(b) 各群に
+   active な fixer 家族 run が**ちょうど 1 本**残り「生存優先」で選ばれる、(c) terminal 化された余剰は
+   `succeeded` ではない(予算不変)、(d) 適用後 `runs_active_fixer_family` が新規重複を弾く、を assert。
+10. **非回帰**: 既存 `tests/*fixer*` の discovery テストは reconciler の arm 判定へ書き換え。
    `scheduler_test.rs` / `issue_reconciler`(旧 merge_tail)の property は破壊しない。`spec_fixer` は
    S3 で無変更(挙動・順位とも)。統合テスト(`tests/fixtures/fake_agent.sh`)で fixer arm が実 tmux /
    実 worktree で回ることを確認。
@@ -420,10 +448,11 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
   (finding 4、`spec_fixer=3` を含む全 loop)。`spec_fixer` は無変更)
 - `src/engine/scheduler.rs`(`queued` run を `dispatch_rank` 順に dispatch、backoff enqueue ゲート、
   resync sweep 呼び出しを継ぐ)
-- `src/store/migrations/0016_reconciler_backoff.sql`(新規: `reconciler_backoff` +
-  `runs_active_fixer_family` 家族横断インデックス(finding 2))+ `src/store/reconciler.rs`
-  (アクセサ新規: `advance_backoff`(高水位マーク方式)/ `clear_backoff` / read)+ 家族横断 active-run の
-  存在判定 helper)
+- `src/store/migrations/0016_reconciler_backoff.sql`(新規: `reconciler_backoff`(`baseline_attempt` +
+  `scheduled_attempt`、finding 1)+ **①既存重複クリーンアップ UPDATE → ②`runs_active_fixer_family`
+  CREATE UNIQUE INDEX** の順、finding 2)+ `src/store/reconciler.rs`(アクセサ新規:
+  `advance_backoff`(episode baseline + 高水位マーク)/ `clear_backoff` / read)+ 家族横断 active-run の
+  存在判定 helper。migration test 用 fixture(既存重複 DB)を含む)
 - `src/config.rs`(`[reconciler]` = `ReconcilerConfig`: step policy allow-set、backoff base/cap、
   carrier 束縛(既定 labels)、instance 名)
 - `src/forge/mod.rs` / `gh.rs` / `fake.rs`(`observe_merge_tail` → `observe_open_prs` 改名 +
@@ -451,10 +480,11 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    comment を載せ `thread_awaits_fixer` を計算できる(f2)。
 4. dispatch が workqueue + resync で動く: `queued` run が `dispatch_rank` 順(マージ近接、`spec_fixer` の
    相対順は不変 —— finding 4)に出る、parked は run を作らない。**backoff(f4 / f5 / f7 / finding 1)**:
-   症状が残る PR×arm で `succeeded_run_count` が高水位 `scheduled_attempt` を超えたときだけ
-   `next_visible_at = now + min(cap, base * 2^n)` を **1 ラウンド 1 回** 置き(同じ成功 run を二度数えない)、
-   due 前は enqueue されず、restart をまたいで生存する。**arm 自身の成功 push(head 前進)や transient
-   (`Pending`/`Unknown`)では clear されず**、positive 解決を観測したときだけ `clear_backoff` される
+   症状が残る PR×arm で `n = succeeded_run_count` が高水位 `scheduled_attempt` を超えたときだけ、指数
+   `k = n - baseline_attempt` で `next_visible_at = now + min(cap, base * 2^k)` を **1 ラウンド 1 回**
+   置き(同じ成功 run を二度数えない)、due 前は enqueue されず、restart をまたいで生存する。
+   **positive 解決で clear すると次の症状は新 episode として指数が 0 に戻り、過去 episode の待ちを
+   引き継がない(finding 1)**。**arm 自身の成功 push / transient(`Pending`/`Unknown`)では clear されず**
    (head SHA は持たない)。**`Interrupted` は backoff を作らず `redispatch_interrupted` が再開**(f7)。
 5. signal binding: `Labels` 担体 seam が入り、seam 経由の `Snapshot` が baseline と一致する
    property test が緑。
@@ -468,9 +498,13 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    - **100 件超 comment の pagination は `fold_comment_pages` の GhForge-level test で担保**(FakeForge 不可)
      —— `pageInfo`/`endCursor` を辿り全ページで `viewerDidAuthor`/`id` が保たれ、2 ページ目の claim
      マーカーが拾えること(f8)。
-8. **`dispatch_rank` が全 loop を順序づけ、`spec_fixer` の相対順が今日と一致**する(finding 4)。
+8. **migration 0016 の前進安全性(finding 2)**: Fixer と CiFixer を同 issue に同時 active・arm 違いの
+   `interrupted` 複数を含む既存 DB を fixture にした migration test が緑 —— ①クリーンアップが余剰 active を
+   `succeeded` 以外で terminal 化し各群に active 1 本を残す、②その後 `CREATE UNIQUE INDEX` が成功して
+   store 起動が通る。
+9. **`dispatch_rank` が全 loop を順序づけ、`spec_fixer` の相対順が今日と一致**する(finding 4)。
    `spec_fixer` は S3 で挙動・順位とも無変更。
-9. 既存テスト(特に `issue_reconciler`(旧 `merge_tail`)property / `scheduler_test.rs` / 統合テスト)が
+10. 既存テスト(特に `issue_reconciler`(旧 `merge_tail`)property / `scheduler_test.rs` / 統合テスト)が
    全て緑。`cargo fmt` / `clippy -D warnings` / `nextest` / `test --doc` が通る。
 
 ## スコープ外(S4 以降)
