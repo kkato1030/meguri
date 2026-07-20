@@ -60,13 +60,20 @@
   人手ゲートを消す*（doctor は未作成パスを前もって検証しない）。子0 は**子1 の bypass 半分の
   緑オラクル**になる（folder-trust 半分は実ターン進行が担保）。
 
-- **D2（doctor は pane 到達 profile だけを gate-probe / finding f2）。** 「対話起動を要するか」は
-  profile ではなく role の launch mode の性質で、同じ profile が pane role と direct role の両方から
-  使われうる。よって子0 は `launch::resolve`（role→mode）と `routing::resolve`（role→profile）を
-  消費し、**いずれかの pane-mode role が解決する profile 集合だけ**を、`(command, config-dir,
-  gating args)` で重複排除して gate-probe する。direct 専用 profile はゲートに当たらないので対象外。
-  既存の per-profile `--version`／model probe ループ（profile 列挙）は**意味を変えず不変**、
-  gate 検知は launch 情報を受け取る別パスとして足す。
+- **D2（doctor は「実ターンとして pane 起動される role」の profile だけを gate-probe / finding f2）。**
+  「対話起動を要するか」は profile ではなく role の launch mode の性質で、同じ profile が pane role と
+  direct role の両方から使われうる。よって子0 は `launch::resolve`（role→mode）と
+  `routing::resolve`（role→profile）を消費し、**実ターンとして pane 起動される role が解決する
+  profile 集合だけ**を、`(command, config-dir, gating args)` で重複排除して gate-probe する。
+  対象 role の絞り込みは2段:
+  - launch mode が `Pane` の role だけ（`self-reviewer` / `cleaner` は既定 `Direct` なので除外）。
+  - かつ **`refiner` は除外**する。`refiner` は `launch::recommended_mode` の既定では `Pane` 扱いに
+    なる（`self-reviewer` / `cleaner` 以外は `Pane`, `src/launch.rs:33`）が、実体は `meguri add` の
+    **headless refine 専用**（`effective_headless_args` 経路）で、実ターンの pane 起動
+    （`spawn_agent_pane`）は通らない。ここを絞らないと、headless・refine 専用 profile まで対話
+    gate-probe して、存在しない詰まりを警告／失敗にしてしまう。
+  direct 専用 profile もゲートに当たらないので対象外。既存の per-profile `--version`／model probe
+  ループ（profile 列挙）は**意味を変えず不変**、gate 検知は launch 情報を受け取る別パスとして足す。
 
 ## 要件カバレッジ（親の受け入れの芯 → 子）
 
@@ -96,9 +103,11 @@
 
 - **対象は config-dir 単位の bypass 受諾ゲートのみ**（D1）。フォルダ信頼は per-worktree で
   doctor 時に検証不能なため子0 では扱わない（子1 の launch-time 前捌きが担保）。
-- **launch 情報で対象を絞る**（D2）。`launch::resolve` ＋ `routing::resolve` から pane-mode role が
+- **launch 情報で対象を絞る**（D2）。`launch::resolve` ＋ `routing::resolve` から、**実ターンとして
+  pane 起動される role**（launch mode が `Pane`、かつ headless refine 専用の `refiner` は除外）が
   解決する profile 集合を作り、`(command, config-dir, gating args)` で重複排除して gate-probe する。
-  既存の per-profile version／model probe は不変。
+  `refiner` は既定で `Pane` 判定になるが `spawn_agent_pane` を通らない headless 専用なので、
+  対話 gate-probe の対象にしない。既存の per-profile version／model probe は不変。
 - **gate probe は pty 下で `-p` なし・timeout 付き起動**し、`~/.claude.json` 内部フィールドの
   **読取り**にも依存しない（書取り同様 version-fragile）。
 - **結果は3値**（`ProbeOutcome` とは別の gate 用型を新設 / f3）:
@@ -144,7 +153,7 @@
 
 ```json meguri-children
 [
-{"title": "doctor: 対話 pane の bypass 受諾ゲートの false-green を潰す", "body": "## 背景\n\nclaude probe が headless `-p` 固定で叩くため（`src/routing.rs:110` `probe_claude` / `:151` `probe_generic`）、対話起動で現れる初回ゲート（Bypass Permissions mode の受諾ダイアログ）を素通りする。結果、対話 pane なら詰まる状態でも doctor が緑になる（false-green）。meguri は画面を読まない設計なので、この緑は「実ターンも通る」を保証しない。\n\n## スコープの決定（親 spec D1）\n\n本 issue が扱うのは config-dir（マシン）単位で永続化される bypass 受諾ゲートのみ。フォルダ信頼は worktree のパス単位で、doctor 実行時には当該 worktree が未作成・probe は doctor の cwd を継承するため検知できない。フォルダ信頼は後続の pre-flight issue が launch 時に担保する（本 issue の対象外）。よって本 issue は『bypass 受諾ゲートの緑オラクル』になる。\n\n## やること\n\n- **対象を launch 情報で絞る（親 spec D2）**: `launch::resolve`（role→launch mode）と `routing::resolve`（role→profile）から、いずれかの pane-mode role が解決する profile 集合を作り、`(command, config-dir, gating args)` で重複排除して gate-probe する。direct 専用 profile はゲートに当たらないので対象外。既存の per-profile `--version`／model probe ループは意味を変えず不変で、gate 検知は launch 情報を受け取る別パスとして足す。\n- **gate probe**: pty 下で `-p` なし・timeout 付き起動し、既知ダイアログ文言を照合する。`~/.claude.json` の内部フィールドの読取りにも依存しない（書取り同様 version-fragile）。\n- **結果は3値（`ProbeOutcome` とは別の gate 用型を新設）**: ready 文言を積極検知した時のみ ✅ 緑／既知 bypass ゲート文言を検知したら ❌ 赤・fatal・1行 remediation／timeout・未知出力・spawn 失敗は ⚠️ 非緑・非 fatal。\n- **hang と副作用の封じ込め**: PTY 子孫を含む process group を必ず終了・回収する（対話 CLI は自然終了しない）。受諾入力は送らず永続状態を変えない。端末バッファをログに出さない。\n- **失敗側規則**: 緑は ready の積極一致がある時だけ。ゲート文言が変わって一致しなくなった状態は ⚠️（非緑）に落ち決して緑にしない — 文言変更で同じ false-green を再発させない。\n- **seam とテスト**: PTY 起動部を closure で注入できる seam にし（現行の closure 注入流儀）、単体テストで ゲート検知→Blocked、ready→Clear、timeout→Inconclusive、spawn 失敗→Inconclusive を検証する。\n\n## 受け入れ\n\n- bypass 受諾が未了の pane 到達 profile で doctor が赤＋remediation を出す。\n- 受諾済みなら緑のまま。フォルダ信頼は本 issue の対象外。\n- 永続状態・config スキーマ・public contract に触れない。\n\n## 関連\n\n- `src/routing.rs:108`（probe_claude）/ `:147`（probe_generic）/ `src/main.rs:779`（doctor_agents）・`:999`（doctor_probe）\n- `src/launch.rs`（launch::resolve）/ `src/routing.rs`（routing::resolve）/ ADR 0012（launch mode）\n- overview.md（画面読み取りで成否判定しない設計前提）", "kind": "ready", "blocked_by": []},
+{"title": "doctor: 対話 pane の bypass 受諾ゲートの false-green を潰す", "body": "## 背景\n\nclaude probe が headless `-p` 固定で叩くため（`src/routing.rs:110` `probe_claude` / `:151` `probe_generic`）、対話起動で現れる初回ゲート（Bypass Permissions mode の受諾ダイアログ）を素通りする。結果、対話 pane なら詰まる状態でも doctor が緑になる（false-green）。meguri は画面を読まない設計なので、この緑は「実ターンも通る」を保証しない。\n\n## スコープの決定（親 spec D1）\n\n本 issue が扱うのは config-dir（マシン）単位で永続化される bypass 受諾ゲートのみ。フォルダ信頼は worktree のパス単位で、doctor 実行時には当該 worktree が未作成・probe は doctor の cwd を継承するため検知できない。フォルダ信頼は後続の pre-flight issue が launch 時に担保する（本 issue の対象外）。よって本 issue は『bypass 受諾ゲートの緑オラクル』になる。\n\n## やること\n\n- **対象を launch 情報で絞る（親 spec D2）**: `launch::resolve`（role→launch mode）と `routing::resolve`（role→profile）から、**実ターンとして pane 起動される role**が解決する profile 集合を作り、`(command, config-dir, gating args)` で重複排除して gate-probe する。対象 role の絞り込みは2段: (1) launch mode が `Pane` の role だけ（`self-reviewer`/`cleaner` は既定 `Direct` で除外）、(2) かつ `refiner` は除外する。`refiner` は `launch::recommended_mode` の既定では `Pane` 扱いになる（`src/launch.rs:33`）が、実体は `meguri add` の headless refine 専用（`effective_headless_args` 経路）で `spawn_agent_pane` を通らないため、対話 gate-probe すると存在しない詰まりを警告／失敗にしてしまう。direct 専用 profile もゲートに当たらないので対象外。既存の per-profile `--version`／model probe ループは意味を変えず不変で、gate 検知は launch 情報を受け取る別パスとして足す。\n- **gate probe**: pty 下で `-p` なし・timeout 付き起動し、既知ダイアログ文言を照合する。`~/.claude.json` の内部フィールドの読取りにも依存しない（書取り同様 version-fragile）。\n- **結果は3値（`ProbeOutcome` とは別の gate 用型を新設）**: ready 文言を積極検知した時のみ ✅ 緑／既知 bypass ゲート文言を検知したら ❌ 赤・fatal・1行 remediation／timeout・未知出力・spawn 失敗は ⚠️ 非緑・非 fatal。\n- **hang と副作用の封じ込め**: PTY 子孫を含む process group を必ず終了・回収する（対話 CLI は自然終了しない）。受諾入力は送らず永続状態を変えない。端末バッファをログに出さない。\n- **失敗側規則**: 緑は ready の積極一致がある時だけ。ゲート文言が変わって一致しなくなった状態は ⚠️（非緑）に落ち決して緑にしない — 文言変更で同じ false-green を再発させない。\n- **seam とテスト**: PTY 起動部を closure で注入できる seam にし（現行の closure 注入流儀）、単体テストで ゲート検知→Blocked、ready→Clear、timeout→Inconclusive、spawn 失敗→Inconclusive を検証する。\n\n## 受け入れ\n\n- bypass 受諾が未了の pane 到達 profile で doctor が赤＋remediation を出す。\n- 受諾済みなら緑のまま。フォルダ信頼は本 issue の対象外。\n- 永続状態・config スキーマ・public contract に触れない。\n\n## 関連\n\n- `src/routing.rs:108`（probe_claude）/ `:147`（probe_generic）/ `src/main.rs:779`（doctor_agents）・`:999`（doctor_probe）\n- `src/launch.rs`（launch::resolve）/ `src/routing.rs`（routing::resolve）/ ADR 0012（launch mode）\n- overview.md（画面読み取りで成否判定しない設計前提）", "kind": "ready", "blocked_by": []},
 {"title": "profile pre-flight で初回対話ゲートを自動前捌き", "body": "## 背景\n\n対話 pane 起動（worker/planner/fixer/pr-reviewer は ADR 0012 の pane mode）で agent CLI の初回対話ゲートに詰まる。claude は yolo（`--dangerously-skip-permissions`, `src/config.rs:921`）の「Bypass Permissions mode」一度きり受諾＋fresh worktree のフォルダ信頼、cursor-agent は `--trust`/`--force`（args で前捌き済み＝同型の別解）。meguri は画面を読まないので、人が `2` を押さない限り永久に詰まる。\n\n調査事実: bypass 受諾を非対話で満たす supported で version 安定な口は現状なく（settings.json の `permissions.defaultMode` では対話受諾は消えない）、受諾フィールドの名前・場所はバージョンで揺れる。フォルダ信頼はパス単位で `~/.claude.json` に記録され、信頼判定は repo 側 settings を読む前なので worktree 内 settings では pre-trust できない。唯一素通りするのは headless `-p`。\n\n## スコープの決定（親 spec D1）\n\nbypass 受諾（config-dir 単位）は先行の doctor issue が緑オラクルになる。フォルダ信頼は per-worktree で doctor では検知できないため、本 issue の launch-time 前捌き（worktree cwd で prime）が唯一の担保。\n\n## やること（この issue は plan: まず実装 spec を書く）\n\n- pane 起動前に非対話でゲートを満たす、一般化された per-profile pre-flight を導入する。claude の bypass 受諾＋フォルダ信頼、cursor-agent の `--trust` を同じ枠で扱う。\n- `~/.claude.json` 内部フィールドの直書きに依存しない（version-fragile 回避）。\n\n## 設計パスで確定させる A/B\n\n- headless prime（例 `claude --dangerously-skip-permissions -p 'ok'` を pane 起動前に一度実行）が bypass 受諾／フォルダ信頼の receipt を claude 自身の形式で永続化するかを実機検証。するならそれが version-stable な前捌き（meguri は JSON を触らず claude に書かせる）。しないなら別解（`CLAUDE_CONFIG_DIR` を meguri 所有にして prime／当該 role の launch mode 見直し 等）。\n- フォルダ信頼はパス単位なので prime を worktree の cwd で走らせて当該パスの信頼を得る。\n- config スキーマへ `preflight`（前捌き argv）を追加するかの是非と形。\n- hang 対策: pre-flight の timeout、PTY 子孫を含む子プロセス回収、pane 起動前に足す遅延の上限。\n\n## 受け入れ\n\n- 新規マシン／新規 config／新規プロファイルで、人が `2` を押さず対話 pane の agent が起動し完了コントラクトを返す（環境非依存・自動）。\n- 前捌き後は doctor（先行 issue）の bypass 検知が緑になり、フォルダ信頼は実ターン進行が担保、実ターンも通る。\n- `~/.claude.json` 内部フィールド直書きに依存しない。\n\n## 必須セクション（design / veto）\n\n- public contract（config スキーマ追加）かつ config-dir 永続状態への副作用があるため migration & rollback を必須で書く: 前捌きが書く／書かせる状態、旧 config 互換、無効化手段、prime 失敗で pane を殺さないフォールバック。\n- `CLAUDE_CONFIG_DIR` を meguri 所有にする案を残す場合は、その config-dir で認証情報をどう供給・保護・profile 間で分離・削除するかも veto 論点に含める。失敗時フォールバックだけでは hang（timeout＋回収が要）と資格情報の副作用（分離・削除が要）を扱えない。\n- 前捌きの設計判断は ADR を1本積む。\n\n## 関連\n\n- `src/engine/flow.rs:1402`（pane 起動列 `{command} {args} <trigger>`）/ `src/config.rs:649`（AgentProfile）/ ADR 0012（launch mode）/ overview.md", "kind": "plan", "blocked_by": [0]}
 ]
 ```
