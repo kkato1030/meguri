@@ -278,7 +278,7 @@ discovery は GitHub ネイティブの issue dependencies（looper の ADR-0004
 
 spec と impl は対称です（ADR 0008）: どちらも PR を開く前に **必須の内部 self-review** を回し、開いた PR に対して **任意の外部 pr-reviewer** を有効化できます。
 
-**内部 self-review** は **内部フェーズ**です（ADR 0006）: 作者が PR を push する前に自分の成果をレビューするので、review→fix の往復は GitHub に一切触れません。`validate` と `open-pr` の間で **review turn** がローカル diff を読んで `{verdict, findings[]}` を書き、設定した全レンズ（`review.lenses`、既定 `correctness / tests / simplicity / security`）を適用します。findings があれば **fix turn** が潰して commit、プロジェクトの check を再実行し、review に戻ります。収束は forge マーカーではなく **ローカルのラウンドカウンタ**（`review.max_rounds`）で縛り、上限に達しても clean にならなければ block せず PR を公開します（pr-reviewer / 人間の merge ゲートが最後の砦）。会話には一切投稿しません — review turn は routing の `self-review` profile で走り（author とは別モデルにもできます）、結果は会話タイムライン外に記録されます: push 後 head の `meguri/self-review` commit status と、PR 本文の折り畳み `<details>`。`review.enabled = false` で丸ごと止められます（外部 bot がレビューを担う場合など）。
+**内部 self-review** は **内部フェーズ**です（ADR 0006）: 作者が PR を push する前に自分の成果をレビューするので、review→fix の往復は GitHub に一切触れません。`validate` と `open-pr` の間、round 1 は設定した `[[review.reviewers]]` 全員に並列で fan out し（異種モデル可、ADR 0023。未指定なら従来どおり単一 reviewer）、各々が担当レンズ（`review.lenses`、既定 `correctness / tests / simplicity / security`）を適用して `{verdict, findings[]}` を書きます。findings は Rust 側の機械的 union でマージされ、orchestrator agent は挟みません。finding はすべて `kind: defect` か `kind: decision` のいずれかで（severity は無く、findings は定義上すべて blocking）、ラウンドを跨いで積み上がる **台帳(ledger)** に乗り、crash resume でも維持されます。**fix turn** が台帳上の open な指摘を潰して（fixed）または理由付きで見送り（waived）commit し、プロジェクトの check を再実行、round 2 以降は単独のアンカーモデルが**前回指摘の解消確認 + 新規のみ**を見ます（ゼロからの再レビューはしません、ADR 0022）。needs_human への escalation はラウンド数ではなく**挙動**で決めます: 2回の fix turn を経ても開いたままの指摘（ping-pong）・記録済み decision への異議・round 1 reviewer の needs_human 判定、のいずれかです。ただし round 1 の needs_human はそのまま鵜呑みにせず、anchor モデルによる確認 turn を1つ挟んでから escalate します — 1本の見誤りが reviewer 本数分だけ増幅されないための措置です（ADR 0023 §2）。`review.max_rounds` の上限に達しても残りが通常の blocking findings だけなら、escalate せず最後の fix + validate を1回走らせて公開します（直近の fix は再レビューされていない旨を PR 本文に注記、pr-reviewer / 人間の merge ゲートが最後の砦）。会話には一切投稿しません — review turn は routing の `self-reviewer` profile で走り（author とは別モデルにもできます）、結果は会話タイムライン外に記録されます: push 後 head の `meguri/self-review` commit status と、PR 本文の折り畳み `<details>`。`review.enabled = false` で丸ごと止められます（外部 bot がレビューを担う場合など）。
 
 **GitHub pr-reviewer** は任意の外部レビューループ（`runs.loop_kind = "pr-reviewer"`）で、project × kind で切り替えます（`review.guard.plan` — 既定 ON、旧 spec reviewer / `review.guard.impl` — 既定 OFF）。開いた PR を独立した `pr-reviewer` profile でレビューし、同じ形式で verdict を残します — `meguri/pr-review` commit status + PR 本文の折り畳み `<details>` — **inline スレッドは決して作りません**。したがって **fixer** は反応せず、AI↔AI の ping-pong は畳まれたままです。plan のレビューは spec ラベルも駆動します（clean → `spec-ready`）。人間にとって赤い pr-review チェックは **advisory** です（`meguri/pr-review` を required check に指定しない限りマージは止めません）。auto-merge にとっては **gate** です（後述）。
 
@@ -413,9 +413,14 @@ ignore = []             # 誤った推薦を黙らせる部分文字列。プロ
 
 [review]
 enabled = true    # 内部 self-review フェーズ（plan + impl）のキルスイッチ
-max_rounds = 3    # run ごとの self-review ラウンド上限。超えたら PR をそのまま公開する
+max_rounds = 3    # run ごとの self-review ラウンド上限。超えたら挙動で分岐する（ADR 0022）—
+                  # ping-pong / needs_human / decision への異議は escalate、それ以外は最後の fix + 公開
 lenses = ["correctness", "tests", "simplicity", "security"]  # 多角視点レンズ（ADR 0008）
 # （旧 impl_enabled / impl_max_rounds キーも alias として読み込めます）
+
+# [[review.reviewers]]        # 任意: round 1 を並列 reviewer に fan out する（ADR 0023）。省略時は
+# profile = "claude-opus"     # 従来どおり単一 self-reviewer。host 専用（[review] は host 側 config.toml
+# lenses = ["correctness"]    # にのみ置き、repo の meguri.toml には置かない — profile は信頼宣言のため）。
 
 [review.guard]    # 任意の外部 pr-reviewer レビュー（kind 別、ADR 0008）
 plan = true       # spec/ADR PR をレビュー（旧・必須 spec reviewer）— 既定 ON
