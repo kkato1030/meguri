@@ -25,7 +25,8 @@ checkpoint JSON(`verdict` フィールド)の互換が絡むため、veto rule(s
    カテゴリ検証 / プロンプトを kind(Plan/Impl)で分岐する。
 3. **blocking カテゴリの正準値は `security | data-loss | cost | performance` の閉じた列挙。**
    `blocking_categories: Vec<BlockingCategory>` で表す。**impl の blocking のみ非空・閉列挙を必須**とし、
-   Plan の blocking と clean/advisory は空を許す。
+   Plan の blocking と clean/advisory は空を許す。**カテゴリは `ReviewFile` だけでなく
+   `PrReviewCheckpoint` にも必ず持たせる**(`settle` は checkpoint だけを読むため。触るファイル参照)。
 4. **Plan の verdict 語彙は `clean | blocking` のみ(advisory を提示しない)。** Plan の settle は
    非 clean をすべて従来の findings 扱い(failure・spec-reviewing 維持・spec_fixer に委譲)にする。
    Plan の blocking はカテゴリを要求しない(品質ゲートのまま)。防御的に、万一 Plan が advisory を
@@ -85,9 +86,13 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
   - `execute_prompt` を kind で impl/plan に分岐(上記プロンプト)。
   - `settle`:verdict × kind の status/ラベル分岐(挙動表)。advisory は Success + `<details>` 記録。
   - `pr_review_details` の outcome 文字列に advisory / blocking(カテゴリ併記)を追加。
-  - `PrReviewCheckpoint` の `verdict`/新フィールドの持ち回り。checkpoint にカテゴリ配列を残すなら
-    そのフィールドに `#[serde(default)]` を付け、旧 JSON でフィールド欠落時は空配列へ default させる
-    (欠落で checkpoint 全体が捨てられ resume が振り出しに戻るのを防ぐ。migration 参照)。
+  - `PrReviewCheckpoint` に `blocking_categories: Vec<BlockingCategory>` を**必ず**追加する。
+    `settle` は `review.json` ではなく checkpoint だけを読んで status・PR 本文・`pr_review.posted`
+    event を出す(`execute` が verdict/review を checkpoint に保存 → `settle` が読む)。カテゴリを
+    checkpoint に載せないと、`execute` 後 `settle` 前の crash/resume でカテゴリが消え、spec が約束する
+    `categories` event と blocking カテゴリ併記が再現できない。フィールドには `#[serde(default)]` を付け、
+    旧 JSON で欠落時は空配列へ default させる(欠落で checkpoint 全体が捨てられ resume が振り出しに
+    戻るのを防ぐ。migration 参照)。`verdict` も同様に持ち回る。
 - `src/config.rs` … 変更なし想定(guard トグルは既存の `[review.guard]` を流用)。
 - `src/engine/auto_merger.rs` … **変更なし**(status ベース gate のまま)。
 - `src/engine/spec_fixer.rs` … **変更なし**(Plan の failure status 駆動のまま)。
@@ -107,12 +112,13 @@ Plan の「非 clean」= 今の findings パス(byte-for-byte 維持):failure st
   `"findings"` として載りうる。`Blocking` に `#[serde(alias="findings")]` を付けることで、デプロイ
   直後に resume した in-flight run も旧値を `Blocking` として読める(deser 失敗→`unwrap_or_default`
   でのリセットを避ける)。
-- **checkpoint に足す新フィールドは欠落時 default にする。** `PrReviewCheckpoint` にカテゴリ配列を
-  持たせるなら(verdict と対で checkpoint に残す場合)、そのフィールドに `#[serde(default)]` を付け、
-  旧 checkpoint JSON に**フィールド自体が無い**ときは空配列へ default させる。これを怠ると、alias で
-  verdict を読めても新フィールドの欠落で `serde_json::from_str(...).unwrap_or_default()`(`drive` 冒頭)が
-  checkpoint 全体を捨て、resume が振り出しに戻る。既存フィールドが全て `#[serde(default)]` なのと同じ
-  扱いを新フィールドにも徹底する。
+- **checkpoint に足す `blocking_categories` は必須、かつ欠落時 default にする。** `settle` は
+  checkpoint だけを読むので、カテゴリを `PrReviewCheckpoint` に載せることは任意ではなく必須である
+  (触るファイル参照)。その新フィールドには `#[serde(default)]` を付け、旧 checkpoint JSON に
+  **フィールド自体が無い**ときは空配列へ default させる。これを怠ると、alias で verdict を読めても
+  新フィールドの欠落で `serde_json::from_str(...).unwrap_or_default()`(`drive` 冒頭)が checkpoint
+  全体を捨て、resume が振り出しに戻る。既存フィールドが全て `#[serde(default)]` なのと同じ扱いを
+  新フィールドにも徹底する。
 - **rollback**: 挙動変更のみなので revert で戻る。戻した後に旧バイナリが読む checkpoint には
   新語彙 `"advisory"`/`"blocking"` が載りうるが、旧 `ReviewVerdict` は `#[serde]` で未知値を拒否する。
   そのため rollback 時は「in-flight run が settle 前で止まっていれば再 review される」ことを許容する
