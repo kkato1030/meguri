@@ -6,7 +6,8 @@ ADR 0012（level-triggered reconciler）移行のスライス 1 / 5。正は
 
 ## 深さの判断：design spec（理由）
 
-新しい**公開型 `Op`** と**新しい forge メソッド `update_branch`** を足す＝公開 contract に触れる。
+新しい**公開型 `Op`** と**新しい forge メソッド `observe_merge_tail` / `update_branch`** を足す＝
+公開 contract に触れる。
 さらに S2〜S5 がここで決めた `Op` / observe の形の上に載るため、間違えたときの波及が広い
 （uncertainty 中 × blast radius 大）。公開 contract に触れる以上、veto 規則により migration &
 rollback 章は必須。よって design 段に上げる。ただし永続状態・スキーマは**この slice では一切
@@ -59,15 +60,51 @@ HumanDisabled、pr-review pending、未解決スレッド待ちなど）。
 informer cache 型の **1 回の一括クエリ**に畳み、PR ごとの `Snapshot` を作る（既存 `OpenPrCache`
 ＝`list_open_prs` の per-tick 共有、の考えを merge-tail の全フィールドへ拡張する）。
 
-`Snapshot` は `merge_watch::Snapshot` を土台に、arm 側が要るフィールド（arm marker の有無と
-arm-since、未解決スレッド有無、pr-review status、opt-in、blocking label）を足した純データにする
-（壁時計・I/O を持ち込まない）。
+engine は `dyn Forge` 越しにしか observe できないので、一括クエリは**トレイトの 1 メソッド**として
+足す（PR ごとの生観測と、その観測にかかった API コストを一緒に返す）：
 
-**API コスト実測**（受け入れ 2）：observe の forge 呼び出し回数をカウントし、
-`store.emit(None, "merge_tail.observe_cost", { "requests": n, "graphql_cost": c, "prs": p })`
-で毎 sweep 記録する。`c` は gh の GraphQL 応答に `rateLimit { cost }` を含めて取れた場合のみ。
-これで「informer cache 化で API コストが観測可能・制御可能になる」（ADR 0012 正の帰結）を数値で
-裏づける。計測ロジックはコードに残し、一過性の実測ベースラインは PR 本文へ書く。
+```rust
+/// merge tail の observe：開いている meguri PR 群を 1 回のクエリ束で観測し、
+/// PR ごとの生観測と、その観測にかかった API コストを返す。engine 側の純関数
+/// next_step はこの生観測から Snapshot を組み立てる（forge は権威境界なので
+/// 判断は持たせない）。
+async fn observe_merge_tail(&self) -> Result<MergeTailObservation>;
+
+pub struct MergeTailObservation {
+    pub prs: Vec<PrObservation>,   // 開いている PR ごとの生観測
+    pub cost: ObserveCost,
+}
+pub struct PrObservation {
+    pub pr: PullRequest,                 // number / head_sha / head_branch / labels / is_draft / body
+    pub merge: Option<MergeState>,       // mergeable / mergeStateStatus / auto_merge_enabled（読めなければ None＝transient）
+    pub armed_since: Option<String>,     // 最古の arm marker の createdAt（marker 無し＝未 arm）
+    pub has_unresolved_thread: bool,     // 未解決 review スレッドの有無
+    pub rollup_failure: bool,            // required check の失敗（Blocked の切り分け用）
+    pub pr_review: Option<CommitStatusState>, // meguri/pr-review status（gate 無効時は照会しない）
+}
+pub struct ObserveCost { pub requests: u32, pub graphql_cost: Option<u32> }
+```
+
+- **`GhForge`**：`list_open_prs` の GraphQL を拡張し、上記フィールド（`mergeStateStatus` /
+  `mergeable` / `autoMergeRequest` / `isDraft` / `labels` / arm marker を含む comments の
+  `createdAt` / `reviewThreads.isResolved` / `statusCheckRollup` / `meguri/pr-review` の
+  commit status）を 1 クエリで引く。`cost.graphql_cost` は応答の `rateLimit { cost }` から、
+  `cost.requests` は実際に投げた HTTP 回数から埋める（取れなければ `graphql_cost = None`）。
+- **`FakeForge`**：既存のインメモリ map（`merge_status` / `auto_merge_enabled` / `pr_comments` /
+  `threads` / `checks` / `commit_statuses` / labels）から `PrObservation` を組み立て、
+  `cost.requests = 1`（一括なので PR 数に依らず 1）を返す。これが受け入れ 1 の BEHIND 回帰テストと
+  受け入れ 2 の API コストテストの土台になる。
+
+`merge_policy`（base 単位・元から 1 sweep 1 回）と、PR ラベルに opt-in が無い PR だけ引く issue
+ラベル fallback は、この一括 observe の外に残す（前者は変更なし、後者は worker が PR へラベルを
+コピーするので稀）。純データの `Snapshot` は engine 側で `PrObservation` から組む（壁時計・I/O を
+持ち込まない）。
+
+**API コスト実測**（受け入れ 2）：`observe_merge_tail` が返す `cost` を
+`store.emit(None, "merge_tail.observe_cost", { "requests": r, "graphql_cost": c, "prs": p })`
+で毎 sweep 記録する（`c` は GraphQL `rateLimit { cost }` が取れた場合のみ）。旧実装の「PR 数に
+比例した個別叩き」と対比して、「informer cache 化で API コストが観測可能・制御可能になる」（ADR
+0012 正の帰結）を数値で裏づける。一過性の実測ベースラインは PR 本文へ書く。
 
 ### 決定 3：`next_step` を純関数化し、所有 arm を property test で守る
 
@@ -134,11 +171,14 @@ async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<Update
 
 ## 変更箇所
 
-- `src/forge/mod.rs`：`Op` は engine 側に置く（forge は権威境界）。ここへは `update_branch` +
-  `UpdateBranchOutcome` をトレイトに追加。
-- `src/forge/gh.rs`：`update_branch` の gh 実装（REST + `expected_head_sha`）、observe 一括クエリ
-  で `rateLimit.cost` を拾えるなら拾う。
-- `src/forge/fake.rs`：`update_branch` の記録・base 進行の仕込み。
+- `src/forge/mod.rs`：`Op` は engine 側に置く（forge は権威境界）。ここへトレイトメソッド
+  `observe_merge_tail`（+ `MergeTailObservation` / `PrObservation` / `ObserveCost`）と
+  `update_branch`（+ `UpdateBranchOutcome`）を追加。
+- `src/forge/gh.rs`：`observe_merge_tail` の GraphQL 実装（決定 2 のフィールドを 1 クエリ束で引き、
+  `rateLimit.cost` と HTTP 回数を `ObserveCost` に詰める）と、`update_branch` の gh 実装
+  （REST `PUT .../update-branch` + `expected_head_sha`）。
+- `src/forge/fake.rs`：`observe_merge_tail` を既存インメモリ map から組んで返す（`requests = 1`）、
+  `update_branch` の記録・base 進行の仕込み。
 - `src/engine/`：merge-tail モジュール新設（`Op` / `Snapshot` / `next_step` / `act` / observe）。
   `auto_merger.rs` / `merge_watch.rs` の純粋ロジックを移設し、両 sweep を畳む。
 - `src/engine/scheduler.rs`：poll-tick の 2 sweep 呼び出しを 1 つに置換（`auto_merger::sweep` /
@@ -148,9 +188,9 @@ async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<Update
 
 ## Architecture impact
 
-- 公開型 `Op` と forge メソッド `update_branch` が増える（純増、既存 API の削除・変更なし）。
-  `Loop` trait は撤去しない（S4）。移行中は「新（merge-tail は Op 経由）× 旧（他ループは従来通り）」
-  が併存する — ADR 0012 の想定どおり。
+- 公開型 `Op` と forge メソッド `observe_merge_tail` / `update_branch` が増える（純増、既存 API の
+  削除・変更なし）。`Loop` trait は撤去しない（S4）。移行中は「新（merge-tail は Op 経由）× 旧
+  （他ループは従来通り）」が併存する — ADR 0012 の想定どおり。
 - observe が informer cache 化し、merge tail の API 叩きが「PR×メソッド」から「1 一括クエリ」へ。
 - `next_step` の純関数化で、以後のトリガ追加（S2〜）が「arm を 1 本足す」で済む土台ができる。
 
@@ -193,8 +233,9 @@ async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<Update
   次観測で再 arm、を native / orchestrator 両モードで通す。
 - **移設等価テスト**（受け入れ 3）：`auto_merger` / `merge_watch` の既存単体テスト（`validate_policy`
   / `classify` / marker / blocking label など）を新モジュールへ引き継ぎ、意味論を落とさない。
-- **API コスト計測テスト**（受け入れ 2）：FakeForge の呼び出し記録から、一括 observe が「PR 数に
-  比例した個別叩き」より少ないことをアサート。
+- **API コスト計測テスト**（受け入れ 2）：`observe_merge_tail` が返す `ObserveCost.requests` が PR 数に
+  依らず一定（FakeForge では 1）であること、および emit された `merge_tail.observe_cost` event を
+  アサート。旧実装の「PR 数比例の個別叩き」との対比を裏づける。
 - 変更後は `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo nextest run`
   / `cargo test --doc` を通す。
 
