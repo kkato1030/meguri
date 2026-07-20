@@ -4,9 +4,10 @@
 //! the impl PR the same optional review. Its output stays **off the
 //! review-thread timeline**:
 //!
-//! - a `meguri/pr-review` **commit status** on the reviewed head (success =
-//!   clean, failure = findings) — the dedup key, the human-visible advisory
-//!   check, and the auto-merger's arm gate (ADR 0008 §5);
+//! - a `meguri/pr-review` **commit status** on the reviewed head — the dedup
+//!   key, the human-visible advisory check, and the auto-merger's arm gate
+//!   (ADR 0008 §5). Its verdict → status mapping is where the guard's retreat
+//!   to a safety tripwire lives (ADR 0025);
 //! - a folded `<details>` block appended to the PR **body** (idempotent by a
 //!   marker) — the round summary.
 //!
@@ -14,14 +15,18 @@
 //! reacts to threads, so a pr-reviewer that opened one would re-ignite the
 //! AI↔AI ping-pong ADR 0006 removed. The pr-reviewer is summary-only.
 //!
-//! Kind-specific behavior lives only in discovery and settle:
-//! - **Plan** (spec/ADR PR, `meguri:spec-reviewing`): additionally drives the
-//!   label state machine — a clean review flips `spec-reviewing → spec-ready`
-//!   (which the combined-mode spec worker keys off), findings keep
-//!   `spec-reviewing` so the next push is re-reviewed. The plan review is on
-//!   by default (it is the old mandatory spec review).
-//! - **Impl** (implementation PR): no label transition; off by default
-//!   (opt-in; external-bot compatible).
+//! Kind-specific behavior lives in the prompt and settle (ADR 0025):
+//! - **Impl** (implementation PR): a *safety tripwire*. self-review already
+//!   converged quality, so guard only stops on a `blocking` verdict naming a
+//!   closed safety category (security / data-loss / cost / performance) →
+//!   Failure + needs-human. `advisory` is recorded in the body but keeps the
+//!   status green so auto-merge proceeds; `clean` likewise. No label
+//!   transition; off by default (opt-in; external-bot compatible).
+//! - **Plan** (spec/ADR PR, `meguri:spec-reviewing`): unchanged quality gate
+//!   that drives the label state machine — a clean review flips
+//!   `spec-reviewing → spec-ready` (which the combined-mode spec worker keys
+//!   off), any non-clean verdict keeps `spec-reviewing` (Failure) so spec_fixer
+//!   re-drives it. On by default (it is the old mandatory spec review).
 //!
 //! Lifetime (issue #92): runs are keyed by the PR's canonical *issue*; the
 //! pane lives in the issue's independent `pr-review` lane; the worktree is a
@@ -71,7 +76,38 @@ const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 #[serde(rename_all = "lowercase")]
 pub enum ReviewVerdict {
     Clean,
-    Findings,
+    /// A note worth recording that does NOT stop the merge (ADR 0025): filed in
+    /// the PR body for a human, commit status stays success.
+    Advisory,
+    /// The safety tripwire hit (ADR 0025): a human clears it before merge.
+    /// `findings` is kept as a deserialize alias so in-flight checkpoints and
+    /// agents still writing the old two-value vocabulary read as `Blocking`.
+    #[serde(alias = "findings")]
+    Blocking,
+}
+
+/// The closed set of categories a `blocking` verdict may name (ADR 0025). An
+/// impl blocking verdict must name at least one; nothing outside this set can
+/// block, which is what keeps the guard a safety tripwire rather than a second
+/// quality gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockingCategory {
+    Security,
+    DataLoss,
+    Cost,
+    Performance,
+}
+
+impl BlockingCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Security => "security",
+            Self::DataLoss => "data-loss",
+            Self::Cost => "cost",
+            Self::Performance => "performance",
+        }
+    }
 }
 
 /// What the agent writes to [`REVIEW_FILE`].
@@ -80,6 +116,12 @@ pub struct ReviewFile {
     pub verdict: ReviewVerdict,
     #[serde(default)]
     pub review: String,
+    /// Categories a `blocking` verdict names (impl only; ADR 0025).
+    /// `#[serde(default)]` — an in-flight turn writing the old `{verdict,
+    /// review}` shape parses to an empty vec instead of failing (same
+    /// treatment as `SelfReviewFile.findings`).
+    #[serde(default)]
+    pub blocking_categories: Vec<BlockingCategory>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -104,6 +146,12 @@ pub struct PrReviewCheckpoint {
     pub verdict: Option<ReviewVerdict>,
     #[serde(default)]
     pub review: String,
+    /// The blocking verdict's categories, carried through to `settle` (which
+    /// reads only the checkpoint). `#[serde(default)]` so a checkpoint written
+    /// before this field existed still resumes (empty vec, not a discarded
+    /// checkpoint — ADR 0025 migration).
+    #[serde(default)]
+    pub blocking_categories: Vec<BlockingCategory>,
 }
 
 fn default_kind() -> Kind {
@@ -474,9 +522,54 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint)
 }
 
 fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
-    let (subject, artifact) = match cp.kind {
-        Kind::Plan => ("spec/ADR pull request", "spec"),
-        Kind::Impl => ("implementation pull request", "change"),
+    let subject = match cp.kind {
+        Kind::Plan => "spec/ADR pull request",
+        Kind::Impl => "implementation pull request",
+    };
+    // Plan keeps the quality review (spec_fixer converges its findings). Impl
+    // retreats to a safety tripwire — self-review already converged quality, so
+    // guard only blocks on a named safety category (ADR 0025).
+    let task = match cp.kind {
+        Kind::Plan => format!(
+            "- Review the spec for correctness, completeness, and fit with the \
+               repository's conventions. A summary-style review is enough — no \
+               inline threads.\n\
+             - Do NOT modify, commit, or push anything; the review file below is \
+               your only deliverable.\n\
+             - Write your review to `{review}` as JSON:\n\
+               `{{\"verdict\": \"clean\" | \"blocking\", \"review\": \"<Markdown review>\"}}`\n\
+               - \"clean\": nothing must change before this PR can proceed (pure \
+                 nitpicks do not block; mention them in `review`).\n\
+               - \"blocking\": something must change; list every finding in `review`.\n\
+             - A completed review is a success regardless of verdict; report \
+               \"failure\"/\"needs_human\" only when you cannot review at all.",
+            review = REVIEW_FILE,
+        ),
+        Kind::Impl => format!(
+            "- The internal self-review has already converged this change's \
+               quality. You are the safety tripwire, NOT a second quality gate — \
+               do not re-litigate style, naming, tests, or completeness. A \
+               summary-style review is enough — no inline threads.\n\
+             - Do NOT modify, commit, or push anything; the review file below is \
+               your only deliverable.\n\
+             - Write your review to `{review}` as JSON:\n\
+               `{{\"verdict\": \"clean\" | \"advisory\" | \"blocking\", \"review\": \
+               \"<Markdown review>\", \"blocking_categories\": [...]}}`\n\
+               - \"blocking\": ONLY when you can name at least one category in \
+                 `blocking_categories` — `security` (vulnerability / secret \
+                 exposure), `data-loss` (data loss / irreversible external \
+                 effect), `cost` (runaway billing), `performance` (catastrophic \
+                 degradation). Describe the finding in `review`.\n\
+               - \"advisory\": anything worth recording that you cannot pin to a \
+                 blocking category above, or that you merely suspect. Advisory \
+                 does NOT stop the merge — it is filed in the PR body for a human. \
+                 If you cannot name a category, it is advisory. If you are merely \
+                 suspicious, it is advisory.\n\
+               - \"clean\": nothing to note.\n\
+             - A completed review is a success regardless of verdict; report \
+               \"failure\"/\"needs_human\" only when you cannot review at all.",
+            review = REVIEW_FILE,
+        ),
     };
     format!(
         "You are the independent pr-reviewer for {subject} #{number} in this \
@@ -486,18 +579,7 @@ fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
          # Instructions\n\
          - Read the PR's full diff at `{diff}`; browse the checked-out code for \
            context as needed.\n\
-         - Review the {artifact} for correctness, completeness, and fit with the \
-           repository's conventions. A summary-style review is enough — no inline \
-           threads.\n\
-         - Do NOT modify, commit, or push anything; the review file below is your \
-           only deliverable.\n\
-         - Write your review to `{review}` as JSON:\n\
-           `{{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown review>\"}}`\n\
-           - \"clean\": nothing must change before this PR can proceed (pure nitpicks \
-             do not block; mention them in `review`).\n\
-           - \"findings\": something must change; list every finding in `review`.\n\
-         - A completed review is a success regardless of verdict; report \
-           \"failure\"/\"needs_human\" only when you cannot review at all.\
+         {task}\
          {lang_section}",
         number = cp.pr_number.unwrap_or_default(),
         sha = cp.head_sha,
@@ -505,7 +587,6 @@ fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
         title = cp.pr_title,
         body = cp.pr_body,
         diff = DIFF_FILE,
-        review = REVIEW_FILE,
         lang_section = flow::language_instruction(language),
     )
     // The completion contract is appended by prepare_turn.
@@ -513,21 +594,55 @@ fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
 
 /// The pr-reviewer's deliverable, verified after each turn: a parseable
 /// review file and an untouched checkout.
-fn read_review(worktree: &Path) -> std::result::Result<ReviewFile, String> {
+fn read_review(worktree: &Path, kind: Kind) -> std::result::Result<ReviewFile, String> {
     let raw = std::fs::read_to_string(worktree.join(REVIEW_FILE)).map_err(|_| {
         format!("- review file `{REVIEW_FILE}` does not exist (write it as instructed)")
     })?;
     let review: ReviewFile = serde_json::from_str(raw.trim()).map_err(|e| {
         format!(
             "- review file `{REVIEW_FILE}` is not valid JSON ({e}); expected \
-             {{\"verdict\": \"clean\" | \"findings\", \"review\": \"<Markdown>\"}}"
+             {{\"verdict\": \"clean\" | \"advisory\" | \"blocking\", \"review\": \
+             \"<Markdown>\", \"blocking_categories\": [\"security\" | \"data-loss\" | \
+             \"cost\" | \"performance\"]}}"
         )
     })?;
-    if review.verdict == ReviewVerdict::Findings && review.review.trim().is_empty() {
-        return Err(format!(
-            "- verdict is \"findings\" but `review` in `{REVIEW_FILE}` is empty; \
-             describe every finding"
-        ));
+    match review.verdict {
+        // Only a blocking verdict names categories; a stray category elsewhere is
+        // a contradiction worth flagging so the agent tightens its verdict.
+        ReviewVerdict::Clean if !review.blocking_categories.is_empty() => {
+            return Err(format!(
+                "- verdict is \"clean\" but `blocking_categories` in `{REVIEW_FILE}` is \
+                 non-empty; only a \"blocking\" verdict names categories"
+            ));
+        }
+        ReviewVerdict::Advisory if review.review.trim().is_empty() => {
+            return Err(format!(
+                "- verdict is \"advisory\" but `review` in `{REVIEW_FILE}` is empty; \
+                 describe the advisory notes"
+            ));
+        }
+        ReviewVerdict::Advisory if !review.blocking_categories.is_empty() => {
+            return Err(format!(
+                "- verdict is \"advisory\" but `blocking_categories` in `{REVIEW_FILE}` is \
+                 non-empty; advisory does not block, so it names no category"
+            ));
+        }
+        ReviewVerdict::Blocking if review.review.trim().is_empty() => {
+            return Err(format!(
+                "- verdict is \"blocking\" but `review` in `{REVIEW_FILE}` is empty; \
+                 describe every finding"
+            ));
+        }
+        // Impl blocking must name a safety category (ADR 0025); plan blocking is
+        // the quality gate and does not require one.
+        ReviewVerdict::Blocking if kind == Kind::Impl && review.blocking_categories.is_empty() => {
+            return Err(format!(
+                "- verdict is \"blocking\" but names no category in `{REVIEW_FILE}`; an \
+                 impl blocking verdict must name at least one of security / data-loss / \
+                 cost / performance — if you cannot, use \"advisory\""
+            ));
+        }
+        _ => {}
     }
     Ok(review)
 }
@@ -591,16 +706,18 @@ async fn execute(
                 expected = cp.head_sha,
             ))
         } else {
-            read_review(worktree).err()
+            read_review(worktree, cp.kind).err()
         };
         let Some(problem) = problem else {
-            let review = read_review(worktree).expect("verified above");
+            let review = read_review(worktree, cp.kind).expect("verified above");
             cp.verdict = Some(review.verdict);
             cp.review = review.review;
+            cp.blocking_categories = review.blocking_categories;
             deps.store.emit(
                 Some(&run.id),
                 "pr_review.verified",
-                json!({ "verdict": review.verdict, "head": cp.head_sha }),
+                json!({ "verdict": review.verdict, "head": cp.head_sha,
+                        "categories": cp.blocking_categories }),
             )?;
             return Ok(flow::StepFlow::Continue);
         };
@@ -632,8 +749,17 @@ async fn execute(
 fn pr_review_details(cp: &PrReviewCheckpoint, verdict: ReviewVerdict) -> String {
     let short = cp.head_sha.get(..12).unwrap_or(&cp.head_sha);
     let outcome = match verdict {
-        ReviewVerdict::Clean => "clean",
-        ReviewVerdict::Findings => "findings",
+        ReviewVerdict::Clean => "clean".to_string(),
+        ReviewVerdict::Advisory => "advisory".to_string(),
+        ReviewVerdict::Blocking if cp.blocking_categories.is_empty() => "blocking".to_string(),
+        ReviewVerdict::Blocking => format!(
+            "blocking ({})",
+            cp.blocking_categories
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     };
     let review = cp.review.trim();
     let review = if review.is_empty() {
@@ -679,12 +805,26 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
     let pr = cp.pr_number.context("checkpoint has no PR number")?;
     let verdict = cp.verdict.context("checkpoint has no review verdict")?;
 
-    let (state, desc) = match verdict {
-        ReviewVerdict::Clean => (CommitStatusState::Success, "clean".to_string()),
-        ReviewVerdict::Findings => (
-            CommitStatusState::Failure,
-            "findings — see the PR body".to_string(),
-        ),
+    // The verdict → status mapping is where the guard's tripwire retreat lives
+    // (ADR 0025): the auto-merge gate reads only this status. Plan collapses any
+    // non-clean verdict into the historical findings failure (spec_fixer owns
+    // its fix loop); impl treats advisory as a passing, recorded verdict and
+    // stops only on a blocking safety category.
+    let stops = match cp.kind {
+        Kind::Plan => verdict != ReviewVerdict::Clean,
+        Kind::Impl => verdict == ReviewVerdict::Blocking,
+    };
+    let desc = match (cp.kind, verdict) {
+        (_, ReviewVerdict::Clean) => "clean".to_string(),
+        (Kind::Impl, ReviewVerdict::Advisory) => "advisory — see the PR body".to_string(),
+        (Kind::Impl, ReviewVerdict::Blocking) => "blocking — see the PR body".to_string(),
+        // Plan advisory (defensive) folds into the findings path.
+        (Kind::Plan, _) => "findings — see the PR body".to_string(),
+    };
+    let state = if stops {
+        CommitStatusState::Failure
+    } else {
+        CommitStatusState::Success
     };
     // The status is the dedup key + advisory check + auto-merge gate (ADR 0008).
     deps.forge()
@@ -698,7 +838,8 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
     deps.store.emit(
         Some(&run.id),
         "pr_review.posted",
-        json!({ "pr": pr, "verdict": verdict, "head": cp.head_sha, "kind": cp.kind.as_str() }),
+        json!({ "pr": pr, "verdict": verdict, "head": cp.head_sha, "kind": cp.kind.as_str(),
+                "categories": cp.blocking_categories }),
     )?;
 
     // Plan review drives the label state machine (ADR 0008 §3): a clean spec
@@ -739,16 +880,26 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
                 .await;
             }
         }
-        // Plan findings: `spec_fixer` (ADR 0013) is the plan-side human gate —
-        // it discovers `spec-reviewing` PRs whose head `meguri/pr-review` is
-        // `Failure` and drives the fix itself, paging a human (ADR 0009 / issue
-        // #153) only once its round budget runs out. Adding `needs-human` here
-        // would starve that discover query (it skips escalated PRs) before
-        // spec_fixer ever runs — the same lockout ADR 0007 avoids by having
-        // the merge tail defer to fixer loops instead of escalating first. Drop the
-        // working claim (this settle's turn is done) but leave the label/status
-        // as-is; the parked-review page moves to spec_fixer's round limit.
-        (Kind::Plan, ReviewVerdict::Findings) => {
+        // Impl advisory: a passing verdict (ADR 0025). It is recorded in the PR
+        // body and the status stays success, so auto-merge proceeds — advisory
+        // never blocks. Drop the working claim like clean; no escalation, no park.
+        (Kind::Impl, ReviewVerdict::Advisory) => {
+            deps.forge()
+                .remove_pr_label(pr, forge::LABEL_WORKING)
+                .await
+                .ok();
+        }
+        // Plan non-clean (advisory folded in defensively): `spec_fixer` (ADR
+        // 0013) is the plan-side human gate — it discovers `spec-reviewing` PRs
+        // whose head `meguri/pr-review` is `Failure` and drives the fix itself,
+        // paging a human (ADR 0009 / issue #153) only once its round budget runs
+        // out. Adding `needs-human` here would starve that discover query (it
+        // skips escalated PRs) before spec_fixer ever runs — the same lockout ADR
+        // 0007 avoids by having the merge tail defer to fixer loops instead of
+        // escalating first. Drop the working claim (this settle's turn is done)
+        // but leave the label/status as-is; the parked-review page moves to
+        // spec_fixer's round limit.
+        (Kind::Plan, ReviewVerdict::Advisory | ReviewVerdict::Blocking) => {
             deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
@@ -759,26 +910,27 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
                 json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
             )?;
         }
-        // Impl findings: no auto-fix loop drives impl PRs off pr-reviewer
-        // findings, so the pr-reviewer stays the human gate here (ADR 0012
-        // P1/P3). `escalate_pr` drops the working claim and adds
-        // needs-human (which also stops discover from re-reviewing until a
-        // human clears it).
-        (Kind::Impl, ReviewVerdict::Findings) => {
+        // Impl blocking: the safety tripwire fired (ADR 0025). No auto-fix loop
+        // drives impl PRs off guard findings, and a blocking safety issue is the
+        // right place for a human gate — `escalate_pr` drops the working claim
+        // and adds needs-human (which also stops discover from re-reviewing until
+        // a human clears it).
+        (Kind::Impl, ReviewVerdict::Blocking) => {
             let lead = format!(
-                "PR review ({}) found issues that need a human before this PR can proceed.",
+                "PR review ({}) found a blocking safety issue that needs a human before this PR can proceed.",
                 cp.kind.as_str()
             );
             let comment = super::escalation::pr_needs_human_comment(
                 &lead,
-                "See the folded 🛡️ PR review in the PR body for the findings.",
+                "See the folded 🛡️ PR review in the PR body for the finding.",
                 &flow::attach_hint(deps, run),
             );
             super::escalation::escalate_pr(deps, pr, &comment).await;
             deps.store.emit(
                 Some(&run.id),
                 "pr_review.escalated",
-                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
+                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha,
+                        "categories": cp.blocking_categories }),
             )?;
         }
     }
@@ -795,7 +947,8 @@ fn plan_clean_parks(deps: &Deps) -> bool {
 fn verdict_str(verdict: ReviewVerdict) -> &'static str {
     match verdict {
         ReviewVerdict::Clean => "clean",
-        ReviewVerdict::Findings => "findings",
+        ReviewVerdict::Advisory => "advisory",
+        ReviewVerdict::Blocking => "blocking",
     }
 }
 
@@ -857,13 +1010,38 @@ mod tests {
         assert!(prompt.contains("# Output language"));
     }
 
+    /// The impl prompt is a safety tripwire (ADR 0025): it names the closed
+    /// blocking categories and steers doubt to advisory; the plan prompt keeps
+    /// the quality review and never offers advisory.
+    #[test]
+    fn impl_prompt_is_a_safety_tripwire_plan_stays_quality() {
+        let impl_prompt = execute_prompt(&cp(Kind::Impl, "abc"), None);
+        assert!(impl_prompt.contains("safety tripwire"));
+        assert!(impl_prompt.contains("security"));
+        assert!(impl_prompt.contains("data-loss"));
+        assert!(impl_prompt.contains("cost"));
+        assert!(impl_prompt.contains("performance"));
+        assert!(impl_prompt.contains("merely suspicious, it is advisory"));
+
+        let plan_prompt = execute_prompt(&cp(Kind::Plan, "abc"), None);
+        assert!(plan_prompt.contains("correctness, completeness"));
+        assert!(!plan_prompt.contains("advisory"));
+    }
+
     #[test]
     fn pr_review_details_folds_verdict_and_head() {
-        let block = pr_review_details(&cp(Kind::Impl, "0123456789abcdef"), ReviewVerdict::Findings);
+        let mut c = cp(Kind::Impl, "0123456789abcdef");
+        c.blocking_categories = vec![BlockingCategory::Security, BlockingCategory::Cost];
+        let block = pr_review_details(&c, ReviewVerdict::Blocking);
         assert!(block.contains(PR_REVIEW_BODY_MARKER));
         assert!(block.contains("<details>"));
-        assert!(block.contains("pr review (impl) — findings at `0123456789ab`"));
+        assert!(block.contains("pr review (impl) — blocking (security, cost) at `0123456789ab`"));
         assert!(block.contains("- missing acceptance criteria"));
+
+        // Advisory folds as a non-blocking note (no categories).
+        let advisory =
+            pr_review_details(&cp(Kind::Impl, "0123456789abcdef"), ReviewVerdict::Advisory);
+        assert!(advisory.contains("pr review (impl) — advisory at `0123456789ab`"));
     }
 
     #[test]
@@ -871,7 +1049,7 @@ mod tests {
         let body = "Refs #5.\n\nBody text.";
         let first = upsert_pr_review_details(
             body,
-            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Findings),
+            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Blocking),
         );
         assert!(first.starts_with("Refs #5."));
         assert!(first.contains("Body text."));
@@ -884,7 +1062,7 @@ mod tests {
         );
         assert_eq!(second.matches(PR_REVIEW_BODY_MARKER).count(), 1);
         assert!(second.contains("clean at `bbb`"));
-        assert!(!second.contains("findings at `aaa`"));
+        assert!(!second.contains("blocking at `aaa`"));
         assert!(second.starts_with("Refs #5."));
     }
 
@@ -896,7 +1074,7 @@ mod tests {
         // With a block: everything from the marker to the end (issue #188).
         let body = upsert_pr_review_details(
             "Refs #5.",
-            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Findings),
+            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Blocking),
         );
         let block = extract_pr_review_details(&body).unwrap();
         assert!(block.starts_with(PR_REVIEW_BODY_MARKER));
@@ -976,10 +1154,11 @@ mod tests {
             Some(CommitStatusState::Success)
         );
 
-        // Findings: spec-reviewing kept (spec_fixer's re-drive target), no
-        // spec-ready, status failure, and — issue #192 — no needs-human, or
-        // spec_fixer's discover (which skips escalated PRs) would never fire.
-        let forge = settle_verdict(ReviewVerdict::Findings).await;
+        // Non-clean (blocking): spec-reviewing kept (spec_fixer's re-drive
+        // target), no spec-ready, status failure, and — issue #192 — no
+        // needs-human, or spec_fixer's discover (which skips escalated PRs)
+        // would never fire. Plan is unchanged by ADR 0025.
+        let forge = settle_verdict(ReviewVerdict::Blocking).await;
         let labels = forge.pr_labels(7);
         assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
         assert!(!labels.contains(&forge::LABEL_SPEC_READY.to_string()));
@@ -993,19 +1172,8 @@ mod tests {
         );
     }
 
-    /// Impl findings are unchanged by issue #192: no auto-fix loop drives
-    /// impl PRs, so the pr-reviewer stays the human gate (ADR 0012).
-    #[tokio::test]
-    async fn impl_findings_still_escalate_to_needs_human() {
-        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
-        forge.add_pr(
-            9,
-            "Add caching (#5)",
-            "Refs #5.",
-            &[forge::LABEL_IMPLEMENTING, forge::LABEL_WORKING],
-            "meguri/5-add-caching-def",
-            "cafef00d",
-        );
+    /// An impl test project + deps with one working impl PR at `head`.
+    fn impl_settle_env(forge: &std::sync::Arc<crate::forge::fake::FakeForge>) -> Deps {
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
             repo_path: Some("/tmp/unused".into()),
@@ -1028,13 +1196,30 @@ mod tests {
             prompts: Default::default(),
             notify: None,
         };
-        let deps = Deps::with_label_source(
+        Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),
             std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge.clone(),
             crate::config::Config::default(),
             project,
+        )
+    }
+
+    /// Impl blocking is the safety tripwire (ADR 0025): no auto-fix loop drives
+    /// impl PRs, so the pr-reviewer stays the human gate — Failure status +
+    /// needs-human, working released.
+    #[tokio::test]
+    async fn impl_blocking_still_escalates_to_needs_human() {
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+        forge.add_pr(
+            9,
+            "Add caching (#5)",
+            "Refs #5.",
+            &[forge::LABEL_IMPLEMENTING, forge::LABEL_WORKING],
+            "meguri/5-add-caching-def",
+            "cafef00d",
         );
+        let deps = impl_settle_env(&forge);
         let run = deps
             .store
             .create_run_for_loop("proj", KIND, 5, "Add caching (#5)")
@@ -1042,7 +1227,8 @@ mod tests {
         let mut c = cp(Kind::Impl, "cafef00d");
         c.pr_number = Some(9);
         c.pr_url = "https://fake.example/pr/9".into();
-        c.verdict = Some(ReviewVerdict::Findings);
+        c.verdict = Some(ReviewVerdict::Blocking);
+        c.blocking_categories = vec![BlockingCategory::Security];
         settle(&deps, &run, &c).await.unwrap();
 
         let labels = forge.pr_labels(9);
@@ -1054,29 +1240,127 @@ mod tests {
         );
     }
 
+    /// Impl advisory does NOT block (ADR 0025): success status, no needs-human,
+    /// working released, and the note folds into the PR body. auto-merge sees a
+    /// green pr-review status and proceeds.
+    #[tokio::test]
+    async fn impl_advisory_does_not_escalate() {
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
+        forge.add_pr(
+            9,
+            "Add caching (#5)",
+            "Refs #5.",
+            &[forge::LABEL_IMPLEMENTING, forge::LABEL_WORKING],
+            "meguri/5-add-caching-def",
+            "cafef00d",
+        );
+        let deps = impl_settle_env(&forge);
+        let run = deps
+            .store
+            .create_run_for_loop("proj", KIND, 5, "Add caching (#5)")
+            .unwrap();
+        let mut c = cp(Kind::Impl, "cafef00d");
+        c.pr_number = Some(9);
+        c.pr_url = "https://fake.example/pr/9".into();
+        c.review = "- consider a comment here".into();
+        c.verdict = Some(ReviewVerdict::Advisory);
+        settle(&deps, &run, &c).await.unwrap();
+
+        let labels = forge.pr_labels(9);
+        assert!(
+            !labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            "advisory must not escalate: {labels:?}"
+        );
+        assert!(!labels.contains(&forge::LABEL_WORKING.to_string()));
+        assert_eq!(
+            forge.commit_status_of("cafef00d", PR_REVIEW_STATUS),
+            Some(CommitStatusState::Success),
+            "advisory keeps the status green so auto-merge proceeds"
+        );
+        let body = forge
+            .prs()
+            .into_iter()
+            .find(|p| p.number == 9)
+            .unwrap()
+            .body;
+        assert!(body.contains("pr review (impl) — advisory"), "body: {body}");
+    }
+
     #[test]
     fn review_file_parses_and_validates() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".meguri")).unwrap();
         let path = dir.path().join(REVIEW_FILE);
+        let write = |json: &str| std::fs::write(&path, json).unwrap();
 
         assert!(
-            read_review(dir.path())
+            read_review(dir.path(), Kind::Impl)
                 .unwrap_err()
                 .contains("does not exist")
         );
-        std::fs::write(&path, "not json").unwrap();
+        write("not json");
         assert!(
-            read_review(dir.path())
+            read_review(dir.path(), Kind::Impl)
                 .unwrap_err()
                 .contains("not valid JSON")
         );
-        std::fs::write(&path, r#"{"verdict":"findings","review":"  "}"#).unwrap();
-        assert!(read_review(dir.path()).unwrap_err().contains("empty"));
-        std::fs::write(&path, r#"{"verdict":"clean"}"#).unwrap();
+
+        // The old two-value vocabulary still parses via the `findings` alias.
+        write(r#"{"verdict":"findings","review":"  "}"#);
+        assert!(
+            read_review(dir.path(), Kind::Impl)
+                .unwrap_err()
+                .contains("empty")
+        );
+        write(r#"{"verdict":"clean"}"#);
         assert_eq!(
-            read_review(dir.path()).unwrap().verdict,
+            read_review(dir.path(), Kind::Impl).unwrap().verdict,
             ReviewVerdict::Clean
+        );
+
+        // Advisory: review required, no categories.
+        write(r#"{"verdict":"advisory","review":""}"#);
+        assert!(
+            read_review(dir.path(), Kind::Impl)
+                .unwrap_err()
+                .contains("empty")
+        );
+        write(r#"{"verdict":"advisory","review":"- note","blocking_categories":["cost"]}"#);
+        assert!(
+            read_review(dir.path(), Kind::Impl)
+                .unwrap_err()
+                .contains("advisory does not block")
+        );
+        write(r#"{"verdict":"advisory","review":"- note"}"#);
+        assert_eq!(
+            read_review(dir.path(), Kind::Impl).unwrap().verdict,
+            ReviewVerdict::Advisory
+        );
+
+        // Impl blocking must name a category from the closed set.
+        write(r#"{"verdict":"blocking","review":"- boom"}"#);
+        assert!(
+            read_review(dir.path(), Kind::Impl)
+                .unwrap_err()
+                .contains("must name at least one")
+        );
+        write(r#"{"verdict":"blocking","review":"- boom","blocking_categories":["bogus"]}"#);
+        assert!(
+            read_review(dir.path(), Kind::Impl)
+                .unwrap_err()
+                .contains("not valid JSON"),
+            "an unknown category is rejected at parse time"
+        );
+        write(r#"{"verdict":"blocking","review":"- boom","blocking_categories":["security"]}"#);
+        let ok = read_review(dir.path(), Kind::Impl).unwrap();
+        assert_eq!(ok.verdict, ReviewVerdict::Blocking);
+        assert_eq!(ok.blocking_categories, vec![BlockingCategory::Security]);
+
+        // Plan blocking is the quality gate — no category required.
+        write(r#"{"verdict":"blocking","review":"- missing acceptance criteria"}"#);
+        assert_eq!(
+            read_review(dir.path(), Kind::Plan).unwrap().verdict,
+            ReviewVerdict::Blocking
         );
     }
 
