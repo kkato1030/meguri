@@ -35,8 +35,9 @@
       7 項目・supersede(0007)・不変移設(0003/0009/0006/0008/0001/0005)を明記している。
 - [ ] 本 spec が 5 スライスそれぞれについて「範囲・受け入れの芯・依存(blocked_by)・kind」を
       持ち、承認後にそのまま起票できる。
-- [ ] ADR が現行の全 loop/sweep(10 `Loop` + 8 poll-tick sweep)を3 Kind のどれが所有するか
-      漏れなく割り当てている(対象外を残さない)。
+- [ ] ADR が現行の全 loop/sweep(10 `Loop` + 8 poll-tick sweep)に加え、tick 最上段の
+      bootstrap reconcile(`ensure_project_clone`、ADR 0018)まで、3 Kind のどれが所有するか
+      漏れなく割り当てている(scheduler 固有の reconcile 経路を残さない)。
 - [ ] ラベル 2 軸の spec/status 再解釈が **ADR 0005 の amend** として位置づけられ、どの既存
       ラベルが spec 軸/status 軸か、人間待ち・停止の権威がどこかまで ADR に書かれている
       (reject ではない)。
@@ -61,8 +62,11 @@
    と cleaner / triage / routing_drift を吸収し、**旧 `Loop` trait を撤去**。ここで残りの
    issue-identity 駆動 sweep も畳む: `reaper`(→ `Op(Finalize)`)・`decompose_materializer`
    (→ spec-ready 分解提案への act)・既存 `reconcile`(body-edit、→ `reconcile_body_edits` へ
-   退避)。芯: default_loops と全 poll-tick sweep が消え、全 Kind が reconciler 経由。
-   blocked_by: [2, 3]。
+   退避)。tick 最上段の `ensure_project_clone`(ADR 0018)も Repo Kind の `Op(EnsureClone)` へ
+   畳み、scheduler 固有の reconcile 経路を残さない(triage-auto の spec 軸昇格・cleaner の
+   レポート更新も Repo Kind の `Op` として整理する — Repo Kind は read-only ではない)。芯:
+   default_loops・全 poll-tick sweep・tick の bootstrap reconcile が消え、全 Kind が
+   reconciler 経由。blocked_by: [2, 3]。
 5. **config 键粒度(ADR 0013)** — kind: plan。設定粒度を新構造に整える。芯: config が新構造に
    追随し hot reload 非回帰。blocked_by: [4]。
 

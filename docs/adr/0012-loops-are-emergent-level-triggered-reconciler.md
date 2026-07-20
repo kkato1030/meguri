@@ -52,12 +52,25 @@ sweep が3 Kind のどれに吸収されるかを**漏れなく**割り当てる
     spec-ready の分解提案という identity に対する act。
   - 既存 `reconcile::sweep`(#142、body-edit 再注意)→ implementing issue の観測から出す
     signal(名前衝突のため `reconcile_body_edits` へ退避、後述)。
-- **Repo Kind**(repo 単位の read-only 検出器) — cleaner / triage / routing_drift。
+- **Repo Kind**(repo 単位の検出器 — 観測は repo 全体、書き込みは `Op`) — cleaner / triage /
+  routing_drift。加えて、scheduler tick の最上段で declared-but-missing な managed clone を
+  実体化する `ensure_project_clone`(#195、ADR 0018 が既に level-triggered reconcile step と
+  呼んでいる)も repo scope の冪等 ensure なので Repo Kind が所有し、`Op(EnsureClone)` として
+  表す。**Repo Kind は read-only ではない**点に注意する:
+  - triage auto(ADR 0017)は閾値超え推薦を `meguri:ready` / `meguri:plan` へ昇格する。これは
+    **spec 軸への書き込み**(決定 5)なので、triage-auto は spec 軸の 4 handshake 列挙メンバの
+    1つとして扱う。検出は repo scope だが、昇格の act は当該 issue identity への `Op` である
+    (ADR 0017 と矛盾しない)。
+  - cleaner(ADR 0003)は 1 本のレポート issue を更新する。これも observe は repo 全体・書き込みは
+    そのレポート issue への `Op`。read-only の原則(レポート以外は書かない)は不変。
+  - routing_drift はドリフト検出。書き込みが要る場合は同様に `Op` として明示する。
 - **Schedule Kind**(cron 起票) — scheduler_fire。
 
-これで現行の10 `Loop` 実装と poll-tick sweep(scheduler_fire / reaper / auto_merger /
-merge_watch / plan_handoff / decompose_materializer / routing_drift / reconcile)はすべて
-いずれかの Kind に属す。対象外にする loop/sweep は無い。
+これで現行の10 `Loop` 実装・poll-tick sweep(scheduler_fire / reaper / auto_merger /
+merge_watch / plan_handoff / decompose_materializer / routing_drift / reconcile)・および
+tick 最上段の bootstrap reconcile(`ensure_project_clone`)はすべていずれかの Kind に属す。
+対象外にする loop/sweep/reconcile step は無い。`ensure_project_clone` は「消える 8 sweep」では
+なく Repo Kind の `Op` へ畳まれる(scheduler 固有の reconcile 経路を移行後に残さない)。
 
 新しいトリガは Kind でなく `next_step` の **arm(分岐)**として増設する。BEHIND のような新条件は
 loop を新設せず、`next_step` に arm を1本足すだけで済む。
