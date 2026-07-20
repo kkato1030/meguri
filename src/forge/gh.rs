@@ -505,6 +505,43 @@ impl GhForge {
         })
     }
 
+    /// Every conversation comment on a PR, fully paginated (REST issue
+    /// comments). Used only when the bulk observe's comment window clipped
+    /// older comments, so the arm marker (the durable idempotency /
+    /// human-override key) is never missed (f1). REST `created_at` is the same
+    /// RFC3339 shape as GraphQL `createdAt`, so `store::parse_ts` reads both.
+    async fn all_pr_comments(&self, number: i64) -> Result<Vec<PrComment>> {
+        let raw = self
+            .gh(&[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!("repos/{}/issues/{number}/comments", self.repo),
+            ])
+            .await?;
+        let pages: Value = serde_json::from_str(&raw).context("parsing paginated PR comments")?;
+        Ok(pages
+            .as_array()
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .filter_map(|c| {
+                        Some(PrComment {
+                            body: c.get("body").and_then(Value::as_str)?.to_string(),
+                            created_at: c
+                                .get("created_at")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// The workflow run id inside a check's details URL
     /// (`.../actions/runs/<id>/job/<job>`), if it points at GitHub Actions.
     fn actions_run_id(url: &str) -> Option<String> {
@@ -1479,13 +1516,18 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        // `comments(last:100)` covers all but the chattiest PRs in one shot;
+        // `totalCount` lets us detect when the window clipped older comments and
+        // paginate them in, so the arm marker (the durable idempotency /
+        // human-override key) is never missed — a clipped marker would let a
+        // human-disarmed head look unarmed and get wrongly re-armed (f1).
         let query = "query($owner:String!,$name:String!){\
              rateLimit{cost}\
              repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
              number title body url headRefName headRefOid isDraft state \
              labels(first:20){nodes{name}} mergeable mergeStateStatus \
              autoMergeRequest{enabledAt} \
-             comments(last:30){nodes{body createdAt}} \
+             comments(last:100){totalCount nodes{body createdAt}} \
              reviewThreads(first:50){nodes{isResolved}} \
              commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
              ... on CheckRun{name status conclusion detailsUrl} \
@@ -1512,14 +1554,29 @@ impl Forge for GhForge {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let prs = nodes
-            .iter()
-            .filter_map(|n| Self::pr_observation_from_node(n, pr_review_context))
-            .collect();
+        let mut requests: u32 = 1;
+        let mut prs = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let Some(mut obs) = Self::pr_observation_from_node(node, pr_review_context) else {
+                continue;
+            };
+            // Window clipped older comments → paginate the full set so no arm
+            // marker is lost. Rare (a PR with >100 comments); the extra reads
+            // are counted so the cost stays honest.
+            let total = node
+                .pointer("/comments/totalCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if total > obs.comments.len() {
+                obs.comments = self.all_pr_comments(obs.pr.number).await?;
+                requests += 1;
+            }
+            prs.push(obs);
+        }
         Ok(MergeTailObservation {
             prs,
             cost: ObserveCost {
-                requests: 1,
+                requests,
                 graphql_cost,
             },
         })

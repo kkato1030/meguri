@@ -149,6 +149,48 @@ async fn orchestrator_behind_is_closed_by_update_branch_then_merge() {
 }
 
 #[tokio::test]
+async fn human_disarm_survives_more_comments_than_the_observe_window() {
+    // f1 regression: the arm marker is the durable idempotency + human-override
+    // key. Buried under far more later comments than any recent-comment window,
+    // the current head must still read as armed — so a human's disarm holds and
+    // the head is never wrongly re-armed. (GhForge paginates on overflow to keep
+    // this true; FakeForge returns every comment, so it guards the invariant.)
+    let forge = Arc::new(FakeForge::default());
+    seed_armable(&forge, 1, "sha1");
+    let deps = deps_with(forge.clone(), AutoMergeMode::Native);
+
+    // Arm it: exactly one arm marker + comment posted.
+    sweep(&deps).await.unwrap();
+    let arm_comments = |f: &FakeForge| {
+        f.pr_comments_of(1)
+            .iter()
+            .filter(|c| c.contains("arm しました"))
+            .count()
+    };
+    assert_eq!(arm_comments(&forge), 1, "armed once");
+
+    // A human disables auto-merge on this same head, then the PR accrues far
+    // more chatter than any recent-comment window would hold.
+    forge.set_auto_merge_enabled(1, false);
+    for i in 0..40 {
+        forge.comment_pr(1, &format!("chatter {i}")).await.unwrap();
+    }
+
+    // The marker must not be lost: still armed → HumanDisabled, never re-armed.
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        arm_comments(&forge),
+        1,
+        "same head not re-armed after human disarm despite >window comments"
+    );
+    assert_eq!(
+        forge.armed_of(1),
+        Some((MergeStrategy::Squash, "sha1".into())),
+        "arm state unchanged"
+    );
+}
+
+#[tokio::test]
 async fn observe_cost_is_constant_and_recorded() {
     // Acceptance 2: the informer-cache observe costs one request regardless of
     // PR count, and each sweep records the measured cost as an event.
