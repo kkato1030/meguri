@@ -2128,3 +2128,527 @@ mod tests {
         }
     }
 }
+
+// ===========================================================================
+// Issue-side decider (ADR 0012 slice 4, 決定1). The PR-side above owns open
+// meguri PRs; this side owns the pre-PR / non-open-PR issue lifecycle
+// (`plan`→planner, `ready`→worker, merged spec PR→handoff), plus a local-task
+// decider for local mode. Pure functions with their own property tests; the
+// observe/enqueue wiring (single-issue snapshot, issue-wide reservation,
+// arm-tagged claim) folds planner/worker/plan_handoff here in a following step.
+// The types are issue-scoped (`Issue*`) so they do not disturb the PR-side
+// `Snapshot`/`Step`/`Arm`/`Op` above; a later step unifies the vocabulary.
+// ===========================================================================
+
+/// How the decider was reached: the normal watch resync, or an explicit manual
+/// `meguri run` (ADR 0016). `ManualRun` bypasses the *discovery throttles*
+/// (`already_shipped` / cadence window) — a human override — but never the
+/// safety gates (human stop / busy / not-before), per finding 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Reconcile,
+    ManualRun,
+}
+
+/// The terminal state of a `speccing` issue's spec PR, read per-issue for the
+/// handoff decision (決定5 / f3). Only meaningful for a `speccing` issue that
+/// has **no open** meguri PR (an open one is owned by the PR side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecPrState {
+    Open,
+    Merged,
+    ClosedUnmerged,
+}
+
+/// A pre-PR / non-open-PR issue arm (ADR 0012 §4, `Agent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueArm {
+    /// `meguri:plan` → write a spec (planner recipe).
+    Planner,
+    /// `meguri:ready` → implement (worker recipe).
+    Worker,
+}
+
+impl IssueArm {
+    /// The `runs.loop_kind` this arm dispatches to (the recipe's `KIND`).
+    pub fn loop_kind(self) -> &'static str {
+        match self {
+            IssueArm::Planner => super::planner::KIND,
+            IssueArm::Worker => super::worker::KIND,
+        }
+    }
+}
+
+/// A pre-PR / non-open-PR issue Op (ADR 0012 §4, `Op`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueOp {
+    /// separate delivery: a merged spec PR advances its `speccing` issue to
+    /// `ready` (決定5; the old `plan_handoff` sweep, label-only).
+    Handoff,
+}
+
+/// The decision [`next_step_issue`] returns for one issue identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStep {
+    Agent(IssueArm),
+    Op(IssueOp),
+    Wait(&'static str),
+    Skip(&'static str),
+}
+
+/// The pure inputs [`next_step_issue`] decides on: one issue's full label set
+/// reduced to phase booleans, plus the ownership/serialization gates and the
+/// discovery gate predicates for the chosen new-work arm (決定1). Deliberately
+/// total so a property test can enumerate it.
+#[derive(Debug, Clone, Copy)]
+pub struct IssueSnapshot {
+    /// A human parked/paused the issue (`hold` / `needs-human`, spec axis).
+    /// Respected even under `ManualRun` (finding 2).
+    pub human_stop: bool,
+    /// The issue has an **open meguri PR** — the ownership boundary hands it to
+    /// the PR-side `next_step`; the issue side stays off it (決定1).
+    pub has_open_meguri_pr: bool,
+    /// A live author-lane run already owns the issue (`issue_has_active_author_run`).
+    pub issue_busy: bool,
+    /// Phase labels present. Priority `plan` > `ready` > `speccing` >
+    /// `implementing`; multiple set (manual drift) still resolves to one arm.
+    pub has_plan: bool,
+    pub has_ready: bool,
+    pub has_speccing: bool,
+    pub has_implementing: bool,
+    /// For a `speccing` issue with no open PR: its spec PR's terminal state.
+    pub spec_pr_state: Option<SpecPrState>,
+    /// Discovery gates for the chosen planner/worker arm (現 `LabelTaskSource`
+    /// と同じ判定関数の結果を畳んだ純入力):
+    /// already shipped (body digest unchanged since a succeeded run).
+    pub already_shipped: bool,
+    /// not-before is still in the future (fail-closed: honored even under
+    /// `ManualRun`, per ADR 0011 / finding 2).
+    pub not_before_wait: bool,
+    /// A `blocked_by` dependency is still open.
+    pub deps_unmet: bool,
+    /// The cadence window is exhausted (`limit - consumed <= 0`).
+    pub cadence_full: bool,
+}
+
+/// The pure decision (ADR 0012 §3, 決定1). Precedence: the ownership /
+/// serialization gates first (human stop, open-PR boundary, busy), then the
+/// single phase arm by priority, with the discovery gates applied to the chosen
+/// new-work arm. Every observed state is owned by exactly one step.
+pub fn next_step_issue(s: &IssueSnapshot, mode: Mode) -> IssueStep {
+    // Human stop is final for every arm and honored even under ManualRun.
+    if s.human_stop {
+        return IssueStep::Wait("human stop (hold/needs-human)");
+    }
+    // Ownership boundary: an open meguri PR is the PR side's (決定1). A stray
+    // open-PR speccing issue lands here too, so the boundary is total.
+    if s.has_open_meguri_pr {
+        return IssueStep::Skip("owned by its open PR");
+    }
+    // A live author-lane run already owns the issue — stay off it (serialize).
+    if s.issue_busy {
+        return IssueStep::Skip("a live run owns the issue");
+    }
+    // Phase priority: exactly one arm. `hold`/`needs-human` was folded into
+    // `human_stop` above, so the ladder is plan > ready > speccing > implementing.
+    if s.has_plan {
+        return gated_new_work(IssueArm::Planner, s, mode);
+    }
+    if s.has_ready {
+        return gated_new_work(IssueArm::Worker, s, mode);
+    }
+    if s.has_speccing {
+        return match s.spec_pr_state {
+            Some(SpecPrState::Merged) => IssueStep::Op(IssueOp::Handoff),
+            Some(SpecPrState::ClosedUnmerged) => IssueStep::Skip("spec PR closed unmerged"),
+            // Open is owned by the PR side (caught by has_open_meguri_pr above);
+            // kept total defensively.
+            Some(SpecPrState::Open) => IssueStep::Skip("owned by its open PR"),
+            None => IssueStep::Skip("speccing: no spec PR yet"),
+        };
+    }
+    if s.has_implementing {
+        return IssueStep::Skip("implementing (in progress)");
+    }
+    IssueStep::Skip("no actionable phase label")
+}
+
+/// Apply the discovery gates to a chosen planner/worker arm. not-before and
+/// dependency gates hold under both modes (fail-closed); `already_shipped` and
+/// the cadence window are the discovery throttles a manual run bypasses.
+fn gated_new_work(arm: IssueArm, s: &IssueSnapshot, mode: Mode) -> IssueStep {
+    if s.not_before_wait {
+        return IssueStep::Wait("not-before (fail-closed)");
+    }
+    if s.deps_unmet {
+        return IssueStep::Wait("blocked by an open dependency");
+    }
+    if mode == Mode::Reconcile {
+        if s.already_shipped {
+            return IssueStep::Skip("already shipped, body unchanged");
+        }
+        if s.cadence_full {
+            return IssueStep::Wait("cadence window full");
+        }
+    }
+    IssueStep::Agent(arm)
+}
+
+/// A local-task arm — local mode has no planner/PR, so only the worker (決定1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalArm {
+    Worker,
+}
+
+/// The decision for a local (`TaskKey::Local`) identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalStep {
+    Agent(LocalArm),
+    Wait(&'static str),
+    Skip(&'static str),
+}
+
+/// The pure inputs for a local task (a subset of [`IssueSnapshot`]: no phase
+/// labels / PR / handoff — local mode has none).
+#[derive(Debug, Clone, Copy)]
+pub struct LocalSnapshot {
+    pub human_stop: bool,
+    pub issue_busy: bool,
+    pub already_shipped: bool,
+    pub not_before_wait: bool,
+    pub deps_unmet: bool,
+    pub cadence_full: bool,
+}
+
+/// The pure decision for a local task (決定1, third decider). Same gate ladder
+/// as the issue side's worker arm, but the only arm is the worker.
+pub fn next_step_local(s: &LocalSnapshot, mode: Mode) -> LocalStep {
+    if s.human_stop {
+        return LocalStep::Wait("human stop (hold/needs-human)");
+    }
+    if s.issue_busy {
+        return LocalStep::Skip("a live run owns the task");
+    }
+    if s.not_before_wait {
+        return LocalStep::Wait("not-before (fail-closed)");
+    }
+    if s.deps_unmet {
+        return LocalStep::Wait("blocked by an open dependency");
+    }
+    if mode == Mode::Reconcile {
+        if s.already_shipped {
+            return LocalStep::Skip("already shipped, body unchanged");
+        }
+        if s.cadence_full {
+            return LocalStep::Wait("cadence window full");
+        }
+    }
+    LocalStep::Agent(LocalArm::Worker)
+}
+
+#[cfg(test)]
+mod issue_side_tests {
+    use super::*;
+
+    /// A baseline: a plain `ready` issue with no gates tripped, not owned by a
+    /// PR, not busy. Tests tweak one field.
+    fn ready_snapshot() -> IssueSnapshot {
+        IssueSnapshot {
+            human_stop: false,
+            has_open_meguri_pr: false,
+            issue_busy: false,
+            has_plan: false,
+            has_ready: true,
+            has_speccing: false,
+            has_implementing: false,
+            spec_pr_state: None,
+            already_shipped: false,
+            not_before_wait: false,
+            deps_unmet: false,
+            cadence_full: false,
+        }
+    }
+
+    #[test]
+    fn phase_priority_picks_exactly_one_arm() {
+        // plan wins over ready (manual drift resolves to the highest phase).
+        let both = IssueSnapshot {
+            has_plan: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&both, Mode::Reconcile),
+            IssueStep::Agent(IssueArm::Planner)
+        );
+        // ready alone → worker.
+        assert_eq!(
+            next_step_issue(&ready_snapshot(), Mode::Reconcile),
+            IssueStep::Agent(IssueArm::Worker)
+        );
+        assert_eq!(IssueArm::Planner.loop_kind(), super::super::planner::KIND);
+        assert_eq!(IssueArm::Worker.loop_kind(), super::super::worker::KIND);
+    }
+
+    #[test]
+    fn ownership_and_serialization_gates_come_first() {
+        // Human stop wins even with a plan label and even under ManualRun.
+        let stopped = IssueSnapshot {
+            human_stop: true,
+            has_plan: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&stopped, Mode::ManualRun),
+            IssueStep::Wait("human stop (hold/needs-human)")
+        );
+        // An open meguri PR hands the issue to the PR side.
+        let owned = IssueSnapshot {
+            has_open_meguri_pr: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&owned, Mode::Reconcile),
+            IssueStep::Skip("owned by its open PR")
+        );
+        // A live author-lane run serializes.
+        let busy = IssueSnapshot {
+            issue_busy: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&busy, Mode::Reconcile),
+            IssueStep::Skip("a live run owns the issue")
+        );
+    }
+
+    #[test]
+    fn speccing_handoff_matches_the_ownership_rule() {
+        // f3: open spec PR → PR side (Skip); merged → Handoff; closed → Skip.
+        let base = IssueSnapshot {
+            has_ready: false,
+            has_speccing: true,
+            ..ready_snapshot()
+        };
+        // An open spec PR sets has_open_meguri_pr, so the boundary catches it
+        // before the speccing branch — the issue side never waits on it.
+        let open = IssueSnapshot {
+            has_open_meguri_pr: true,
+            spec_pr_state: Some(SpecPrState::Open),
+            ..base
+        };
+        assert_eq!(
+            next_step_issue(&open, Mode::Reconcile),
+            IssueStep::Skip("owned by its open PR")
+        );
+        let merged = IssueSnapshot {
+            spec_pr_state: Some(SpecPrState::Merged),
+            ..base
+        };
+        assert_eq!(
+            next_step_issue(&merged, Mode::Reconcile),
+            IssueStep::Op(IssueOp::Handoff)
+        );
+        let closed = IssueSnapshot {
+            spec_pr_state: Some(SpecPrState::ClosedUnmerged),
+            ..base
+        };
+        assert_eq!(
+            next_step_issue(&closed, Mode::Reconcile),
+            IssueStep::Skip("spec PR closed unmerged")
+        );
+    }
+
+    #[test]
+    fn discovery_gates_hold_under_reconcile_and_manual_bypasses_throttles() {
+        // finding 3: blocked / not-before / cadence-full / already-shipped do not
+        // enqueue under Reconcile.
+        let shipped = IssueSnapshot {
+            already_shipped: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&shipped, Mode::Reconcile),
+            IssueStep::Skip("already shipped, body unchanged")
+        );
+        let full = IssueSnapshot {
+            cadence_full: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&full, Mode::Reconcile),
+            IssueStep::Wait("cadence window full")
+        );
+        let blocked = IssueSnapshot {
+            deps_unmet: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&blocked, Mode::Reconcile),
+            IssueStep::Wait("blocked by an open dependency")
+        );
+        // finding 2: ManualRun bypasses already_shipped + cadence window …
+        assert_eq!(
+            next_step_issue(&shipped, Mode::ManualRun),
+            IssueStep::Agent(IssueArm::Worker)
+        );
+        assert_eq!(
+            next_step_issue(&full, Mode::ManualRun),
+            IssueStep::Agent(IssueArm::Worker)
+        );
+        // … but not-before stays fail-closed even under ManualRun, and a human
+        // stop / dependency block still hold.
+        let nb = IssueSnapshot {
+            not_before_wait: true,
+            ..ready_snapshot()
+        };
+        assert_eq!(
+            next_step_issue(&nb, Mode::ManualRun),
+            IssueStep::Wait("not-before (fail-closed)")
+        );
+        assert_eq!(
+            next_step_issue(&blocked, Mode::ManualRun),
+            IssueStep::Wait("blocked by an open dependency")
+        );
+    }
+
+    #[test]
+    fn local_decider_only_yields_worker_and_respects_the_same_gates() {
+        let base = LocalSnapshot {
+            human_stop: false,
+            issue_busy: false,
+            already_shipped: false,
+            not_before_wait: false,
+            deps_unmet: false,
+            cadence_full: false,
+        };
+        assert_eq!(
+            next_step_local(&base, Mode::Reconcile),
+            LocalStep::Agent(LocalArm::Worker)
+        );
+        assert_eq!(
+            next_step_local(
+                &LocalSnapshot {
+                    human_stop: true,
+                    ..base
+                },
+                Mode::ManualRun
+            ),
+            LocalStep::Wait("human stop (hold/needs-human)")
+        );
+        // ManualRun bypasses already_shipped for a local task too.
+        assert_eq!(
+            next_step_local(
+                &LocalSnapshot {
+                    already_shipped: true,
+                    ..base
+                },
+                Mode::ManualRun
+            ),
+            LocalStep::Agent(LocalArm::Worker)
+        );
+    }
+
+    #[test]
+    fn ownership_is_total_exactly_one_step_over_the_phase_space() {
+        // Enumerate the observed issue-side state space and assert next_step_issue
+        // always returns exactly the expected single owning step (no gap, no
+        // double) under both modes. The phase powerset × the gate flags × PR
+        // ownership × busy is the state space; the expected owner mirrors the
+        // precedence ladder.
+        for &human_stop in &[true, false] {
+            for &has_open_pr in &[true, false] {
+                for &busy in &[true, false] {
+                    for &plan in &[true, false] {
+                        for &ready in &[true, false] {
+                            for &speccing in &[true, false] {
+                                for &implementing in &[true, false] {
+                                    for spec_pr in [
+                                        None,
+                                        Some(SpecPrState::Open),
+                                        Some(SpecPrState::Merged),
+                                        Some(SpecPrState::ClosedUnmerged),
+                                    ] {
+                                        for &shipped in &[true, false] {
+                                            for &nb in &[true, false] {
+                                                for &deps in &[true, false] {
+                                                    for &cadence in &[true, false] {
+                                                        for mode in
+                                                            [Mode::Reconcile, Mode::ManualRun]
+                                                        {
+                                                            let s = IssueSnapshot {
+                                                                human_stop,
+                                                                has_open_meguri_pr: has_open_pr,
+                                                                issue_busy: busy,
+                                                                has_plan: plan,
+                                                                has_ready: ready,
+                                                                has_speccing: speccing,
+                                                                has_implementing: implementing,
+                                                                spec_pr_state: spec_pr,
+                                                                already_shipped: shipped,
+                                                                not_before_wait: nb,
+                                                                deps_unmet: deps,
+                                                                cadence_full: cadence,
+                                                            };
+                                                            assert_eq!(
+                                                                next_step_issue(&s, mode),
+                                                                expected(&s, mode),
+                                                                "{s:?} {mode:?}"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reference precedence, independently spelled out, that the property
+    /// test above checks `next_step_issue` against.
+    fn expected(s: &IssueSnapshot, mode: Mode) -> IssueStep {
+        if s.human_stop {
+            return IssueStep::Wait("human stop (hold/needs-human)");
+        }
+        if s.has_open_meguri_pr {
+            return IssueStep::Skip("owned by its open PR");
+        }
+        if s.issue_busy {
+            return IssueStep::Skip("a live run owns the issue");
+        }
+        let gated = |arm: IssueArm| {
+            if s.not_before_wait {
+                IssueStep::Wait("not-before (fail-closed)")
+            } else if s.deps_unmet {
+                IssueStep::Wait("blocked by an open dependency")
+            } else if mode == Mode::Reconcile && s.already_shipped {
+                IssueStep::Skip("already shipped, body unchanged")
+            } else if mode == Mode::Reconcile && s.cadence_full {
+                IssueStep::Wait("cadence window full")
+            } else {
+                IssueStep::Agent(arm)
+            }
+        };
+        if s.has_plan {
+            gated(IssueArm::Planner)
+        } else if s.has_ready {
+            gated(IssueArm::Worker)
+        } else if s.has_speccing {
+            match s.spec_pr_state {
+                Some(SpecPrState::Merged) => IssueStep::Op(IssueOp::Handoff),
+                Some(SpecPrState::ClosedUnmerged) => IssueStep::Skip("spec PR closed unmerged"),
+                Some(SpecPrState::Open) => IssueStep::Skip("owned by its open PR"),
+                None => IssueStep::Skip("speccing: no spec PR yet"),
+            }
+        } else if s.has_implementing {
+            IssueStep::Skip("implementing (in progress)")
+        } else {
+            IssueStep::Skip("no actionable phase label")
+        }
+    }
+}
