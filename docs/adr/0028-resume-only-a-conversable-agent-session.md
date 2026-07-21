@@ -65,12 +65,18 @@ resume の健全性を、単発の生存確認から**多層のゲート**に変
 - 診断同梱を「read するが裁定しない」と明記するのは、pane を読み始めた実装が成否判定に流用される
   退行を防ぐため。overview の原則との整合を将来のレビューが確認できるようにする。
 
-## 影響
+## 影響(公開境界は spec と一致させる)
 
-- turn の結果に「無応答で有界に諦めた」を表す終端 outcome が増える(park の無限待ちを置き換える)。
+- **公開 `TurnOutcome` は変えない**。turn engine の待受メソッド(`await_completion` 系)の戻り型を
+  新しい公開 enum `AwaitOutcome`(「無応答で有界に諦めた」= AgentQuiet / AgentAbsent を含む)にし、
+  `run_turn_in` がそれを既存 `TurnOutcome` へ正規化する。こうすると `TurnOutcome` を match している
+  多数の呼び出し側が非網羅にならずコンパイルが通る(理由の詳細と代替案は spec)。
+- mux トレイトに能力が **2つ** 増える: 在否を問う `agent_present`(既定 `true` で既存 mux は不変)と、
+  在否ゲート付きの `nudge`(**required method・既定 body なし**。原子性は本番の herdr が担い、tmux は
+  best-effort + 自己修復。詳細は spec の D5b)。生の `send_line` による無条件 nudge は廃する。
 - pane registry に quiet カウンタ列が1つ増える(加算のみ・後方互換。詳細は spec の migration 節)。
-- mux トレイトに `agent_present` が1つ増える(既定 `true` で既存 mux の挙動は不変)。
-- agent プロファイルに transcript サイズ閾値の設定が1つ増える(既定 5MiB・省略可)。
+- agent プロファイルに transcript サイズ閾値の設定が1つ増える(既定 5MiB・省略可)。診断 tail は
+  外部公開前に必ず sanitize する。
 
 具体的な touch 点・イベント名・テスト・migration/rollback は使い捨ての実装 spec
 `docs/specs/issue-245.md` にある(実装が land したら spec は捨て、この ADR が残る)。
