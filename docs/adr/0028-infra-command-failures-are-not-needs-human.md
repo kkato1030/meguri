@@ -19,11 +19,15 @@ ADR 0012 は「needs-human を貼れるのは `escalation.rs` だけ」という
 ## Decision
 
 1. **`run_flow` の失敗経路を二分岐にする**。`super::escalation::infra_reason(&err)` が
-   `Some(reason)` を返す場合(エラーチェーンに `crate::mux::MuxError`、または `gh`/`curl` の
-   spawn 失敗由来の生 `std::io::Error` がある場合)は forge/mux コマンド故障とみなし、
-   `flavor.release_claim`(claim だけ外す — 次 sweep が再試行できる)+
-   `escalation::escalate_infra` を呼ぶ。それ以外(`NeedsHuman` を含む従来の全ケース)は
-   `flavor.escalate` のまま、挙動は不変。
+   `Some(reason)` を返す場合(エラーチェーンに `crate::mux::MuxError`、または `gh` の
+   プロセス起動そのものが失敗したことを表す専用型 `crate::forge::gh::GhSpawnFailed` がある
+   場合)は forge/mux コマンド故障とみなし、`flavor.release_claim`(claim だけ外す — 次 sweep
+   が再試行できる)+ `escalation::escalate_infra` を呼ぶ。それ以外(`NeedsHuman` を含む従来の
+   全ケース)は `flavor.escalate` のまま、挙動は不変。
+   自己レビュー finding f1(issue #250)の指摘どおり、**裸の `std::io::Error` はチェーンに
+   あるだけでは分類しない**。`io::Error` は git(`src/gitops.rs`)・direct-mode エージェントの
+   `cmd.spawn()`・prompt/log のファイル書き込みなど forge/mux 以外からも大量に発生するため、
+   型でその境界を狭く保つ(下記 §3)。
 2. **`infra` はイベントも通知も needs-human と別トークンにする**。`escalate_infra` は
    `infra.raised` イベントを毎回 emit する(統計上、`escalation.raised`/needs-human 系のカウンタ
    から自然に除外される)一方、通知(`Notification::infra`)の `dedup_key` は **issue/run 番号を
@@ -31,12 +35,14 @@ ADR 0012 は「needs-human を貼れるのは `escalation.rs` だけ」という
    issue が同時に落ちても、`Notifier` の既存 throttle 窓の中では通知は1本に収束する
    (「同一 reason は backoff 付きで1本化」)。`infra` は ADR 0020 の allowlist に新規トークンとして
    追加し、既定では非購読(既存ホストの通知挙動は無改変)。
-3. **分類は型で行い、文字列パターンマッチはしない**。forge 呼び出し(`gh` CLI)の失敗の大半は
-   `bail!` による無型のエラー文字列で、ビジネスロジック上の拒否(権限不足・404 等、人間の判断が
-   要る)と接続断を安全に区別する材料が無い。無理に stderr を文字列一致させるより、確実に
-   「コマンド/接続そのものが失敗した」と言える型(`MuxError` とプロセス起動の `io::Error`)だけを
-   `infra` に倒す。曖昧なケースは従来どおり needs-human 側に残る(過検知より見落としを許容しない
-   側に倒す)。
+3. **分類は型で行い、文字列パターンマッチも「io::Error なら infra」という緩い型判定もしない**。
+   forge 呼び出し(`gh` CLI)の失敗の大半は `bail!` による無型のエラー文字列で、ビジネスロジック
+   上の拒否(権限不足・404 等、人間の判断が要る)と接続断を安全に区別する材料が無い。無理に
+   stderr を文字列一致させる代わりに、`src/forge/gh.rs` の `gh`/`gh_try`/`gh_stdin`/`create_repo`
+   —— `gh` プロセスの起動そのものが失敗する4箇所 —— だけを専用の `GhSpawnFailed` 型で包む。
+   `infra_reason` はこの型と `MuxError` のみを見る。裸の `std::io::Error` は(git・direct-mode
+   エージェント spawn・ファイル I/O など出処が多すぎるため)一律で対象外とし、従来どおり
+   needs-human 側に残す(過検知より見落としを許容しない側に倒す)。
 
 ## Consequences
 
@@ -47,6 +53,10 @@ ADR 0012 は「needs-human を貼れるのは `escalation.rs` だけ」という
   同じファイルに置かれているが needs-human ラベルには一切触れない、別分類の関数として明確に分離。
 - config 編集中の一瞬の profile 消失(design doc §3-E の別事例)は、forge/mux コマンド故障ではなく
   `routing.rs` の設定解決エラーなので、本 ADR の分類には入らない。別課題として扱う。
-- `gh`/`curl` の spawn 失敗以外の forge 側ネットワーク断(`gh` プロセス自体は起動しレスポンス無しで
+- `gh` プロセス起動失敗以外の forge 側ネットワーク断(`gh` プロセス自体は起動しレスポンス無しで
   非ゼロ終了するケース)は無型のため今回は `infra` に分類されない。型を持たせる forge 側の変更は
   スコープ外(必要になれば別 issue)。
+- 裸の `std::io::Error`(git・direct-mode エージェント spawn・prompt/log のファイル書き込み等)は
+  引き続き `flavor.escalate` 経由で needs-human に残る。これは意図した保守的側であり、自己レビュー
+  finding f1 の回帰テスト(`src/engine/escalation.rs::tests::infra_reason_is_none_for_a_bare_io_error`)
+  で固定した。

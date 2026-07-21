@@ -100,19 +100,30 @@ pub async fn escalate_pr(deps: &Deps, pr: i64, comment: &str) {
 
 /// Classify a run failure as a forge/mux command fault rather than something
 /// a human must judge (issue #250). Looks for a [`crate::mux::MuxError`] (a
-/// stopped mux, a dead pane, a command it refused) or a raw `io::Error` (e.g.
-/// a failed `gh`/`curl` spawn) anywhere in the error chain — both say "a
-/// command to a dependency failed", never "the agent needs a decision".
-/// Everything else (including forge's own business-logic failures, which
-/// carry no distinct type) keeps escalating to needs-human as before — only
-/// the connection/transport layer is reclassified here.
+/// stopped mux, a dead pane, a command it refused) or a
+/// [`crate::forge::gh::GhSpawnFailed`] (the `gh` binary itself could not be
+/// started) anywhere in the error chain — both say "a command to a
+/// dependency failed", never "the agent needs a decision".
+///
+/// Deliberately NOT a bare `std::io::Error` check (issue #250 f1, self-review
+/// finding): `io::Error` also comes from git (`src/gitops.rs`), the
+/// direct-mode agent's own `cmd.spawn()`, and plain prompt/log file writes —
+/// none of those are forge/mux command faults, and misclassifying them would
+/// silently drop genuine failures from the needs-human queue and retry them
+/// forever instead. Everything else (including forge's own business-logic
+/// failures, which carry no distinct type) keeps escalating to needs-human
+/// as before — only the two typed, unambiguous boundaries above are
+/// reclassified here.
 pub fn infra_reason(err: &anyhow::Error) -> Option<&'static str> {
     for cause in err.chain() {
         if let Some(mux_err) = cause.downcast_ref::<crate::mux::MuxError>() {
             return Some(mux_infra_reason(mux_err));
         }
-        if cause.downcast_ref::<std::io::Error>().is_some() {
-            return Some("command_spawn_failed");
+        if cause
+            .downcast_ref::<crate::forge::gh::GhSpawnFailed>()
+            .is_some()
+        {
+            return Some("gh_spawn_failed");
         }
     }
     None
@@ -259,8 +270,28 @@ mod tests {
     }
 
     #[test]
+    fn infra_reason_classifies_gh_spawn_failure() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gh: command not found");
+        let err = anyhow::Error::new(crate::forge::gh::GhSpawnFailed::from(io_err));
+        assert_eq!(infra_reason(&err), Some("gh_spawn_failed"));
+    }
+
+    #[test]
     fn infra_reason_is_none_for_needs_human_style_failures() {
         let err = anyhow::anyhow!("agent reported needs_human: could not resolve the ask");
+        assert_eq!(infra_reason(&err), None);
+    }
+
+    /// Regression for issue #250 f1: a bare `io::Error` (git, direct-mode
+    /// agent spawn, prompt/log file writes, ...) must NOT be classified as
+    /// infra just because it happens to be an `io::Error` — only the typed
+    /// `GhSpawnFailed`/`MuxError` boundaries above may. Misclassifying this
+    /// would drop a genuine failure out of the needs-human queue and retry it
+    /// forever instead of ever telling a human.
+    #[test]
+    fn infra_reason_is_none_for_a_bare_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = anyhow::Error::new(io_err).context("writing .meguri/prompt-x.md");
         assert_eq!(infra_reason(&err), None);
     }
 
