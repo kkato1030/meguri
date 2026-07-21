@@ -367,6 +367,52 @@ pub fn next_step(s: &Snapshot) -> Step {
     }
 }
 
+/// Step policy allow-filter (ADR 0026 step policy): a disabled fixer-family
+/// arm's `Agent` step becomes `Wait(PolicyDisabled)` — the uniform replacement
+/// for the scattered per-loop kill switches. Ownership totality is preserved (a
+/// `Wait` is still exactly one owner). Pure, so a property test covers it.
+pub fn apply_policy(step: Step, policy: &crate::config::StepPolicyConfig) -> Step {
+    match step {
+        Step::Agent(arm) if !arm_allowed(arm, policy) => Step::Wait("policy disabled"),
+        other => other,
+    }
+}
+
+fn arm_allowed(arm: Arm, p: &crate::config::StepPolicyConfig) -> bool {
+    match arm {
+        Arm::ConflictResolver => p.conflict_resolver,
+        Arm::CiFixer => p.ci_fixer,
+        Arm::Fixer => p.fixer,
+    }
+}
+
+/// The spec/status-axis signal carrier seam (ADR 0026 signal binding, partial
+/// introduction). How the reconciler reads the spec-axis signals it must NOT
+/// reconstruct from observation (human stop) and the spec-worker ownership. This
+/// slice ships only the [`Labels`] binding — today's behaviour moved behind the
+/// seam; a `Markers` binding is future work (the seam is the deliverable).
+pub trait SignalCarrier {
+    /// A human parked/paused the PR (spec-axis: `hold` / `needs-human`). A
+    /// clipped label window reads conservatively as stopped (never miss a stop).
+    fn human_stop(&self, pr: &PullRequest, labels_complete: bool) -> bool;
+    /// The spec worker owns this branch (combined delivery + `spec-ready`).
+    fn spec_worker_owns(&self, pr: &PullRequest, combined: bool) -> bool;
+}
+
+/// The default carrier: spec/status signals live on forge labels (ADR 0005).
+pub struct Labels;
+
+impl SignalCarrier for Labels {
+    fn human_stop(&self, pr: &PullRequest, labels_complete: bool) -> bool {
+        pr.has_label(forge::LABEL_HOLD)
+            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
+            || !labels_complete
+    }
+    fn spec_worker_owns(&self, pr: &PullRequest, combined: bool) -> bool {
+        combined && pr.has_label(forge::LABEL_SPEC_READY)
+    }
+}
+
 /// Current epoch seconds (`std::time`, same source as `store::now`).
 fn epoch_now() -> u64 {
     std::time::SystemTime::now()
@@ -433,9 +479,7 @@ async fn build_snapshot(
     // window must never be missed (it would let an arm slip the review gate). So
     // an incomplete label set reads as a human stop, and an incomplete thread set
     // reads as "has an unresolved thread".
-    let human_stop = pr.has_label(forge::LABEL_HOLD)
-        || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-        || !obs.labels_complete;
+    let human_stop = Labels.human_stop(pr, obs.labels_complete);
     let has_unresolved_thread =
         obs.review_threads.iter().any(|t| !t.resolved) || !obs.review_threads_complete;
     // The Fixer arm launches a heavy agent, so on an incomplete thread window we
@@ -450,7 +494,7 @@ async fn build_snapshot(
             .any(super::fixer::thread_awaits_fixer);
     // A `spec-ready` PR under combined delivery is the spec worker's branch — no
     // fixer-family arm touches it (`pr_is_touchable`'s spec-ready gate).
-    let spec_worker_owns = is_combined(deps) && pr.has_label(forge::LABEL_SPEC_READY);
+    let spec_worker_owns = Labels.spec_worker_owns(pr, is_combined(deps));
     // Fixer-family budgets: the arm escalates (parks) once it has spent its
     // successful rounds and the symptom persists (issue #176 order — the arm is
     // only reached while the symptom is still observed).
@@ -557,7 +601,16 @@ async fn process(
     // Clear backoff for any arm whose symptom is *positively* resolved this
     // resync (§4.5) — runs regardless of `next_step`'s single decision.
     clear_resolved_backoffs(deps, obs, &snap)?;
-    match next_step(&snap) {
+    // Step policy (ADR 0026): a disabled arm's Agent becomes Wait(PolicyDisabled).
+    let step = apply_policy(next_step(&snap), &deps.config.reconciler.policy);
+    if let Step::Wait("policy disabled") = step {
+        deps.store.emit(
+            None,
+            "reconciler.policy_disabled",
+            json!({ "pr": obs.pr.number }),
+        )?;
+    }
+    match step {
         Step::Agent(arm) => enqueue_agent(deps, obs, arm).await?,
         Step::Op(op) => act(deps, am, obs, &snap, op).await?,
         Step::Wait(reason) | Step::Skip(reason) => {
@@ -574,9 +627,14 @@ const BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// The head-independent prefix of every claim-marker comment (ADR 0027 / §7).
 const CLAIM_MARKER_PREFIX: &str = "<!-- meguri:claim";
 
-/// This instance's id — the claim marker's owner field (default = mux session).
+/// This instance's id — the claim marker's owner field (`[reconciler] instance`,
+/// falling back to the mux session so a single machine needs no config).
 fn instance_id(deps: &Deps) -> &str {
-    &deps.config.mux.session
+    deps.config
+        .reconciler
+        .instance
+        .as_deref()
+        .unwrap_or(&deps.config.mux.session)
 }
 
 /// The claim marker meguri posts on a PR it is working (arm-agnostic, one per PR).
@@ -1463,6 +1521,110 @@ mod tests {
                 ..arm_snapshot()
             };
             assert_eq!(next_step(&s), Step::Op(Op::UpdateBranch), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn step_policy_disables_only_the_named_arm() {
+        use crate::config::StepPolicyConfig;
+        let all = StepPolicyConfig::default();
+        // Enabled: every step passes through unchanged.
+        for step in [
+            Step::Agent(Arm::ConflictResolver),
+            Step::Agent(Arm::CiFixer),
+            Step::Agent(Arm::Fixer),
+            Step::Op(Op::UpdateBranch),
+            Step::Wait("x"),
+            Step::Skip("y"),
+        ] {
+            assert_eq!(apply_policy(step, &all), step);
+        }
+        // Disable each arm in turn: only that arm becomes Wait(policy disabled),
+        // and non-Agent steps are never touched.
+        let cases = [
+            (
+                Arm::ConflictResolver,
+                StepPolicyConfig {
+                    conflict_resolver: false,
+                    ..all
+                },
+            ),
+            (
+                Arm::CiFixer,
+                StepPolicyConfig {
+                    ci_fixer: false,
+                    ..all
+                },
+            ),
+            (
+                Arm::Fixer,
+                StepPolicyConfig {
+                    fixer: false,
+                    ..all
+                },
+            ),
+        ];
+        for (arm, policy) in cases {
+            assert_eq!(
+                apply_policy(Step::Agent(arm), &policy),
+                Step::Wait("policy disabled")
+            );
+            // Other arms still pass.
+            for other in [Arm::ConflictResolver, Arm::CiFixer, Arm::Fixer] {
+                if other != arm {
+                    assert_eq!(
+                        apply_policy(Step::Agent(other), &policy),
+                        Step::Agent(other)
+                    );
+                }
+            }
+            // Ownership totality is preserved: a Wait is still exactly one owner.
+            assert_eq!(
+                apply_policy(Step::Op(Op::MergePr), &policy),
+                Step::Op(Op::MergePr)
+            );
+        }
+    }
+
+    #[test]
+    fn labels_carrier_reproduces_the_direct_reading() {
+        // The signal-binding seam is behaviour-preserving for the Labels
+        // binding: for every label combination, the carrier's human_stop /
+        // spec_worker_owns equal the direct label reading (the baseline).
+        use crate::forge::{LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY};
+        let label_sets: &[Vec<String>] = &[
+            vec![],
+            vec![LABEL_HOLD.into()],
+            vec![LABEL_NEEDS_HUMAN.into()],
+            vec![LABEL_SPEC_READY.into()],
+            vec![LABEL_HOLD.into(), LABEL_SPEC_READY.into()],
+        ];
+        for labels in label_sets {
+            let mut pr = pr_with_labels(labels.clone());
+            for &complete in &[true, false] {
+                for &combined in &[true, false] {
+                    let baseline_stop =
+                        pr.has_label(LABEL_HOLD) || pr.has_label(LABEL_NEEDS_HUMAN) || !complete;
+                    assert_eq!(Labels.human_stop(&pr, complete), baseline_stop);
+                    let baseline_owns = combined && pr.has_label(LABEL_SPEC_READY);
+                    assert_eq!(Labels.spec_worker_owns(&pr, combined), baseline_owns);
+                }
+            }
+            pr.labels.clear();
+        }
+    }
+
+    fn pr_with_labels(labels: Vec<String>) -> crate::forge::PullRequest {
+        crate::forge::PullRequest {
+            number: 1,
+            title: "t".into(),
+            body: String::new(),
+            url: String::new(),
+            head_branch: "meguri/1-x-abc".into(),
+            head_sha: String::new(),
+            state: "open".into(),
+            is_draft: false,
+            labels,
         }
     }
 

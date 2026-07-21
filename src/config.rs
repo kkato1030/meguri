@@ -180,6 +180,8 @@ pub struct Config {
     pub decompose: DecomposeConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
+    #[serde(default)]
+    pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
     /// the shared `all` key) → repo-relative path to a file whose contents are
     /// injected into the turn prompt. Per-project `[projects.prompts]` overrides
@@ -372,6 +374,44 @@ fn default_reconcile_body_edits() -> bool {
 }
 fn default_reconcile_signal_comment() -> bool {
     true
+}
+
+/// Settings for the Issue Kind reconciler (`[reconciler]`, ADR 0012 slice 3):
+/// the step-policy allow-set (ADR 0026 — a disabled arm becomes
+/// `Wait(PolicyDisabled)`) and the claim instance id (ADR 0027).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReconcilerConfig {
+    /// Which fixer-family arms may launch. A disabled arm's `Agent` step is
+    /// filtered to `Wait(PolicyDisabled)` (the uniform replacement for the
+    /// scattered per-loop kill switches).
+    #[serde(default)]
+    pub policy: StepPolicyConfig,
+    /// This instance's claim-marker owner id (ADR 0027 / §7). `None` falls back
+    /// to `mux.session`, so a single-machine deploy needs no config.
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+/// The step-policy allow-set (ADR 0026). Every arm is enabled by default; set a
+/// field false to make that symptom `Wait(PolicyDisabled)` instead of launching.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StepPolicyConfig {
+    #[serde(default = "default_true")]
+    pub conflict_resolver: bool,
+    #[serde(default = "default_true")]
+    pub ci_fixer: bool,
+    #[serde(default = "default_true")]
+    pub fixer: bool,
+}
+
+impl Default for StepPolicyConfig {
+    fn default() -> Self {
+        Self {
+            conflict_resolver: true,
+            ci_fixer: true,
+            fixer: true,
+        }
+    }
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
