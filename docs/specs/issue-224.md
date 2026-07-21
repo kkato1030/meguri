@@ -93,6 +93,31 @@ test の意味も薄れる。ADR 0012 自身が Issue Kind を「issue/PR identi
   **open → `Wait("spec PR in review")`** / **closed-unmerged → `Skip`(人手領域、handoff しない)**
   を返す。open/merged/closed-unmerged の3状態 handoff テストを追加する。
 
+### 既存 discovery の安全ゲートを漏れなく保持する(finding 3)
+
+planner / worker の enqueue は「phase ラベルと `issue_busy`」だけでは不十分で、現
+`LabelTaskSource::discover` / `claim`(`src/tasks.rs`)が適用している全ゲートを保たないと、blocked
+issue・not-before 待ち・cadence 超過・body 未変更 issue を誤って enqueue してしまう。
+
+- **決定**: planner / worker arm の **観測と claim を現 `task_source.discover(Plan/Work)` /
+  `task_source.claim` の再利用にする**(ラベル走査を作り直さない)。level-triggered の observe(I/O
+  境界)を task_source が担い、decider は「返ってきた actionable な `Task` 列 → `Agent(arm)`(予約
+  済み `cadence_label` を添える)」という純関数に保つ。これで以下のゲートが **逐語的に**残る:
+  - `hold` / `working` skip(discover)。`working` は run-liveness の `issue_busy` とも二重化。
+  - `already_shipped`(body digest、`implementing` 済みや同一 body の再処理抑止)。
+  - not-before(`cadence::parse_not_before` / `not_before_wait`)。
+  - `blocked_by` 依存(依存 issue 未 close はまだ動かさない)。
+  - cadence 窓(`evaluate` が bucket を予約、`limit - consumed` を超えない)。
+  - **claim 直前の再検証**: enqueue の act は `task_source.claim` を通し、hold / trigger ラベル /
+    not-before / cadence を **書き込み直前に再確認**してから `working` を貼る(discover と claim の
+    間の drift は benign race として Skip)。
+  - **cadence run-stamp**: run は `create_run_for_loop_cadence` で予約 bucket を刻み、窓を
+    正しく消費する(手動 `run` の二重消費防止と同型)。
+- **受け入れ**: blocked issue / not-before 待ち / cadence 窓超過 / body 未変更 issue が enqueue
+  **されない**ことの回帰テストを追加(受け入れ13)。
+- local decider(`observe_local_tasks`)も同じ `task_source` を通すので、local task source が持つ
+  ゲートを同様に継承する。
+
 ## 決定2: spec 段階の 3 loop は PR 側 next_step の arm にする
 
 `Arm` を拡張: `SpecWorker` / `PrReviewer` / `SpecFixer` を追加。Snapshot に spec 段階のフィールド
@@ -138,6 +163,12 @@ spec-fix budget 到達か、decompose 提案か)を足す。
     **ローカル資源登録**(mux pane・worktree ディレクトリ・`runs` 記録から引く issue→資源の対応)を
     列挙し、その issue が **open-issue 観測に現れない**(= closed/merged)ものを candidate とする。
     現 reaper の discover(pane/worktree を数え上げ issue の closed 性を突き合わせる)と同型。
+  - **local / forge-less の除外(finding 4)**: forge が無い local mode、および `TaskKey::Local` の
+    identity は **terminal 観測に載せない**。local には issue lifecycle が無く、`deliver = "branch"`
+    の成果物はブランチ + worktree そのものなので、「open issue が無い」を理由に回収してはならない。
+    これは現 reaper の `deps.forge.is_none() → StateUnknown`(非回収)ガード(`reaper.rs`)を
+    そのまま契約に写したもの。既存の「local 成果物は自動回収しない」保証を回帰テストで固定する。
+    active run が所有する資源も従来どおり除外(`ActiveRun`)。
   - **頻度**: 毎 resync。現 reaper は毎 tick 走る。Finalize は Issue Kind reconciler の
     **毎-resync パス**(`reclaim_stale_claims` と同列)として呼び、この頻度を保つ。
   - **decide の純関数入力**: candidate が持つ資源集合と terminal フラグ。判定は自明(terminal かつ
@@ -145,8 +176,9 @@ spec-fix budget 到達か、decompose 提案か)を足す。
   - **所有境界**: terminal に達した issue identity は Issue Kind が所有し、その唯一の arm が
     Finalize(ADR 0012「issue が terminal に達したときの `Op(Finalize)`」)。open PR / open issue
     の decider とは「issue が terminal か」で排他。
-  - **回帰テスト**: closed issue に live な pane/worktree が残る状態 → Finalize → 回収される、を
-    追加。
+  - **回帰テスト**: (a) closed issue に live な pane/worktree が残る状態 → Finalize → 回収される、
+    (b) local mode の worktree/branch は open issue が無くても Finalize されない(既存の非回収保証)、
+    の両方を追加。
 - **`reconcile.rs` → `reconcile_body_edits.rs`**: 機械的改名(module 名 + `sweep`)。新しい
   `reconcile(id)` 契約(ADR 0012 決定2)との名前衝突を解消する。挙動は不変(`implementing` issue
   の body 変化 → signal comment、agent は起こさない)。scheduler の独立 sweep 呼び出しをやめ、
@@ -235,22 +267,43 @@ redispatch / 各 sweep)をゲートする `ready` 集合を作る。f5 の指摘
 介入面を identity への 3 動詞 `run` / `why` / `attach` に確定し、役割別動詞 `plan`/`impl`/`review`/
 `fix` は採らない。
 
-- `run` / `attach` は既存(`src/cli.rs`)。役割別動詞は元々存在しないので「足さないと決める」だけ。
-- **`why <id>` を新設**(読み取り専用)。f6 で入力文法・出力・観測方式・read-only 検証を固定する:
-  - **入力文法**: `meguri why <id> [--project <P>]`。`<id>` は `attach` と同じ解決順(issue 番号 →
-    run id)に、PR を明示する `--pr <N>` と、local mode の `TaskKey::Local` id を加える。`--project`
-    は複数 project 構成の曖昧さ解消(`run` / `attach` と同じ)。対応 identity 集合 = {issue 番号,
-    PR 番号, run id, local task id}。
-  - **例**: `meguri why 224`(issue) / `meguri why --pr 231` / `meguri why run_abc123` /
-    `meguri why 42 --project foo`。
-  - **観測方式**: **fresh observation**(informer cache ではなく1回きりの observe を今回す)。
-    `why` は「今どうなっているか」を答えるので、古い cache を映さない。
-  - **出力**: 解決した identity、所有する Kind / decider、`next_step` が返した Step、その理由文字列を
-    人間可読で出す(issue/PR は Snapshot の主要フィールドも)。
-  - **read-only 検証**: CLI テストで `why` が forge への書き込みも run 生成もしないことを assert
-    (FakeForge が mutating 呼び出しを記録せず、`runs` に新行が増えない)。
-  - 3 動詞のうち最も切り離しやすい部品ではあるが、reconciler との噛み合いが良く安価なため本スライス
-    で入れる。
+### `run` を役割非依存にする(finding 1)
+
+現 `meguri run --issue N`(`src/app.rs::cmd_run`)は loop_kind を `"worker"` に固定し `run_worker` を
+直接呼ぶ。これは ADR 0016 の「役割を指定せず reconciler が次の役割を決める」に反する(worker 固定
+なので `plan` フェーズの issue に対しても worker を起こしてしまう)。
+
+- **分岐**: (A) `run` を reconciler の fresh observe / decide に接続し、観測が選んだ arm を dispatch
+  する / (B) ADR 0016 の `run` 定義を「default new-work run(= worker)を起こす」に狭める。
+- **決定**: **(A)**。ADR 0016 の芯は「命令は役割でなく identity に対して」であり、issue-side decider
+  を作る本スライスでこそ安価に成立する。新しい `cmd_run` の契約:
+  - その identity を **fresh observe** し `next_step_issue`(local identity なら `next_step_local`)を
+    回す。
+  - 結果が `Agent(arm)` なら **その arm** の run を作って dispatch(worker 固定をやめる)。
+  - `Op` / `Wait` / `Skip` なら、その Step と理由を表示して終わる(起こすべき agent が無い)。
+  - 現 `run` の性質は保つ: **cadence 窓ゲートは迂回**(人間の明示 override)しつつ **cadence は
+    stamp して消費に数える**(`create_run_for_loop_cadence`、同日 `watch` の二重消費防止)。
+  - 変更箇所・受け入れ(受け入れ10)に「`run` が観測 arm を dispatch する」ことを含める。
+
+### `why` を新設(finding 2 / 旧 f6)
+
+読み取り専用の観測窓。**clap で一意に解析できる文法**に修正する(旧案の位置引数 `<id>` +
+`--pr` は解析不能だった)。
+
+- **入力文法**: 相互排他の識別子フラグを **ちょうど1つ必須**にする(clap `ArgGroup`、required、
+  複数不可):
+  `meguri why (--issue <N> | --pr <N> | --run <id> | --task <id>) [--project <P>]`。
+  型付きフラグなので issue 番号・PR 番号・run id・local task id が同値でも曖昧にならない
+  (解決優先順という概念自体が不要)。`--project` は複数 project の曖昧さ解消のみ(identity では
+  ない、決定6の finding 8 と整合)。
+- **識別子の形式**: run id は実在形式 `run-<8hex>`(`runs.rs`、uuid 先頭 8 桁)。
+- **例**: `meguri why --issue 224` / `meguri why --pr 231` / `meguri why --run run-1a2b3c4d` /
+  `meguri why --task 42 --project foo`。
+- **観測方式**: **fresh observation**(informer cache でなく1回きりの observe を今回す)。
+- **出力**: 解決した identity、所有する Kind / decider、`next_step` が返した Step、その理由文字列を
+  人間可読で出す(issue/PR は Snapshot の主要フィールドも)。
+- **read-only 検証**: CLI テストで `why` が forge 書き込みも run 生成もしないことを assert
+  (FakeForge が mutating 呼び出しを記録せず、`runs` に新行が増えない)。
 
 ## 決定10: step policy を新 arm に広げる
 
@@ -282,7 +335,10 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
 - `src/engine/{reaper,decompose_materializer,plan_handoff,routing_drift}.rs` — sweep 本体を
   act として保ち、scheduler の独立呼び出しを撤去。
 - `src/config.rs` — `StepPolicyConfig` に新 arm の bool を追加。
-- `src/cli.rs` / `src/main.rs` / `src/app.rs` — `Why` サブコマンドを追加。
+- `src/cli.rs` / `src/main.rs` / `src/app.rs` — `Why` サブコマンド(型付き相互排他フラグ)を追加。
+  `cmd_run` を worker 固定から **観測 arm の dispatch** に変更(finding 1、cadence stamp は維持)。
+- `src/tasks.rs` — planner / worker arm の観測 / claim を reconciler から再利用する接続
+  (既存ゲートを逐語的に保持、finding 3)。
 - `docs/adr/0016-operator-surface-run-why-attach.md`(本 PR 同梱)。
 
 ## 受け入れ基準
@@ -312,14 +368,19 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
    `Wait` / `Op(Handoff)`(→ ready)/ `Skip` になる handoff テストがある。
 9. **f4**: closed issue に live な pane/worktree が残る状態から `Op(Finalize)` が発火し、pane /
    worktree / merged branch が回収される回帰テストがある。
-10. operator 面が `run` / `why` / `attach` の 3 動詞に確定。`meguri why <id>` が identity の
-   Step + 理由を read-only で表示し(**f6**: forge 書き込みも run 生成もしないことを CLI テストで
-   assert)、対応 identity 集合 {issue, PR, run, local task} を解決する。役割別動詞は追加されて
-   いない。ADR 0016 が land。
+9b. **finding 4**: local mode(forge 無し)/ `TaskKey::Local` の worktree・branch は open issue が
+   無くても Finalize されない(既存の非回収保証)回帰テストがある。
+10. operator 面が `run` / `why` / `attach` の 3 動詞に確定。`meguri why (--issue|--pr|--run|--task)`
+   が型付きフラグで identity を一意に取り、Step + 理由を read-only で表示する(**f6**: forge 書き込みも
+   run 生成もしないことを CLI テストで assert)。**`meguri run` は worker 固定をやめ、fresh observe で
+   選ばれた arm を dispatch する**(finding 1)。役割別動詞は追加されていない。ADR 0016 が land。
 11. 統合テスト(`tests/*.rs`、実 tmux + FakeForge/FakeMux)で plan→spec→ready→impl→merge の
    通し、虚偽申告訂正、crash recovery が `Loop` trait 撤去後も回帰しない。
 12. `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo nextest run` /
    `cargo test --doc` が通る。
+13. **finding 3**: 既存 discovery ゲート(hold/working / already_shipped(body digest)/ not-before /
+   `blocked_by` 依存 / cadence 窓 / claim 直前の再検証 / cadence run-stamp)が保持され、blocked issue・
+   not-before 待ち・cadence 窓超過・body 未変更 issue が **enqueue されない**回帰テストがある。
 
 ## 移行とロールバック(veto により必須)
 
@@ -356,7 +417,10 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
   緑のまま通す(planner は `meguri:plan` で発火、worker の needs_plan ping-pong ガード、
   spec_fixer の budget escalation、cleaner/triage の scan cadence、等)。
 - **新規テスト**: local mode worker(f1、受け入れ7)/ spec-PR handoff の3状態(f3、受け入れ8)/
-  closed-issue の Finalize 回収(f4、受け入れ9)/ `why` の read-only(f6、受け入れ10)。
+  closed-issue の Finalize 回収(f4、受け入れ9)/ local 資源の非 Finalize(finding 4、受け入れ9b)/
+  `why` の read-only + 型付きフラグ解析(f6/finding 2、受け入れ10)/ `run` が観測 arm を dispatch
+  する(finding 1、受け入れ10)/ discovery ゲート保持(finding 3、受け入れ13: blocked / not-before /
+  cadence 窓超過 / body 未変更が enqueue されない)。
 - **統合**(`tests/*.rs`): `Loop` trait 撤去後の通し(受け入れ11)。
 - **回帰ガード**: 受け入れ1–4 を満たす grep/compile ベースのアサーション(sweep 呼び出し・
   `Loop`・`default_loops` が消えたことの機械的確認)。
