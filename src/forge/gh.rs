@@ -87,6 +87,21 @@ const REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:I
      reviewThreads(first:100){nodes{id isResolved path line \
      comments(first:100){nodes{author{login} body}}}}}}}";
 
+/// Edit a PR conversation comment by node id ([`GhForge::update_comment`]).
+/// Kept as a const for the same parse-level brace check as the read-side
+/// GraphQL strings above — a mutation typo is invisible to `FakeForge` tests
+/// just like a query typo is (issue #251 self-review f1: the brace check had
+/// only covered `query`s, not `mutation`s, leaving the same class of bug
+/// #227 hit reachable through either of the two mutations below).
+const UPDATE_COMMENT_MUTATION: &str = "mutation($id:ID!,$body:String!){\
+     updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+
+/// Reply to a PR review thread ([`GhForge::reply_review_thread`]). Kept as a
+/// const for the same parse-level brace check (issue #251 self-review f1).
+const REPLY_REVIEW_THREAD_MUTATION: &str = "mutation($threadId:ID!,$body:String!){\
+     addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
+     {comment{id}}}";
+
 /// Scheme color (hex, no `#`) and description for a known meguri label — the
 /// color encodes the two-axis model (ADR 0005): phase labels by stage
 /// (plan/ready = blue, speccing = purple, implementing = green) and ball
@@ -1403,8 +1418,7 @@ impl Forge for GhForge {
     async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
         // GraphQL `updateIssueComment` edits a PR conversation comment by its
         // node id (the id the bulk observe folded in, §1.5).
-        let query = "mutation($id:ID!,$body:String!){\
-             updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+        let query = UPDATE_COMMENT_MUTATION;
         self.gh(&[
             "api",
             "graphql",
@@ -1634,9 +1648,7 @@ impl Forge for GhForge {
     }
 
     async fn reply_review_thread(&self, _pr: i64, thread_id: &str, body: &str) -> Result<()> {
-        let mutation = "mutation($threadId:ID!,$body:String!){\
-             addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
-             {comment{id}}}";
+        let mutation = REPLY_REVIEW_THREAD_MUTATION;
         self.gh(&[
             "api",
             "graphql",
@@ -1911,9 +1923,9 @@ mod tests {
     // FakeForge tests never execute these hand-written GraphQL strings, so a
     // syntax slip in one of them (an unbalanced brace killed every merge-tail
     // sweep in production on 2026-07-21, #227) only surfaces via this
-    // parse-level check — hence every literal query is a module-level const
-    // covered here, not just the one #242 fixed (issue #251, design doc P6.5
-    // item 2).
+    // parse-level check — hence every literal query *and mutation* is a
+    // module-level const covered here, not just the one #242 fixed (issue
+    // #251, design doc P6.5 item 2; self-review f1 added the two mutations).
     fn assert_braces_balance(name: &str, query: &str) {
         let mut depth = 0i64;
         for (i, c) in query.chars().enumerate() {
@@ -1947,6 +1959,16 @@ mod tests {
     #[test]
     fn review_threads_query_braces_balance() {
         assert_braces_balance("REVIEW_THREADS_QUERY", REVIEW_THREADS_QUERY);
+    }
+
+    #[test]
+    fn update_comment_mutation_braces_balance() {
+        assert_braces_balance("UPDATE_COMMENT_MUTATION", UPDATE_COMMENT_MUTATION);
+    }
+
+    #[test]
+    fn reply_review_thread_mutation_braces_balance() {
+        assert_braces_balance("REPLY_REVIEW_THREAD_MUTATION", REPLY_REVIEW_THREAD_MUTATION);
     }
 
     #[test]

@@ -20,11 +20,27 @@ use serde_json::json;
 use super::Deps;
 use crate::notify::Notification;
 
-/// Per-project, per-sweep consecutive failure streak. Lives in the watch
-/// loop, not sqlite — a restart resets it, the same tradeoff
-/// `schedule::DiagMemory` already makes for edge-triggered diagnostics.
+/// One sweep's in-flight streak state. `alerted` is the edge-trigger latch
+/// itself — not a derived comparison against the *current* threshold, because
+/// `sweep_degraded_threshold` can hot-reload mid-streak (issue #251
+/// self-review f2): comparing `consecutive_failures` against a possibly-new
+/// threshold every tick would either never fire (threshold raised after a
+/// streak already passed the old, lower one, so the streak never again
+/// crosses the new higher one) or re-fire on the very same outage (threshold
+/// lowered after already alerting, then later raised back past the streak's
+/// current value). Latching `alerted` once true makes the notify a one-way
+/// transition per outage regardless of how the threshold moves around it.
 #[derive(Default)]
-pub struct SweepHealth(HashMap<(String, &'static str), u32>);
+struct Streak {
+    consecutive_failures: u32,
+    alerted: bool,
+}
+
+/// Per-project, per-sweep streak state. Lives in the watch loop, not sqlite —
+/// a restart resets it, the same tradeoff `schedule::DiagMemory` already
+/// makes for edge-triggered diagnostics.
+#[derive(Default)]
+pub struct SweepHealth(HashMap<(String, &'static str), Streak>);
 
 impl SweepHealth {
     pub fn new() -> Self {
@@ -43,10 +59,10 @@ impl SweepHealth {
         match outcome {
             Ok(()) => {
                 // Edge-triggered recovery: only worth an event if this sweep
-                // was actually degraded (streak had reached the threshold),
-                // not on every quiet success.
-                if let Some(streak) = self.0.remove(&key)
-                    && streak >= threshold
+                // actually alerted at some point during the streak, not on
+                // every quiet success.
+                if let Some(state) = self.0.remove(&key)
+                    && state.alerted
                 {
                     let _ = deps.store.emit(
                         None,
@@ -56,7 +72,8 @@ impl SweepHealth {
                     tracing::info!(
                         project = deps.project.id,
                         sweep = name,
-                        "sweep recovered after {streak} consecutive failures"
+                        "sweep recovered after {} consecutive failures",
+                        state.consecutive_failures
                     );
                 }
             }
@@ -68,19 +85,22 @@ impl SweepHealth {
                     "sweep.failed",
                     json!({ "project": deps.project.id, "sweep": name, "error": detail }),
                 );
-                let streak = self.0.entry(key).or_insert(0);
-                *streak += 1;
-                // `==` rather than `>=`: fires exactly once per outage (issue
-                // #251 acceptance criterion), not on every failure once past
-                // the threshold.
-                if *streak == threshold {
+                let state = self.0.entry(key).or_default();
+                state.consecutive_failures += 1;
+                let streak = state.consecutive_failures;
+                // `>=` (not `==`) plus the `alerted` latch: a threshold
+                // lowered mid-streak must still catch up and fire once the
+                // streak already exceeds it (`==` would skip past it and
+                // never fire).
+                if !state.alerted && streak >= threshold {
+                    state.alerted = true;
                     let _ = deps.store.emit(
                         None,
                         "sweep.degraded",
                         json!({
                             "project": deps.project.id,
                             "sweep": name,
-                            "consecutive_failures": *streak,
+                            "consecutive_failures": streak,
                             "error": detail,
                         }),
                     );
@@ -88,7 +108,7 @@ impl SweepHealth {
                         .notify(&Notification::sweep_degraded(
                             &deps.project.id,
                             name,
-                            *streak,
+                            streak,
                             &detail,
                         ))
                         .await;
@@ -241,5 +261,75 @@ mod tests {
         health.record(&deps, "reaper", Err(anyhow!("boom"))).await;
         // Neither sweep alone has reached the threshold of 2 yet.
         assert_eq!(gw.delivered().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn threshold_lowered_mid_streak_still_escalates_once_crossed() {
+        // issue #251 self-review f2: a hot reload can lower the threshold
+        // while a streak is already running. The streak must still catch up
+        // and fire once it exceeds the *new* threshold, not stay silent
+        // forever because it stepped past the old comparison point.
+        let (notifier, gw) = recording_notifier_with_events(&["sweep.degraded"]);
+        let mut deps = deps_with_threshold(10, notifier);
+        let mut health = SweepHealth::new();
+
+        for _ in 0..5 {
+            health
+                .record(&deps, "merge-tail", Err(anyhow!("boom")))
+                .await;
+        }
+        assert_eq!(gw.delivered().len(), 0, "threshold 10 not yet reached at 5");
+
+        deps.config.scheduler.sweep_degraded_threshold = 3;
+        health
+            .record(&deps, "merge-tail", Err(anyhow!("boom")))
+            .await;
+        assert_eq!(
+            gw.delivered().len(),
+            1,
+            "streak (6) already exceeds the lowered threshold (3) — must fire"
+        );
+
+        // And it stays a one-time escalation from here.
+        for _ in 0..3 {
+            health
+                .record(&deps, "merge-tail", Err(anyhow!("boom")))
+                .await;
+        }
+        assert_eq!(gw.delivered().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn threshold_raised_after_alert_does_not_renotify_the_same_outage() {
+        // issue #251 self-review f2: a hot reload can raise the threshold
+        // after this outage already alerted. The same outage continuing must
+        // not notify a second time just because the streak count later
+        // reaches the new, higher threshold.
+        let (notifier, gw) = recording_notifier_with_events(&["sweep.degraded"]);
+        let mut deps = deps_with_threshold(3, notifier);
+        let mut health = SweepHealth::new();
+
+        for _ in 0..3 {
+            health
+                .record(&deps, "merge-tail", Err(anyhow!("boom")))
+                .await;
+        }
+        assert_eq!(
+            gw.delivered().len(),
+            1,
+            "escalates at the original threshold"
+        );
+
+        deps.config.scheduler.sweep_degraded_threshold = 10;
+        for _ in 0..7 {
+            health
+                .record(&deps, "merge-tail", Err(anyhow!("boom")))
+                .await;
+        }
+        assert_eq!(
+            gw.delivered().len(),
+            1,
+            "streak reaching the raised threshold must not re-notify the same outage"
+        );
     }
 }
