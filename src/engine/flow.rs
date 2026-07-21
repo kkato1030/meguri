@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, WorkerOutcome, lane_for_loop};
+use super::{Deps, MEGURI_BRANCH_PREFIX, StoreControl, WorkerOutcome, lane_for_loop};
 use crate::agent_session;
 use crate::config::{Deliver, LaunchMode};
 use crate::forge;
@@ -2335,6 +2335,35 @@ async fn deliver(
     }
 }
 
+/// Duplicate-delivery guard (issue #249, design doc §3-D/§P5): right before
+/// the worker/planner open a *new* PR for an issue, check whether the forge
+/// already cross-references an open PR on a non-meguri branch. If one
+/// exists, a human already has (or is running) a rail-external delivery for
+/// this issue — opening a second one risks shipping the same change twice
+/// under different file names, as #236/#237/#238 did. Only meguri's own
+/// branches (`meguri/...`) are exempt: a resumed run's own PR, or a sibling
+/// meguri loop's, must never trip this. Local tasks (no github issue) are
+/// exempt — there is nothing on a forge to cross-reference.
+async fn reject_rail_external_duplicate(deps: &Deps, run: &RunRecord) -> Result<()> {
+    let TaskKey::Issue(issue) = run.task_key() else {
+        return Ok(());
+    };
+    let linked = deps.forge().linked_open_prs(issue).await?;
+    let mut rail_external = linked
+        .iter()
+        .filter(|pr| !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX));
+    if let Some(pr) = rail_external.next() {
+        return Err(NeedsHuman(format!(
+            "issue #{issue} already has an open PR outside meguri's rails \
+             (#{} on branch `{}`, {}). adopt it or close it — a human must \
+             decide before meguri opens another PR for this issue.",
+            pr.number, pr.head_branch, pr.url
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// open-pr: push, create the PR, settle labels. All side effects here are
 /// idempotent enough to re-run after an interruption.
 async fn open_pr(
@@ -2359,6 +2388,7 @@ async fn open_pr(
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
     } else {
+        reject_rail_external_duplicate(deps, run).await?;
         let title = flavor.pr_title(run, cp);
         let body = compose_pr_body(run, cp, lenses, close);
         // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
