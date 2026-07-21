@@ -2,6 +2,7 @@
 //! same approach as looper).
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -28,6 +29,12 @@ const DEFAULT_LABEL_COLOR: &str = "1D76DB";
 /// budget the observation is marked incomplete and the engine parks the PR
 /// (safe side) instead of re-paginating forever.
 const MAX_COMMENT_PAGES: u32 = 10;
+
+/// How long a truncated comment pagination stays parked before it may be
+/// retried with an unchanged `totalCount` (a changed count retries at once).
+/// Bounds the worst case to one page budget per PR per window instead of one
+/// per resync.
+const COMMENT_PAGINATION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
 /// The merge-tail informer-cache observe (issue #221, ADR 0012 decision 3):
 /// one GraphQL query folding every per-PR signal the old sweeps read (merge
@@ -161,6 +168,20 @@ pub fn fold_comment_pages(pages: &[Value]) -> Vec<PrComment> {
 pub struct GhForge {
     /// "owner/repo"
     repo: String,
+    /// Cooldown for the comment overflow pagination, keyed by PR number. A PR
+    /// whose conversation was truncated (page budget / stalled cursor) is not
+    /// re-paginated while its `totalCount` is unchanged and the cooldown has
+    /// not expired — without this, a 10k-comment PR would re-spend its whole
+    /// page budget on every 30s resync, forever. `totalCount` movement (new or
+    /// deleted comments) retries immediately; otherwise the TTL does.
+    comment_pagination_cooldown: std::sync::Mutex<std::collections::HashMap<i64, CommentCooldown>>,
+}
+
+/// One truncated-pagination memo: the conversation size it was seen at and
+/// when the cooldown lapses.
+struct CommentCooldown {
+    total_count: usize,
+    until: std::time::Instant,
 }
 
 /// Production [`ForgeFactory`](super::ForgeFactory): builds a [`GhForge`] per
@@ -178,6 +199,7 @@ impl GhForge {
     pub fn new(repo_slug: &str) -> Self {
         Self {
             repo: repo_slug.to_string(),
+            comment_pagination_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -598,7 +620,33 @@ impl GhForge {
         })
     }
 
-    /// Every conversation comment on a PR, fully paginated over **GraphQL** so
+    /// Whether the comment overflow pagination for `pr` is parked: it already
+    /// truncated at this `total_count` and the cooldown has not lapsed. A
+    /// changed count (someone added or deleted comments) retries immediately.
+    fn comment_pagination_parked(&self, pr: i64, total_count: usize) -> bool {
+        let map = self.comment_pagination_cooldown.lock().unwrap();
+        map.get(&pr)
+            .is_some_and(|c| c.total_count == total_count && Instant::now() < c.until)
+    }
+
+    /// Remember a truncated pagination (start the cooldown) or clear a
+    /// completed one.
+    fn record_pagination_outcome(&self, pr: i64, total_count: usize, complete: bool) {
+        let mut map = self.comment_pagination_cooldown.lock().unwrap();
+        if complete {
+            map.remove(&pr);
+        } else {
+            map.insert(
+                pr,
+                CommentCooldown {
+                    total_count,
+                    until: Instant::now() + COMMENT_PAGINATION_COOLDOWN,
+                },
+            );
+        }
+    }
+
+    /// Every conversation comment on a PR, paginated over **GraphQL** so
     /// `id` + `viewerDidAuthor` survive on every page (f6). Used only when the
     /// bulk observe's comment window clipped older comments, so the arm marker
     /// and any self-authored claim marker are never missed. Returns the folded
@@ -1707,10 +1755,17 @@ impl Forge for GhForge {
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
             if total > obs.comments.len() {
-                let (all, reqs, complete) = self.paginate_pr_comments(obs.pr.number).await?;
-                obs.comments = all;
-                obs.comments_complete = complete;
-                requests += reqs;
+                if self.comment_pagination_parked(obs.pr.number, total) {
+                    // Cooldown: this conversation already truncated at this
+                    // size — stay parked without re-spending the page budget.
+                    obs.comments_complete = false;
+                } else {
+                    let (all, reqs, complete) = self.paginate_pr_comments(obs.pr.number).await?;
+                    obs.comments = all;
+                    obs.comments_complete = complete;
+                    requests += reqs;
+                    self.record_pagination_outcome(obs.pr.number, total, complete);
+                }
             }
             prs.push(obs);
         }
@@ -1893,6 +1948,21 @@ mod tests {
         assert_eq!(folded[1].id, "n2");
         assert!(folded[1].viewer_did_author);
         assert!(folded[1].body.contains("meguri:claim"));
+    }
+
+    #[test]
+    fn comment_pagination_cooldown_parks_until_count_moves_or_ttl() {
+        let forge = GhForge::new("o/r");
+        // Truncated at 10_000 comments: parked at the same size...
+        forge.record_pagination_outcome(7, 10_000, false);
+        assert!(forge.comment_pagination_parked(7, 10_000));
+        // ...but a moved totalCount retries immediately...
+        assert!(!forge.comment_pagination_parked(7, 10_001));
+        // ...and a completed pagination clears the memo.
+        forge.record_pagination_outcome(7, 10_001, true);
+        assert!(!forge.comment_pagination_parked(7, 10_001));
+        // Other PRs are unaffected.
+        assert!(!forge.comment_pagination_parked(8, 10_000));
     }
 
     #[test]
