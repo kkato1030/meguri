@@ -47,15 +47,27 @@ usage(往復数・ピーク文脈・処理 input/output token)を集計する **
   としてすでに動いている(各 reviewer が自分専用のペイン・トランスクリプトを持つ)。したがって
   reviewer 別の token を按分・N 等分する必要は無い — そのターンの usage がそのまま、その
   reviewer に帰属する。
-- **usage 欠損は2種類を区別し、静かに比較母集団から消さない**(f7)。「そもそもターンが
-  動かなかった」(`EVENT_REVIEWER_DROPPED` — profile 未検出などで fan-out 前に弾かれた。
-  cost も catch も真にゼロなので比較から外してよい)と、「ターンは動いて token を消費したが
-  usage を復元できなかった」(sidecar が対象 CLI のトランスクリプト形式を読めない、または
-  ターンが完走前に死んだ)は別の状態として記録する。後者は現実にコストを払っているので、
-  静かに分母から除くと途中失敗しやすい高コスト reviewer ほど効率を過大評価してしまう。
-  効率(`exclusive_catch/token`)は usage が既知の行だけで算出してよいが、その数字には必ず
-  coverage(usage 既知のターン数 / 対象ターン総数)と欠損率を併記し、比較母集団が縮んでいる
-  ことを常に見える形にする。
+- **効率式の分母 `token` は「そのターンの transcript usage から集計した input 系
+  (cache read / cache creation を含む)と output の総和(raw 値・課金補正なし)」に固定する**。
+  単位は 1k token(指標は `exclusive_catch / 1k token`)。sidecar は内訳
+  (`input_tok / cache_read_tok / output_tok / round_trips` 等)を個別に記録するが、
+  比較指標の分母はこの総和一本であり、slice ごとに別の分母(input のみ・課金 token 等)を
+  実装してはならない — backend 非依存を掲げる以上、分母が揺れると reviewer 間・backend 間の
+  比較が再現できない。内訳の一部しか復元できず総和を構成できないターンは、下記の
+  「実行後 usage 欠損」として扱う(部分値で効率を出さない)。
+- **usage 欠損は「事前 drop」と「実行後欠損」を区別して記録し、静かに比較母集団から
+  消さない**(f7)。現行実装の `EVENT_REVIEWER_DROPPED`(`src/engine/self_review.rs`)は
+  (a) profile 未検出で fan-out **前**に弾かれた場合と、(b) fan-out **後**にターンが
+  pane death・エラー・不正な出力で落ちた場合の両方で発行される — この2つを同一視しては
+  ならない。(a) はプロセスを起動していないので cost も catch も真にゼロであり、比較母集団
+  (対象ターン総数)からも外してよい。(b) は token を消費している可能性があるので対象ターン
+  総数に算入し、usage を復元できなければ「usage 不明」として欠損率に数える(トランスクリプト
+  形式を読めなかった完走ターンも同じ「usage 不明」)。段階1(sidecar)は、この2状態を
+  区別できるようイベントを分割するか `stage: pre_fanout | post_start` のような判別子を
+  足すところまでを含む。(b) を静かに分母から除くと、途中失敗しやすい高コスト reviewer ほど
+  効率を過大評価してしまう。効率(`exclusive_catch/token`)は usage が既知の行だけで算出して
+  よいが、その数字には必ず coverage(usage 既知のターン数 / 対象ターン総数)と欠損率を併記し、
+  比較母集団が縮んでいることを常に見える形にする。
 
 ### 軸B: CATCH
 
@@ -107,6 +119,8 @@ reviewer の採否や並列数 N を treatment として割り当てる仕組み
 段階分割そのものを確定させる**追跡 issue**であり、以下のどの段の実装コードも含まない。
 
 1. **sidecar**(COST 記録) — telemetry sidecar を実装し、ターン完了時に usage を記録する。
+   `EVENT_REVIEWER_DROPPED` の事前 drop / 実行後 drop の区別(イベント分割または判別子の
+   追加)もこの段に含む。
 2. **`meguri stats review` 拡張**(COST と CATCH の join ビュー) — 1 の記録と台帳から導出した
    `exclusive_catch` を join し、reviewer 別の効率(`exclusive_catch / token`)と、その
    coverage・欠損率(f7)をあわせて出す。
