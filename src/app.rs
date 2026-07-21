@@ -2232,6 +2232,14 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                 // whatever this run targets (github: the working label; local:
                 // back to queued).
                 let _ = deps.task_source.release(&run.task_key()).await;
+                // A PR-claiming loop (fixer family, spec_worker, pr-reviewer)
+                // tracks its claim in the run's checkpoint, not the
+                // coordination layer above — the live-driver finalize path
+                // (`engine::flow::finalize_cancelled` / pr_reviewer's own)
+                // knows to drop it via each loop's `Flavor`, but this
+                // no-driver path never reaches a `Flavor`. Mirror that
+                // release directly (issue #252).
+                engine::flow::release_stray_pr_claim(&deps, &run).await;
                 released.is_some()
             }
             Err(_) => false,

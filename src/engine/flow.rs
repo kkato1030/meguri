@@ -980,6 +980,22 @@ pub(crate) fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
         .and_then(|cp| cp.pr_number)
 }
 
+/// `meguri stop` on a run with no live driver (queued/interrupted — issue
+/// #252): `cmd_stop` finalizes right there in the CLI process, without ever
+/// reaching the loop's `Flavor`, so it cannot call `Flavor::release_claim`
+/// the way [`finalize_cancelled`] (a live driver noticing `desired_state`)
+/// does. A PR-claiming loop's [`Checkpoint::pr_number`] is loop-agnostic
+/// (every `Flavor` that claims a PR stores it there), so this reads straight
+/// from the checkpoint and drops `meguri:working` from that PR itself.
+/// Best-effort and a no-op when the run never claimed a PR (issue-claim
+/// loops release through the task source instead); a failed removal is
+/// still swept up by #223's run-liveness check on the next discovery.
+pub(crate) async fn release_stray_pr_claim(deps: &Deps, run: &RunRecord) {
+    if let Some(pr) = claimed_pr(deps, &run.id) {
+        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+    }
+}
+
 /// `meguri stop`: cancel the run, release the claim, release the pane (its
 /// session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
@@ -3343,6 +3359,79 @@ mod tests {
             project,
         );
         (deps, run)
+    }
+
+    /// `meguri stop` on a queued/interrupted run finalizes straight in the
+    /// CLI process (`app::cmd_stop`) and never reaches a `Flavor`, so it
+    /// cannot rely on `Flavor::release_claim` the way a live driver's
+    /// `finalize_cancelled` does (issue #252 / P6.7 design doc §3-F). A
+    /// PR-claiming loop (fixer family, spec_worker, pr-reviewer) still
+    /// stamps the claimed PR into `Checkpoint::pr_number` before doing
+    /// anything else, so `release_stray_pr_claim` can drop `meguri:working`
+    /// from that PR straight from the checkpoint. Acceptance: after
+    /// claim → stop, the next discovery can re-claim the same PR.
+    #[tokio::test]
+    async fn release_stray_pr_claim_drops_working_after_a_driverless_stop() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        let pr = forge.push_pr("meguri/7-fix-aaa111", "Fix (#7)", &[forge::LABEL_WORKING]);
+        // What the fixer's `prepare_work` does at claim time: label the PR,
+        // then stamp its number into the checkpoint.
+        let cp = Checkpoint {
+            pr_number: Some(pr),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+
+        release_stray_pr_claim(&deps, &run).await;
+
+        assert!(
+            !forge
+                .pr_labels(pr)
+                .contains(&forge::LABEL_WORKING.to_string()),
+            "{:?}",
+            forge.pr_labels(pr)
+        );
     }
 
     #[tokio::test]
