@@ -96,6 +96,7 @@ fn local_deps(schedules: Vec<ScheduleConfig>) -> (Deps, tempfile::TempDir) {
         config: Config::default(),
         project,
         open_prs: Default::default(),
+        preflight_enabled: false,
     };
     (deps, dir)
 }

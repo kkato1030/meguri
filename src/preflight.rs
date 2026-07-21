@@ -84,21 +84,41 @@ fn ensure_deny_settings() -> Result<PathBuf> {
 }
 
 /// Testable core of [`ensure_deny_settings`]: write `deny.json` under `dir`.
+///
+/// The deny file is shared by every prime (all worktrees), while each prime
+/// serializes on its *own* identity lock — so two primes for different
+/// worktrees can write it concurrently. A plain truncate-and-write would let a
+/// third prime's `claude` read an empty or half-written file and lose the tool
+/// deny (issue #235 f2). Write to a unique temp file in the same directory,
+/// `chmod 0600`, then `rename` onto `deny.json`: `rename` is atomic, so any
+/// reader always sees a complete file (the old one or the new one), never a
+/// partial one.
 fn write_deny_settings_in(dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating preflight dir {}", dir.display()))?;
     let path = dir.join("deny.json");
-    let needs_write = match std::fs::read_to_string(&path) {
-        Ok(existing) => existing != DENY_SETTINGS_JSON,
-        Err(_) => true,
-    };
-    if needs_write {
-        std::fs::write(&path, DENY_SETTINGS_JSON)
-            .with_context(|| format!("writing deny settings {}", path.display()))?;
+    // Fast path: already correct — just re-assert the mode.
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && existing == DENY_SETTINGS_JSON
+    {
+        set_owner_only(&path)?;
+        return Ok(path);
     }
-    set_owner_only(&path)?;
+    let tmp = dir.join(format!(
+        ".deny.json.tmp.{}.{}",
+        std::process::id(),
+        DENY_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, DENY_SETTINGS_JSON)
+        .with_context(|| format!("writing deny settings temp {}", tmp.display()))?;
+    set_owner_only(&tmp)?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("atomic-renaming deny settings onto {}", path.display()))?;
     Ok(path)
 }
+
+/// Per-process sequence so concurrent temp-file names never collide.
+static DENY_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(unix)]
 fn set_owner_only(path: &Path) -> Result<()> {
@@ -195,37 +215,50 @@ pub async fn ensure_preflight(
     }
 
     let key = identity_hash(&profile.command, config_dir, &argv, cwd);
-    let marker = config::preflight_dir().join(&key);
+    let command = profile.command.clone();
+    ensure_once(&key, &config::preflight_dir(), || async {
+        // Set up the deny file only now that we are actually about to prime. If
+        // it can't be written we must NOT run a tool-enabled turn — record a
+        // failure (claim-once) and let the pane launch as today.
+        if let Err(e) = ensure_deny_settings() {
+            return PreflightOutcome::Failed {
+                reason: format!("deny-settings: {e:#}"),
+                duration_ms: 0,
+            };
+        }
+        run_preflight(&command, &argv, cwd, config_dir, PREFLIGHT_TIMEOUT).await
+    })
+    .await
+}
+
+/// The once-per-`(identity, path)`, serialized, claim-once core (issue #235
+/// f7/f8), factored out so tests drive it with a fake `prime` and a temp marker
+/// dir — no real subprocess or env mutation. `marker_dir` holds the persistent
+/// marker named `key`; a present marker (from a prior `success` *or* `failed`)
+/// is `AlreadyDone` and `prime` is never called again. The per-key async lock
+/// serializes concurrent first-spawns so `prime` runs at most once.
+async fn ensure_once<F, Fut>(key: &str, marker_dir: &Path, prime: F) -> PreflightOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = PreflightOutcome>,
+{
+    let marker = marker_dir.join(key);
     if marker.exists() {
         return PreflightOutcome::AlreadyDone;
     }
-
-    let lock = lock_for(&key);
+    let lock = lock_for(key);
     let _guard = lock.lock().await;
     // Re-check under the lock: a concurrent first-spawn may have just primed.
     if marker.exists() {
         return PreflightOutcome::AlreadyDone;
     }
-
-    // Set up the deny file only now that we are actually about to prime. If it
-    // can't be written we must NOT run a tool-enabled turn — record a failure
-    // (claim-once) and let the pane launch as today.
-    if let Err(e) = ensure_deny_settings() {
-        let reason = format!("deny-settings: {e:#}");
-        write_marker(&marker, &format!("failed:{reason}"));
-        return PreflightOutcome::Failed {
-            reason,
-            duration_ms: 0,
-        };
-    }
-
-    let outcome = run_preflight(&profile.command, &argv, cwd, config_dir, PREFLIGHT_TIMEOUT).await;
+    let outcome = prime().await;
     match &outcome {
         PreflightOutcome::Ran { .. } => write_marker(&marker, "success"),
         PreflightOutcome::Failed { reason, .. } => {
             write_marker(&marker, &format!("failed:{reason}"))
         }
-        // run_preflight only ever returns Ran/Failed.
+        // `prime` only ever returns Ran/Failed.
         _ => {}
     }
     outcome
@@ -240,12 +273,46 @@ fn write_marker(marker: &Path, record: &str) {
     let _ = std::fs::write(marker, record);
 }
 
+/// Bound on `{command} --version` (issue #235 f1). `--version` is normally
+/// instant; a CLI that hangs here must not hang the whole pane launch, so on
+/// timeout (or any error) the version is treated as unknown and the prime is
+/// skipped — the pane launches as before (best-effort).
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The installed `claude`-family CLI version, from `{command} --version`, with
+/// a hard timeout. `None` on any spawn/timeout/parse failure ("unknown" ⇒
+/// prime skipped). Async (not `spawn_blocking`) so the timeout can actually
+/// kill a hung `--version` — a blocking task cannot be cancelled.
 async fn detect_version(command: &str) -> Option<(u64, u64, u64)> {
-    let command = command.to_string();
-    tokio::task::spawn_blocking(move || routing::cli_version(&command))
-        .await
-        .ok()
-        .flatten()
+    detect_version_with(command, VERSION_PROBE_TIMEOUT).await
+}
+
+/// [`detect_version`] with an explicit deadline (a seam for tests).
+async fn detect_version_with(command: &str, timeout: Duration) -> Option<(u64, u64, u64)> {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let child = cmd.spawn().ok()?;
+    let pid = child.id().map(|p| p as libc::pid_t);
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        _ => {
+            // Timeout or wait error: kill the whole group best-effort (the
+            // dropped future's `kill_on_drop` covers the direct child too).
+            if let Some(pid) = pid {
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
+            return None;
+        }
+    };
+    if !out.status.success() {
+        return None;
+    }
+    routing::parse_version_triple(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Run one prime as a plain async subprocess (no PTY — `-p` exits on its own).
@@ -444,5 +511,193 @@ mod tests {
             matches!(out, PreflightOutcome::Failed { ref reason, .. } if reason.starts_with("spawn")),
             "got {out:?}"
         );
+    }
+
+    // ---- f1: version probe is time-bounded ----
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detect_version_times_out_on_a_hanging_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hang.sh");
+        // Ignores `--version` and hangs; the timeout must cut it off.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let short = Duration::from_millis(200);
+        let start = Instant::now();
+        let v = detect_version_with(script.to_str().unwrap(), short).await;
+        let elapsed = start.elapsed();
+        assert_eq!(v, None, "a hanging --version must resolve to unknown");
+        assert!(
+            elapsed < short + Duration::from_secs(2),
+            "version probe hung: {elapsed:?}"
+        );
+    }
+
+    // ---- f2: the shared deny file is written atomically ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deny_writes_are_atomic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        // Seed a stale file so every writer takes the temp+rename rewrite path.
+        std::fs::write(dir.path().join("deny.json"), "STALE\n").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let dir = dir.clone();
+            let stop = stop.clone();
+            readers.push(tokio::task::spawn_blocking(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(s) = std::fs::read_to_string(dir.path().join("deny.json")) {
+                        // A truncate-and-write would let this read see "" or a
+                        // half-written file; atomic rename never does.
+                        assert!(
+                            s == "STALE\n" || s == DENY_SETTINGS_JSON,
+                            "reader saw a partial deny file: {s:?}"
+                        );
+                    }
+                }
+            }));
+        }
+        let mut writers = Vec::new();
+        for _ in 0..16 {
+            let dir = dir.clone();
+            writers.push(tokio::task::spawn_blocking(move || {
+                write_deny_settings_in(dir.path()).unwrap();
+            }));
+        }
+        for w in writers {
+            w.await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("deny.json")).unwrap(),
+            DENY_SETTINGS_JSON
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".deny.json.tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "temp files leaked");
+    }
+
+    // ---- f4: the once-per-(identity,path) orchestration ----
+
+    #[tokio::test]
+    async fn ensure_once_runs_then_reports_already_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = "f4-basic";
+
+        let c = calls.clone();
+        let first = ensure_once(key, dir.path(), || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            PreflightOutcome::Ran { duration_ms: 1 }
+        })
+        .await;
+        assert!(
+            matches!(first, PreflightOutcome::Ran { .. }),
+            "got {first:?}"
+        );
+
+        let c2 = calls.clone();
+        let second = ensure_once(key, dir.path(), || async move {
+            c2.fetch_add(1, Ordering::SeqCst);
+            PreflightOutcome::Ran { duration_ms: 1 }
+        })
+        .await;
+        assert!(
+            matches!(second, PreflightOutcome::AlreadyDone),
+            "got {second:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "prime must run once");
+    }
+
+    #[tokio::test]
+    async fn ensure_once_records_failure_and_does_not_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = "f4-failed";
+
+        let c = calls.clone();
+        let first = ensure_once(key, dir.path(), || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            PreflightOutcome::Failed {
+                reason: "boom".into(),
+                duration_ms: 0,
+            }
+        })
+        .await;
+        assert!(
+            matches!(first, PreflightOutcome::Failed { .. }),
+            "got {first:?}"
+        );
+
+        // Claim-once: a recorded failure is not retried.
+        let c2 = calls.clone();
+        let second = ensure_once(key, dir.path(), || async move {
+            c2.fetch_add(1, Ordering::SeqCst);
+            PreflightOutcome::Ran { duration_ms: 1 }
+        })
+        .await;
+        assert!(
+            matches!(second, PreflightOutcome::AlreadyDone),
+            "got {second:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "must not retry a failure");
+        let marker = std::fs::read_to_string(dir.path().join(key)).unwrap();
+        assert!(marker.starts_with("failed:boom"), "marker was {marker:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_once_concurrent_first_spawns_prime_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = "f4-concurrent";
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let dir = dir.clone();
+            let calls = calls.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_once(key, dir.path(), || async move {
+                    // Slow prime so racers pile up on the identity lock.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    PreflightOutcome::Ran { duration_ms: 50 }
+                })
+                .await
+            }));
+        }
+        let mut ran = 0;
+        let mut done = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                PreflightOutcome::Ran { .. } => ran += 1,
+                PreflightOutcome::AlreadyDone => done += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "prime must run exactly once"
+        );
+        assert_eq!(ran, 1);
+        assert_eq!(done, 7);
     }
 }

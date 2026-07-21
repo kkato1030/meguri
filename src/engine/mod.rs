@@ -64,6 +64,12 @@ pub struct Deps {
     /// forge one call per project per tick instead of three (issue #170).
     /// `Scheduler` clears it at the top of every tick; see [`OpenPrCache`].
     pub open_prs: OpenPrCache,
+    /// Whether launch-time pre-flight priming is active (issue #235). Production
+    /// (`app::build_deps`) sets it `true`; the test constructor
+    /// [`Deps::with_label_source`] leaves it `false`, so integration tests —
+    /// which pair a `FakeMux` (never executes the agent command) with the
+    /// default `claude` command — never fire a *real* `claude` prime subprocess.
+    pub preflight_enabled: bool,
 }
 
 impl Deps {
@@ -98,6 +104,8 @@ impl Deps {
             config,
             project,
             open_prs: OpenPrCache::default(),
+            // Test seam: never run a real prime subprocess in tests.
+            preflight_enabled: false,
         }
     }
 

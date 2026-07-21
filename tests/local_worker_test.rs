@@ -88,6 +88,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         config,
         project,
         open_prs: Default::default(),
+        preflight_enabled: false,
     };
     TestEnv {
         deps,

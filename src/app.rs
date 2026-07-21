@@ -80,6 +80,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         config: cfg.clone(),
         project: project.clone(),
         open_prs: Default::default(),
+        preflight_enabled: true,
     })
 }
 

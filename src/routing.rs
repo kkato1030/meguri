@@ -314,19 +314,6 @@ pub fn parse_version_triple(version_line: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// The installed `claude`-family CLI version, from `{command} --version`.
-/// `None` on any spawn/parse failure — treated as "unknown" (prime skipped).
-pub fn cli_version(command: &str) -> Option<(u64, u64, u64)> {
-    let out = std::process::Command::new(command)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_version_triple(&String::from_utf8_lossy(&out.stdout))
-}
-
 /// Extract the model selector from a profile's launch `args` so the pre-flight
 /// prime uses the *same* model as the pane it precedes (issue #235 f2). Handles
 /// both the split form (`--model opus` / `-m opus`) and the joined form
@@ -354,11 +341,21 @@ pub fn model_flag_from_args(args: &[String]) -> Vec<String> {
 /// Whether an argv carries a yolo / skip-permissions flag — the marker of an
 /// unsafe pre-flight override (issue #235 f13) or an unsafe posture in general.
 pub fn args_carry_yolo(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        a == "--dangerously-skip-permissions"
-            || a == "--yolo"
-            || a == "--permission-mode=bypassPermissions"
-    })
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--dangerously-skip-permissions" || a == "--yolo" {
+            return true;
+        }
+        // Both the joined (`--permission-mode=bypassPermissions`) and the split
+        // (`--permission-mode bypassPermissions`) forms of the bypass mode.
+        if a == "--permission-mode=bypassPermissions" {
+            return true;
+        }
+        if a == "--permission-mode" && it.next().map(String::as_str) == Some("bypassPermissions") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve the argv for a profile's launch-time pre-flight prime, or an empty
@@ -1534,11 +1531,18 @@ args = ["--permission-mode", "acceptEdits"]
         assert!(args_carry_yolo(&[
             "--permission-mode=bypassPermissions".into()
         ]));
+        // Split form must be caught too (f3 regression).
+        assert!(args_carry_yolo(&[
+            "--permission-mode".into(),
+            "bypassPermissions".into()
+        ]));
         assert!(!args_carry_yolo(&[
             "--permission-mode".into(),
             "acceptEdits".into()
         ]));
         assert!(!args_carry_yolo(&["--model".into(), "opus".into()]));
+        // A dangling `--permission-mode` with no value must not panic or match.
+        assert!(!args_carry_yolo(&["--permission-mode".into()]));
     }
 
     #[test]

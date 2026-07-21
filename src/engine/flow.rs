@@ -1408,6 +1408,11 @@ async fn preflight_and_emit(
     config_dir: &Path,
 ) {
     use crate::preflight::PreflightOutcome;
+    // Disabled in the test harness so a FakeMux run never fires a real prime
+    // subprocess against the default `claude` command (issue #235).
+    if !deps.preflight_enabled {
+        return;
+    }
     let outcome = crate::preflight::ensure_preflight(profile, cwd, config_dir).await;
     let (kind, data) = match &outcome {
         PreflightOutcome::Ran { duration_ms } => (
