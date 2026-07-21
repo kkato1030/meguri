@@ -35,6 +35,7 @@ pub const NOTIFY_EVENT_TOKENS: &[&str] = &[
     "escalation",
     "schedule.failed",
     "schedule.skipped",
+    "sweep.degraded",
 ];
 
 /// One notification ready for delivery. Sources build these through the
@@ -147,6 +148,33 @@ impl Notification {
             body: format!("schedule \"{schedule}\" ({project}) の発火に失敗しました: {error}"),
             url: None,
             fields: json!({ "project": project, "schedule": schedule, "error": error }),
+        }
+    }
+
+    /// A scheduler sweep whose consecutive-failure streak crossed the
+    /// configured threshold (`sweep_health.rs`, issue #251) — the escalation
+    /// that would have caught #227's silent merge-tail outage. Fires once per
+    /// outage (edge-triggered on the streak, not throttled per-failure).
+    pub fn sweep_degraded(
+        project: &str,
+        sweep: &str,
+        consecutive_failures: u32,
+        error: &str,
+    ) -> Self {
+        Self {
+            event: "sweep.degraded".into(),
+            dedup_key: format!("sweep:{project}:{sweep}"),
+            title: format!("meguri sweep {sweep} degraded"),
+            body: format!(
+                "sweep \"{sweep}\" ({project}) が {consecutive_failures} 回連続で失敗しています: {error}"
+            ),
+            url: None,
+            fields: json!({
+                "project": project,
+                "sweep": sweep,
+                "consecutive_failures": consecutive_failures,
+                "error": error,
+            }),
         }
     }
 
@@ -576,6 +604,18 @@ mod tests {
         // Structured fields are merged in for JSON consumers.
         assert_eq!(v["project"], "proj");
         assert_eq!(v["schedule"], "nightly");
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn json_payload_carries_sweep_degraded_fields() {
+        let n = Notification::sweep_degraded("proj", "merge-tail", 10, "boom");
+        let req = webhook_request(WebhookKind::Json, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(v["event"], "sweep.degraded");
+        assert_eq!(v["project"], "proj");
+        assert_eq!(v["sweep"], "merge-tail");
+        assert_eq!(v["consecutive_failures"], 10);
         assert_eq!(v["error"], "boom");
     }
 
