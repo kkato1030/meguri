@@ -338,6 +338,17 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    // Give the PTY a real window size before the CLI starts: a 0×0 window
+    // makes some TUIs skip rendering entirely, which would burn the whole
+    // per-target timeout as a silent `Inconclusive`.
+    let winsize = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &winsize) };
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return Ok(PtyCapture::SpawnFailed),
@@ -347,13 +358,53 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
     set_nonblocking(master)?;
     let capture = read_until_decisive_or_timeout(master, timeout);
 
-    // Best-effort: an interactive CLI does not exit on its own, so this is
-    // expected to hit ESRCH once in a while if it already died on its own.
-    unsafe { libc::killpg(pid, libc::SIGKILL) };
-    let _ = child.wait();
+    kill_and_reap_with_deadline(&mut child, pid);
     drop(master_guard);
 
     Ok(capture)
+}
+
+/// How long to wait for the killed probe child to be reapable before giving
+/// up and leaking it as a zombie. Giving up is deliberate: an unbounded
+/// `wait()` here would let one unkillable child hang `doctor --probe` past
+/// its declared per-target timeout forever.
+const REAP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Kill the probe child and reap it without ever blocking indefinitely.
+///
+/// `killpg(pid)` is the happy path (the child was spawned as its own group
+/// leader, so the whole tree dies), but it is not guaranteed to deliver: the
+/// CLI may have moved itself to another process group, or the group may be
+/// gone already (ESRCH). Falling back to `kill(pid)` and reaping via
+/// `try_wait` under a deadline keeps the invariant that a probe never
+/// outlives its declared timeout by more than [`REAP_DEADLINE`].
+fn kill_and_reap_with_deadline(child: &mut std::process::Child, pid: libc::pid_t) {
+    // Expected to hit ESRCH once in a while if the child died on its own;
+    // the direct-pid fallback covers a child that left its process group.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let mut deadline = Instant::now() + REAP_DEADLINE;
+    let mut resignaled = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            if resignaled {
+                // Still not reapable: leak the zombie rather than hang the
+                // probe (the doctor process is short-lived anyway).
+                return;
+            }
+            // One direct-pid retry (with a second reap window) in case the
+            // group kill silently missed.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            resignaled = true;
+            deadline = Instant::now() + REAP_DEADLINE;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// How long to keep reading after a ready marker first appears, before
@@ -437,7 +488,14 @@ fn read_until_decisive_or_timeout(master: RawFd, timeout: Duration) -> PtyCaptur
             return PtyCapture::Output(String::from_utf8_lossy(&buf).into_owned());
         } else {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                // WouldBlock: poll raced the data away; Interrupted: a signal
+                // landed mid-read — neither says anything about the child, so
+                // retry instead of finalizing early (a false EOF here could
+                // false-green a bypass dialog that was about to appear).
                 continue;
             }
             // Most commonly EIO once the slave closes — treat like EOF.
