@@ -884,6 +884,17 @@ const SCHEDULE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 ///
 /// The child is killed on drop, so a timed-out fetch does not linger.
 pub async fn fetch_default_branch(repo_path: &Path, default_branch: &str) -> Result<()> {
+    fetch_default_branch_within(repo_path, default_branch, SCHEDULE_FETCH_TIMEOUT).await
+}
+
+/// The timeout-injectable core of [`fetch_default_branch`] (the public wrapper
+/// pins [`SCHEDULE_FETCH_TIMEOUT`]); tests drive it with a short bound to prove
+/// a hanging fetch times out rather than stalling.
+async fn fetch_default_branch_within(
+    repo_path: &Path,
+    default_branch: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
     if run_git(repo_path, &["remote", "get-url", "origin"])
         .await
         .is_err()
@@ -898,12 +909,12 @@ pub async fn fetch_default_branch(repo_path: &Path, default_branch: &str) -> Res
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let out = tokio::time::timeout(SCHEDULE_FETCH_TIMEOUT, cmd.output())
+    let out = tokio::time::timeout(timeout, cmd.output())
         .await
         .with_context(|| {
             format!(
                 "git fetch origin {default_branch} timed out after {}s",
-                SCHEDULE_FETCH_TIMEOUT.as_secs()
+                timeout.as_secs()
             )
         })?
         .context("spawning git fetch")?;
@@ -1560,6 +1571,36 @@ mod tests {
         .await
         .unwrap();
         assert!(fetch_default_branch(repo.path(), "main").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_default_branch_times_out_instead_of_hanging() {
+        // issue #222 f4: a fetch that never returns (a stuck credential helper)
+        // must be bounded, not stall the serial scheduler. A `git` remote via the
+        // `ext::` transport running `sleep` hangs deterministically; the bounded
+        // fetch returns an error well before the sleep would end.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        run_git(repo.path(), &["config", "protocol.ext.allow", "always"])
+            .await
+            .unwrap();
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "ext::sh -c \"sleep 30\""],
+        )
+        .await
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let r =
+            fetch_default_branch_within(repo.path(), "main", std::time::Duration::from_millis(300))
+                .await;
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "a hanging fetch must fail, not hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "bounded by the 300ms timeout, not the 30s sleep (took {elapsed:?})"
+        );
     }
 
     #[tokio::test]
