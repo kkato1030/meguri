@@ -78,6 +78,7 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
+# sweep_degraded_threshold = 10        # この回数連続で失敗したら sweep.degraded を通知(issue #251)
 #
 # [limits]
 # idle_grace_secs = 120
@@ -89,7 +90,7 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://hooks.slack.com/services/..."  # 省略で webhook 無効。${ENV} 展開可
 # kind = "slack"                     # 省略で URL から自動判別(slack/ntfy/json)
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra"]  # 既定は ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # 既定は ["awaiting_human"]
 # throttle_secs = 60                 # 同一通知キーの連続通知の最短間隔(秒)
 # [projects.notify]                  # per-project: 指定ラベルの issue 起票を通知(issue #205)
 # labels = ["human:todo"]
@@ -1022,6 +1023,15 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_runs: u32,
+    /// Consecutive-failure threshold before a watch-loop sweep (merge-tail /
+    /// handoff / reaper / …) escalates from a `tracing::warn!` to a
+    /// `sweep.degraded` event + notification (issue #251, design doc P6.5).
+    /// #227's unbalanced-brace GraphQL bug killed the merge-tail sweep every
+    /// poll for hours with no trace beyond the log — this bounds how long a
+    /// silent sweep failure can go unnoticed to roughly
+    /// `threshold * poll_interval_secs`.
+    #[serde(default = "default_sweep_degraded_threshold")]
+    pub sweep_degraded_threshold: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -1029,6 +1039,7 @@ impl Default for SchedulerConfig {
         Self {
             poll_interval_secs: default_poll_interval(),
             max_concurrent_runs: default_max_concurrent(),
+            sweep_degraded_threshold: default_sweep_degraded_threshold(),
         }
     }
 }
@@ -1038,6 +1049,9 @@ fn default_poll_interval() -> u64 {
 }
 fn default_max_concurrent() -> u32 {
     2
+}
+fn default_sweep_degraded_threshold() -> u32 {
+    10
 }
 
 /// Restart policy for the OS-supervised watch (maps to launchd `KeepAlive`).
@@ -1106,8 +1120,8 @@ pub struct NotificationsConfig {
     #[serde(default)]
     pub kind: Option<WebhookKind>,
     /// Which event tokens are delivered (`awaiting_human` / `escalation` /
-    /// `schedule.failed` / `schedule.skipped` / `infra`). Default
-    /// `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
+    /// `schedule.failed` / `schedule.skipped` / `infra` / `sweep.degraded`).
+    /// Default `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
     /// watching is configured separately via `[projects.notify]`, not here.
     #[serde(default = "default_notifications_events")]
     pub events: Vec<String>,
@@ -1772,6 +1786,13 @@ impl Config {
             }
             self.validate_cadence(p)?;
             self.validate_triage(p)?;
+        }
+        // A threshold of 0 would escalate on the very first failure, i.e.
+        // exactly the per-tick spam the edge-triggered design (issue #251)
+        // exists to avoid — reject it rather than silently degrade the
+        // feature to "notify on every failure".
+        if self.scheduler.sweep_degraded_threshold == 0 {
+            anyhow::bail!("scheduler.sweep_degraded_threshold must be >= 1");
         }
         // Workspace invariants are global, not per-project — validate once here
         // (issue #222 f4: this used to hang off `validate_schedules`, which the

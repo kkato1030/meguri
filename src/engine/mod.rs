@@ -17,6 +17,7 @@ pub mod scheduler;
 pub mod self_review;
 pub mod spec_fixer;
 pub mod spec_worker;
+pub mod sweep_health;
 pub mod triage;
 pub mod worker;
 

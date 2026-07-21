@@ -27,11 +27,18 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
 
 impl Store {
     pub fn emit(&self, run_id: Option<&str>, kind: &str, data: Value) -> Result<()> {
+        self.emit_at(run_id, kind, data, &now())
+    }
+
+    /// Like [`Store::emit`] but with an explicit timestamp — tests fabricate
+    /// events outside the `events_since` window (the same pattern
+    /// [`Store::heartbeat_at`] uses for a stale heartbeat).
+    pub fn emit_at(&self, run_id: Option<&str>, kind: &str, data: Value, ts: &str) -> Result<()> {
         tracing::info!(run_id, kind, %data, "event");
         self.with_conn(|c| {
             c.execute(
                 "INSERT INTO events (ts, run_id, kind, data_json) VALUES (?1, ?2, ?3, ?4)",
-                params![now(), run_id, kind, data.to_string()],
+                params![ts, run_id, kind, data.to_string()],
             )?;
             Ok(())
         })
@@ -79,6 +86,23 @@ impl Store {
                 |r| r.get(0),
             )?;
             Ok(n as usize)
+        })
+    }
+
+    /// Events of `kind` at or after `since_ts` (RFC3339, string-sortable like
+    /// every other `ts` column) — the read side of `meguri doctor`'s sweep
+    /// failure-rate display (issue #251, design doc P6.5 item 3). Global, not
+    /// run-scoped: sweep events carry no `run_id`.
+    pub fn events_since(&self, kind: &str, since_ts: &str) -> Result<Vec<EventRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, ts, run_id, kind, data_json FROM events
+                 WHERE kind = ?1 AND ts >= ?2 ORDER BY id ASC",
+            )?;
+            let events = stmt
+                .query_map(params![kind, since_ts], event_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(events)
         })
     }
 
@@ -132,5 +156,36 @@ mod tests {
         let limited = store.events_for_run_after(&run.id, 0, 2).unwrap();
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].id, all[0].id);
+    }
+
+    #[test]
+    fn events_since_filters_by_ts_and_kind() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .emit_at(
+                None,
+                "sweep.failed",
+                json!({ "sweep": "merge-tail" }),
+                "2026-07-21T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .emit_at(
+                None,
+                "sweep.failed",
+                json!({ "sweep": "merge-tail" }),
+                "2026-07-21T02:00:00Z",
+            )
+            .unwrap();
+        // A different kind at the same ts must not be counted.
+        store
+            .emit_at(None, "sweep.degraded", json!({}), "2026-07-21T02:00:00Z")
+            .unwrap();
+
+        let recent = store
+            .events_since("sweep.failed", "2026-07-21T01:00:00Z")
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].data["sweep"], "merge-tail");
     }
 }
