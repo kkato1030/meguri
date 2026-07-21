@@ -80,6 +80,9 @@ async fn setup() -> TestEnv {
     assert_eq!(pr, 1);
     forge.set_pr_check(1, "test", CheckState::Failure);
     forge.set_pr_check(1, "lint", CheckState::Success);
+    // A failing required check makes GitHub report the PR Blocked — the ci arm's
+    // trigger (ADR 0012 §4: `Blocked && rollup_failure`).
+    forge.set_merge_state_status(1, meguri::forge::MergeStateStatus::Blocked);
     forge.set_pr_failed_check_logs(1, "### test\n```\nassertion `left == right` failed\n```");
 
     let mut config = Config::default();
@@ -128,6 +131,26 @@ fn create_ci_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
         .store
         .create_run_for_loop("proj", ci_fixer::KIND, 9, "Add feature (#9)")
         .unwrap()
+}
+
+/// Run the Issue Kind reconciler once and return the canonical issues that got
+/// a queued ci-fixer run — the S3 replacement for `CiFixerLoop.discover()`.
+async fn reconciler_ci_targets(env: &TestEnv) -> Vec<i64> {
+    meguri::engine::issue_reconciler::sweep(&env.deps)
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = env
+        .deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.loop_kind == ci_fixer::KIND && r.status == RunStatus::Queued)
+        .map(|r| r.issue_number)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn find_worktree(worktree_root: &Path) -> Option<PathBuf> {
@@ -321,11 +344,23 @@ async fn ci_fixer_discovery_wants_red_unclaimed_meguri_prs_only() {
     // PR #3: a human's PR — not meguri's to touch.
     let pr = env.forge.push_pr("feature/manual", "Manual work", &[]);
     env.forge.set_pr_check(pr, "test", CheckState::Failure);
-    // PR #4: already claimed by another loop or host.
+    // PR #4: already being worked by another fixer-family arm (ADR 0027: the
+    // active-run index is the exclusion, not the `working` label projection).
     let pr = env
         .forge
         .push_pr("meguri/13-busy-aaa111", "Busy (#13)", &[LABEL_WORKING]);
     env.forge.set_pr_check(pr, "test", CheckState::Failure);
+    env.forge
+        .set_merge_state_status(pr, meguri::forge::MergeStateStatus::Blocked);
+    let busy = env
+        .deps
+        .store
+        .create_run_for_loop("proj", "fixer", 13, "Busy (#13)")
+        .unwrap();
+    env.deps
+        .store
+        .update_run_status(&busy.id, RunStatus::Running, None)
+        .unwrap();
     // PR #5: escalated — waits for a human to clear the label.
     let pr = env.forge.push_pr(
         "meguri/14-stuck-bbb222",
@@ -352,23 +387,21 @@ async fn ci_fixer_discovery_wants_red_unclaimed_meguri_prs_only() {
     env.forge.set_pr_check(pr, "test", CheckState::Failure);
     env.forge.set_pr_state(pr, "merged");
 
-    let targets = CiFixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        reconciler_ci_targets(&env).await,
         vec![9],
-        "only the open, unclaimed, unescalated meguri PR whose CI settled red is actionable \
-         — keyed by its canonical issue"
+        "only the open, unclaimed, unescalated meguri PR whose CI settled red \
+         (Blocked) and has no active family run is actionable"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
     let env = setup().await;
-    assert_eq!(CiFixerLoop.discover(&env.deps).await.unwrap().len(), 1);
 
-    // Every budgeted round succeeded (a fix was pushed), yet CI is red
-    // again: the flow's failure escalation never fired, so discovery must
-    // escalate instead of looping forever.
+    // Every budgeted round succeeded (a fix was pushed), yet CI is red again:
+    // the flow's failure escalation never fired, so the ci arm parks it
+    // (needs-human) instead of enqueuing forever.
     for _ in 0..MAX_CI_FIX_RUNS {
         let run = create_ci_fixer_run(&env);
         env.deps
@@ -376,12 +409,9 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
     }
-    // A new tick: the scheduler would clear the shared open-PR cache here
-    // (issue #170) before calling discover again.
-    env.deps.open_prs.clear().await;
     assert!(
-        CiFixerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "a PR whose CI keeps coming back red must stop being rediscovered"
+        reconciler_ci_targets(&env).await.is_empty(),
+        "a PR whose CI keeps coming back red must escalate, not loop"
     );
     let labels = env.forge.pr_labels(1);
     assert!(
@@ -392,10 +422,8 @@ async fn ci_fixer_escalates_when_the_fix_budget_is_spent_and_ci_stays_red() {
     assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(comments[0].contains("still failing"), "{}", comments[0]);
 
-    // The next sweep hits the needs-human guard: no second comment, no
-    // extra rollup poll needed.
-    env.deps.open_prs.clear().await;
-    assert!(CiFixerLoop.discover(&env.deps).await.unwrap().is_empty());
+    // The next sweep hits the human-stop guard (needs-human): no second comment.
+    assert!(reconciler_ci_targets(&env).await.is_empty());
     assert_eq!(env.forge.comments_of(1).len(), 1, "escalate exactly once");
 }
 

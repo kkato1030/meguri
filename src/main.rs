@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
-        Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
+        Command::Schedules { project } => app::cmd_schedules(project.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
             StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
@@ -320,7 +320,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
     use meguri::config::AutoMergeMode;
-    use meguri::engine::merge_tail::validate_policy;
+    use meguri::engine::issue_reconciler::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
 
@@ -485,74 +485,116 @@ async fn doctor_clones(cfg: &Config) -> bool {
     ok
 }
 
-/// Doctor's schedules section (issue #146): the cron expression, name
-/// uniqueness, body exclusivity, and local-mode `plan` rejection are already
-/// enforced at config load (so a loaded `cfg` has passed them). What load does
-/// *not* check is that each `body_file` is a regular file on the default branch
-/// — do that here (ADR 0015), and print each schedule's next fire. Returns false
-/// if any `body_file` is missing/unreadable; projects without schedules print
-/// nothing.
+/// Doctor's schedules section (issue #146 / #222): print each project's
+/// *effective* schedule set — host `[[projects.schedules]]` ∪ the repo's own
+/// `meguri.toml` on the default branch — via the same resolver the sweep uses,
+/// so display and firing agree (ADR 0026). Per-schedule / collection / cron /
+/// local-mode-plan validity is enforced at config load for host schedules and
+/// by the resolver for repo schedules; here we additionally check each
+/// `body_file` is a regular file on the default branch (ADR 0015) and surface
+/// the resolver's diagnostics. Returns false on an invalid repo config or an
+/// unreadable `body_file`. Reads only — it never emits the diagnostics (f6).
 async fn doctor_schedules(cfg: &Config) -> bool {
-    use meguri::cron::Cron;
+    use meguri::engine::schedule::{Diagnostic, resolve_effective_schedules};
     use meguri::gitops::{self, DefaultBranchFile};
     use meguri::store::format_epoch;
 
-    let has_any = cfg.projects.iter().any(|p| !p.schedules.is_empty());
-    if !has_any {
-        return true;
-    }
-    let now = meguri::engine::scheduler_fire::epoch_now();
+    let now = meguri::engine::schedule::epoch_now();
     let mut ok = true;
-    println!("\nschedules:");
+    let mut printed_header = false;
     for project in &cfg.projects {
-        if project.schedules.is_empty() {
-            continue;
-        }
-        // A managed clone that isn't materialized yet can't be read from; that
-        // is normal (doctor_clones reports it), so skip the body_file check here
-        // rather than failing on a missing path.
         let repo_path = cfg.repo_path_for(project);
+        // A managed clone that isn't materialized yet can't be read/fetched from;
+        // that is normal (doctor_clones reports it), so skip the body_file check.
         let cloned = matches!(
             project_clone_state(cfg, project).await,
             ProjectCloneState::Present
         );
-        for s in &project.schedules {
-            let next = Cron::parse(&s.cron)
+        let resolved = resolve_effective_schedules(
+            &repo_path,
+            &project.default_branch,
+            project.mode,
+            &project.schedules,
+        )
+        .await;
+        if resolved.schedules.is_empty() && resolved.diagnostics.is_empty() {
+            continue; // nothing configured for this project
+        }
+        if !printed_header {
+            println!("\nschedules:");
+            printed_header = true;
+        }
+
+        for d in &resolved.diagnostics {
+            match d {
+                Diagnostic::Shadowed { name } => println!(
+                    "  ⚠️  {}/{name} — repo schedule shadowed by a host schedule (host wins)",
+                    project.id
+                ),
+                Diagnostic::RepoInvalid { detail } => {
+                    ok = false;
+                    println!(
+                        "  ❌ {} — repo meguri.toml schedules invalid: {detail}",
+                        project.id
+                    );
+                }
+                Diagnostic::RepoScheduleDropped { detail } => {
+                    ok = false;
+                    println!("  ❌ {} — repo schedule dropped: {detail}", project.id);
+                }
+                Diagnostic::RepoUnavailable { detail } => println!(
+                    "  ⚠️  {} — repo schedules unavailable this check (fetch): {detail}",
+                    project.id
+                ),
+            }
+        }
+
+        for s in &resolved.schedules {
+            let c = &s.config;
+            let next = meguri::cron::Cron::parse(&c.cron)
                 .ok()
-                .and_then(|c| c.next_after(now))
+                .and_then(|cr| cr.next_after(now))
                 .map(format_epoch)
                 .unwrap_or_else(|| "never".into());
-            // body_file must be a regular file on the default branch (ADR
-            // 0015); inline body is always fine.
-            let (line_ok, body_detail) = match &s.body_file {
+            // body_file must be a regular file on the pinned snapshot (repo) or
+            // the default branch (host on a fetch-failed tick); inline is fine.
+            let (line_ok, body_detail) = match &c.body_file {
                 _ if !cloned => (true, "body_file check skipped (clone pending)".to_string()),
-                Some(rel) => match gitops::read_file_at_default_branch(
-                    &repo_path,
-                    &project.default_branch,
-                    rel,
-                )
-                .await
-                {
-                    Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
-                    Ok(DefaultBranchFile::Absent) => {
-                        (false, format!("body_file {rel} not on default branch"))
+                Some(rel) => {
+                    let read = match &s.pin_sha {
+                        Some(sha) => gitops::read_file_at_ref(&repo_path, sha, rel).await,
+                        None => {
+                            gitops::read_file_at_default_branch(
+                                &repo_path,
+                                &project.default_branch,
+                                rel,
+                            )
+                            .await
+                        }
+                    };
+                    match read {
+                        Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
+                        Ok(DefaultBranchFile::Absent) => {
+                            (false, format!("body_file {rel} not on default branch"))
+                        }
+                        Ok(DefaultBranchFile::NotRegularFile) => (
+                            false,
+                            format!("body_file {rel} is not a regular file on default branch"),
+                        ),
+                        Err(e) => (false, format!("body_file {rel}: {e:#}")),
                     }
-                    Ok(DefaultBranchFile::NotRegularFile) => (
-                        false,
-                        format!("body_file {rel} is not a regular file on default branch"),
-                    ),
-                    Err(e) => (false, format!("body_file {rel}: {e:#}")),
-                },
+                }
                 None => (true, "inline body".to_string()),
             };
             ok &= line_ok;
             println!(
-                "  {} {}/{} ({} {}, next {next} UTC) — {body_detail}",
+                "  {} {}/{} [{}] ({} {}, next {next} UTC) — {body_detail}",
                 if line_ok { "✅" } else { "❌" },
                 project.id,
-                s.name,
-                s.kind.as_str(),
-                s.cron,
+                c.name,
+                s.source.as_str(),
+                c.kind.as_str(),
+                c.cron,
             );
         }
     }
@@ -599,7 +641,7 @@ fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
     if !has_any {
         return;
     }
-    let now = meguri::engine::scheduler_fire::epoch_now();
+    let now = meguri::engine::schedule::epoch_now();
     println!("\ncadence:");
     for project in &cfg.projects {
         for rule in &project.cadence {
@@ -898,7 +940,54 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
     }
 
     ok &= doctor_launch(cfg);
+    if probe {
+        ok &= doctor_gate(cfg, &meguri::gate::spawn_pty_probe);
+    }
     ok &= doctor_collab(cfg);
+    ok
+}
+
+/// Bypass-permissions gate probe (issue #234): for every profile a `Pane`
+/// launch would actually reach (`meguri::gate::pane_gate_targets`), fire a
+/// short interactive PTY launch and classify the screen against known
+/// dialog/ready text. Only runs under `--probe`, alongside the model-alias
+/// probe — like that one, it launches a real CLI rather than just checking
+/// `--version`. `launch` is the injected PTY seam so this stays unit-
+/// testable without a real subprocess.
+fn doctor_gate(
+    cfg: &Config,
+    launch: &dyn Fn(&meguri::gate::GateTarget) -> meguri::gate::PtyCapture,
+) -> bool {
+    use meguri::{gate, routing};
+
+    let targets = gate::pane_gate_targets(cfg, &routing::detect_command);
+    if targets.is_empty() {
+        return true;
+    }
+    println!("\nbypass gate (pane-launched profiles):");
+    let mut ok = true;
+    for target in &targets {
+        let labels = target.labels.join(", ");
+        match gate::probe_gate(target, launch) {
+            gate::GateOutcome::Clear => {
+                println!("  ✅ {labels} [{}]: bypass gate accepted", target.command);
+            }
+            gate::GateOutcome::Blocked => {
+                println!(
+                    "  ❌ {labels} [{}]: bypass 受諾ダイアログで停止 — {}",
+                    target.command,
+                    gate::remediation_line(target),
+                );
+                ok = false;
+            }
+            gate::GateOutcome::Inconclusive => {
+                println!(
+                    "  ⚠️  {labels} [{}]: probe inconclusive (timeout/unknown output) — doctor は fail させない",
+                    target.command,
+                );
+            }
+        }
+    }
     ok
 }
 
@@ -1087,6 +1176,32 @@ mod tests {
         let p = fake_profile();
         let bad = |_: &config::AgentProfile| ProbeOutcome::ModelInvalid;
         assert!(!doctor_probe("default", &p, &bad));
+    }
+
+    #[test]
+    fn doctor_gate_fails_on_a_blocked_target_and_stays_green_when_clear() {
+        // Legacy config collapses every pane role onto the `default` profile
+        // (see gate::pane_gate_targets tests), so exactly one target is
+        // probed here.
+        let cfg = Config::default();
+        let blocked = |_: &meguri::gate::GateTarget| {
+            meguri::gate::PtyCapture::Output("Bypass Permissions mode".to_string())
+        };
+        assert!(!doctor_gate(&cfg, &blocked));
+
+        let clear = |_: &meguri::gate::GateTarget| {
+            meguri::gate::PtyCapture::Output("Welcome to Claude Code!".to_string())
+        };
+        assert!(doctor_gate(&cfg, &clear));
+    }
+
+    #[test]
+    fn doctor_gate_does_not_fail_on_inconclusive_outcomes() {
+        let cfg = Config::default();
+        let timeout = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::Timeout;
+        assert!(doctor_gate(&cfg, &timeout));
+        let spawn_failed = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::SpawnFailed;
+        assert!(doctor_gate(&cfg, &spawn_failed));
     }
 
     #[test]

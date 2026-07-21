@@ -79,6 +79,9 @@ impl Scheduler {
         // run_id → slot weight (issue #111): most runs weigh 1, a collab-advisor
         // run weighs 2. The budget is the sum, not the count.
         let mut active_run_ids: HashMap<String, usize> = HashMap::new();
+        // Per-project memory for edge-triggered schedule diagnostics (issue
+        // #222 f6): lives across ticks so a persisting condition emits once.
+        let mut schedule_diag: super::schedule::DiagMemory = HashMap::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -143,7 +146,7 @@ impl Scheduler {
             // out-of-band enqueue like the sweeps below — it creates an
             // issue/task that the loops above discover next tick. `now` is
             // sampled once so every project's schedules see the same instant.
-            let now = super::scheduler_fire::epoch_now();
+            let now = super::schedule::epoch_now();
 
             // Ride the poll: reclaim panes and worktrees whose issue closed
             // (the issue is the unit of lifetime — one author pane plus one
@@ -155,7 +158,7 @@ impl Scheduler {
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
-                if let Err(e) = super::scheduler_fire::sweep(deps, now).await {
+                if let Err(e) = super::schedule::sweep(deps, now, &mut schedule_diag).await {
                     tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
                 }
                 if let Err(e) = super::reaper::sweep(deps).await {
@@ -167,7 +170,7 @@ impl Scheduler {
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                if let Err(e) = super::merge_tail::sweep(deps).await {
+                if let Err(e) = super::issue_reconciler::sweep(deps).await {
                     tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
@@ -319,7 +322,14 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashMap<String, usize>,
     ) -> Result<()> {
-        for run in store.list_runs(true)? {
+        // The workqueue's activeQ order (ADR 0012 §5): dispatch `queued` runs by
+        // merge-proximity `dispatch_rank` (then issue number, FIFO) rather than
+        // by creation order, so the reconciler's fixer-family runs — created in
+        // the sweep, outside discovery — get their priority. Head-of-line
+        // admission (the `break` below) then applies to the highest-priority run.
+        let mut runs = store.list_runs(true)?;
+        runs.sort_by_key(|r| (super::dispatch_rank(&r.loop_kind), r.issue_number));
+        for run in runs {
             if active_weight(active) >= self.max_concurrent {
                 break;
             }

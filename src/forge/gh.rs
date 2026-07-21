@@ -2,6 +2,7 @@
 //! same approach as looper).
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -20,6 +21,42 @@ const FAILED_LOG_TAIL_LINES: usize = 200;
 
 /// The generic color for a meguri label with no scheme entry.
 const DEFAULT_LABEL_COLOR: &str = "1D76DB";
+
+/// Page budget for the per-PR comment overflow pagination (100 comments per
+/// page, on top of the bulk window's last-100). Anyone who can comment on a
+/// public PR controls the conversation's length, so an unbounded walk would
+/// let one chatty PR spend arbitrary API cost on every resync; past this
+/// budget the observation is marked incomplete and the engine parks the PR
+/// (safe side) instead of re-paginating forever.
+const MAX_COMMENT_PAGES: u32 = 10;
+
+/// How long a truncated comment pagination stays parked before it may be
+/// retried with an unchanged `totalCount` (a changed count retries at once).
+/// Bounds the worst case to one page budget per PR per window instead of one
+/// per resync.
+const COMMENT_PAGINATION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// The merge-tail informer-cache observe (issue #221, ADR 0012 decision 3):
+/// one GraphQL query folding every per-PR signal the old sweeps read (merge
+/// state, arm-marker comments, review threads, check rollup) into a single
+/// round-trip. `comments(last:100)` covers all but the chattiest PRs in one
+/// shot; `totalCount` detects when the window clipped older comments so the
+/// arm marker (the durable idempotency / human-override key) is never missed —
+/// a clipped marker would let a human-disarmed head look unarmed and get
+/// wrongly re-armed (f1). Kept as a const so a unit test can parse-check it:
+/// FakeForge tests never execute this string, so an unbalanced brace here
+/// reaches production silently and kills every merge-tail sweep.
+const MERGE_TAIL_OBSERVE_QUERY: &str = "query($owner:String!,$name:String!){\
+     rateLimit{cost}\
+     repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
+     number title body url headRefName headRefOid isDraft state \
+     labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
+     autoMergeRequest{enabledAt} \
+     comments(last:100){totalCount pageInfo{startCursor} nodes{id body createdAt viewerDidAuthor}} \
+     reviewThreads(first:100){totalCount nodes{isResolved comments(last:1){nodes{author{login} body}}}} \
+     commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
+     ... on CheckRun{name status conclusion detailsUrl} \
+     ... on StatusContext{context state targetUrl}}}}}}}}}}}";
 
 /// Scheme color (hex, no `#`) and description for a known meguri label — the
 /// color encodes the two-axis model (ADR 0005): phase labels by stage
@@ -90,9 +127,55 @@ pub async fn create_repo(slug: &str, public: bool) -> Result<()> {
     }
 }
 
+/// One GraphQL comment node → [`PrComment`], preserving the node `id` and
+/// `viewerDidAuthor` (the claim marker's authenticity + tombstone-edit key, §7).
+fn comment_from_node(c: &Value) -> Option<PrComment> {
+    Some(PrComment {
+        body: c.get("body").and_then(Value::as_str)?.to_string(),
+        created_at: c
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        id: c
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        viewer_did_author: c
+            .get("viewerDidAuthor")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Fold GraphQL comment *pages* (each a `comments` connection object,
+/// `{ nodes: [...], pageInfo, totalCount }`) into a flat [`PrComment`] list,
+/// carrying `id` + `viewerDidAuthor` on every page. This is the overflow path
+/// for a >100-comment PR (f6): the REST fallback dropped `viewerDidAuthor`, so a
+/// self-authored claim on a chatty PR was seen as a third party's and no-steal
+/// was lost. Pure and page-shaped so it is unit-testable without a live `gh`
+/// (f8).
+pub fn fold_comment_pages(pages: &[Value]) -> Vec<PrComment> {
+    pages
+        .iter()
+        .filter_map(|p| p.pointer("/nodes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(comment_from_node)
+        .collect()
+}
+
 pub struct GhForge {
     /// "owner/repo"
     repo: String,
+    /// Cooldown for the comment overflow pagination, keyed by PR number. A PR
+    /// whose conversation was truncated (page budget / stalled cursor) is not
+    /// re-paginated until the cooldown lapses — without this, a 10k-comment PR
+    /// would re-spend its whole page budget on every 30s resync, forever. The
+    /// cooldown deliberately ignores `totalCount` movement: keying the retry
+    /// on it would let anyone who can comment reset the cooldown every poll.
+    comment_pagination_cooldown:
+        std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
 }
 
 /// Production [`ForgeFactory`](super::ForgeFactory): builds a [`GhForge`] per
@@ -110,6 +193,7 @@ impl GhForge {
     pub fn new(repo_slug: &str) -> Self {
         Self {
             repo: repo_slug.to_string(),
+            comment_pagination_cooldown: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -444,22 +528,8 @@ impl GhForge {
             auto_merge_enabled: node.get("autoMergeRequest").is_some_and(|a| !a.is_null()),
         });
         let comments = node
-            .pointer("/comments/nodes")
-            .and_then(Value::as_array)
-            .map(|cs| {
-                cs.iter()
-                    .filter_map(|c| {
-                        Some(PrComment {
-                            body: c.get("body").and_then(Value::as_str)?.to_string(),
-                            created_at: c
-                                .get("createdAt")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
+            .pointer("/comments")
+            .map(|conn| fold_comment_pages(std::slice::from_ref(conn)))
             .unwrap_or_default();
         let review_threads: Vec<ReviewThread> = node
             .pointer("/reviewThreads/nodes")
@@ -474,7 +544,30 @@ impl GhForge {
                             .unwrap_or(false),
                         path: None,
                         line: None,
-                        comments: Vec::new(),
+                        // Only the last comment is fetched (`comments(last:1)`) —
+                        // enough for `thread_awaits_fixer`'s "ball in meguri's
+                        // court" test (the Fixer arm's trigger, §1.5).
+                        comments: t
+                            .pointer("/comments/nodes")
+                            .and_then(Value::as_array)
+                            .map(|cs| {
+                                cs.iter()
+                                    .filter_map(|c| {
+                                        Some(ReviewComment {
+                                            author: c
+                                                .pointer("/author/login")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                            body: c
+                                                .get("body")
+                                                .and_then(Value::as_str)?
+                                                .to_string(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                     .collect()
             })
@@ -515,44 +608,100 @@ impl GhForge {
             pr_review,
             labels_complete,
             review_threads_complete,
+            // The bulk window is complete unless the overflow pagination (the
+            // caller) says otherwise.
+            comments_complete: true,
         })
     }
 
-    /// Every conversation comment on a PR, fully paginated (REST issue
-    /// comments). Used only when the bulk observe's comment window clipped
-    /// older comments, so the arm marker (the durable idempotency /
-    /// human-override key) is never missed (f1). REST `created_at` is the same
-    /// RFC3339 shape as GraphQL `createdAt`, so `store::parse_ts` reads both.
-    async fn all_pr_comments(&self, number: i64) -> Result<Vec<PrComment>> {
-        let raw = self
-            .gh(&[
-                "api",
-                "--paginate",
-                "--slurp",
-                &format!("repos/{}/issues/{number}/comments", self.repo),
-            ])
-            .await?;
-        let pages: Value = serde_json::from_str(&raw).context("parsing paginated PR comments")?;
-        Ok(pages
-            .as_array()
-            .map(|pages| {
-                pages
-                    .iter()
-                    .filter_map(Value::as_array)
-                    .flatten()
-                    .filter_map(|c| {
-                        Some(PrComment {
-                            body: c.get("body").and_then(Value::as_str)?.to_string(),
-                            created_at: c
-                                .get("created_at")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+    /// Whether the comment overflow pagination for `pr` is parked: it already
+    /// truncated recently and the cooldown has not lapsed. Deliberately blind
+    /// to conversation growth — a count-sensitive retry would hand anyone who
+    /// can comment a lever to reset the cooldown on every poll.
+    fn comment_pagination_parked(&self, pr: i64) -> bool {
+        let map = self.comment_pagination_cooldown.lock().unwrap();
+        map.get(&pr).is_some_and(|until| Instant::now() < *until)
+    }
+
+    /// Remember a truncated pagination (start the cooldown) or clear a
+    /// completed one.
+    fn record_pagination_outcome(&self, pr: i64, complete: bool) {
+        let mut map = self.comment_pagination_cooldown.lock().unwrap();
+        if complete {
+            map.remove(&pr);
+        } else {
+            map.insert(pr, Instant::now() + COMMENT_PAGINATION_COOLDOWN);
+        }
+    }
+
+    /// Every conversation comment on a PR, paginated over **GraphQL** so
+    /// `id` + `viewerDidAuthor` survive on every page (f6). Used only when the
+    /// bulk observe's comment window clipped older comments, so the arm marker
+    /// and any self-authored claim marker are never missed. Returns the folded
+    /// comments, the number of HTTP round-trips it took (for the cost), and
+    /// whether the conversation was read to the end: the walk stops at
+    /// [`MAX_COMMENT_PAGES`] or on a non-advancing cursor, because a
+    /// pathologically chatty PR (anyone can comment on a public PR) must not
+    /// be able to spend unbounded API cost on every resync — the caller marks
+    /// the observation incomplete and the engine parks the PR instead.
+    async fn paginate_pr_comments(&self, number: i64) -> Result<(Vec<PrComment>, u32, bool)> {
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        let query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
+             repository(owner:$owner,name:$name){pullRequest(number:$number){\
+             comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} \
+             nodes{id body createdAt viewerDidAuthor}}}}}";
+        let mut pages: Vec<Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut requests: u32 = 0;
+        let complete = loop {
+            let mut args: Vec<String> = vec![
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-f".into(),
+                format!("owner={owner}"),
+                "-f".into(),
+                format!("name={name}"),
+                "-F".into(),
+                format!("number={number}"),
+            ];
+            if let Some(c) = &cursor {
+                args.push("-f".into());
+                args.push(format!("cursor={c}"));
+            }
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let raw = self.gh(&argv).await?;
+            requests += 1;
+            let v: Value = serde_json::from_str(&raw).context("parsing paginated PR comments")?;
+            let conn = v
+                .pointer("/data/repository/pullRequest/comments")
+                .cloned()
+                .unwrap_or_default();
+            let has_next = conn
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let next_cursor = conn
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let advanced = next_cursor.is_some() && next_cursor != cursor;
+            cursor = next_cursor;
+            pages.push(conn);
+            if !has_next {
+                break true;
+            }
+            // hasNextPage with a missing or stalled cursor: a malformed
+            // response would otherwise re-read the same page forever.
+            if !advanced || requests >= MAX_COMMENT_PAGES {
+                break false;
+            }
+        };
+        Ok((fold_comment_pages(&pages), requests, complete))
     }
 
     /// The workflow run id inside a check's details URL
@@ -1205,7 +1354,11 @@ impl Forge for GhForge {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        Some(PrComment { body, created_at })
+                        Some(PrComment {
+                            body,
+                            created_at,
+                            ..Default::default()
+                        })
                     })
                     .collect()
             })
@@ -1221,6 +1374,25 @@ impl Forge for GhForge {
             &self.repo,
             "--body",
             body,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
+        // GraphQL `updateIssueComment` edits a PR conversation comment by its
+        // node id (the id the bulk observe folded in, §1.5).
+        let query = "mutation($id:ID!,$body:String!){\
+             updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+        self.gh(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("id={comment_id}"),
+            "-f",
+            &format!("body={body}"),
         ])
         .await?;
         Ok(())
@@ -1519,7 +1691,7 @@ impl Forge for GhForge {
         }
     }
 
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
         // Informer-cache observe (issue #221, ADR 0012 decision 3): one GraphQL
         // query folds every signal the two old sweeps read per PR (merge state,
         // arm-marker comments, review threads, the check rollup, the pr-review
@@ -1529,28 +1701,17 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        // `comments(last:100)` covers all but the chattiest PRs in one shot;
-        // `totalCount` lets us detect when the window clipped older comments and
-        // paginate them in, so the arm marker (the durable idempotency /
-        // human-override key) is never missed — a clipped marker would let a
-        // human-disarmed head look unarmed and get wrongly re-armed (f1).
-        let query = "query($owner:String!,$name:String!){\
-             rateLimit{cost}\
-             repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
-             number title body url headRefName headRefOid isDraft state \
-             labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
-             autoMergeRequest{enabledAt} \
-             comments(last:100){totalCount nodes{body createdAt}} \
-             reviewThreads(first:100){totalCount nodes{isResolved}} \
-             commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
-             ... on CheckRun{name status conclusion detailsUrl} \
-             ... on StatusContext{context state targetUrl}}}}}}}}}}}}";
+        // The query is the module-level `MERGE_TAIL_OBSERVE_QUERY` const so a
+        // unit test can parse-check its braces (issue #242); this branch (#223)
+        // extended it with each comment's `id`/`viewerDidAuthor` (claim
+        // authenticity) and each thread's last comment (the Fixer arm's
+        // trigger), plus `pageInfo` for the >100-comment pagination fallback.
         let raw = self
             .gh(&[
                 "api",
                 "graphql",
                 "-f",
-                &format!("query={query}"),
+                &format!("query={MERGE_TAIL_OBSERVE_QUERY}"),
                 "-f",
                 &format!("owner={owner}"),
                 "-f",
@@ -1573,16 +1734,26 @@ impl Forge for GhForge {
             let Some(mut obs) = Self::pr_observation_from_node(node, pr_review_context) else {
                 continue;
             };
-            // Window clipped older comments → paginate the full set so no arm
-            // marker is lost. Rare (a PR with >100 comments); the extra reads
-            // are counted so the cost stays honest.
+            // Window clipped older comments → paginate the full set via GraphQL
+            // (not REST — REST drops `viewerDidAuthor`, breaking the claim's
+            // authenticity on a chatty PR, f6). Rare (a PR with >100 comments);
+            // the extra reads are counted so the cost stays honest.
             let total = node
                 .pointer("/comments/totalCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
             if total > obs.comments.len() {
-                obs.comments = self.all_pr_comments(obs.pr.number).await?;
-                requests += 1;
+                if self.comment_pagination_parked(obs.pr.number) {
+                    // Cooldown: this conversation already truncated at this
+                    // size — stay parked without re-spending the page budget.
+                    obs.comments_complete = false;
+                } else {
+                    let (all, reqs, complete) = self.paginate_pr_comments(obs.pr.number).await?;
+                    obs.comments = all;
+                    obs.comments_complete = complete;
+                    requests += reqs;
+                    self.record_pagination_outcome(obs.pr.number, complete);
+                }
             }
             prs.push(obs);
         }
@@ -1718,6 +1889,68 @@ impl Forge for GhForge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FakeForge tests never execute the real observe query, so a syntax slip
+    // here (an unbalanced brace killed every merge-tail sweep in production
+    // on 2026-07-21) only surfaces via this parse-level check.
+    #[test]
+    fn merge_tail_observe_query_braces_balance() {
+        let mut depth = 0i64;
+        for (i, c) in MERGE_TAIL_OBSERVE_QUERY.chars().enumerate() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    assert!(depth >= 0, "extra closing brace at index {i}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "{depth} unclosed brace(s) in the observe query");
+    }
+
+    #[test]
+    fn fold_comment_pages_preserves_author_and_id_across_pages() {
+        // Two scripted `comments` connection pages (the second reached only by
+        // following `endCursor`): a >100-comment PR. `viewerDidAuthor` and the
+        // node `id` must survive on every page (f6/f8), so a self-authored claim
+        // marker on page 2 is still recognised (and editable by its id).
+        let page1 = serde_json::json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+            "nodes": [
+                {"id": "n1", "body": "hi", "createdAt": "2026-01-01T00:00:00Z", "viewerDidAuthor": false},
+            ]
+        });
+        let page2 = serde_json::json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": serde_json::Value::Null},
+            "nodes": [
+                {"id": "n2", "body": "<!-- meguri:claim instance=me run=r-1 -->",
+                 "createdAt": "2026-01-02T00:00:00Z", "viewerDidAuthor": true},
+            ]
+        });
+        let folded = fold_comment_pages(&[page1, page2]);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].id, "n1");
+        assert!(!folded[0].viewer_did_author);
+        // The page-2 claim marker keeps its authorship and node id.
+        assert_eq!(folded[1].id, "n2");
+        assert!(folded[1].viewer_did_author);
+        assert!(folded[1].body.contains("meguri:claim"));
+    }
+
+    #[test]
+    fn comment_pagination_cooldown_parks_regardless_of_count_movement() {
+        let forge = GhForge::new("o/r");
+        // Truncated: parked for the TTL — conversation growth (an attacker
+        // adding a comment per poll) must NOT reset or bypass the cooldown.
+        forge.record_pagination_outcome(7, false);
+        assert!(forge.comment_pagination_parked(7));
+        // A completed pagination clears the memo.
+        forge.record_pagination_outcome(7, true);
+        assert!(!forge.comment_pagination_parked(7));
+        // Other PRs are unaffected.
+        assert!(!forge.comment_pagination_parked(8));
+    }
 
     #[test]
     fn merge_args_pin_head_and_toggle_auto() {
