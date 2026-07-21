@@ -20,12 +20,13 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::Deps;
 use super::pr_reviewer::PR_REVIEW_STATUS;
+use super::{Deps, canonical_key, is_combined};
 use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn, Autonomy};
 use crate::forge::{
-    self, ArmOutcome, CheckState, CommitStatusState, MergePolicy, MergeState, MergeStateStatus,
-    MergeStrategy, MergeableState, PrObservation, PullRequest, UpdateBranchOutcome,
+    self, ArmOutcome, CheckRollup, CheckState, CommitStatusState, MergePolicy, MergeState,
+    MergeStateStatus, MergeStrategy, MergeableState, PrObservation, PullRequest,
+    UpdateBranchOutcome,
 };
 use crate::store::parse_ts;
 
@@ -148,11 +149,38 @@ pub enum Op {
     Escalate,
 }
 
-/// The decision `next_step` returns for one PR. `Op` acts, `Wait` means the
-/// owning arm intentionally stays idle (human stop / pending / not eligible),
-/// and `Skip` means another loop owns the state or it is terminal/transient.
+/// A fixer-family arm: a heavy agent recipe the reconciler launches (ADR 0012
+/// §4, Step's `Agent` arm). Each maps to a `runs.loop_kind` and its `run_*`
+/// entry point; the `dispatch_rank` ordering (ADR 0001 → §5) is
+/// conflict-resolver < ci-fixer < fixer (closest to merge first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// A CONFLICTING PR — merge the base and resolve semantically.
+    ConflictResolver,
+    /// A Blocked PR with a failing required check — diagnose and fix CI.
+    CiFixer,
+    /// An open review thread awaiting meguri — address the comments.
+    Fixer,
+}
+
+impl Arm {
+    /// The `runs.loop_kind` this arm dispatches to (the recipe's `KIND`).
+    pub fn loop_kind(self) -> &'static str {
+        match self {
+            Arm::ConflictResolver => super::conflict_resolver::KIND,
+            Arm::CiFixer => super::ci_fixer::KIND,
+            Arm::Fixer => super::fixer::KIND,
+        }
+    }
+}
+
+/// The decision `next_step` returns for one PR. `Agent` launches a fixer-family
+/// recipe, `Op` runs a light API operation, `Wait` means the owning arm
+/// intentionally stays idle (human stop / pending / policy-disabled), and
+/// `Skip` means the state is terminal / not ours / transient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    Agent(Arm),
     Op(Op),
     Wait(&'static str),
     Skip(&'static str),
@@ -187,8 +215,18 @@ pub struct Snapshot {
     pub merge: Option<MergeState>,
     /// Armed longer than [`STALE_AFTER_SECS`] (any head) — the Stuck threshold.
     pub stale: bool,
-    /// A required check failed (only splits a Blocked PR: ci-fixer vs Stuck).
+    /// A required check failed (splits a Blocked PR: ci-fixer vs Stuck).
     pub rollup_failure: bool,
+    /// The spec worker owns this branch (combined delivery + `spec-ready`); no
+    /// fixer-family arm may touch it (`pr_is_touchable`'s spec-ready gate).
+    pub spec_worker_owns: bool,
+    /// A review thread has the ball in meguri's court (unresolved, last comment
+    /// not meguri's reply marker) — the Fixer arm's trigger.
+    pub awaits_fixer_thread: bool,
+    /// The conflict-resolver budget is spent (still-conflicting → escalate).
+    pub conflict_exhausted: bool,
+    /// The ci-fixer budget is spent (still-red → escalate).
+    pub ci_exhausted: bool,
     /// The PR is an arm candidate: linked issue, opted in, no arm-blocking label.
     pub arm_candidate: bool,
     /// An unresolved review thread is open (arm waits on resolution).
@@ -212,9 +250,12 @@ impl Snapshot {
     }
 }
 
-/// The pure decision (ADR 0012 §3). Ordering encodes precedence. `current_head
-/// _armed` routes between the watch regime (an armed PR: watch drift, close
-/// BEHIND) and the arm regime (a not-yet-armed candidate: arm / merge / wait).
+/// The pure decision (ADR 0012 §3). Ordering encodes precedence: the fixer
+/// family (conflict > ci > threads, by merge proximity) is decided first
+/// because a conflicting / red-CI / thread-awaiting PR needs an agent whatever
+/// its arm state; then the merge tail (S1) handles BEHIND / arm / merge / stuck.
+/// Every observed state is owned by exactly one arm (the `no gap / no double`
+/// property).
 pub fn next_step(s: &Snapshot) -> Step {
     if !s.open {
         return Step::Skip("terminal (merged/closed)");
@@ -222,25 +263,49 @@ pub fn next_step(s: &Snapshot) -> Step {
     if !s.is_meguri_branch {
         return Step::Skip("not a meguri branch");
     }
-    // A human stop is final for both regimes, and the durable "already
-    // escalated" brake that makes a Stuck / review-failed escalation fire once.
+    // A human stop is final for every arm, and the durable "already escalated"
+    // brake that makes a Stuck / review-failed / budget escalation fire once.
     if s.human_stop {
         return Step::Skip("human stop (hold/needs-human)");
     }
+    // Under combined delivery a `spec-ready` PR's branch is the spec worker's
+    // (ADR 0008 §6); no fixer-family arm nor the merge tail touches it.
+    if s.spec_worker_owns {
+        return Step::Skip("spec worker owns the branch");
+    }
+
+    // Fixer family (ADR 0007 supersede completed): the two S1 placeholder Skips
+    // become real Agent arms, plus a thread arm. Budget exhaustion parks
+    // (needs-human) instead of looping — the #176 order holds because we only
+    // reach the conflict/ci escalate while the symptom is still present.
+    if let Some(m) = &s.merge {
+        if m.mergeable == MergeableState::Conflicting || m.status == MergeStateStatus::Dirty {
+            return if s.conflict_exhausted {
+                Step::Op(Op::Escalate)
+            } else {
+                Step::Agent(Arm::ConflictResolver)
+            };
+        }
+        if m.status == MergeStateStatus::Blocked && s.rollup_failure {
+            return if s.ci_exhausted {
+                Step::Op(Op::Escalate)
+            } else {
+                Step::Agent(Arm::CiFixer)
+            };
+        }
+    }
+    if s.awaits_fixer_thread {
+        return Step::Agent(Arm::Fixer);
+    }
 
     if s.current_head_armed {
-        // Watch regime: this head is armed; classify the drift.
+        // Watch regime: this head is armed; classify the residual drift
+        // (conflict / red-CI already owned by the fixer arms above).
         let Some(m) = &s.merge else {
             return Step::Skip("merge state unreadable (transient)");
         };
         if !m.auto_merge_enabled {
             return Step::Wait("human disabled auto-merge");
-        }
-        if m.mergeable == MergeableState::Conflicting || m.status == MergeStateStatus::Dirty {
-            return Step::Skip("conflict-resolver owns it");
-        }
-        if m.status == MergeStateStatus::Blocked && s.rollup_failure {
-            return Step::Skip("ci-fixer owns it");
         }
         // BEHIND — the hole the old sweeps left open. Close it by re-basing,
         // gated by the same write-eligibility arming needs.
@@ -369,6 +434,45 @@ async fn build_snapshot(
         || !obs.labels_complete;
     let has_unresolved_thread =
         obs.review_threads.iter().any(|t| !t.resolved) || !obs.review_threads_complete;
+    // The Fixer arm launches a heavy agent, so on an incomplete thread window we
+    // do *not* launch on uncertainty (unlike `has_unresolved_thread`, which
+    // conservatively blocks arming): a missed awaiting-thread just waits for the
+    // next resync's complete observation. `thread_awaits_fixer` reads each
+    // thread's last comment (the bulk observe's `comments(last:1)`, §1.5).
+    let awaits_fixer_thread = obs.review_threads_complete
+        && obs
+            .review_threads
+            .iter()
+            .any(super::fixer::thread_awaits_fixer);
+    // A `spec-ready` PR under combined delivery is the spec worker's branch — no
+    // fixer-family arm touches it (`pr_is_touchable`'s spec-ready gate).
+    let spec_worker_owns = is_combined(deps) && pr.has_label(forge::LABEL_SPEC_READY);
+    // Fixer-family budgets: the arm escalates (parks) once it has spent its
+    // successful rounds and the symptom persists (issue #176 order — the arm is
+    // only reached while the symptom is still observed).
+    let issue = canonical_key(pr);
+    let conflict_exhausted =
+        deps.store
+            .succeeded_run_count(&deps.project.id, super::conflict_resolver::KIND, issue)?
+            >= super::conflict_resolver::MAX_RESOLVE_RUNS;
+    let ci_exhausted =
+        deps.store
+            .succeeded_run_count(&deps.project.id, super::ci_fixer::KIND, issue)?
+            >= super::ci_fixer::MAX_CI_FIX_RUNS;
+    // The ci arm and the Stuck backstop only care about *real* CI: meguri's own
+    // `meguri/*` advisory statuses carry no failed-job log and must not spin the
+    // ci-fixer (ci_fixer criterion 6).
+    let rollup_failure = CheckRollup {
+        checks: obs
+            .rollup
+            .checks
+            .iter()
+            .filter(|c| !c.name.starts_with("meguri/"))
+            .cloned()
+            .collect(),
+    }
+    .state()
+        == CheckState::Failure;
     Ok(Snapshot {
         open: pr.state == "open",
         is_meguri_branch: pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX),
@@ -376,7 +480,11 @@ async fn build_snapshot(
         current_head_armed: head_already_armed(&obs.comments, &pr.head_sha),
         merge: obs.merge.clone(),
         stale,
-        rollup_failure: obs.rollup.state() == CheckState::Failure,
+        rollup_failure,
+        spec_worker_owns,
+        awaits_fixer_thread,
+        conflict_exhausted,
+        ci_exhausted,
         arm_candidate,
         has_unresolved_thread,
         pr_review,
@@ -442,11 +550,214 @@ async fn process(
         *policy_ok = Some(resolve_policy_ok(deps, am).await);
     }
     let snap = build_snapshot(deps, am, obs, policy_ok.unwrap_or(false), now).await?;
+    // Clear backoff for any arm whose symptom is *positively* resolved this
+    // resync (§4.5) — runs regardless of `next_step`'s single decision.
+    clear_resolved_backoffs(deps, obs, &snap)?;
     match next_step(&snap) {
+        Step::Agent(arm) => enqueue_agent(deps, obs, arm).await?,
         Step::Op(op) => act(deps, am, obs, &snap, op).await?,
         Step::Wait(reason) | Step::Skip(reason) => {
-            tracing::debug!("PR #{}: merge-tail — {reason}", obs.pr.number);
+            tracing::debug!("PR #{}: reconciler — {reason}", obs.pr.number);
         }
+    }
+    Ok(())
+}
+
+/// Exponential-backoff base / cap (seconds) for the fixer ping-pong spacing.
+const BACKOFF_BASE_SECS: u64 = 5 * 60;
+const BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// The head-independent prefix of every claim-marker comment (ADR 0027 / §7).
+const CLAIM_MARKER_PREFIX: &str = "<!-- meguri:claim";
+
+/// This instance's id — the claim marker's owner field (default = mux session).
+fn instance_id(deps: &Deps) -> &str {
+    &deps.config.mux.session
+}
+
+/// The claim marker meguri posts on a PR it is working (arm-agnostic, one per PR).
+fn claim_marker(instance: &str, run_id: &str) -> String {
+    format!("{CLAIM_MARKER_PREFIX} instance={instance} run={run_id} -->")
+}
+
+/// The run id embedded in a claim marker, if the body carries one.
+fn parse_claim_run(body: &str) -> Option<&str> {
+    let after = body.split(CLAIM_MARKER_PREFIX).nth(1)?;
+    let run = after.split("run=").nth(1)?;
+    let run = run.split_whitespace().next()?;
+    (!run.is_empty()).then_some(run)
+}
+
+/// The run id of a *live* claim on this PR, or `None` when unclaimed / stale.
+/// Only a self-authored marker is trusted (a third-party forgery is ignored, so
+/// no-steal cannot be frozen, f3); a marker whose run is terminal / missing is
+/// stale and reclaimable (finding 3). A live run of *any* arm blocks (the
+/// family exclusion is per-PR).
+fn live_claim(deps: &Deps, obs: &PrObservation) -> Option<String> {
+    for c in &obs.comments {
+        if !c.viewer_did_author || !c.body.contains(CLAIM_MARKER_PREFIX) {
+            continue;
+        }
+        let Some(run_id) = parse_claim_run(&c.body) else {
+            continue;
+        };
+        match deps.store.get_run(run_id) {
+            Ok(Some(run)) if run.status.is_active() => return Some(run_id.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Post the instance-named claim marker (the forge projection of the family
+/// active-run index). Best-effort: the DB index is the atomic authority, so a
+/// failed comment does not lose exclusion.
+async fn claim_pr(deps: &Deps, pr: i64, run_id: &str) {
+    let instance = instance_id(deps).to_string();
+    let _ = deps
+        .forge()
+        .comment_pr(pr, &claim_marker(&instance, run_id))
+        .await;
+    let _ = deps.store.emit(
+        Some(run_id),
+        "pr.claimed",
+        json!({ "pr": pr, "run": run_id, "instance": instance }),
+    );
+}
+
+/// The stripped rollup (meguri's own `meguri/*` advisory statuses removed).
+fn real_rollup(obs: &PrObservation) -> CheckRollup {
+    CheckRollup {
+        checks: obs
+            .rollup
+            .checks
+            .iter()
+            .filter(|c| !c.name.starts_with("meguri/"))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Drop backoff rows for arms whose symptom is positively resolved (§4.5): a
+/// mergeable PR (conflict gone), a green CI rollup (not merely pending), or no
+/// thread awaiting meguri. The next symptom opens a fresh episode at exponent 0.
+fn clear_resolved_backoffs(deps: &Deps, obs: &PrObservation, snap: &Snapshot) -> Result<()> {
+    let p = &deps.project.id;
+    let issue = canonical_key(&obs.pr);
+    if snap
+        .merge
+        .as_ref()
+        .is_some_and(|m| m.mergeable == MergeableState::Mergeable)
+    {
+        deps.store
+            .clear_backoff(p, issue, super::conflict_resolver::KIND)?;
+    }
+    if real_rollup(obs).state() == CheckState::Success {
+        deps.store.clear_backoff(p, issue, super::ci_fixer::KIND)?;
+    }
+    if obs.review_threads_complete && !snap.awaits_fixer_thread {
+        deps.store.clear_backoff(p, issue, super::fixer::KIND)?;
+    }
+    Ok(())
+}
+
+/// Advance the episode backoff for a still-present symptom (§4.5): open the
+/// episode (baseline = current succeeded count, immediately visible) on the
+/// first observation, then space each *new* succeeded round once by
+/// `base * 2^(n - baseline)` capped at `cap`.
+fn advance_backoff(deps: &Deps, issue: i64, arm: Arm) -> Result<()> {
+    let p = &deps.project.id;
+    let kind = arm.loop_kind();
+    let n = deps.store.succeeded_run_count(p, kind, issue)?;
+    let now = epoch_now() as i64;
+    match deps.store.get_backoff(p, issue, kind)? {
+        None => {
+            deps.store.upsert_backoff(
+                p,
+                issue,
+                kind,
+                crate::store::BackoffRow {
+                    baseline_attempt: n,
+                    scheduled_attempt: n,
+                    next_visible_at: now,
+                },
+            )?;
+        }
+        Some(row) if n > row.scheduled_attempt => {
+            let k = (n - row.baseline_attempt).max(0) as u32;
+            let delay = BACKOFF_BASE_SECS
+                .saturating_mul(1u64.checked_shl(k).unwrap_or(u64::MAX))
+                .min(BACKOFF_CAP_SECS);
+            let next = now.saturating_add(delay as i64);
+            deps.store.upsert_backoff(
+                p,
+                issue,
+                kind,
+                crate::store::BackoffRow {
+                    baseline_attempt: row.baseline_attempt,
+                    scheduled_attempt: n,
+                    next_visible_at: next,
+                },
+            )?;
+            deps.store.emit(
+                None,
+                "reconciler.backoff_scheduled",
+                json!({ "arm": kind, "issue": issue, "scheduled_attempt": n, "next_visible_at": next }),
+            )?;
+        }
+        Some(_) => {} // this round already spaced — leave next_visible_at
+    }
+    Ok(())
+}
+
+/// Enqueue a fixer-family arm: gate on backoff (`next_visible_at`) and the
+/// claim marker's liveness (no-steal / family exclusion, §7), then create a
+/// `queued` run keyed by the PR's canonical issue and the arm's `loop_kind`.
+/// The scheduler dispatches it (by `dispatch_rank`) through the arm's recipe.
+/// The family-wide active-run index (`runs_active_fixer_family`) is the atomic
+/// backstop: a unique-index violation just means the work is already in flight,
+/// so it is a benign skip.
+async fn enqueue_agent(deps: &Deps, obs: &PrObservation, arm: Arm) -> Result<()> {
+    let pr = &obs.pr;
+    let issue = canonical_key(pr);
+    // Advance the episode backoff for this still-present symptom, then gate on
+    // it: the PR×arm is spaced out after a fix round that did not resolve the
+    // symptom (§4.5).
+    advance_backoff(deps, issue, arm)?;
+    if deps
+        .store
+        .backoff_active(&deps.project.id, issue, arm.loop_kind(), epoch_now() as i64)?
+    {
+        tracing::debug!(
+            "PR #{}: reconciler — {} in backoff",
+            pr.number,
+            arm.loop_kind()
+        );
+        return Ok(());
+    }
+    // claim gate (no-steal / family exclusion): a live claim by any instance
+    // means the PR is already being worked; a stale claim (terminal run) is
+    // reclaimed (§7).
+    if let Some(claim) = live_claim(deps, obs) {
+        deps.store.emit(
+            None,
+            "reconciler.claim_skipped",
+            json!({ "pr": pr.number, "run": claim }),
+        )?;
+        return Ok(());
+    }
+    // A create failure means an active family run already exists (the family /
+    // per-loop index) — a benign race; the reconciler retries next resync.
+    if let Ok(run) =
+        deps.store
+            .create_run_for_loop(&deps.project.id, arm.loop_kind(), issue, &pr.title)
+    {
+        deps.store.emit(
+            Some(&run.id),
+            "reconciler.enqueued",
+            json!({ "arm": arm.loop_kind(), "issue": issue, "pr": pr.number }),
+        )?;
+        claim_pr(deps, pr.number, &run.id).await;
     }
     Ok(())
 }
@@ -727,6 +1038,10 @@ mod tests {
             )),
             stale: false,
             rollup_failure: false,
+            spec_worker_owns: false,
+            awaits_fixer_thread: false,
+            conflict_exhausted: false,
+            ci_exhausted: false,
             arm_candidate: true,
             has_unresolved_thread: false,
             pr_review: PrReviewGate::Proceed,
@@ -765,10 +1080,12 @@ mod tests {
             PrComment {
                 body: "unrelated".into(),
                 created_at: String::new(),
+                ..Default::default()
             },
             PrComment {
                 body: armed_marker("abc123"),
                 created_at: String::new(),
+                ..Default::default()
             },
         ];
         assert!(head_already_armed(&comments, "abc123"));
@@ -868,7 +1185,9 @@ mod tests {
     }
 
     #[test]
-    fn conflict_and_red_ci_are_ceded_to_their_loops() {
+    fn conflict_and_red_ci_are_owned_by_their_arms() {
+        // The two S1 placeholder Skips are now real Agent arms (ADR 0007
+        // supersede completed).
         let conflict = Snapshot {
             merge: Some(merge(
                 MergeStateStatus::Dirty,
@@ -877,9 +1196,14 @@ mod tests {
             )),
             ..armed_snapshot()
         };
+        assert_eq!(next_step(&conflict), Step::Agent(Arm::ConflictResolver));
+        // Budget spent while still conflicting → park (needs-human), not loop.
         assert_eq!(
-            next_step(&conflict),
-            Step::Skip("conflict-resolver owns it")
+            next_step(&Snapshot {
+                conflict_exhausted: true,
+                ..conflict
+            }),
+            Step::Op(Op::Escalate)
         );
         let red = Snapshot {
             merge: Some(merge(
@@ -890,7 +1214,49 @@ mod tests {
             rollup_failure: true,
             ..armed_snapshot()
         };
-        assert_eq!(next_step(&red), Step::Skip("ci-fixer owns it"));
+        assert_eq!(next_step(&red), Step::Agent(Arm::CiFixer));
+        assert_eq!(
+            next_step(&Snapshot {
+                ci_exhausted: true,
+                ..red
+            }),
+            Step::Op(Op::Escalate)
+        );
+    }
+
+    #[test]
+    fn unresolved_thread_awaiting_meguri_is_the_fixer_arm() {
+        // A thread with the ball in meguri's court fires the Fixer arm; a
+        // parked thread (awaits_fixer false) only blocks arming (Wait).
+        let awaiting = Snapshot {
+            current_head_armed: false,
+            awaits_fixer_thread: true,
+            has_unresolved_thread: true,
+            merge: Some(merge(
+                MergeStateStatus::Unknown,
+                MergeableState::Unknown,
+                false,
+            )),
+            ..armed_snapshot()
+        };
+        assert_eq!(next_step(&awaiting), Step::Agent(Arm::Fixer));
+        let parked = Snapshot {
+            awaits_fixer_thread: false,
+            ..awaiting
+        };
+        assert_eq!(next_step(&parked), Step::Wait("unresolved review thread"));
+    }
+
+    #[test]
+    fn spec_worker_owned_branch_is_never_touched() {
+        assert_eq!(
+            next_step(&Snapshot {
+                spec_worker_owns: true,
+                awaits_fixer_thread: true,
+                ..armed_snapshot()
+            }),
+            Step::Skip("spec worker owns the branch")
+        );
     }
 
     #[test]
@@ -1007,14 +1373,31 @@ mod tests {
             ..arm_snapshot()
         };
         assert_eq!(next_step(&mergeable), Step::Op(Op::MergePr));
-        for state in [MergeableState::Conflicting, MergeableState::Unknown] {
-            let s = Snapshot {
-                mode: AutoMergeMode::Orchestrator,
-                merge: Some(merge(MergeStateStatus::Unknown, state, false)),
-                ..arm_snapshot()
-            };
-            assert_eq!(next_step(&s), Step::Skip("orchestrator: not mergeable yet"));
-        }
+        // Conflicting is now the ConflictResolver arm (owned before the arm
+        // regime); only Unknown stays the orchestrator "not mergeable yet" Skip.
+        let conflicting = Snapshot {
+            mode: AutoMergeMode::Orchestrator,
+            merge: Some(merge(
+                MergeStateStatus::Unknown,
+                MergeableState::Conflicting,
+                false,
+            )),
+            ..arm_snapshot()
+        };
+        assert_eq!(next_step(&conflicting), Step::Agent(Arm::ConflictResolver));
+        let unknown = Snapshot {
+            mode: AutoMergeMode::Orchestrator,
+            merge: Some(merge(
+                MergeStateStatus::Unknown,
+                MergeableState::Unknown,
+                false,
+            )),
+            ..arm_snapshot()
+        };
+        assert_eq!(
+            next_step(&unknown),
+            Step::Skip("orchestrator: not mergeable yet")
+        );
     }
 
     #[test]
@@ -1035,10 +1418,12 @@ mod tests {
 
     #[test]
     fn ownership_is_total_no_gap_no_double() {
-        // Enumerate the observed state space and assert next_step always
-        // returns exactly one Step, and that every armed BEHIND-eligible state
-        // is owned by UpdateBranch (the hole is closed). A missing arm would
-        // surface as a panic (unreachable match) or a wrong Step here.
+        // Enumerate the observed state space and assert next_step always returns
+        // exactly one Step (totality), and that each symptom is owned by exactly
+        // the expected arm: BEHIND → UpdateBranch (the closed hole), Conflicting
+        // → ConflictResolver, Blocked+red → CiFixer, awaiting thread → Fixer. A
+        // missing arm would surface as a panic (unreachable match) or a wrong
+        // Step here; a double owner as a precedence-order mismatch.
         use MergeStateStatus::*;
         use MergeableState as M;
         let statuses = [
@@ -1050,26 +1435,62 @@ mod tests {
                     for &auto in &[true, false] {
                         for &stale in &[true, false] {
                             for &rollup in &[true, false] {
-                                let s = Snapshot {
-                                    current_head_armed: armed,
-                                    merge: Some(merge(status, mergeable, auto)),
-                                    stale,
-                                    rollup_failure: rollup,
-                                    ..armed_snapshot()
-                                };
-                                let step = next_step(&s);
-                                // The BEHIND hole is closed: an armed, eligible,
-                                // auto-on, behind PR always updates.
-                                if armed && auto && status == Behind && mergeable != M::Conflicting
-                                {
-                                    assert_eq!(
-                                        step,
-                                        Step::Op(Op::UpdateBranch),
-                                        "armed behind must update: {s:?}"
-                                    );
+                                for &awaits in &[true, false] {
+                                    for &cx in &[true, false] {
+                                        for &cix in &[true, false] {
+                                            let s = Snapshot {
+                                                current_head_armed: armed,
+                                                merge: Some(merge(status, mergeable, auto)),
+                                                stale,
+                                                rollup_failure: rollup,
+                                                awaits_fixer_thread: awaits,
+                                                conflict_exhausted: cx,
+                                                ci_exhausted: cix,
+                                                ..armed_snapshot()
+                                            };
+                                            let step = next_step(&s);
+                                            let conflicting =
+                                                mergeable == M::Conflicting || status == Dirty;
+                                            // Conflict is the highest-precedence
+                                            // symptom (merge proximity).
+                                            if conflicting {
+                                                assert_eq!(
+                                                    step,
+                                                    if cx {
+                                                        Step::Op(Op::Escalate)
+                                                    } else {
+                                                        Step::Agent(Arm::ConflictResolver)
+                                                    },
+                                                    "conflict must be owned: {s:?}"
+                                                );
+                                            } else if status == Blocked && rollup {
+                                                assert_eq!(
+                                                    step,
+                                                    if cix {
+                                                        Step::Op(Op::Escalate)
+                                                    } else {
+                                                        Step::Agent(Arm::CiFixer)
+                                                    },
+                                                    "red required CI must be owned: {s:?}"
+                                                );
+                                            } else if awaits {
+                                                assert_eq!(
+                                                    step,
+                                                    Step::Agent(Arm::Fixer),
+                                                    "awaiting thread must be owned: {s:?}"
+                                                );
+                                            } else if armed && auto && status == Behind {
+                                                assert_eq!(
+                                                    step,
+                                                    Step::Op(Op::UpdateBranch),
+                                                    "armed behind must update: {s:?}"
+                                                );
+                                            }
+                                            // Total: a Step was returned.
+                                            let _ = step;
+                                        }
+                                    }
                                 }
-                                // Total: a Step was returned for every combo.
-                                let _ = step;
                             }
                         }
                     }

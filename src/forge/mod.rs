@@ -454,12 +454,20 @@ impl PullRequest {
 /// One PR conversation comment with its creation time (RFC3339 UTC, as GitHub
 /// returns `createdAt`). merge-watch reads the #41 arm marker's `createdAt` to
 /// know how long a PR has been armed (arm-since) without any local state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PrComment {
     pub body: String,
     /// GitHub's `createdAt`, e.g. `2026-07-13T09:00:00Z`; empty when the forge
     /// did not supply one (`store::parse_ts` then yields None → never stale).
     pub created_at: String,
+    /// The comment's GraphQL node id — how the reconciler edits its own claim
+    /// marker to a tombstone on release (ADR 0027 / §7). Empty when the forge
+    /// did not supply one.
+    pub id: String,
+    /// Whether the viewer (meguri's token) authored this comment. The claim
+    /// marker is trusted only when self-authored, so a third party cannot forge
+    /// a claim to freeze no-steal (ADR 0027 / §7). False for a lossy source.
+    pub viewer_did_author: bool,
 }
 
 /// One comment inside a review thread.

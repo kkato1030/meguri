@@ -947,6 +947,7 @@ impl Forge for FakeForge {
             .map(|(_, body, created_at)| PrComment {
                 body: body.clone(),
                 created_at: created_at.clone(),
+                ..Default::default()
             })
             .collect())
     }
@@ -1143,6 +1144,7 @@ impl Forge for FakeForge {
                 .map(|(_, body, created_at)| PrComment {
                     body: body.clone(),
                     created_at: created_at.clone(),
+                    ..Default::default()
                 })
                 .collect();
             let review_threads = self.threads_of(number);
