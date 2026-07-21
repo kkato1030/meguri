@@ -275,6 +275,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // active drift the watch's sweep recorded. Read-only, all-project.
             if let Some(store) = &store {
                 doctor_drift(store);
+                // Sweep failures in the last hour (issue #251, design doc
+                // P6.5 item 3): the same events `sweep_health.rs` emits on
+                // every failure, read here purely for visibility.
+                doctor_sweep_health(store);
             }
             doctor_workspaces(cfg);
             // Managed clones (issue #195): show each project's clone state
@@ -1136,6 +1140,41 @@ fn doctor_drift(store: &Store) {
             "  ⚠️  [{}] {}/{} の成績が悪化 — CLI 更新かモデル変更の影響の可能性",
             d.project_id, d.loop_kind, profile
         );
+    }
+}
+
+/// Doctor's sweep-health section (issue #251, design doc P6.5 item 3): the
+/// per-(project, sweep) `sweep.failed` event count in the last hour, read
+/// straight from `events` — no dedicated state table, since `sweep_health.rs`
+/// already emits one event per failure. Read-only and never fails doctor;
+/// this is visibility into an ongoing outage, not a precondition check.
+fn doctor_sweep_health(store: &Store) {
+    let since = meguri::store::format_epoch(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(3600),
+    );
+    let failures = match store.events_since("sweep.failed", &since) {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("sweep-health read failed: {e:#}");
+            return;
+        }
+    };
+    if failures.is_empty() {
+        return;
+    }
+    let mut counts: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for e in &failures {
+        let project = e.data["project"].as_str().unwrap_or("?").to_string();
+        let sweep = e.data["sweep"].as_str().unwrap_or("?").to_string();
+        *counts.entry((project, sweep)).or_default() += 1;
+    }
+    println!("\nsweep failures (直近1時間):");
+    for ((project, sweep), n) in counts {
+        println!("  ⚠️  [{project}] {sweep}: {n} 回");
     }
 }
 

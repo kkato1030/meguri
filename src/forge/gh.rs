@@ -58,6 +58,35 @@ const MERGE_TAIL_OBSERVE_QUERY: &str = "query($owner:String!,$name:String!){\
      ... on CheckRun{name status conclusion detailsUrl} \
      ... on StatusContext{context state targetUrl}}}}}}}}}}}";
 
+/// Paginated conversation-comment fallback used when the bulk observe's
+/// `comments(last:100)` window clipped older comments ([`GhForge::paginate_pr_comments`]).
+/// Kept as a const so the brace-balance unit test below covers it too (issue
+/// #251, design doc P6.5 item 2 — the same class of silent-failure bug #227
+/// hit in [`MERGE_TAIL_OBSERVE_QUERY`] can hide in any hand-written GraphQL
+/// string, not just that one).
+const COMMENT_PAGINATION_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} \
+     nodes{id body createdAt viewerDidAuthor}}}}}";
+
+/// Checks + classic commit statuses for one PR's head commit
+/// ([`GhForge::pr_check_rollup`]). Kept as a const for the same parse-level
+/// brace check as the other GraphQL strings (issue #251).
+const CHECK_ROLLUP_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     commits(last:1){nodes{commit{statusCheckRollup{\
+     contexts(first:100){nodes{__typename \
+     ... on CheckRun{name status conclusion detailsUrl} \
+     ... on StatusContext{context state targetUrl}}}}}}}}}}";
+
+/// Review-thread resolution state for one PR ([`GhForge::list_review_threads`]).
+/// Kept as a const for the same parse-level brace check as the other GraphQL
+/// strings (issue #251).
+const REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     reviewThreads(first:100){nodes{id isResolved path line \
+     comments(first:100){nodes{author{login} body}}}}}}}";
+
 /// Scheme color (hex, no `#`) and description for a known meguri label — the
 /// color encodes the two-axis model (ADR 0005): phase labels by stage
 /// (plan/ready = blue, speccing = purple, implementing = green) and ball
@@ -649,10 +678,7 @@ impl GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} \
-             nodes{id body createdAt viewerDidAuthor}}}}}";
+        let query = COMMENT_PAGINATION_QUERY;
         let mut pages: Vec<Value> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut requests: u32 = 0;
@@ -1213,12 +1239,7 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             commits(last:1){nodes{commit{statusCheckRollup{\
-             contexts(first:100){nodes{__typename \
-             ... on CheckRun{name status conclusion detailsUrl} \
-             ... on StatusContext{context state targetUrl}}}}}}}}}}";
+        let query = CHECK_ROLLUP_QUERY;
         let raw = self
             .gh(&[
                 "api",
@@ -1521,10 +1542,7 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             reviewThreads(first:100){nodes{id isResolved path line \
-             comments(first:100){nodes{author{login} body}}}}}}}";
+        let query = REVIEW_THREADS_QUERY;
         let raw = self
             .gh(&[
                 "api",
@@ -1890,23 +1908,45 @@ impl Forge for GhForge {
 mod tests {
     use super::*;
 
-    // FakeForge tests never execute the real observe query, so a syntax slip
-    // here (an unbalanced brace killed every merge-tail sweep in production
-    // on 2026-07-21) only surfaces via this parse-level check.
-    #[test]
-    fn merge_tail_observe_query_braces_balance() {
+    // FakeForge tests never execute these hand-written GraphQL strings, so a
+    // syntax slip in one of them (an unbalanced brace killed every merge-tail
+    // sweep in production on 2026-07-21, #227) only surfaces via this
+    // parse-level check — hence every literal query is a module-level const
+    // covered here, not just the one #242 fixed (issue #251, design doc P6.5
+    // item 2).
+    fn assert_braces_balance(name: &str, query: &str) {
         let mut depth = 0i64;
-        for (i, c) in MERGE_TAIL_OBSERVE_QUERY.chars().enumerate() {
+        for (i, c) in query.chars().enumerate() {
             match c {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    assert!(depth >= 0, "extra closing brace at index {i}");
+                    assert!(depth >= 0, "{name}: extra closing brace at index {i}");
                 }
                 _ => {}
             }
         }
-        assert_eq!(depth, 0, "{depth} unclosed brace(s) in the observe query");
+        assert_eq!(depth, 0, "{name}: {depth} unclosed brace(s)");
+    }
+
+    #[test]
+    fn merge_tail_observe_query_braces_balance() {
+        assert_braces_balance("MERGE_TAIL_OBSERVE_QUERY", MERGE_TAIL_OBSERVE_QUERY);
+    }
+
+    #[test]
+    fn comment_pagination_query_braces_balance() {
+        assert_braces_balance("COMMENT_PAGINATION_QUERY", COMMENT_PAGINATION_QUERY);
+    }
+
+    #[test]
+    fn check_rollup_query_braces_balance() {
+        assert_braces_balance("CHECK_ROLLUP_QUERY", CHECK_ROLLUP_QUERY);
+    }
+
+    #[test]
+    fn review_threads_query_braces_balance() {
+        assert_braces_balance("REVIEW_THREADS_QUERY", REVIEW_THREADS_QUERY);
     }
 
     #[test]

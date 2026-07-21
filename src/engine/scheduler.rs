@@ -82,6 +82,10 @@ impl Scheduler {
         // Per-project memory for edge-triggered schedule diagnostics (issue
         // #222 f6): lives across ticks so a persisting condition emits once.
         let mut schedule_diag: super::schedule::DiagMemory = HashMap::new();
+        // Consecutive-failure streaks for the sweeps below (issue #251): a
+        // streak past the configured threshold escalates once to
+        // `sweep.degraded` + a notification instead of staying a silent WARN.
+        let mut sweep_health = super::sweep_health::SweepHealth::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -158,47 +162,64 @@ impl Scheduler {
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
-                if let Err(e) = super::schedule::sweep(deps, now, &mut schedule_diag).await {
-                    tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
-                }
-                if let Err(e) = super::reaper::sweep(deps).await {
-                    tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
-                }
+                // Every sweep below routes its outcome through `sweep_health`
+                // (issue #251, design doc P6.5) instead of a bare
+                // `tracing::warn!`: each failure is still logged and now also
+                // an event, and a streak that survives past the configured
+                // threshold escalates once to `sweep.degraded` + a
+                // notification — the silent-failure gap #227's GraphQL bug
+                // fell through (a sweep failing every poll for hours with no
+                // trace beyond the log).
+                sweep_health
+                    .record(
+                        deps,
+                        "schedule",
+                        super::schedule::sweep(deps, now, &mut schedule_diag).await,
+                    )
+                    .await;
+                sweep_health
+                    .record(deps, "worktree", super::reaper::sweep(deps).await)
+                    .await;
                 // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
                 // informer-cache observe drives arm (ADR 0003) / orchestrator
                 // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                if let Err(e) = super::issue_reconciler::sweep(deps).await {
-                    tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
-                }
+                sweep_health
+                    .record(
+                        deps,
+                        "merge-tail",
+                        super::issue_reconciler::sweep(deps).await,
+                    )
+                    .await;
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
                 // flips its issue speccing → ready so the worker implements it.
-                if let Err(e) = super::plan_handoff::sweep(deps).await {
-                    tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
-                }
+                sweep_health
+                    .record(deps, "handoff", super::plan_handoff::sweep(deps).await)
+                    .await;
                 // Materialize approved decomposition proposals into child issues
                 // + dependencies (issue #134). Forge-only, like handoff — the
                 // adjacent spec-flow sweep that consumes spec-ready proposal PRs.
-                if let Err(e) = super::decompose_materializer::sweep(deps).await {
-                    tracing::warn!(
-                        "decompose materialize sweep failed for {}: {e:#}",
-                        deps.project.id
-                    );
-                }
+                sweep_health
+                    .record(
+                        deps,
+                        "decompose-materializer",
+                        super::decompose_materializer::sweep(deps).await,
+                    )
+                    .await;
                 // Ride the poll: recompute routing outcome drift from run
                 // history and record any threshold crossing (routing 2/3,
                 // #65). Pure sqlite, no pane, no API.
-                if let Err(e) = super::routing_drift::sweep(deps) {
-                    tracing::warn!("routing drift sweep failed for {}: {e:#}", deps.project.id);
-                }
+                sweep_health
+                    .record(deps, "routing-drift", super::routing_drift::sweep(deps))
+                    .await;
                 // Notice body edits on already-shipped issues the label-filtered
                 // discovery can no longer see (issue #142, half B) and leave a
                 // re-attention signal. Light API sweep, no run record.
-                if let Err(e) = super::reconcile::sweep(deps).await {
-                    tracing::warn!("reconcile sweep failed for {}: {e:#}", deps.project.id);
-                }
+                sweep_health
+                    .record(deps, "reconcile", super::reconcile::sweep(deps).await)
+                    .await;
             }
 
             tokio::select! {
