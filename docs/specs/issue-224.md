@@ -171,21 +171,32 @@ redispatch / 各 sweep)をゲートする `ready` 集合を作る。f5 の指摘
 - **分岐**: (A) EnsureClone を「特別な bootstrap ゲート」として scheduler に残す / (B) EnsureClone を
   Repo Kind reconcile の **通常の第一 Op** にし、scheduler は他 Kind より先にその Op を回すだけに
   する(順序は「clone が repo_path 仕事の前提」という依存であって、bespoke ゲートではない)。
-- **決定**: **(B)**。単一契約は以下。
-  - **observe**: `RepoSnapshot.clone_health: CloneHealth`(`Absent` / `Present` / `Unreadable`)を
-    managed-clone パスの観測(既存 `clone_health`)から作る。
-  - **decide**: `next_step_repo` は `clone_health == Absent`(かつ managed clone)なら
-    `Op(EnsureClone)` を返す。`Present` なら repo は当該 tick で ready で、cleaner / triage / drift
-    の判定へ進む。`Unreadable` は not-ready(下記のとおり除外)。
-  - **act**: `Op(EnsureClone)` の act は bare clone を実体化(現 `ensure_project_clone` 本体)し、
-    成否を返す。
+- **決定**: **(B)**。既存の `gitops::CloneHealth`(`Healthy` / `Absent` / `Broken(String)`、
+  f7)を **そのまま**使い、新しい状態名は導入しない。単一契約は以下。managed clone でない project
+  (`repo_path` 明示)は clone 不要なので常に ready。
+  - **observe**: `RepoSnapshot.clone_health: gitops::CloneHealth` を managed-clone パスの観測
+    (既存 `gitops::clone_health`)から作る。3 状態を漏れなく持つ:
+    - `Healthy` — clone 実体化済み。
+    - `Absent` — 未 clone(または空ディレクトリ)。
+    - `Broken(why)` — 読めない / bare でない / slug 不一致など。`why: String` は理由をそのまま保持。
+  - **decide**: `next_step_repo` は clone_health で網羅 match する(property test も同型で網羅):
+    - `Absent` → `Op(EnsureClone)`(clone を実体化させる)。
+    - `Healthy` → clone 済みなので当該 tick は ready。cleaner / triage / drift の判定へ進む。
+    - `Broken(why)` → `Op(EnsureClone)` を返す。現 `gitops::ensure_bare_clone` は `Broken` を
+      `bail!` する(自動修復しない)ので、この act は失敗し project は not-ready になる。`why` は
+      失敗理由として event / `meguri doctor` / `meguri why` に載せる(下記)。
+  - **act**: `Op(EnsureClone)` の act は現 `ensure_project_clone` 本体(= `gitops::ensure_bare_clone`
+    経由)。`Absent` は clone して `Healthy` へ、`Broken(why)` は `why` を付けて `Err` を返す
+    (`repo.clone.failed` を毎失敗 tick emit、level-triggered)。`Healthy` は no-op。
   - **readiness 契約(単一)**: scheduler は tick 先頭で `repo_reconciler::reconcile_ready(deps)` を
     呼ぶ。これは `next_step_repo` の **EnsureClone 部分のみ**を評価・act し、`ready:
-    HashSet<project_id>` を返す(EnsureClone 成功後 `Present`、または失敗/`Unreadable` で除外)。
-    cleaner / triage / drift(slot や書き込みを伴う)は project ごとの通常ブロックで、しかも
-    **ready な project にのみ**回す — 他 Kind と同じゲート。
-  - **失敗時の遮断**: EnsureClone に失敗した project はその tick の `ready` から外れ、redispatch /
-    新規 enqueue / 全 Kind の処理が当該 tick で止まる(現 `ensure_projects_ready` の除外と同一)。
+    HashSet<project_id>` を返す。**ready に入る条件は「act 後に `Healthy`」の一点**:
+    - `Healthy`(元から / clone 成功後)→ ready。
+    - `Absent` で clone 失敗 → not-ready(除外)。
+    - `Broken(why)` → act が `Err(why)` を返し not-ready(除外)。
+  - **失敗時の遮断**: ready から外れた project は redispatch / 新規 enqueue / 全 Kind の処理が当該
+    tick で止まる(現 `ensure_projects_ready` の除外と同一)。`Broken` の理由 `why` は握り潰さず
+    event に残し、`meguri why <project>` が読めるようにする。
   - 芯: scheduler 固有の bootstrap reconcile 経路は消え、clone 実体化は Repo Kind の第一 Op として
     表現される。scheduler が先に呼ぶのは「順序依存」であって二重ロジックではない。
 
@@ -280,7 +291,9 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
    `decompose_materializer::sweep` / `routing_drift::sweep` / `reconcile::sweep`)が消え、
    全て reconciler(issue / repo)の act / arm 経由になっている。
 3. `ensure_project_clone` の scheduler 固有経路が消え、`Op(EnsureClone)` として表現されている。
-   tick の ready ゲート順序は不変(clone 未実体化の project は当該 tick で除外)。
+   tick の ready ゲート順序は不変(clone 未実体化の project は当該 tick で除外)。`next_step_repo` は
+   既存 `gitops::CloneHealth`(`Healthy`/`Absent`/`Broken`)を網羅 match し、ready 条件は「act 後
+   `Healthy`」、`Broken(why)` の理由は event に残る(f7)。
 4. `reconcile` 名前衝突が解消(body-edit sweep は `reconcile_body_edits` に改名)。
 5. planner(`meguri:plan`)/ worker(`meguri:ready`)/ spec_worker(combined の spec-ready PR)/
    pr_reviewer / spec_fixer / cleaner / triage が **全て reconciler の arm** から enqueue され、
@@ -333,8 +346,10 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
 ## test strategy
 
 - **純関数 property test**: `next_step_issue` / `next_step_repo` / `next_step_local` の全域性
-  (既存 PR 側 property test と同型)。**結合 property test**(f2): 2 decider が同一 issue に
-  二重の enqueue を出さないこと(受け入れ6、drift 込み)。
+  (既存 PR 側 property test と同型)。`next_step_repo` は `CloneHealth` の3状態
+  (`Healthy` / `Absent` / `Broken`)を網羅し、readiness(act 後 `Healthy` のみ ready)を assert
+  する(f7)。**結合 property test**(f2): 2 decider が同一 issue に二重の enqueue を出さないこと
+  (受け入れ6、drift 込み)。
 - **挙動保存**: 各 loop の既存ユニット/挙動テストを、enqueue 経路を reconciler に差し替えても
   緑のまま通す(planner は `meguri:plan` で発火、worker の needs_plan ping-pong ガード、
   spec_fixer の budget escalation、cleaner/triage の scan cadence、等)。
