@@ -37,6 +37,11 @@ PR レベル escalation 36 件、herdr ConnectionRefused の重複 escalation 23
 
 ### 3-A. 復旧不能セッションの resume ループ(最大の時間損失)
 
+> 再発記録: 本ドキュメント起票の数時間後(07-21 06:14 UTC)、別 issue(#235)の
+> pr-review lane でも同一故障が再発した(gpt reviewer が spec レビュー3周を同一
+> セッションで回して context 100% 到達)。単発事故ではなく、review 系 lane を
+> resume で回し続ける構造そのものが原因である傍証。
+
 gpt プロファイル(cliproxyapi 経由・context window が claude より小さい)の
 pr-reviewer セッションが context 100% に達し、以後すべての入力が
 `API Error: 400 input exceeds the context window` になった。transcript は 8.8MB。
