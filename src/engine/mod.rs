@@ -11,6 +11,7 @@ pub mod planner;
 pub mod pr_reviewer;
 pub mod reaper;
 pub mod reconcile_body_edits;
+pub mod repo_reconciler;
 pub mod routing_drift;
 pub mod schedule;
 pub mod scheduler;
