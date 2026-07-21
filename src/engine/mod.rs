@@ -5,7 +5,7 @@ pub mod decompose_materializer;
 pub mod escalation;
 pub mod fixer;
 pub mod flow;
-pub mod merge_tail;
+pub mod issue_reconciler;
 pub mod plan_handoff;
 pub mod planner;
 pub mod pr_reviewer;

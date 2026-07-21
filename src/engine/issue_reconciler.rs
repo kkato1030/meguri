@@ -3,8 +3,8 @@
 //! ADR 0009) and `merge_watch` (drift detection, superseded ADR 0007) — into a
 //! single level-triggered pass: **observe → next_step → act**.
 //!
-//! - **observe** is one informer-cache query (`Forge::observe_merge_tail`) whose
-//!   API cost is measured and emitted (`merge_tail.observe_cost`).
+//! - **observe** is one informer-cache query (`Forge::observe_open_prs`) whose
+//!   API cost is measured and emitted (`reconciler.observe_cost`).
 //! - **decide** is the pure function [`next_step`]: same [`Snapshot`] ⇒ same
 //!   [`Step`]. Every observed state has exactly one owning arm, so a property
 //!   test can prove there is no gap (the BEHIND hole) and no double ownership.
@@ -401,10 +401,10 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     // observe: one bulk query, its API cost measured and recorded (issue #221,
     // acceptance 2). The pr-review context is passed in so the forge stays free
     // of engine vocabulary.
-    let observation = deps.forge().observe_merge_tail(PR_REVIEW_STATUS).await?;
+    let observation = deps.forge().observe_open_prs(PR_REVIEW_STATUS).await?;
     let _ = deps.store.emit(
         None,
-        "merge_tail.observe_cost",
+        "reconciler.observe_cost",
         json!({
             "requests": observation.cost.requests,
             "graphql_cost": observation.cost.graphql_cost,

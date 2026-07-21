@@ -167,7 +167,7 @@ impl Scheduler {
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                if let Err(e) = super::merge_tail::sweep(deps).await {
+                if let Err(e) = super::issue_reconciler::sweep(deps).await {
                     tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR

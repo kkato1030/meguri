@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use meguri::config::{AutoMergeMode, Autonomy, Config, ProjectConfig};
 use meguri::engine::Deps;
-use meguri::engine::merge_tail::sweep;
+use meguri::engine::issue_reconciler::sweep;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_AUTOMERGE, MergeStateStatus, MergeStrategy, MergeableState};
 
@@ -235,7 +235,7 @@ async fn observe_cost_is_constant_and_recorded() {
         seed_armable(&forge, n, "sha");
     }
     let one = forge
-        .observe_merge_tail(meguri::engine::pr_reviewer::PR_REVIEW_STATUS)
+        .observe_open_prs(meguri::engine::pr_reviewer::PR_REVIEW_STATUS)
         .await
         .unwrap();
     assert_eq!(one.prs.len(), 3);
@@ -244,7 +244,7 @@ async fn observe_cost_is_constant_and_recorded() {
     let deps = deps_with(forge.clone(), AutoMergeMode::Native);
     sweep(&deps).await.unwrap();
     assert_eq!(
-        deps.store.count_events("merge_tail.observe_cost").unwrap(),
+        deps.store.count_events("reconciler.observe_cost").unwrap(),
         1,
         "each sweep records the observe cost"
     );

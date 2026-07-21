@@ -1519,7 +1519,7 @@ impl Forge for GhForge {
         }
     }
 
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
         // Informer-cache observe (issue #221, ADR 0012 decision 3): one GraphQL
         // query folds every signal the two old sweeps read per PR (merge state,
         // arm-marker comments, review threads, the check rollup, the pr-review

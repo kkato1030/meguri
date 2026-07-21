@@ -153,7 +153,7 @@ pub enum UpdateBranchOutcome {
     HeadMoved,
 }
 
-/// The API cost of one [`Forge::observe_merge_tail`] call — the measured value
+/// The API cost of one [`Forge::observe_open_prs`] call — the measured value
 /// ADR 0012 (decision 3) wants observable (issue #221). `requests` counts the
 /// HTTP round-trips the observe took; `graphql_cost` is GitHub's own
 /// `rateLimit.cost` when the query returned it, `None` otherwise.
@@ -168,7 +168,7 @@ pub struct ObserveCost {
 /// `next_step` reduces them to its decision Snapshot. The arm marker and the
 /// pr-review context are engine vocabulary, so the forge stays free of them:
 /// the marker is read by the engine out of [`Self::comments`], and the
-/// pr-review status is the context the caller passed to `observe_merge_tail`.
+/// pr-review status is the context the caller passed to `observe_open_prs`.
 #[derive(Debug, Clone)]
 pub struct PrObservation {
     pub pr: PullRequest,
@@ -645,7 +645,7 @@ pub trait Forge: Send + Sync {
     /// arming (`meguri/pr-review`, ADR 0008); the caller supplies it so the
     /// forge stays free of engine vocabulary, exactly as [`Forge::commit_status`]
     /// takes its context.
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
     /// Close a pull request **without merging** (`gh pr close`). The decompose

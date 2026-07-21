@@ -122,11 +122,11 @@ pub struct FakeForge {
     /// (issue #221). A call whose expected head matches advances the recorded
     /// head (base merged in); a stale expected head is rejected (HeadMoved).
     pub update_branch_calls: Mutex<Vec<(i64, String)>>,
-    /// PRs whose `observe_merge_tail` reports its label set as clipped
+    /// PRs whose `observe_open_prs` reports its label set as clipped
     /// (`labels_complete = false`) — exercises the engine's conservative
     /// safety-gate fallback for a real forge's bounded label window.
     pub incomplete_labels: Mutex<HashSet<i64>>,
-    /// PRs whose `observe_merge_tail` reports its thread set as clipped
+    /// PRs whose `observe_open_prs` reports its thread set as clipped
     /// (`review_threads_complete = false`).
     pub incomplete_threads: Mutex<HashSet<i64>>,
 }
@@ -1091,7 +1091,7 @@ impl Forge for FakeForge {
         Ok(UpdateBranchOutcome::Updated)
     }
 
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
         let open: Vec<RecordedPr> = self
             .prs
             .lock()
