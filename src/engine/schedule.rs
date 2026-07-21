@@ -96,12 +96,26 @@ pub enum Diagnostic {
 }
 
 impl Diagnostic {
-    /// A stable key for edge-triggered dedup (same condition ⇒ same signature).
+    /// A stable key for edge-triggered dedup. It includes the *detail*, not just
+    /// the kind, so a same-kind condition whose cause changes (e.g. a fetch
+    /// timeout becoming an auth error) is a new transition and re-emits (issue
+    /// #222 f6). The detail is a stable message for a stable cause (no clock /
+    /// counter), so the steady state still dedups.
     fn signature(&self) -> String {
         match self {
             Self::Shadowed { name } => format!("shadowed:{name}"),
-            Self::RepoInvalid { .. } => "repo_invalid".to_string(),
-            Self::RepoUnavailable { .. } => "repo_unavailable".to_string(),
+            Self::RepoInvalid { detail } => format!("repo_invalid:{detail}"),
+            Self::RepoUnavailable { detail } => format!("repo_unavailable:{detail}"),
+        }
+    }
+
+    /// The event kind emitted when this diagnostic first appears (or its cause
+    /// changes). The matching resolution emits `schedule.diagnostic_cleared`.
+    fn event_kind(&self) -> &'static str {
+        match self {
+            Self::Shadowed { .. } => "schedule.shadowed",
+            Self::RepoInvalid { .. } => "repo_config.invalid",
+            Self::RepoUnavailable { .. } => "schedule.repo_unavailable",
         }
     }
 }
@@ -356,58 +370,65 @@ pub async fn sweep(deps: &Deps, now: u64, diag_memory: &mut DiagMemory) -> Resul
     Ok(())
 }
 
-/// Emit resolver diagnostics only on their transition (appearance / change),
-/// not every tick (issue #222 f6). `doctor` / `meguri schedules` never call
-/// this — they display the diagnostics instead.
+/// Emit resolver diagnostics only on their **transitions** — appearance, cause
+/// change, and resolution — never every tick (issue #222 f6). `doctor` /
+/// `meguri schedules` never call this; they display the diagnostics instead.
 async fn emit_diagnostics_edge_triggered(
     deps: &Deps,
     diagnostics: &[Diagnostic],
     diag_memory: &mut DiagMemory,
 ) {
-    let current: HashSet<String> = diagnostics.iter().map(|d| d.signature()).collect();
+    // Signature → diagnostic for this tick. The signature carries the detail, so
+    // a same-kind cause change is a new signature (a fresh appearance).
+    let current: HashMap<String, &Diagnostic> =
+        diagnostics.iter().map(|d| (d.signature(), d)).collect();
     let previous = diag_memory.entry(deps.project.id.clone()).or_default();
 
-    for d in diagnostics {
-        if previous.contains(&d.signature()) {
+    // Appearance / change: a signature not present last tick.
+    for (sig, d) in &current {
+        if previous.contains(sig) {
             continue; // steady state — already emitted on its transition
         }
-        match d {
+        let data = match d {
             Diagnostic::Shadowed { name } => {
-                let _ = deps.store.emit(
-                    None,
-                    "schedule.shadowed",
-                    json!({ "project": deps.project.id, "name": name }),
-                );
                 tracing::warn!(
                     "schedule {name:?} in {}'s repo meguri.toml is shadowed by a host schedule",
                     deps.project.id
                 );
+                json!({ "project": deps.project.id, "name": name })
             }
             Diagnostic::RepoInvalid { detail } => {
-                let _ = deps.store.emit(
-                    None,
-                    "repo_config.invalid",
-                    json!({ "project": deps.project.id, "error": detail }),
-                );
                 tracing::warn!(
                     "repo meguri.toml schedules for {} are invalid: {detail}",
                     deps.project.id
                 );
+                json!({ "project": deps.project.id, "error": detail })
             }
             Diagnostic::RepoUnavailable { detail } => {
-                let _ = deps.store.emit(
-                    None,
-                    "schedule.repo_unavailable",
-                    json!({ "project": deps.project.id, "error": detail }),
-                );
                 tracing::warn!(
                     "repo schedules for {} unavailable this tick (fetch): {detail}",
                     deps.project.id
                 );
+                json!({ "project": deps.project.id, "error": detail })
             }
+        };
+        let _ = deps.store.emit(None, d.event_kind(), data);
+    }
+
+    // Resolution: a signature present last tick but gone now (fetch recovered,
+    // config fixed, shadow removed). Emit one `schedule.diagnostic_cleared`.
+    for sig in previous.iter() {
+        if !current.contains_key(sig) {
+            let _ = deps.store.emit(
+                None,
+                "schedule.diagnostic_cleared",
+                json!({ "project": deps.project.id, "diagnostic": sig }),
+            );
+            tracing::info!("schedule diagnostic cleared for {}: {sig}", deps.project.id);
         }
     }
-    *previous = current;
+
+    *previous = current.keys().cloned().collect();
 }
 
 async fn fire_one(deps: &Deps, sched: &EffectiveSchedule, now: u64) -> Result<()> {
@@ -720,5 +741,27 @@ mod tests {
         );
         // Not due → wait, open item irrelevant.
         assert_eq!(next_step(&Snapshot { due: false, ..base }), Step::Wait);
+    }
+
+    #[test]
+    fn diagnostic_signature_tracks_the_cause_not_just_the_kind() {
+        // issue #222 f6: a same-kind diagnostic whose cause changes is a new
+        // transition (re-emits); an identical cause dedups.
+        let timeout = Diagnostic::RepoUnavailable {
+            detail: "fetch timed out".into(),
+        };
+        let auth = Diagnostic::RepoUnavailable {
+            detail: "auth failed".into(),
+        };
+        assert_ne!(timeout.signature(), auth.signature());
+        assert_eq!(
+            timeout.signature(),
+            Diagnostic::RepoUnavailable {
+                detail: "fetch timed out".into()
+            }
+            .signature()
+        );
+        // The clear event kind is stable per diagnostic kind.
+        assert_eq!(timeout.event_kind(), "schedule.repo_unavailable");
     }
 }

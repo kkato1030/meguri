@@ -1509,6 +1509,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_at_ref_pins_the_commit_even_after_the_branch_moves() {
+        // issue #222 f5: the schedule resolver reads meguri.toml and body_file at
+        // one pinned SHA so a concurrent fetch can't split them across commits.
+        // Commit A adds the file; commit B removes it and advances main.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("f.md"), "at commit A").unwrap();
+        run_git(repo.path(), &["add", "f.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "add f"])
+            .await
+            .unwrap();
+        let sha_a = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        run_git(repo.path(), &["rm", "f.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "remove f"])
+            .await
+            .unwrap();
+
+        // The pinned SHA still yields the content; the moved branch does not.
+        match read_file_at_ref(repo.path(), &sha_a, "f.md").await.unwrap() {
+            DefaultBranchFile::Content(c) => assert_eq!(c, "at commit A"),
+            other => panic!("expected content at the pinned sha, got {other:?}"),
+        }
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "f.md")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Absent
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_default_branch_reports_failure_without_hanging() {
+        // issue #222 f1/f4: no-remote is a benign success; a broken remote is a
+        // reported failure (the caller then abstains) — never a hang.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        // No `origin` remote → nothing to fetch, treated as success.
+        assert!(fetch_default_branch(repo.path(), "main").await.is_ok());
+        // A broken origin → the fetch fails fast (bounded), surfaced as an error.
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "/nonexistent/definitely-not-a-repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(fetch_default_branch(repo.path(), "main").await.is_err());
+    }
+
+    #[tokio::test]
     async fn ancestry_and_marker_scan_verify_a_merge() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;

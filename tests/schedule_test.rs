@@ -567,6 +567,27 @@ impl RemoteRepo {
         git(self.pusher.path(), &["commit", "-m", msg]);
         git(self.pusher.path(), &["push", "origin", "main"]);
     }
+
+    /// Update the work clone's `origin/main` now (what a healthy resolver fetch
+    /// would do), so a later [`break_origin`] leaves the schedule present but
+    /// only in the *stale* ref.
+    fn fetch_work(&self) {
+        git(&self.work(), &["fetch", "origin", "main"]);
+    }
+
+    /// Point the work clone's origin at a nonexistent path so the resolver's
+    /// freshness fetch fails (the fail-closed abstain path).
+    fn break_origin(&self) {
+        git(
+            &self.work(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "/nonexistent/definitely-not-a-repo.git",
+            ],
+        );
+    }
 }
 
 #[tokio::test]
@@ -654,4 +675,155 @@ async fn broken_repo_meguri_toml_still_lets_host_schedules_fire() {
     let issues = forge.issues.lock().unwrap();
     assert_eq!(issues.len(), 1, "only the host schedule fired");
     assert_eq!(issues[0].title, "host-daily 2026-07-13");
+}
+
+#[tokio::test]
+async fn fetch_failure_abstains_repo_layer_but_host_still_fires() {
+    // f2(a) / ADR 0026 fail-closed: the repo schedule IS present in the (stale)
+    // origin/main, but the freshness fetch fails — so meguri abstains and does
+    // NOT fire it (never fire a possibly-deleted schedule from a stale ref),
+    // while the host schedule fires unaffected.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"repo-daily\"\ncron = \"0 9 * * *\"\ntitle = \"repo\"\nbody = \"r\"\n",
+        "repo schedule",
+    );
+    repo.fetch_work(); // work's origin/main now has the repo schedule …
+    repo.break_origin(); // … but future fetches fail.
+
+    let store = Store::open_in_memory().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        store.clone(),
+        forge.clone(),
+        repo.work(),
+        vec![sched("host-daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire
+
+    let issues = forge.issues.lock().unwrap();
+    assert_eq!(issues.len(), 1, "only the host schedule fired");
+    assert_eq!(issues[0].title, "host-daily 2026-07-13");
+    assert!(
+        store.count_events("schedule.repo_unavailable").unwrap() >= 1,
+        "the abstain is surfaced, not silent"
+    );
+}
+
+#[tokio::test]
+async fn invalid_cron_in_repo_drops_only_that_entry() {
+    // f2(d) / D6: a single bad-cron entry is dropped; the sibling repo schedule
+    // still fires (a per-schedule error, not a whole-set collection error).
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"good\"\ncron = \"0 9 * * *\"\ntitle = \"good {{date}}\"\nbody = \"g\"\n\
+         [[schedules]]\nname = \"bad\"\ncron = \"not a cron\"\ntitle = \"bad\"\nbody = \"b\"\n",
+        "one good one bad",
+    );
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge.clone(),
+        repo.work(),
+        vec![],
+    );
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed good
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // good fires
+
+    let issues = forge.issues.lock().unwrap();
+    assert_eq!(issues.len(), 1, "only the valid entry fired");
+    assert_eq!(issues[0].title, "good 2026-07-13");
+}
+
+#[tokio::test]
+async fn edge_triggered_diagnostic_emits_once_and_again_on_clear() {
+    // f2(e) / D12: a persisting condition (host shadows a repo schedule) emits a
+    // single event across steady ticks, and its resolution emits one clear.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"daily\"\ncron = \"0 9 * * *\"\ntitle = \"REPO\"\nbody = \"r\"\n",
+        "shadowing repo schedule",
+    );
+    let store = Store::open_in_memory().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        store.clone(),
+        forge.clone(),
+        repo.work(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    // A shared memory across ticks (the watch loop keeps one).
+    let mut diag = DiagMemory::new();
+    for t in ["00:00:00", "00:05:00", "00:10:00"] {
+        sweep_impl(&deps, ts(&format!("2026-07-13T{t}Z")), &mut diag)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store.count_events("schedule.shadowed").unwrap(),
+        1,
+        "steady state does not re-emit every tick"
+    );
+
+    // Resolve the shadow: the repo no longer defines `daily`.
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"other\"\ncron = \"0 9 * * *\"\ntitle = \"o\"\nbody = \"o\"\n",
+        "drop the shadow",
+    );
+    sweep_impl(&deps, ts("2026-07-13T00:15:00Z"), &mut diag)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_events("schedule.shadowed").unwrap(),
+        1,
+        "no new shadow event after it cleared"
+    );
+    assert_eq!(
+        store.count_events("schedule.diagnostic_cleared").unwrap(),
+        1,
+        "the resolution emits exactly one clear"
+    );
+}
+
+#[tokio::test]
+async fn crash_between_enqueue_and_record_refires_at_least_once() {
+    // f2(f): the at-least-once boundary. A fire that created its item but was
+    // killed before `record_schedule_fire` leaves the window un-advanced and no
+    // key saved — so the next sweep re-fires (a duplicate), and the overlap
+    // guard cannot prevent it (there is no saved key to check).
+    use meguri::forge::Forge;
+
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge.clone(),
+        dir.path().to_path_buf(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+
+    // Seed only (window bottom at 00:00, no key).
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap();
+    // Simulate the enqueue that happened just before the crash: the item exists…
+    forge
+        .create_issue("crashed daily", "body", &[LABEL_READY])
+        .await
+        .unwrap();
+    assert_eq!(issue_count(&forge), 1);
+    // …but the window was never advanced. The next sweep re-fires the window:
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap();
+    assert_eq!(
+        issue_count(&forge),
+        2,
+        "at-least-once: the un-recorded window re-fires (guard is blind, no saved key)"
+    );
+
+    // Once recorded, the same window does not fire again (the non-crash path).
+    sweep(&deps, ts("2026-07-13T09:31:00Z")).await.unwrap();
+    assert_eq!(issue_count(&forge), 2, "a recorded window is not re-fired");
 }
