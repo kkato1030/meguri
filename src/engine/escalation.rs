@@ -168,8 +168,10 @@ const INFRA_FAULT_WINDOW_SECS: u64 = 24 * 3600;
 ///
 /// Bounded: past [`MAX_INFRA_FAULTS_PER_WINDOW`] faults for the same target
 /// inside the window, the fault is no longer treated as transient and falls
-/// back to the standard needs-human escalation ([`escalate_task`]) — the cap
-/// that keeps a permanently broken dependency from retrying forever.
+/// back to the standard needs-human escalation ([`escalate_task`]) **plus
+/// `meguri:hold`** — needs-human alone would not stop a ready/plan issue's
+/// discovery (the next claim clears it and retries), so hold is what makes
+/// the stop durable until a human removes it.
 pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: &str) {
     let key = run.task_key();
     let target = match key {
@@ -197,10 +199,24 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
             deps,
             run,
             &format!(
-                "infra fault persisted after {recent} retries within 24h                  ({reason}): {detail} — the dependency looks permanently                  broken, retrying stops until a human clears it"
+                "infra fault persisted after {recent} retries within 24h ({reason}): {detail} — \
+                 the dependency looks permanently broken. `meguri:hold` was added so discovery \
+                 stops re-dispatching; remove it (with `meguri:needs-human`) to resume once the \
+                 dependency is fixed"
             ),
         )
         .await;
+        // needs-human alone is NOT a discovery stop for a ready/plan issue:
+        // discovery only skips hold/working, and the next claim clears
+        // needs-human ("a fresh claim supersedes the escalation"). Without a
+        // durable stop the capped issue would retry on the very next poll —
+        // hold is the label both discovery and claim respect. Local tasks
+        // need none of this: `status=needs_human` already stops their queue.
+        if let TaskKey::Issue(n) = key
+            && deps.forge.is_some()
+        {
+            let _ = deps.forge().add_label(n, forge::LABEL_HOLD).await;
+        }
         return;
     }
     deps.notifier
@@ -376,13 +392,18 @@ mod tests {
             "below the cap the fault must stay classified as infra"
         );
 
-        // The capping fault: no longer transient — a human takes over.
+        // The capping fault: no longer transient — a human takes over, and
+        // hold makes the stop durable (needs-human alone is cleared by the
+        // next claim, so discovery would retry without it).
         escalate_infra(&deps, &run, "mux_connection_refused", "refused").await;
+        let labels = forge.labels_of(7);
         assert!(
-            forge
-                .labels_of(7)
-                .contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
             "past the cap the target must escalate to needs-human"
+        );
+        assert!(
+            labels.contains(&forge::LABEL_HOLD.to_string()),
+            "past the cap the issue must be held so discovery stops re-dispatching"
         );
     }
 
