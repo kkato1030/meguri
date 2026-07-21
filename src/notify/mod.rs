@@ -150,7 +150,7 @@ impl Notification {
         }
     }
 
-    /// A schedule occurrence skipped by the overlap guard (`scheduler_fire.rs`).
+    /// A schedule occurrence skipped by the overlap guard (`schedule.rs`).
     pub fn schedule_skipped(project: &str, schedule: &str, open_key: i64) -> Self {
         Self {
             event: "schedule.skipped".into(),

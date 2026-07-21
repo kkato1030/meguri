@@ -32,12 +32,12 @@ use crate::store::Store;
 
 /// Injected epoch-seconds clock (issue #148): production reads the system
 /// clock, tests supply a fixed value so not-before passage and cadence window
-/// rollover are deterministic. Mirrors `scheduler_fire`'s injected-clock seam.
+/// rollover are deterministic. Mirrors `schedule`'s injected-clock seam.
 pub type EpochClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// The default clock: the same wall-clock the schedule sweep uses.
 fn system_clock() -> EpochClock {
-    Arc::new(crate::engine::scheduler_fire::epoch_now)
+    Arc::new(crate::engine::schedule::epoch_now)
 }
 
 /// The reconcile loop's fingerprint of an issue body (issue #142): a SHA-256
