@@ -184,7 +184,9 @@ redispatch / 各 sweep)をゲートする `ready` 集合を作る。f5 の指摘
     - `Healthy` → clone 済みなので当該 tick は ready。cleaner / triage / drift の判定へ進む。
     - `Broken(why)` → `Op(EnsureClone)` を返す。現 `gitops::ensure_bare_clone` は `Broken` を
       `bail!` する(自動修復しない)ので、この act は失敗し project は not-ready になる。`why` は
-      失敗理由として event / `meguri doctor` / `meguri why` に載せる(下記)。
+      失敗理由として `repo.clone.failed` event と `meguri doctor` に載せる(下記)。**`meguri why` の
+      対象ではない**: ADR 0016 の identity 集合は issue / PR / run / local task に閉じており、repo /
+      project はそこに含めない。clone 失敗の人間向け面は従来どおり `doctor`(ADR 0018)。
   - **act**: `Op(EnsureClone)` の act は現 `ensure_project_clone` 本体(= `gitops::ensure_bare_clone`
     経由)。`Absent` は clone して `Healthy` へ、`Broken(why)` は `why` を付けて `Err` を返す
     (`repo.clone.failed` を毎失敗 tick emit、level-triggered)。`Healthy` は no-op。
@@ -196,7 +198,7 @@ redispatch / 各 sweep)をゲートする `ready` 集合を作る。f5 の指摘
     - `Broken(why)` → act が `Err(why)` を返し not-ready(除外)。
   - **失敗時の遮断**: ready から外れた project は redispatch / 新規 enqueue / 全 Kind の処理が当該
     tick で止まる(現 `ensure_projects_ready` の除外と同一)。`Broken` の理由 `why` は握り潰さず
-    event に残し、`meguri why <project>` が読めるようにする。
+    `repo.clone.failed` event に残し、`meguri doctor`(ADR 0018 の clone 面)が表示する。
   - 芯: scheduler 固有の bootstrap reconcile 経路は消え、clone 実体化は Repo Kind の第一 Op として
     表現される。scheduler が先に呼ぶのは「順序依存」であって二重ロジックではない。
 
