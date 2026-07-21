@@ -42,17 +42,32 @@ usage(往復数・ピーク文脈・処理 input/output token)を集計する **
   計測が実行時の不変条件を変えないという ADR 0020 の立て付けをそのまま踏襲する。
 - **backend 非依存。** コストは meguri ではなく載せている CLI 側の自律ループが背負っている
   以上、sidecar は特定の CLI 実装に縛られない形で usage を読めなければならない。
+- **記録粒度は「ターン」単位、join key は `(run_id, turn_id, lane)`**(f6)。round1 並列
+  reviewer(ADR 0023)は設定エントリごとに `self-review#<index>` という専用 lane の独立ターン
+  としてすでに動いている(各 reviewer が自分専用のペイン・トランスクリプトを持つ)。したがって
+  reviewer 別の token を按分・N 等分する必要は無い — そのターンの usage がそのまま、その
+  reviewer に帰属する。usage を記録できなかったターン(sidecar が対象 CLI のトランスクリプト
+  形式を解釈できない、または reviewer が完走前に drop された)は、その reviewer の行を
+  「分母未定義」として join から除外する。全体 token に丸めたり等分したりはしない。
 
 ### 軸B: CATCH
 
 台帳(ADR 0022/0023 の findings ledger)から reviewer 単位の捕捉を導出する。
 
+- **reviewer の識別単位は `reviewer_profile` ではなく設定エントリの `reviewer_index`(round1
+  並列 reviewer の `[[review.reviewers]]` 上の位置、0始まり)とする**(f5)。ADR 0023 §3 の
+  「単一モデル構成 → lens 分割」では、同じ profile の複数エントリが異なる lens を持つため、
+  profile 名だけを識別子にすると lens 分割された reviewer の寄与が1つに潰れて排他捕捉の
+  数え上げを誤る。`Finding`/`LedgerEntry` に(既存の `reviewer_profile` は残したまま)
+  `reviewer_index` を追加する — round1 の fan-out はすでに `ReviewerPlan.index` /
+  `self-review#<index>` lane としてこの index を内部で持っているので、それを ledger まで
+  引き通すだけでよい。checkpoint 側の追加フィールドであり、DB スキーマ変更は伴わない。
 - **指標名は `unique_fixed` ではなく `exclusive_catch`(reviewer 排他捕捉)とする**(f2)。
   round 1 の機械的 union(ADR 0023)は reviewer ごとに別 id を振るので、同じ指摘を複数
   reviewer が出しても id だけでは同一と分からない。集計クエリ側で同一フェーズ内の
   entry を `path` 一致 かつ `line` の差が3行以内なら同一指摘とみなす同値化ルールで束ね、
-  その同値クラスに reviewer_profile が1種類しか無い entry だけを `exclusive_catch` と数える。
-  既存の `path`/`line`/`reviewer_profile` から導出でき、新しいイベント・スキーマは要らない。
+  その同値クラスに `reviewer_index` が1種類しか無い entry だけを `exclusive_catch` と数える。
+  既存の `path`/`line`/`reviewer_index` から導出でき、新しいイベント・スキーマは要らない。
   **これは観測可能な代理指標であり、「その reviewer を抜いたら本当に拾えなかったか」という
   反事実の証明ではない。** 真の限界寄与は下記 §反事実 の leave-one-out canary(opt-in)でのみ
   検証する。
@@ -108,6 +123,9 @@ reviewer の採否や並列数 N を treatment として割り当てる仕組み
 - **backend 非依存という制約が sidecar の実装難度を上げる。** コストは meguri 本体ではなく
   ペインに載せた CLI の自律ループ側にあるため、sidecar は特定 CLI のトランスクリプト形式に
   結合しすぎない読み取り層を持つ必要がある — 詳細設計は段階1の spec に委ねる。
+- **ledger の checkpoint フィールドが1つ増える。** `Finding`/`LedgerEntry` に `reviewer_index`
+  を足す(段階2)。DB スキーマ変更ではなく、`reviewer_profile` 追加(ADR 0023)と同じ性質の
+  追加フィールドで、単一 reviewer 経路の checkpoint は byte-for-byte のまま変わらない。
 - **観察データのまま留める判断を明示する。** canary(4)を「常時」ではなく「編成変更の
   意思決定時だけ」の opt-in にしたのは、観察データの相関を安易に因果へ格上げしないための
   歯止めであり、ADR 0017/0020 と同型の位置づけである。
