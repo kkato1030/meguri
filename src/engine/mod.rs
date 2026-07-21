@@ -459,6 +459,29 @@ pub trait Loop: Send + Sync {
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome>;
 }
 
+/// The dispatch priority of a `runs.loop_kind` (ADR 0001 → ADR 0012 §5): the
+/// smaller the rank, the closer to merge, the earlier it dispatches. This is
+/// the explicit form of the old "registration order is priority" — the value is
+/// the loop's index in [`default_loops`], now needed because the reconciler
+/// (issue #223) enqueues fixer-family runs *outside* the discovery loop, so the
+/// scheduler sorts every `queued` run by this key rather than by creation order.
+/// An unknown loop_kind sorts last (kept stable, never panics).
+pub fn dispatch_rank(loop_kind: &str) -> u8 {
+    match loop_kind {
+        conflict_resolver::KIND => 0,
+        ci_fixer::KIND => 1,
+        fixer::KIND => 2,
+        spec_fixer::KIND => 3,
+        spec_worker::KIND => 4,
+        pr_reviewer::KIND => 5,
+        worker::KIND => 6,
+        planner::KIND => 7,
+        cleaner::KIND => 8,
+        triage::KIND => 9,
+        _ => u8::MAX,
+    }
+}
+
 /// The loops meguri ships today, in dispatch-priority order (the pipeline
 /// reversed = closest to merge first). The scheduler hands out slots from
 /// the head of this list, so ordering alone is the priority mechanism.

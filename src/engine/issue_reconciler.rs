@@ -1,15 +1,19 @@
-//! merge-tail reconciler (ADR 0012 slice 1, issue #221). Folds the two old
-//! poll-tick sweeps — `auto_merger` (arm-only, ADR 0003 / orchestrator merge,
-//! ADR 0009) and `merge_watch` (drift detection, superseded ADR 0007) — into a
-//! single level-triggered pass: **observe → next_step → act**.
+//! The Issue Kind reconciler's PR side (ADR 0012). S1 (#221) seeded it as the
+//! merge tail — folding `auto_merger` (ADR 0003 / 0009) and `merge_watch`
+//! (superseded ADR 0007) into one level-triggered pass **observe → next_step →
+//! act**. S3 (#223) folds the fixer family in: the two placeholder Skips S1 left
+//! (conflict / red-CI) become real `Step::Agent` arms, plus a review-thread arm,
+//! so `fixer` / `ci_fixer` / `conflict_resolver` are now arms of one `next_step`
+//! rather than three self-discovering loops.
 //!
 //! - **observe** is one informer-cache query (`Forge::observe_open_prs`) whose
 //!   API cost is measured and emitted (`reconciler.observe_cost`).
 //! - **decide** is the pure function [`next_step`]: same [`Snapshot`] ⇒ same
 //!   [`Step`]. Every observed state has exactly one owning arm, so a property
 //!   test can prove there is no gap (the BEHIND hole) and no double ownership.
-//! - **act** runs the chosen [`Op`] — meguri's own light API operations. No
-//!   agent is ever launched from here.
+//! - **act** runs the chosen [`Op`] itself, or enqueues a fixer-family
+//!   [`Arm`]'s recipe as a `queued` run (gated by backoff and the claim marker,
+//!   the workqueue of ADR 0012 §6).
 //!
 //! The BEHIND problem (an armed PR whose base moved and which no loop rescues)
 //! is closed by `Op(UpdateBranch)`: the branch is re-based onto its base and,
@@ -801,9 +805,24 @@ async fn act(
         Op::ArmAutoMerge => arm(deps, am, &obs.pr).await,
         Op::MergePr => merge_directly(deps, am, &obs.pr).await,
         Op::Escalate => {
-            // The two escalation branches are distinguishable by regime: an
-            // unarmed candidate is the pr-review failure, an armed PR is Stuck.
-            if snap.current_head_armed {
+            // Distinguish the escalation cause from the Snapshot: a spent fixer
+            // budget while the symptom persists (conflict / red CI), else the
+            // regime split — an armed PR is Stuck, an unarmed one review-failed.
+            let conflicting = snap.merge.as_ref().is_some_and(|m| {
+                m.mergeable == MergeableState::Conflicting || m.status == MergeStateStatus::Dirty
+            });
+            let ci = snap
+                .merge
+                .as_ref()
+                .is_some_and(|m| m.status == MergeStateStatus::Blocked)
+                && snap.rollup_failure;
+            if conflicting && snap.conflict_exhausted {
+                escalate_budget_exhausted(deps, &obs.pr, Arm::ConflictResolver).await;
+                Ok(())
+            } else if ci && snap.ci_exhausted {
+                escalate_budget_exhausted(deps, &obs.pr, Arm::CiFixer).await;
+                Ok(())
+            } else if snap.current_head_armed {
                 escalate_stuck(deps, &obs.pr, snap).await
             } else {
                 escalate_pr_review_failed(deps, &obs.pr).await;
@@ -811,6 +830,37 @@ async fn act(
             }
         }
     }
+}
+
+/// Park a fixer-family PR whose successful rounds are spent but the symptom
+/// persists (the old per-loop budget escalations, unified). The `needs-human`
+/// label is the durable "escalated" record, so this fires once (`human_stop`
+/// then brakes it).
+async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest, arm: Arm) {
+    let (rounds, what, cta) = match arm {
+        Arm::ConflictResolver => (
+            super::conflict_resolver::MAX_RESOLVE_RUNS,
+            "resolved this PR's conflicts",
+            "the base keeps re-conflicting",
+        ),
+        Arm::CiFixer => (
+            super::ci_fixer::MAX_CI_FIX_RUNS,
+            "pushed CI fixes to this PR",
+            "its checks are still failing",
+        ),
+        Arm::Fixer => (0, "addressed this PR's review comments", "they persist"),
+    };
+    let comment = super::escalation::pr_needs_human_comment(
+        &format!("{what} {rounds} times but {cta}, and needs a human."),
+        "解消したら `meguri:needs-human` を外すと再開します(`meguri run --issue N` でも再走できます)。",
+        crate::tasks::DEFAULT_ATTACH_HINT,
+    );
+    super::escalation::escalate_pr(deps, pr.number, &comment).await;
+    let _ = deps.store.emit(
+        None,
+        "reconciler.budget_exhausted",
+        json!({ "pr": pr.number, "arm": arm.loop_kind() }),
+    );
 }
 
 /// Merge base into the head branch (BEHIND fix). Pinned to the observed head so
