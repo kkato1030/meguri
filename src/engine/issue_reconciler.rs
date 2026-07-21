@@ -239,6 +239,11 @@ pub struct Snapshot {
     pub pr_review: PrReviewGate,
     /// The project runs at `full` autonomy (else a human is the merge gate).
     pub autonomy_full: bool,
+    /// Auto-merge is enabled in config (`[pr.auto_merge] enabled`). The fixer
+    /// arms run regardless; only the merge tail (arm / merge / update / stuck)
+    /// is gated on it, so turning auto-merge off never disables conflict / CI /
+    /// thread fixing.
+    pub auto_merge_config_enabled: bool,
     /// The repository merge settings pass [`validate_policy`].
     pub policy_ok: bool,
     /// native (arm) vs orchestrator (direct merge).
@@ -300,6 +305,12 @@ pub fn next_step(s: &Snapshot) -> Step {
     }
     if s.awaits_fixer_thread {
         return Step::Agent(Arm::Fixer);
+    }
+
+    // The merge tail (arm / merge / update-branch / stuck) only runs when
+    // auto-merge is enabled; the fixer arms above are independent of it.
+    if !s.auto_merge_config_enabled {
+        return Step::Skip("auto-merge disabled");
     }
 
     if s.current_head_armed {
@@ -537,6 +548,7 @@ async fn build_snapshot(
         has_unresolved_thread,
         pr_review,
         autonomy_full: deps.config.autonomy_for(&deps.project) == Autonomy::Full,
+        auto_merge_config_enabled: am.enabled,
         policy_ok,
         mode: am.mode,
     })
@@ -549,10 +561,10 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     if deps.forge.is_none() {
         return Ok(()); // no forge, no PRs (local mode)
     }
+    // The sweep runs whenever there is a forge: the fixer family (conflict / CI
+    // / thread arms) is independent of auto-merge. Only the merge-tail Ops
+    // respect `am.enabled` (gated in `next_step` via `auto_merge_config_enabled`).
     let am = deps.config.pr_for(&deps.project).auto_merge.clone();
-    if !am.enabled {
-        return Ok(());
-    }
 
     // observe: one bulk query, its API cost measured and recorded (issue #221,
     // acceptance 2). The pr-review context is passed in so the forge stays free
@@ -594,7 +606,9 @@ async fn process(
     if !obs.pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
         return Ok(());
     }
-    if policy_ok.is_none() {
+    // The repo merge policy is only needed by the merge-tail Ops, so resolve it
+    // lazily and only when auto-merge is enabled (the fixer arms never use it).
+    if am.enabled && policy_ok.is_none() {
         *policy_ok = Some(resolve_policy_ok(deps, am).await);
     }
     let snap = build_snapshot(deps, am, obs, policy_ok.unwrap_or(false), now).await?;
@@ -1154,6 +1168,7 @@ mod tests {
             has_unresolved_thread: false,
             pr_review: PrReviewGate::Proceed,
             autonomy_full: true,
+            auto_merge_config_enabled: true,
             policy_ok: true,
             mode: AutoMergeMode::Native,
         }
