@@ -17,6 +17,7 @@
 
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -81,7 +82,7 @@ pub fn pane_gate_targets(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Vec<Gat
         let Ok(profile) = routing::profile_by_name(cfg, &profile_name) else {
             continue;
         };
-        let config_dir = crate::agent_session::session_root(&profile);
+        let config_dir = pane_effective_config_dir();
         let label = format!("{role} ({profile_name})");
         match targets.iter_mut().find(|t| {
             t.command == profile.command && t.args == profile.args && t.config_dir == config_dir
@@ -98,15 +99,36 @@ pub fn pane_gate_targets(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Vec<Gat
     targets
 }
 
+/// The config-dir a real `Pane` launch actually resolves to (mirrors
+/// `spawn_agent_pane`, `src/engine/flow.rs`): the pane inherits whatever
+/// `$CLAUDE_CONFIG_DIR` the meguri process itself has (or the CLI's own
+/// `~/.claude` default) — it is NOT redirected by `AgentProfile::
+/// session_dir`. That field only steers where the *reaper* looks for a
+/// resumable session id after the fact ([`crate::agent_session::
+/// session_root`]); it plays no part in the actual spawn. Probing a
+/// different dir than the one the pane will really use would make the
+/// verdict meaningless (issue #234 self-review f2), so this resolves the
+/// same way spawning does, not the reaper's lookup path — and deliberately
+/// ignores the profile entirely, since none of it affects this.
+fn pane_effective_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
 /// A one-line, actionable remediation for a `Blocked` target: accept the
 /// dialog once by hand, and it stays accepted for every future pane launch
-/// against the same config dir.
+/// against the same config dir. Deliberately omits `target.args` — a
+/// profile's launch args are user-configured and may carry a secret (an API
+/// key, a bearer token, ...); echoing them into doctor's stdout / CI logs
+/// would leak it (issue #234 self-review f4). Naming the command and
+/// config-dir is enough to act on.
 pub fn remediation_line(target: &GateTarget) -> String {
     format!(
-        "一度 `{} {}` を対話で起動し、bypass permissions ダイアログを受諾してください \
-         （config-dir: {} に保存されます）",
+        "一度 `{}` をそのプロファイルの起動引数で対話起動し、bypass permissions ダイアログを受諾して \
+         ください（config-dir: {} に保存されます。起動引数は伏せています — profile 設定を確認してください）",
         target.command,
-        target.args.join(" "),
         target.config_dir.display(),
     )
 }
@@ -200,7 +222,24 @@ impl Drop for FdGuard {
     }
 }
 
-fn open_pty_master() -> Result<RawFd> {
+/// `ptsname` writes into a shared, process-wide static buffer — not
+/// reentrant. Doctor's own probe loop runs targets one at a time, but the
+/// test suite doesn't: plain `cargo test` (unlike `cargo nextest`) runs every
+/// `#[test]` fn in one process on separate threads, and two gate probes
+/// racing here corrupted each other's slave path and hung for 60s+ (issue
+/// #234 self-review f3). Serialize the whole acquire sequence — open through
+/// `ptsname` — behind this lock; the read/timeout phase afterward stays
+/// concurrent, each probe on its own fd.
+static PTY_ACQUIRE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Open a PTY master/slave pair and return `(master fd, slave path)`, holding
+/// [`PTY_ACQUIRE_LOCK`] for the whole sequence (see its doc).
+fn acquire_pty() -> Result<(RawFd, PathBuf)> {
+    let _guard = match PTY_ACQUIRE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
     let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if fd < 0 {
         bail!("posix_openpt failed: {}", std::io::Error::last_os_error());
@@ -215,19 +254,22 @@ fn open_pty_master() -> Result<RawFd> {
         unsafe { libc::close(fd) };
         bail!("unlockpt failed: {err}");
     }
-    Ok(fd)
-}
 
-/// `ptsname` writes into a shared static buffer and is not reentrant; gate
-/// probes run one at a time in doctor's probe loop (never concurrently), so
-/// that's safe here.
-fn pty_slave_path(fd: RawFd) -> Result<PathBuf> {
     let ptr = unsafe { libc::ptsname(fd) };
     if ptr.is_null() {
-        bail!("ptsname failed: {}", std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        bail!("ptsname failed: {err}");
     }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
-    Ok(PathBuf::from(cstr.to_string_lossy().into_owned()))
+    // Copy out of the shared buffer before the lock (and thus the next
+    // caller's ptsname call) is released.
+    let slave_path = PathBuf::from(
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    Ok((fd, slave_path))
 }
 
 fn set_nonblocking(fd: RawFd) -> Result<()> {
@@ -242,9 +284,8 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 }
 
 fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCapture> {
-    let master = open_pty_master().context("open pty master")?;
+    let (master, slave_path) = acquire_pty().context("acquire pty")?;
     let master_guard = FdGuard(master);
-    let slave_path = pty_slave_path(master)?;
 
     let open_slave = || -> std::io::Result<std::fs::File> {
         std::fs::OpenOptions::new()
@@ -259,23 +300,28 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
         open_slave().with_context(|| format!("open pty slave {}", slave_path.display()))?;
 
     let mut cmd = std::process::Command::new(&target.command);
+    // No explicit CLAUDE_CONFIG_DIR: the child inherits our env exactly like
+    // a real pane spawn does (`pane_effective_config_dir` computes
+    // `target.config_dir` the same way, without redirecting anything here —
+    // see its doc / issue #234 self-review f2).
     cmd.args(&target.args)
-        .env("CLAUDE_CONFIG_DIR", &target.config_dir)
         .env("TERM", "xterm-256color")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
-    unsafe {
+    {
+        // New process group (pgid = the child's own pid), so a single
+        // killpg(pid) reaps it and every descendant. `process_group(0)`
+        // (stable API, no `pre_exec`/`unsafe` needed) lets std use
+        // `posix_spawn` instead of `fork`+exec — `pre_exec` forces the
+        // classic fork path, and forking this process (which links tokio
+        // and other multi-threaded runtime bits) deadlocked the child
+        // inside its own exec on this machine (issue #234 self-review f3
+        // follow-up: the observed 60s+ hang wasn't only the `ptsname` race,
+        // it also reproduced with a single, fully serialized probe —
+        // `fork()` after multiple threads exist is the classic culprit).
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            // New session: no controlling terminal inherited from doctor's
-            // own pane, and the child becomes its own process-group leader
-            // so a single killpg(pid) reaps it and every descendant.
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.process_group(0);
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -295,15 +341,38 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
     Ok(capture)
 }
 
+/// How long to keep reading after a ready marker first appears, before
+/// finalizing as `Clear`. A CLI can render its ready banner and then, a
+/// moment later, still show the bypass dialog (e.g. a slow first-run
+/// migration between the two) — returning the instant `Clear` looked true
+/// would false-green exactly the race this module exists to close (issue
+/// #234 self-review f1). A `Blocked` marker arriving during this window
+/// still wins immediately (see the loop below); only the absence of one
+/// for the whole window finalizes `Clear`.
+const READY_SETTLE_WINDOW: Duration = Duration::from_millis(1500);
+
 fn read_until_decisive_or_timeout(master: RawFd, timeout: Duration) -> PtyCapture {
-    let deadline = Instant::now() + timeout;
+    let hard_deadline = Instant::now() + timeout;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    // Set the first time a ready marker is seen; None means "no ready marker
+    // yet, the hard deadline is a plain Timeout".
+    let mut settle_deadline: Option<Instant> = None;
+
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return PtyCapture::Timeout;
+        let now = Instant::now();
+        let effective_deadline = match settle_deadline {
+            Some(t) => t.min(hard_deadline),
+            None => hard_deadline,
+        };
+        if now >= effective_deadline {
+            return if settle_deadline.is_some() {
+                PtyCapture::Output(String::from_utf8_lossy(&buf).into_owned())
+            } else {
+                PtyCapture::Timeout
+            };
         }
+        let remaining = effective_deadline - now;
         let mut pfd = libc::pollfd {
             fd: master,
             events: libc::POLLIN,
@@ -312,7 +381,11 @@ fn read_until_decisive_or_timeout(master: RawFd, timeout: Duration) -> PtyCaptur
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if n < 0 {
-            return PtyCapture::Timeout;
+            return if settle_deadline.is_some() {
+                PtyCapture::Output(String::from_utf8_lossy(&buf).into_owned())
+            } else {
+                PtyCapture::Timeout
+            };
         }
         if n == 0 {
             continue;
@@ -323,11 +396,21 @@ fn read_until_decisive_or_timeout(master: RawFd, timeout: Duration) -> PtyCaptur
             let room = CAPTURE_CAP.saturating_sub(buf.len());
             buf.extend_from_slice(&chunk[..r.min(room)]);
             let text = String::from_utf8_lossy(&buf).into_owned();
-            if classify_output(&text) != GateOutcome::Inconclusive {
-                return PtyCapture::Output(text);
+            match classify_output(&text) {
+                // Decisive and safety-first: stop immediately, never wait
+                // out a settle window for a Blocked verdict.
+                GateOutcome::Blocked => return PtyCapture::Output(text),
+                // Decisive-looking but not final: start (or keep) the settle
+                // window instead of returning, so a later Blocked marker
+                // still wins.
+                GateOutcome::Clear => {
+                    settle_deadline.get_or_insert_with(|| Instant::now() + READY_SETTLE_WINDOW);
+                }
+                GateOutcome::Inconclusive => {}
             }
         } else if r == 0 {
-            // EOF: the slave side is gone (process exited on its own).
+            // EOF: the slave side is gone (process exited on its own) —
+            // nothing more can arrive, so finalize on whatever we have.
             return PtyCapture::Output(String::from_utf8_lossy(&buf).into_owned());
         } else {
             let err = std::io::Error::last_os_error();
@@ -508,11 +591,63 @@ mod tests {
     }
 
     #[test]
-    fn remediation_line_names_the_command_and_config_dir() {
-        let t = fake_target();
+    fn remediation_line_names_the_command_and_config_dir_but_never_the_args() {
+        // A profile's launch args are user-configured and may carry a
+        // secret; remediation_line must never echo them into doctor's
+        // stdout / CI logs (issue #234 self-review f4).
+        let t = GateTarget {
+            labels: vec!["worker (default)".to_string()],
+            command: "fake-claude".to_string(),
+            args: vec!["--api-key".to_string(), "sk-super-secret-token".to_string()],
+            config_dir: PathBuf::from("/tmp/fake-claude-config"),
+        };
         let line = remediation_line(&t);
         assert!(line.contains("fake-claude"));
-        assert!(line.contains("--dangerously-skip-permissions"));
         assert!(line.contains("/tmp/fake-claude-config"));
+        assert!(!line.contains("sk-super-secret-token"), "{line}");
+        assert!(!line.contains("--api-key"), "{line}");
+    }
+
+    #[test]
+    fn profiles_differing_only_by_session_dir_still_share_one_gate_target() {
+        // AgentProfile::session_dir only steers the reaper's session-
+        // transcript lookup (crate::agent_session::session_root); it plays
+        // no part in what config-dir a real pane spawn actually uses, so two
+        // profiles that differ only there must still probe as one identity
+        // (issue #234 self-review f2) — probing them separately, or against
+        // a dir the real launch never uses, would make the verdict
+        // meaningless.
+        // variant-a/b's args deliberately differ from the `default` profile's
+        // (`--dangerously-skip-permissions` alone) so this test isolates the
+        // session_dir question — planner/pr-reviewer (unlisted in manual
+        // mode, so they fall to `default`) forming their own separate target
+        // is expected and unrelated to what's under test here.
+        let cfg = cfg_from(
+            r#"
+[routing]
+mode = "manual"
+
+[routing.roles]
+worker = "variant-a"
+fixer = "variant-b"
+
+[agents.profiles.variant-a]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "sonnet"]
+session_dir = "/tmp/custom-a"
+
+[agents.profiles.variant-b]
+command = "claude"
+args = ["--dangerously-skip-permissions", "--model", "sonnet"]
+session_dir = "/tmp/custom-b"
+"#,
+        );
+        let targets = pane_gate_targets(&cfg, &only(&["claude"]));
+        let variants = targets
+            .iter()
+            .find(|t| t.labels.iter().any(|l| l.starts_with("worker")))
+            .expect("worker/fixer target present");
+        assert_eq!(variants.labels.len(), 2, "{targets:?}");
+        assert!(variants.labels.iter().any(|l| l.starts_with("fixer")));
     }
 }
