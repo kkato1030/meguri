@@ -1,4 +1,4 @@
-# ADR 0026: レビューの効き目は COST(token) × CATCH(限界catch) で測る — 効率 = 限界catch/token、実行時 union は不変
+# ADR 0026: レビューの効き目は COST(token) と CATCH(捕捉)の二軸で測る — 比較指標は効率(捕捉/token)、実行時 union は不変
 
 - Status: proposed
 - Date: 2026-07-21
@@ -25,8 +25,12 @@
 
 ## Decision
 
-**レビューの効き目を COST(token) × CATCH(限界catch) の積で測る。効率 = 限界catch / token。
-実行時の finding merge(無差別 union、ADR 0020/0023)は本 ADR でも不変のままにする。**
+**レビューの効き目を COST(token) と CATCH(捕捉)の独立した二軸で計測する。両者の積を「効き目
+スコア」として採用することはしない**(f1 — 積だと token が増えるほど値が大きくなり、同じ捕捉
+でも高コストな編成を良く見せてしまい、二つの軸の目的関数が矛盾する)**。二軸を比較可能な形に
+落とす派生指標は 効率 = 捕捉 / token の一つに絞り、「同じ捕捉なら token が少ないほど良い、
+同じ token なら捕捉が多いほど良い」の一方向だけを改善と判定する。実行時の finding merge
+(無差別 union、ADR 0020/0023)は本 ADR でも不変のままにする。**
 
 ### 軸A: COST
 
@@ -41,22 +45,39 @@ usage(往復数・ピーク文脈・処理 input/output token)を集計する **
 
 ### 軸B: CATCH
 
-台帳(ADR 0022/0023 の findings ledger)から `unique_fixed`(reviewer 単位で「その reviewer が
-出さなければ誰も拾わなかった finding」)を導出する。
+台帳(ADR 0022/0023 の findings ledger)から reviewer 単位の捕捉を導出する。
 
-- ground truth は段階導入で、**Phase1** は台帳の `fixed` / `waived`(自己申告 + reviewer
-  確認済みの状態)、**Phase2** は revert / CI / reopen といった下流シグナル(§スコープ 3)に
-  広げる。
-- **導出できる指標の例**: reviewer 別 `unique_fixed / 1k token`、guard の
-  `blocking_saves / token`(ADR 0025 の blocking カテゴリ救済数を token で割る)、
-  cap 到達率 × コストの交差(cap に落ちる編成ほど高コストか)。
+- **指標名は `unique_fixed` ではなく `exclusive_catch`(reviewer 排他捕捉)とする**(f2)。
+  round 1 の機械的 union(ADR 0023)は reviewer ごとに別 id を振るので、同じ指摘を複数
+  reviewer が出しても id だけでは同一と分からない。集計クエリ側で同一フェーズ内の
+  entry を `path` 一致 かつ `line` の差が3行以内なら同一指摘とみなす同値化ルールで束ね、
+  その同値クラスに reviewer_profile が1種類しか無い entry だけを `exclusive_catch` と数える。
+  既存の `path`/`line`/`reviewer_profile` から導出でき、新しいイベント・スキーマは要らない。
+  **これは観測可能な代理指標であり、「その reviewer を抜いたら本当に拾えなかったか」という
+  反事実の証明ではない。** 真の限界寄与は下記 §反事実 の leave-one-out canary(opt-in)でのみ
+  検証する。
+- **numerator は `fixed` のみとする**(f3)。Phase1 の ground truth は台帳の `fixed`
+  (reviewer が解消を確認した状態)だけを捕捉に数え、`waived`(作者が反対し reviewer がその
+  扱いを確認しただけの状態)は含めない — waived は「直った証拠」ではないからだ。waived は
+  別カウンタ `waive_rate` として並記し、捕捉とは混ぜない。Phase2 で revert / CI / reopen と
+  いった下流シグナル(§スコープ 3)が入れば、fixed のうち実際に効いたものだけへ ground truth
+  をさらに絞り込む。
+- **`blocking_saves`(guard が防いだ損害数)は Phase1 では定義しない**(f3)。guard の
+  `blocking` 件数だけでは false positive や人間が却下した停止まで「救った」件数に混ざる。
+  実害の有無を確認できる Phase2 まで `blocking_saves` の算出を先送りする。
+- **Phase1 で出す指標はこの2つに限る**: reviewer 別 `exclusive_catch / 1k token`、cap 到達率
+  × コストの交差(cap に落ちる編成ほど高コストか、という相関であって救済数の主張ではない)。
 
-### 反事実(canary)は先送りにする
+### 反事実(canary)は段階4まで先送りする
 
-観察データ(observational)を先行させる。ADR 0013 の `explore_ratio` canary は再利用するが、
-**編成変更(reviewer の採否・並列数の増減)の意思決定時にのみ opt-in** で回す。常時の A/B では
-ない — ADR 0017/0020 が守ってきた「観察データは相関であって因果の証明ではない」という
-正直な位置づけを本 ADR でも崩さない。
+観察データ(observational)を先行させる。**編成変更(reviewer の採否・並列数の増減)の意思決定
+時にのみ opt-in で回す専用の leave-one-out canary を段階4で新設する**(f4)。ADR 0013 の
+`explore_ratio` は auto routing が issue 単位で推奨 profile と次候補を振り分ける仕組みであり、
+reviewer の採否や並列数 N を treatment として割り当てる仕組みではないため、そのまま
+「再利用」はできない。段階4は既存 canary の流用ではなく、reviewer 構成(フル構成 / 1本抜き)
+そのものを issue 単位の arm として割り当て、`exclusive_catch` の反事実を測る専用の設定
+スナップショットと比較単位を新設する。常時の A/B ではない — ADR 0017/0020 が守ってきた
+「観察データは相関であって因果の証明ではない」という正直な位置づけを本 ADR でも崩さない。
 
 ## スコープ(段階導入)
 
@@ -64,16 +85,20 @@ usage(往復数・ピーク文脈・処理 input/output token)を集計する **
 段階分割そのものを確定させる**追跡 issue**であり、以下のどの段の実装コードも含まない。
 
 1. **sidecar**(COST 記録) — telemetry sidecar を実装し、ターン完了時に usage を記録する。
-2. **`meguri stats review` 拡張**(COST×CATCH の join ビュー) — 1 の記録と台帳の
-   `unique_fixed` を join し、reviewer 別の効率を出す。
-3. **下流シグナル**(Phase2: revert / CI / reopen) — CATCH の ground truth を広げる。
-4. **canary**(opt-in) — `explore_ratio` を編成変更の意思決定時だけ回す経路を作る。
+2. **`meguri stats review` 拡張**(COST と CATCH の join ビュー) — 1 の記録と台帳から導出した
+   `exclusive_catch` を join し、reviewer 別の効率(`exclusive_catch / token`)を出す。
+3. **下流シグナル**(Phase2: revert / CI / reopen) — CATCH の ground truth を広げ、
+   `blocking_saves` を定義可能にする。
+4. **canary**(opt-in) — reviewer 構成(フル構成 / 1本抜き)を issue 単位の arm として割り当てる
+   専用の leave-one-out canary を新設し、編成変更の意思決定時だけ回す。
 
 ## Consequences
 
 - **「品質担保に必要か、過剰か」を編成の変更なしに問えるようになる。** sidecar と
   join ビューが揃えば、reviewer 追加・guard 縮退のたびに「recall は上がったか」ではなく
-  「token あたりの限界catch は上がったか」で判断できる。
+  「token あたりの捕捉(効率)は上がったか」で判断できる。ただし Phase1 の `exclusive_catch`
+  は観測できる代理指標であり、真の反事実(§反事実)を証明するのは段階4の leave-one-out
+  canary だけである点は判断のたびに意識する。
 - **completion contract・実行時 merge は無傷。** COST 計測は read-only の telemetry で、
   git tree・`check_command` の3条件にも、self-review/guard の無差別 union merge
   (ADR 0020/0023)にも触れない。
