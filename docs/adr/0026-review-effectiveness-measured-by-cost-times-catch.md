@@ -46,9 +46,16 @@ usage(往復数・ピーク文脈・処理 input/output token)を集計する **
   reviewer(ADR 0023)は設定エントリごとに `self-review#<index>` という専用 lane の独立ターン
   としてすでに動いている(各 reviewer が自分専用のペイン・トランスクリプトを持つ)。したがって
   reviewer 別の token を按分・N 等分する必要は無い — そのターンの usage がそのまま、その
-  reviewer に帰属する。usage を記録できなかったターン(sidecar が対象 CLI のトランスクリプト
-  形式を解釈できない、または reviewer が完走前に drop された)は、その reviewer の行を
-  「分母未定義」として join から除外する。全体 token に丸めたり等分したりはしない。
+  reviewer に帰属する。
+- **usage 欠損は2種類を区別し、静かに比較母集団から消さない**(f7)。「そもそもターンが
+  動かなかった」(`EVENT_REVIEWER_DROPPED` — profile 未検出などで fan-out 前に弾かれた。
+  cost も catch も真にゼロなので比較から外してよい)と、「ターンは動いて token を消費したが
+  usage を復元できなかった」(sidecar が対象 CLI のトランスクリプト形式を読めない、または
+  ターンが完走前に死んだ)は別の状態として記録する。後者は現実にコストを払っているので、
+  静かに分母から除くと途中失敗しやすい高コスト reviewer ほど効率を過大評価してしまう。
+  効率(`exclusive_catch/token`)は usage が既知の行だけで算出してよいが、その数字には必ず
+  coverage(usage 既知のターン数 / 対象ターン総数)と欠損率を併記し、比較母集団が縮んでいる
+  ことを常に見える形にする。
 
 ### 軸B: CATCH
 
@@ -101,7 +108,8 @@ reviewer の採否や並列数 N を treatment として割り当てる仕組み
 
 1. **sidecar**(COST 記録) — telemetry sidecar を実装し、ターン完了時に usage を記録する。
 2. **`meguri stats review` 拡張**(COST と CATCH の join ビュー) — 1 の記録と台帳から導出した
-   `exclusive_catch` を join し、reviewer 別の効率(`exclusive_catch / token`)を出す。
+   `exclusive_catch` を join し、reviewer 別の効率(`exclusive_catch / token`)と、その
+   coverage・欠損率(f7)をあわせて出す。
 3. **下流シグナル**(Phase2: revert / CI / reopen) — CATCH の ground truth を広げ、
    `blocking_saves` を定義可能にする。
 4. **canary**(opt-in) — reviewer 構成(フル構成 / 1本抜き)を issue 単位の arm として割り当てる
@@ -126,6 +134,10 @@ reviewer の採否や並列数 N を treatment として割り当てる仕組み
 - **ledger の checkpoint フィールドが1つ増える。** `Finding`/`LedgerEntry` に `reviewer_index`
   を足す(段階2)。DB スキーマ変更ではなく、`reviewer_profile` 追加(ADR 0023)と同じ性質の
   追加フィールドで、単一 reviewer 経路の checkpoint は byte-for-byte のまま変わらない。
+- **効率の数字は必ず coverage 付きで出す。** usage を復元できなかったターンを「無かったこと」
+  にして分母を静かに縮める設計は、途中失敗しやすい高コスト reviewer ほど効率を過大評価する
+  危険がある(f7)。段階2の join ビューは効率と一緒に coverage・欠損率を常に表示し、比較
+  母集団が縮んでいることを隠さない。
 - **観察データのまま留める判断を明示する。** canary(4)を「常時」ではなく「編成変更の
   意思決定時だけ」の opt-in にしたのは、観察データの相関を安易に因果へ格上げしないための
   歯止めであり、ADR 0017/0020 と同型の位置づけである。
