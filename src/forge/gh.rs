@@ -1794,6 +1794,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fold_comment_pages_preserves_author_and_id_across_pages() {
+        // Two scripted `comments` connection pages (the second reached only by
+        // following `endCursor`): a >100-comment PR. `viewerDidAuthor` and the
+        // node `id` must survive on every page (f6/f8), so a self-authored claim
+        // marker on page 2 is still recognised (and editable by its id).
+        let page1 = serde_json::json!({
+            "pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+            "nodes": [
+                {"id": "n1", "body": "hi", "createdAt": "2026-01-01T00:00:00Z", "viewerDidAuthor": false},
+            ]
+        });
+        let page2 = serde_json::json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": serde_json::Value::Null},
+            "nodes": [
+                {"id": "n2", "body": "<!-- meguri:claim instance=me run=r-1 -->",
+                 "createdAt": "2026-01-02T00:00:00Z", "viewerDidAuthor": true},
+            ]
+        });
+        let folded = fold_comment_pages(&[page1, page2]);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].id, "n1");
+        assert!(!folded[0].viewer_did_author);
+        // The page-2 claim marker keeps its authorship and node id.
+        assert_eq!(folded[1].id, "n2");
+        assert!(folded[1].viewer_did_author);
+        assert!(folded[1].body.contains("meguri:claim"));
+    }
+
+    #[test]
     fn merge_args_pin_head_and_toggle_auto() {
         let armed = GhForge::merge_args("7", "me/repo", MergeStrategy::Squash, "abc", true);
         assert_eq!(

@@ -171,6 +171,87 @@ mod tests {
     }
 
     #[test]
+    fn migration_0016_folds_preexisting_family_duplicates() {
+        // Forward-safety (finding 2): an upgrade may already have a Fixer AND a
+        // CiFixer active on the same issue (the old per-loop_kind index allowed
+        // it). Migration 0016 must fold each (project, issue) group to one active
+        // run — keeping the newest by created_at — BEFORE the unique index, or
+        // startup aborts. We simulate the pre-index state on a raw connection,
+        // then run the migration and assert the outcome.
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        // Apply every migration up to but not including 0016.
+        for (name, sql) in super::super::MIGRATIONS {
+            if *name == "0016_reconciler_backoff" {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        // Two active fixer-family runs on issue 9 (different arms) with staggered
+        // created_at, plus a lone conflict run on issue 10.
+        let insert = |id: &str, kind: &str, issue: i64, status: &str, created: &str| {
+            conn.execute(
+                "INSERT INTO runs (id, project_id, loop_kind, issue_number, status, created_at)
+                 VALUES (?1, 'proj', ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, kind, issue, status, created],
+            )
+            .unwrap();
+        };
+        insert("run-old", "fixer", 9, "interrupted", "2026-01-01T00:00:00Z");
+        insert("run-new", "ci-fixer", 9, "running", "2026-01-02T00:00:00Z");
+        insert(
+            "run-solo",
+            "conflict-resolver",
+            10,
+            "queued",
+            "2026-01-01T00:00:00Z",
+        );
+
+        // Apply 0016 (cleanup + CREATE UNIQUE INDEX) — must not error.
+        let sql = super::super::MIGRATIONS
+            .iter()
+            .find(|(n, _)| *n == "0016_reconciler_backoff")
+            .unwrap()
+            .1;
+        conn.execute_batch(sql)
+            .expect("migration 0016 must apply cleanly over pre-existing duplicates");
+
+        // Issue 9: exactly one active run remains — the newest (run-new).
+        let active_9: Vec<String> = conn
+            .prepare(
+                "SELECT id FROM runs WHERE issue_number = 9
+                   AND status IN ('queued','running','interrupted')",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(active_9, vec!["run-new".to_string()]);
+        // The folded run is `cancelled` (not succeeded) with a reason + finished_at.
+        let (status, error, finished): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, error, finished_at FROM runs WHERE id = 'run-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert!(error.unwrap().contains("migration 0016"));
+        assert!(finished.is_some());
+        // The lone run and unrelated issues are untouched.
+        let active_10: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE issue_number = 10
+                   AND status IN ('queued','running','interrupted')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_10, 1);
+    }
+
+    #[test]
     fn fixer_family_active_spans_arms() {
         let store = Store::open_in_memory().unwrap();
         assert!(!store.fixer_family_active("proj", 9).unwrap());

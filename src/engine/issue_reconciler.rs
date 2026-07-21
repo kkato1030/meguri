@@ -1137,6 +1137,155 @@ fn stuck_comment(snap: &Snapshot) -> String {
 mod tests {
     use super::*;
     use crate::forge::PrComment;
+    use crate::store::{RunStatus, Store};
+
+    /// A minimal github-mode `Deps` over an in-memory store + fakes.
+    fn test_deps() -> Deps {
+        use std::sync::Arc;
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some("/tmp/unused".into()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            crate::config::Config::default(),
+            project,
+        )
+    }
+
+    fn obs_with_comment(number: i64, branch: &str, comment: PrComment) -> PrObservation {
+        PrObservation {
+            pr: PullRequest {
+                number,
+                title: "t".into(),
+                body: String::new(),
+                url: String::new(),
+                head_branch: branch.into(),
+                head_sha: String::new(),
+                state: "open".into(),
+                is_draft: false,
+                labels: vec![],
+            },
+            merge: None,
+            comments: vec![comment],
+            review_threads: vec![],
+            rollup: CheckRollup::default(),
+            pr_review: None,
+            labels_complete: true,
+            review_threads_complete: true,
+        }
+    }
+
+    #[test]
+    fn claim_marker_round_trips_and_no_steal_reads_run_liveness() {
+        let deps = test_deps();
+        // An active run of *any* arm holds the PR (family exclusion / no-steal).
+        let run = deps
+            .store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 9, "t")
+            .unwrap();
+        let self_marker = PrComment {
+            body: claim_marker("me", &run.id),
+            viewer_did_author: true,
+            ..Default::default()
+        };
+        assert_eq!(parse_claim_run(&self_marker.body), Some(run.id.as_str()));
+        let obs = obs_with_comment(1, "meguri/9-x-abc", self_marker.clone());
+        assert_eq!(live_claim(&deps, &obs), Some(run.id.clone()));
+
+        // A third party forging the same marker is ignored (viewer_did_author
+        // false) — a forgery cannot freeze no-steal.
+        let forged = PrComment {
+            viewer_did_author: false,
+            ..self_marker.clone()
+        };
+        assert_eq!(
+            live_claim(&deps, &obs_with_comment(1, "meguri/9-x-abc", forged)),
+            None
+        );
+
+        // Once the run is terminal the self-authored marker is stale → reclaim.
+        deps.store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        assert_eq!(live_claim(&deps, &obs), None);
+    }
+
+    #[test]
+    fn backoff_episode_resets_after_positive_resolution() {
+        let deps = test_deps();
+        let kind = super::super::ci_fixer::KIND;
+        let mk_succeeded = || {
+            let r = deps
+                .store
+                .create_run_for_loop("proj", kind, 9, "t")
+                .unwrap();
+            deps.store
+                .update_run_status(&r.id, RunStatus::Succeeded, None)
+                .unwrap();
+        };
+
+        // Episode 1: first observation (n=0) opens the row, immediately visible.
+        advance_backoff(&deps, 9, Arm::CiFixer).unwrap();
+        let row0 = deps.store.get_backoff("proj", 9, kind).unwrap().unwrap();
+        assert_eq!(row0.baseline_attempt, 0);
+        assert_eq!(row0.scheduled_attempt, 0);
+        assert!(row0.next_visible_at <= epoch_now() as i64);
+
+        // A fix round succeeds (n=1) and the symptom persists → space once.
+        mk_succeeded();
+        advance_backoff(&deps, 9, Arm::CiFixer).unwrap();
+        let row1 = deps.store.get_backoff("proj", 9, kind).unwrap().unwrap();
+        assert_eq!(row1.scheduled_attempt, 1);
+        assert!(row1.next_visible_at > epoch_now() as i64, "spaced out");
+        // Same round observed again: next_visible_at must not be pushed forward.
+        advance_backoff(&deps, 9, Arm::CiFixer).unwrap();
+        let row1b = deps.store.get_backoff("proj", 9, kind).unwrap().unwrap();
+        assert_eq!(row1b.next_visible_at, row1.next_visible_at);
+
+        // Positive resolution clears the row (green CI).
+        let snap = Snapshot {
+            merge: None,
+            rollup_failure: false,
+            awaits_fixer_thread: false,
+            ..armed_snapshot()
+        };
+        let green = obs_with_comment(1, "meguri/9-x-abc", PrComment::default());
+        clear_resolved_backoffs(&deps, &green, &snap).unwrap();
+        assert!(deps.store.get_backoff("proj", 9, kind).unwrap().is_none());
+
+        // Episode 2 after re-symptom: the exponent resets — baseline is now the
+        // all-time succeeded count (1), so k=0 again (immediately visible),
+        // not inheriting episode 1's wait.
+        advance_backoff(&deps, 9, Arm::CiFixer).unwrap();
+        let row2 = deps.store.get_backoff("proj", 9, kind).unwrap().unwrap();
+        assert_eq!(row2.baseline_attempt, 1);
+        assert_eq!(row2.scheduled_attempt, 1);
+        assert!(
+            row2.next_visible_at <= epoch_now() as i64,
+            "fresh episode: immediate"
+        );
+    }
 
     fn merge(status: MergeStateStatus, mergeable: MergeableState, auto: bool) -> MergeState {
         MergeState {
