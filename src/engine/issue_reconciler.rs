@@ -224,6 +224,12 @@ pub struct Snapshot {
     /// The spec worker owns this branch (combined delivery + `spec-ready`); no
     /// fixer-family arm may touch it (`pr_is_touchable`'s spec-ready gate).
     pub spec_worker_owns: bool,
+    /// The PR carries `meguri:working` — some loop (a fixer-family recipe in
+    /// flight, or an external loop like spec_fixer) has claimed it. The
+    /// reconciler must not enqueue over it: the family index only excludes the
+    /// three fixer `loop_kind`s, so an external claim would otherwise churn (the
+    /// recipe's `pr_is_touchable` would then Skip, never advancing backoff).
+    pub externally_claimed: bool,
     /// A review thread has the ball in meguri's court (unresolved, last comment
     /// not meguri's reply marker) — the Fixer arm's trigger.
     pub awaits_fixer_thread: bool,
@@ -281,6 +287,13 @@ pub fn next_step(s: &Snapshot) -> Step {
     // (ADR 0008 §6); no fixer-family arm nor the merge tail touches it.
     if s.spec_worker_owns {
         return Step::Skip("spec worker owns the branch");
+    }
+    // Some loop already claimed the PR (`meguri:working`). The family index only
+    // covers the three fixer loop_kinds, so an external claim (e.g. spec_fixer)
+    // must be respected here or the reconciler would re-enqueue every sweep only
+    // for the recipe's `pr_is_touchable` to Skip it (no success → no backoff).
+    if s.externally_claimed {
+        return Step::Skip("claimed by a loop (meguri:working)");
     }
 
     // Fixer family (ADR 0007 supersede completed): the two S1 placeholder Skips
@@ -506,6 +519,7 @@ async fn build_snapshot(
     // A `spec-ready` PR under combined delivery is the spec worker's branch — no
     // fixer-family arm touches it (`pr_is_touchable`'s spec-ready gate).
     let spec_worker_owns = Labels.spec_worker_owns(pr, is_combined(deps));
+    let externally_claimed = pr.has_label(forge::LABEL_WORKING);
     // Fixer-family budgets: the arm escalates (parks) once it has spent its
     // successful rounds and the symptom persists (issue #176 order — the arm is
     // only reached while the symptom is still observed).
@@ -541,6 +555,7 @@ async fn build_snapshot(
         stale,
         rollup_failure,
         spec_worker_owns,
+        externally_claimed,
         awaits_fixer_thread,
         conflict_exhausted,
         ci_exhausted,
@@ -612,6 +627,9 @@ async fn process(
         *policy_ok = Some(resolve_policy_ok(deps, am).await);
     }
     let snap = build_snapshot(deps, am, obs, policy_ok.unwrap_or(false), now).await?;
+    // Release (tombstone) any of our own claim markers whose run is terminal
+    // (ADR 0027 §7) — runs every resync regardless of `next_step`.
+    reclaim_stale_claims(deps, obs).await;
     // Clear backoff for any arm whose symptom is *positively* resolved this
     // resync (§4.5) — runs regardless of `next_step`'s single decision.
     clear_resolved_backoffs(deps, obs, &snap)?;
@@ -683,6 +701,54 @@ fn live_claim(deps: &Deps, obs: &PrObservation) -> Option<String> {
         }
     }
     None
+}
+
+/// The body a released claim marker is edited to (ADR 0027 release). It must
+/// NOT contain [`CLAIM_MARKER_PREFIX`] so a tombstoned comment is never
+/// re-matched as a live claim.
+const CLAIM_TOMBSTONE: &str = "🔁 meguri — claim released.";
+
+/// Tombstone self-authored claim markers whose run is terminal (ADR 0027 §7
+/// release). This is the reconciler-side release: because the reconciler
+/// observes every comment's node id each resync, it releases its own claims
+/// here rather than from each recipe's `release_claim` — which also mops up a
+/// claim left behind by a crashed run. Best-effort: correctness rides on
+/// run-liveness (a stale marker is already ignored by `live_claim`), so an edit
+/// failure only emits `reconciler.claim_release_failed` and is retried next
+/// resync.
+async fn reclaim_stale_claims(deps: &Deps, obs: &PrObservation) {
+    for c in &obs.comments {
+        if !c.viewer_did_author || c.id.is_empty() || !c.body.contains(CLAIM_MARKER_PREFIX) {
+            continue;
+        }
+        let Some(run_id) = parse_claim_run(&c.body) else {
+            continue;
+        };
+        // A live claim is the active projection — leave it. Only terminal /
+        // missing runs are stale and get tombstoned.
+        let live = matches!(deps.store.get_run(run_id), Ok(Some(r)) if r.status.is_active());
+        if live {
+            continue;
+        }
+        let run_id = run_id.to_string();
+        match deps.forge().update_comment(&c.id, CLAIM_TOMBSTONE).await {
+            Ok(()) => {
+                let _ = deps.store.emit(
+                    None,
+                    "reconciler.claim_reclaimed",
+                    json!({ "pr": obs.pr.number, "run": run_id }),
+                );
+            }
+            Err(e) => {
+                tracing::debug!("PR #{}: claim release edit failed: {e:#}", obs.pr.number);
+                let _ = deps.store.emit(
+                    None,
+                    "reconciler.claim_release_failed",
+                    json!({ "pr": obs.pr.number, "run": run_id }),
+                );
+            }
+        }
+    }
 }
 
 /// Post the instance-named claim marker (the forge projection of the family
@@ -1136,7 +1202,7 @@ fn stuck_comment(snap: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::PrComment;
+    use crate::forge::{Forge, PrComment};
     use crate::store::{RunStatus, Store};
 
     /// A minimal github-mode `Deps` over an in-memory store + fakes.
@@ -1231,6 +1297,163 @@ mod tests {
         assert_eq!(live_claim(&deps, &obs), None);
     }
 
+    #[tokio::test]
+    async fn stale_claim_is_tombstoned_live_claim_is_left() {
+        use std::sync::Arc;
+        let forge = Arc::new(crate::forge::fake::FakeForge::default());
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some("/tmp/unused".into()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+        let pr = forge.push_pr("meguri/9-x-abc", "t (#9)", &[]);
+        let run = deps
+            .store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 9, "t")
+            .unwrap();
+        // meguri posts its own claim marker (viewer_did_author = true, real id).
+        forge
+            .comment_pr(pr, &claim_marker("me", &run.id))
+            .await
+            .unwrap();
+
+        // Live run → the marker is left intact.
+        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        reclaim_stale_claims(&deps, obs).await;
+        assert!(
+            forge
+                .pr_comments_of(pr)
+                .iter()
+                .any(|b| b.contains("meguri:claim")),
+            "a live claim must be left as the projection"
+        );
+
+        // Terminal run → the marker is tombstoned by its node id.
+        deps.store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        reclaim_stale_claims(&deps, obs).await;
+        assert!(
+            !forge
+                .pr_comments_of(pr)
+                .iter()
+                .any(|b| b.contains("meguri:claim")),
+            "a stale claim must be tombstoned"
+        );
+        assert_eq!(
+            deps.store
+                .count_events("reconciler.claim_reclaimed")
+                .unwrap(),
+            1
+        );
+
+        // A third party's forged claim marker is never touched (not self-authored).
+        forge.add_pr_comment_at(
+            pr,
+            &claim_marker("attacker", "run-forged"),
+            "2026-01-01T00:00:00Z",
+        );
+        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        reclaim_stale_claims(&deps, obs).await;
+        assert!(
+            forge
+                .pr_comments_of(pr)
+                .iter()
+                .any(|b| b.contains("run=run-forged")),
+            "a third party's marker must never be edited by us"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_release_failure_is_recorded_not_fatal() {
+        use std::sync::Arc;
+        let forge = Arc::new(crate::forge::fake::FakeForge::default());
+        // The fake fails update_comment when issue -1 is in comment_errors.
+        forge.comment_errors.lock().unwrap().insert(-1);
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some("/tmp/unused".into()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+        let pr = forge.push_pr("meguri/9-x-abc", "t (#9)", &[]);
+        let run = deps
+            .store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 9, "t")
+            .unwrap();
+        forge
+            .comment_pr(pr, &claim_marker("me", &run.id))
+            .await
+            .unwrap();
+        deps.store
+            .update_run_status(&run.id, RunStatus::Succeeded, None)
+            .unwrap();
+        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        // Must not panic; the edit failure is recorded and the marker stays
+        // (reclaimed next resync). Correctness rides on run-liveness regardless.
+        reclaim_stale_claims(&deps, obs).await;
+        assert_eq!(
+            deps.store
+                .count_events("reconciler.claim_release_failed")
+                .unwrap(),
+            1
+        );
+        assert!(
+            forge
+                .pr_comments_of(pr)
+                .iter()
+                .any(|b| b.contains("meguri:claim"))
+        );
+    }
+
     #[test]
     fn backoff_episode_resets_after_positive_resolution() {
         let deps = test_deps();
@@ -1310,6 +1533,7 @@ mod tests {
             stale: false,
             rollup_failure: false,
             spec_worker_owns: false,
+            externally_claimed: false,
             awaits_fixer_thread: false,
             conflict_exhausted: false,
             ci_exhausted: false,
@@ -1528,6 +1752,25 @@ mod tests {
                 ..armed_snapshot()
             }),
             Step::Skip("spec worker owns the branch")
+        );
+    }
+
+    #[test]
+    fn externally_claimed_pr_is_skipped() {
+        // A PR another loop claimed (meguri:working) is left alone even with a
+        // live fixer symptom, so the reconciler does not churn (f1).
+        let conflicting = Snapshot {
+            externally_claimed: true,
+            merge: Some(merge(
+                MergeStateStatus::Dirty,
+                MergeableState::Conflicting,
+                true,
+            )),
+            ..armed_snapshot()
+        };
+        assert_eq!(
+            next_step(&conflicting),
+            Step::Skip("claimed by a loop (meguri:working)")
         );
     }
 

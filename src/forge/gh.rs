@@ -1298,6 +1298,25 @@ impl Forge for GhForge {
         Ok(())
     }
 
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
+        // GraphQL `updateIssueComment` edits a PR conversation comment by its
+        // node id (the id the bulk observe folded in, §1.5).
+        let query = "mutation($id:ID!,$body:String!){\
+             updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+        self.gh(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("id={comment_id}"),
+            "-f",
+            &format!("body={body}"),
+        ])
+        .await?;
+        Ok(())
+    }
+
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
         self.gh(&[
             "issue",

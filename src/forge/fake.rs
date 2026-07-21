@@ -58,10 +58,14 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
-    /// PR conversation comments: (pr, body, createdAt). `comment_pr` stamps
-    /// `store::now()`; [`FakeForge::add_pr_comment_at`] seeds an explicit
-    /// (e.g. stale) timestamp for merge-watch arm-since tests.
-    pub pr_comments: Mutex<Vec<(i64, String, String)>>,
+    /// PR conversation comments as `(pr, PrComment)`. `comment_pr` stamps a
+    /// unique node `id`, `store::now()`, and `viewer_did_author = true` (meguri
+    /// is the fake's viewer — the claim-marker authenticity the reconciler
+    /// checks); [`FakeForge::add_pr_comment_at`] seeds a third-party comment
+    /// (`viewer_did_author = false`) with an explicit timestamp.
+    pub pr_comments: Mutex<Vec<(i64, PrComment)>>,
+    /// Monotonic source of fake comment node ids.
+    pub comment_seq: Mutex<u64>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
     /// `mergeStateStatus` per PR (merge-watch); unset reports `Unknown`.
     pub merge_status: Mutex<HashMap<i64, MergeStateStatus>>,
@@ -361,18 +365,32 @@ impl FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _, _)| *n == number)
-            .map(|(_, body, _)| body.clone())
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.body.clone())
             .collect()
     }
 
-    /// Seed a PR comment with an explicit `createdAt` (merge-watch tests seed a
-    /// stale arm marker to drive arm-since past `STALE_AFTER`).
+    /// The next fake comment node id (monotonic).
+    fn next_comment_id(&self) -> String {
+        let mut seq = self.comment_seq.lock().unwrap();
+        *seq += 1;
+        format!("fc-{seq}")
+    }
+
+    /// Seed a *third-party* PR comment (`viewer_did_author = false`) with an
+    /// explicit `createdAt` (merge-watch tests seed a stale arm marker to drive
+    /// arm-since past `STALE_AFTER`; f3 tests seed a forged claim marker).
     pub fn add_pr_comment_at(&self, pr: i64, body: &str, created_at: &str) {
-        self.pr_comments
-            .lock()
-            .unwrap()
-            .push((pr, body.into(), created_at.into()));
+        let id = self.next_comment_id();
+        self.pr_comments.lock().unwrap().push((
+            pr,
+            PrComment {
+                body: body.into(),
+                created_at: created_at.into(),
+                id,
+                viewer_did_author: false,
+            },
+        ));
     }
 
     /// Simulate GitHub's `mergeStateStatus` for a PR (merge-watch tests).
@@ -943,21 +961,37 @@ impl Forge for FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _, _)| *n == number)
-            .map(|(_, body, created_at)| PrComment {
-                body: body.clone(),
-                created_at: created_at.clone(),
-                ..Default::default()
-            })
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.clone())
             .collect())
     }
 
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
-        self.pr_comments
-            .lock()
-            .unwrap()
-            .push((pr, body.into(), crate::store::now()));
+        let id = self.next_comment_id();
+        self.pr_comments.lock().unwrap().push((
+            pr,
+            PrComment {
+                body: body.into(),
+                created_at: crate::store::now(),
+                id,
+                viewer_did_author: true,
+            },
+        ));
         Ok(())
+    }
+
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
+        if self.comment_errors.lock().unwrap().contains(&-1) {
+            bail!("simulated update_comment failure");
+        }
+        let mut comments = self.pr_comments.lock().unwrap();
+        match comments.iter_mut().find(|(_, c)| c.id == comment_id) {
+            Some((_, c)) => {
+                c.body = body.into();
+                Ok(())
+            }
+            None => bail!("no comment with id {comment_id}"),
+        }
     }
 
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
@@ -1140,12 +1174,8 @@ impl Forge for FakeForge {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(n, _, _)| *n == number)
-                .map(|(_, body, created_at)| PrComment {
-                    body: body.clone(),
-                    created_at: created_at.clone(),
-                    ..Default::default()
-                })
+                .filter(|(n, _)| *n == number)
+                .map(|(_, c)| c.clone())
                 .collect();
             let review_threads = self.threads_of(number);
             let rollup = CheckRollup {

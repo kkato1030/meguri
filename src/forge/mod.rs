@@ -568,6 +568,11 @@ pub trait Forge: Send + Sync {
     async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>>;
     /// Post a conversation comment on a pull request.
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
+    /// Edit a conversation comment by its node id — how the reconciler
+    /// tombstones its own claim marker on release (ADR 0027 / §7). Best-effort:
+    /// correctness does not depend on it (a stale marker is reclaimed by
+    /// run-liveness), so callers log a failure rather than abort.
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
     /// Bodies of an issue's conversation comments, oldest first (triage
     /// advise's hidden-marker lookup, issue #87 — the per-issue mirror of
