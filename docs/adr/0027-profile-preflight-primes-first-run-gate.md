@@ -36,31 +36,31 @@ CLI 自身の形式で永続化させる。** meguri は `~/.claude.json` を一
 - **prime の担当はフォルダ信頼だけ（親 spec D1 に忠実）**。初回ゲートは bypass 受諾（config-dir 単位）と
   フォルダ信頼（パス単位）の2つ。親 spec D1 は前者を doctor（#234、既マージ）＋人間の一度きり受諾に、
   後者を本 prime に割り当てている。prime は bypass を書かせない。
-- claude の既定 pre-flight は **`effective_headless_args`（モデルは保つが yolo は載せない既存 argv）＋
-  実行封じ posture フラグ ＋ no-op プロンプト** を対象 cwd で走らせる。headless `-p` は唯一ゲートを素通り
-  する経路で、その一回で当該パスのフォルダ信頼を CLI 自身が書き残す。以降、同じパスへの対話 pane 起動は
-  フォルダ信頼ゲートに当たらない。
-- **モデルを引き継ぐ（plan review f2）**。builtin profile はモデルを `args` に持つので、prime が別モデルに
-  なると CLI 既定モデルが未認証のとき失敗し、claim-once で再試行されず pane が hang したままになる。既定
-  prime を `effective_headless_args`（refine と同じく「モデルは保つが yolo は載せない」）の上に組むことで
-  pane と同じモデルを使う。自前で arg をパースするより既存の解決関数に乗る方が堅い。
-- **安全は「非 yolo」ではなく「明示した実行封じ posture」で担保（plan review f1）**。当初は「headless ×
-  非 yolo ⇒ ツール実行不可」で安全としたが誤り。`-p` に permission mode を明示しないと、継承した
-  `CLAUDE_CONFIG_DIR` の `settings.json`（`defaultMode`／allow ルール）が効き CLAUDE.md 経由でツールが動きうる。
-  よって prime は `--permission-mode plan`（実行しない）等の posture フラグを **argv で明示**して継承設定を
-  上書きする（CLI フラグは settings より優先）。実行不能は **permissive な config を含む injection テスト** で
-  固定する — これが真の担保。実機検証で (a) 実行封じが効かない／(b) folder trust を書けない と判明したら、
-  yolo を足すのではなく meguri 所有 config-dir 案（meguri が settings を握って deny を強制。後述 rejected 案 2）
-  へ切り替える。yolo を足す道は injection 面を復活させるので採らない。
+- claude の既定 pre-flight は **`[pane と同じ --model]（あれば）＋ 全ツール deny フラグ ＋ no-op プロンプト`**
+  を headless `-p` で対象 cwd に走らせる。headless `-p` は唯一ゲートを素通りする経路で、その一回で当該パスの
+  フォルダ信頼を CLI 自身が書き残す。以降、同じパスへの対話 pane 起動はフォルダ信頼ゲートに当たらない。
+- **モデルは `profile.args` から引き継ぐ（plan review f2）**。prime が pane と別モデルになると、CLI 既定
+  モデルが未認証のとき失敗し claim-once で再試行されず pane が hang する。`effective_headless_args` は
+  `headless_args` 未設定時に `["-p"]` を返すだけで `args` の `--model` を拾わないため（custom profile で
+  破綻）、pane の実モデル源である `profile.args` の `--model`/`-m` を直接抽出して引き継ぐ。builtin も custom も
+  pane==prime モデルが保証される。
+- **安全は「全ツール面を塞ぐ deny を injection test で証明して」担保（plan review f1）**。「非 yolo だから
+  安全」も `--permission-mode plan`（Read と read-only Bash を許す）も `--allowedTools`（許可ではなく自動承認
+  リスト）も不十分だと分かった。継承 `settings.json` の allow ルールはモードの上に乗るため、CLI フラグで
+  allow を無効化する前提は成り立たない。よって prime は built-in tools・Bash・MCP を **deny で塞いだ完全な
+  argv／設定**（候補: `--disallowedTools`＋MCP ロード禁止、足りなければ meguri 所有 `--settings` の
+  `permissions.deny` 全ツール）で走らせ、その「ツールを一切実行しない」を **permissive config × 全ツール面の
+  実機 injection test で証明** する。どうしても全面 deny を証明できなければ、yolo を足すのではなく安全でない
+  prime を出さず meguri 所有 config-dir 案（後述 rejected 案 2）へ切り替える。
 - **明示 override は危険な opt-in（f13）**。`preflight` に非空値を書くと argv はそのまま実行され、既定の
-  実行封じ（および非 yolo）縛りを迂回できる。host は信頼境界の内側（ADR 0011）なのでブロックはしないが、
+  全ツール deny（および非 yolo）縛りを迂回できる。host は信頼境界の内側（ADR 0011）なのでブロックはしないが、
   yolo 相当フラグを含む override は config ロード時に警告し、README で「injection 無防備・自己責任」と明示する。
   全 preflight に安全 argv を強制注入しないのは、`preflight` が `headless_args` 同様「完全な argv をそのまま
   使う」契約で、meguri が勝手に引数を足し引きすると override の意味が壊れるため。
 - cursor-agent は `--trust`/`--force` を launch `args` に載せて毎回素通りする既存方式のままで、
   pre-flight は空（不要）。
-- **副作用**: prime は実モデルターンを1回・cwd で走らせ CLAUDE.md を読む（トークンと1往復）。実行封じ
-  posture により injection が指示を奪ってもツールは実行されない。README に明記する。
+- **副作用**: prime は実モデルターンを1回・cwd で走らせ CLAUDE.md を読む（トークンと1往復）。全ツール
+  deny により injection が指示を奪ってもツールは実行されない。README に明記する。
 - **config-dir の一致**: tmux/herdr はサーバー経由で pane を作るため、prime（daemon 環境）と pane
   （サーバー環境）で `CLAUDE_CONFIG_DIR` がずれ得る。実効 config-dir を絶対パスに解決し、prime の env
   と `PaneSpec.env` の両方へ明示的に渡して一致させる（f1）。
