@@ -38,14 +38,10 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{
-    Deps, MEGURI_BRANCH_PREFIX, Target, canonical_key, is_combined, open_pr_for_issue,
-    pr_is_touchable,
-};
+use super::{Deps, MEGURI_BRANCH_PREFIX, Target, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, MergeableState};
 use crate::gitops;
 use crate::store::RunRecord;
-use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for conflict-resolver runs.
@@ -65,62 +61,15 @@ impl super::Loop for ConflictResolverLoop {
         KIND
     }
 
-    /// Open meguri PRs the forge reports as CONFLICTING. Escalated PRs wait
-    /// for a human (a failed resolve would otherwise re-trigger forever) and
-    /// the per-PR resolve budget stops a resolve→re-conflict ping-pong; the
-    /// active-run unique index dedups concurrent rounds as usual.
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let combined = is_combined(deps);
-        let mut targets = Vec::new();
-        for pr in deps.open_prs.get(deps).await? {
-            if pr_is_touchable(&pr, combined).is_some() {
-                continue;
-            }
-            let issue = canonical_key(&pr);
-            let exhausted = deps
-                .store
-                .succeeded_run_count(&deps.project.id, KIND, issue)?
-                >= MAX_RESOLVE_RUNS;
-            // Only conflicting PRs are actionable. Check this BEFORE acting on
-            // the budget: a PR that already stopped conflicting (resolved by a
-            // human, or a base that moved) must not be escalated just because it
-            // spent its resolve budget (issue #176).
-            if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
-                continue;
-            }
-            if exhausted {
-                // Budget spent AND still conflicting: a base that re-conflicts
-                // this often needs a human (ADR 0012, P4 — was a silent discover
-                // skip before #176). The needs-human filter above makes this
-                // fire exactly once; a human clears the label / `meguri run`
-                // forces another round.
-                let comment = super::escalation::pr_needs_human_comment(
-                    &format!(
-                        "resolved this PR's conflicts {MAX_RESOLVE_RUNS} times but the base keeps \
-                         re-conflicting, and needs a human."
-                    ),
-                    "Clear the needs-human label (and `meguri run --issue N` if wanted) once the \
-                     repeated conflict is understood.",
-                    crate::tasks::DEFAULT_ATTACH_HINT,
-                );
-                super::escalation::escalate_pr(deps, pr.number, &comment).await;
-                deps.store.emit(
-                    None,
-                    "conflict_resolver.exhausted",
-                    json!({ "pr": pr.number, "issue": issue }),
-                )?;
-                continue;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(issue),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
+    /// Discovery moved to the Issue Kind reconciler (ADR 0012 slice 3): the
+    /// Conflicting arm of `issue_reconciler::next_step` owns conflicting PRs
+    /// (parking them via `Op(Escalate)` once the resolve budget is spent — the
+    /// #176 order is preserved by only escalating while still conflicting) and
+    /// enqueues this loop's runs. The `Loop` registration is kept only so
+    /// `Scheduler::dispatch` can route a reconciler-created run to
+    /// [`Self::drive`] (removed with the `Loop` trait in S4).
+    async fn discover(&self, _deps: &Deps) -> Result<Vec<Target>> {
+        Ok(Vec::new())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

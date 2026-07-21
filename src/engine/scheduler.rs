@@ -170,7 +170,7 @@ impl Scheduler {
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                if let Err(e) = super::merge_tail::sweep(deps).await {
+                if let Err(e) = super::issue_reconciler::sweep(deps).await {
                     tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
                 }
                 // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
@@ -322,7 +322,14 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashMap<String, usize>,
     ) -> Result<()> {
-        for run in store.list_runs(true)? {
+        // The workqueue's activeQ order (ADR 0012 §5): dispatch `queued` runs by
+        // merge-proximity `dispatch_rank` (then issue number, FIFO) rather than
+        // by creation order, so the reconciler's fixer-family runs — created in
+        // the sweep, outside discovery — get their priority. Head-of-line
+        // admission (the `break` below) then applies to the highest-priority run.
+        let mut runs = store.list_runs(true)?;
+        runs.sort_by_key(|r| (super::dispatch_rank(&r.loop_kind), r.issue_number));
+        for run in runs {
             if active_weight(active) >= self.max_concurrent {
                 break;
             }

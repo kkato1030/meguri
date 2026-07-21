@@ -6,11 +6,13 @@ use rusqlite::Connection;
 
 mod panes;
 mod reconcile;
+mod reconciler;
 mod runs;
 mod schedules;
 mod stats;
 mod tasks;
 pub use panes::*;
+pub use reconciler::*;
 pub use runs::*;
 pub use schedules::*;
 pub use stats::*;
@@ -86,6 +88,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0015_collab_mode",
         include_str!("migrations/0015_collab_mode.sql"),
+    ),
+    // ADR 0012 slice 3 (#223): reconciler_backoff (local execution progress) +
+    // the fixer-family active-run exclusion index, with a forward cleanup of
+    // pre-existing cross-arm duplicates so CREATE UNIQUE INDEX cannot abort
+    // startup.
+    (
+        "0016_reconciler_backoff",
+        include_str!("migrations/0016_reconciler_backoff.sql"),
     ),
 ];
 
