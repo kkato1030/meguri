@@ -359,13 +359,17 @@ required、複数不可):
   run を作る。fresh observe をそのまま通すと、成功済み・本文未変更・cadence 窓満杯の issue で
   `Skip`/`Wait` になり **再実行できなくなる**。よって decider に **観測モード**を渡す:
   - `next_step_issue(snapshot, Mode)`。`Mode::ManualRun` では **discovery throttle** ゲート
-    (`already_shipped` / cadence 窓 / not-before)を **skip** し、phase が示す arm を返す。
+    (`already_shipped` / cadence 窓)を **skip** し、phase が示す arm を返す。**not-before は
+    skip しない** — ADR 0011 が手動 run に許す bypass は cadence 窓だけであり、not-before は
+    fail-closed 契約(解析不能・未来時刻なら実行しない)として `LabelTaskSource::claim` の
+    書き込み直前再検証にも刻まれている。解禁前の issue は手動でも実行しない。
   - `Mode::Reconcile`(watch の通常経路)では従来どおり全ゲートを適用。
   - **手動でも保持する安全ゲート**: `hold` / `needs-human`(人間の停止宣言、spec 軸)と `issue_busy`
     (二重起動防止)は ManualRun でも尊重する。cadence は **stamp して消費に数える**
     (`create_run_for_loop_cadence`、同日 `watch` の二重消費防止)のは不変 — bypass するのは「窓が
     満杯なら止める」判定だけで、消費計上は残す。
-  - つまり **override = discovery throttle の迂回**、**保持 = 人間停止 + 二重起動 + 消費計上**。
+  - つまり **override = already_shipped + cadence 窓の迂回**、**保持 = 人間停止 + 二重起動 +
+    not-before(fail-closed) + 消費計上**。
 
 ### `attach` に identity セレクタを足す(finding 1)
 
@@ -431,8 +435,9 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
   `(--issue|--pr|--run|--task)` を `Why`(新設)/ `Run` / `Attach` に足す(finding 1)。`cmd_run` /
   `cmd_why` は **所有 decider へルーティング**(`--pr` は PR 側、`--run` は保存 loop_kind を保持、
   `--issue` は open PR の有無、`--task` は local)し、issue に潰さない。`cmd_run` は worker 固定を
-  やめ観測 arm を dispatch、`Mode::ManualRun` で discovery throttle(already_shipped / cadence 窓 /
-  not-before)を bypass しつつ hold/needs-human と cadence 消費計上は保持(finding 2)。
+  やめ観測 arm を dispatch、`Mode::ManualRun` で discovery throttle(already_shipped / cadence 窓)を
+  bypass しつつ hold/needs-human・not-before(ADR 0011 fail-closed)と cadence 消費計上は保持
+  (finding 2)。
   `resolve_attach_pane` を PR / task フラグに拡張。既存の `run --issue` / `attach <位置引数>` は
   後方互換で維持。
 - `src/tasks.rs` — planner / worker arm が使う **ゲート述語**(`already_shipped` / not-before /
@@ -500,7 +505,8 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
 16. **finding 2(手動 run の override)**: 成功済み・本文未変更・cadence 窓満杯の issue で
    `meguri run --issue N` が **`Skip`/`Wait` にならず arm を dispatch** する(`Mode::ManualRun` が
    discovery throttle を bypass)。ただし `hold`/`needs-human` の issue では **起動しない**(人間停止を
-   尊重)、かつ cadence は **消費に計上**される、を回帰テストで固定する。
+   尊重)、**not-before が未来時刻の issue でも起動しない**(ADR 0011 fail-closed の保持)、かつ
+   cadence は **消費に計上**される、を回帰テストで固定する。
 
 ## 移行とロールバック(veto により必須)
 
