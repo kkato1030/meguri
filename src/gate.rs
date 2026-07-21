@@ -126,10 +126,7 @@ pub fn pane_gate_targets(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Vec<Gat
 /// or teaching `spawn_agent_pane` to pass an explicit env doctor cannot see
 /// in advance — both bigger than this probe.
 fn pane_effective_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::home_dir().unwrap_or_default().join(".claude")
+    crate::config::effective_config_dir()
 }
 
 /// A one-line, actionable remediation for a `Blocked` target: accept the
@@ -369,7 +366,7 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
 /// up and leaking it as a zombie. Giving up is deliberate: an unbounded
 /// `wait()` here would let one unkillable child hang `doctor --probe` past
 /// its declared per-target timeout forever.
-const REAP_DEADLINE: Duration = Duration::from_secs(2);
+pub const REAP_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Kill the probe child and reap it without ever blocking indefinitely.
 ///

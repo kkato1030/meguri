@@ -26,6 +26,55 @@ pub fn worktrees_root() -> PathBuf {
     meguri_home().join("worktrees")
 }
 
+/// Pre-flight state directory: `~/.meguri/preflight`. Holds the meguri-owned
+/// deny-all `--settings` file the prime runs under and the per-identity "done"
+/// markers (issue #235). Deliberately under [`meguri_home`], NOT inside a
+/// worktree/advisor cwd, so an ephemeral cwd's teardown never wipes the marker
+/// and re-triggers a redundant prime.
+pub fn preflight_dir() -> PathBuf {
+    meguri_home().join("preflight")
+}
+
+/// The config-dir a `claude` launch (pane or prime) actually resolves to: an
+/// explicit `$CLAUDE_CONFIG_DIR` (normalized to absolute against the daemon's
+/// cwd if it was relative), else the CLI's own `~/.claude` default. Resolving
+/// to a single absolute path lets the prime and the pane be handed the exact
+/// same `CLAUDE_CONFIG_DIR` (issue #235 f1): tmux/herdr spawn the pane through
+/// a long-lived server whose captured environment can differ from the daemon's,
+/// so a relative or unset value would let the prime write folder trust to a
+/// different dir than the pane reads.
+pub fn effective_config_dir() -> PathBuf {
+    normalize_config_dir(
+        std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        std::env::current_dir().ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// Pure core of [`effective_config_dir`], factored out so its normalization is
+/// testable without mutating process env. An absolute `$CLAUDE_CONFIG_DIR`
+/// passes through; a relative one is joined onto `cwd`; an unset value falls
+/// back to `home/.claude`.
+fn normalize_config_dir(
+    env_value: Option<String>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    if let Some(dir) = env_value {
+        let p = PathBuf::from(dir);
+        if p.is_absolute() {
+            return p;
+        }
+        if let Some(cwd) = cwd {
+            return cwd.join(p);
+        }
+        return p;
+    }
+    home.map(|h| h.to_path_buf())
+        .unwrap_or_default()
+        .join(".claude")
+}
+
 /// Root of meguri-managed bare clones: `~/.meguri/repos`. Each project whose
 /// `repo_path` is omitted gets `repos_root().join(<id>)` (a bare clone
 /// materialized from its `repo_slug`). Deliberately a sibling of
@@ -699,6 +748,24 @@ pub struct AgentProfile {
     /// resumable session id before closing a pane.
     #[serde(default)]
     pub session_dir: Option<PathBuf>,
+    /// Complete argv for the launch-time pre-flight prime (issue #235): a
+    /// headless one-shot run in the worktree cwd just before the interactive
+    /// pane spawns, so the CLI records folder trust for that path and the real
+    /// pane no longer stalls at the first-run trust prompt (meguri never reads
+    /// the screen to answer it).
+    ///
+    /// Resolution (see [`crate::routing::effective_preflight_args`]): a
+    /// non-empty value is used verbatim (a complete argv — a host opt-in that
+    /// bypasses the safe default and is warned about if it carries yolo); an
+    /// explicit empty `[]` disables the prime; absence falls back to a
+    /// known-CLI default that keeps the pane's model but adds a meguri-owned
+    /// all-tool deny (`--settings` + `--strict-mcp-config`) so the prime turn
+    /// executes no tool even against a permissive inherited config. On a
+    /// `claude` older than [`crate::routing::PREFLIGHT_MIN_CLAUDE_VERSION`] (or
+    /// any non-`claude` command) the default resolves empty — the prime is
+    /// skipped and the pane launches as before.
+    #[serde(default)]
+    pub preflight: Option<Vec<String>>,
 }
 
 impl Default for AgentProfile {
@@ -711,6 +778,7 @@ impl Default for AgentProfile {
             direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         }
     }
 }
@@ -2281,6 +2349,50 @@ impl ConfigReloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_config_dir_normalization() {
+        // Absolute passes through.
+        assert_eq!(
+            normalize_config_dir(
+                Some("/abs/cfg".into()),
+                Some(Path::new("/cwd")),
+                Some(Path::new("/home/u"))
+            ),
+            PathBuf::from("/abs/cfg")
+        );
+        // Relative is joined onto cwd (so prime and the mux-server-spawned pane
+        // resolve the same absolute dir — issue #235 f1).
+        assert_eq!(
+            normalize_config_dir(
+                Some("rel/cfg".into()),
+                Some(Path::new("/cwd")),
+                Some(Path::new("/home/u"))
+            ),
+            PathBuf::from("/cwd/rel/cfg")
+        );
+        // Unset falls back to ~/.claude.
+        assert_eq!(
+            normalize_config_dir(None, Some(Path::new("/cwd")), Some(Path::new("/home/u"))),
+            PathBuf::from("/home/u/.claude")
+        );
+    }
+
+    #[test]
+    fn preflight_field_roundtrips_and_defaults_none() {
+        assert_eq!(AgentProfile::default().preflight, None);
+        let cfg: Config =
+            toml::from_str("[agent]\ncommand = \"claude\"\npreflight = [\"-p\", \"ok\"]\n")
+                .unwrap();
+        assert_eq!(
+            cfg.agent.preflight,
+            Some(vec!["-p".to_string(), "ok".to_string()])
+        );
+        // An explicit empty array is preserved (the opt-out sentinel).
+        let off: Config =
+            toml::from_str("[agent]\ncommand = \"claude\"\npreflight = []\n").unwrap();
+        assert_eq!(off.agent.preflight, Some(vec![]));
+    }
 
     #[test]
     fn defaults_roundtrip() {

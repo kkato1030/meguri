@@ -280,6 +280,152 @@ pub fn effective_headless_args(profile: &AgentProfile) -> Option<Vec<String>> {
     }
 }
 
+/// The no-op prompt handed to the pre-flight prime (issue #235): a headless
+/// one-shot whose only intended effect is that the CLI enters the worktree
+/// directory once (recording folder trust). The prompt asks for no work; the
+/// all-tool deny (D1 [prime 仕様]) is what actually guarantees no tool runs
+/// even if a hostile `CLAUDE.md` tries to hijack the turn.
+pub const PREFLIGHT_NOOP_PROMPT: &str = "reply ok and make no changes";
+
+/// The lowest `claude` version the pre-flight prime is enabled for (issue
+/// #235). The prime's safety rests on a meguri-owned `--settings` deny file
+/// plus `--strict-mcp-config`; older CLIs that lack those flags (or the
+/// `permissions.deny` schema) cannot be made provably tool-free, so the prime
+/// is skipped there and the pane launches as before. The floor is deliberately
+/// conservative: `--settings` / `--strict-mcp-config` are 1.x-era flags, so a
+/// major of `1` gates out the pre-1.0 line. The exact floor is confirmed by
+/// the all-surface injection test (spec test strategy) on real hardware.
+pub const PREFLIGHT_MIN_CLAUDE_VERSION: (u64, u64, u64) = (1, 0, 0);
+
+/// Parse a `major.minor.patch` triple out of a `--version` line, e.g.
+/// "claude 1.2.3 (…)" → (1, 2, 3), "v2.0" → (2, 0, 0). Missing components
+/// default to 0; a line with no leading version number is `None`. Coarser
+/// than a full semver parser on purpose — only the numeric prefix is compared.
+pub fn parse_version_triple(version_line: &str) -> Option<(u64, u64, u64)> {
+    let start = version_line.find(|c: char| c.is_ascii_digit())?;
+    let rest = &version_line[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let mut parts = rest[..end].split('.').map(|p| p.parse::<u64>().ok());
+    let major = parts.next().flatten()?;
+    let minor = parts.next().flatten().unwrap_or(0);
+    let patch = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// The installed `claude`-family CLI version, from `{command} --version`.
+/// `None` on any spawn/parse failure — treated as "unknown" (prime skipped).
+pub fn cli_version(command: &str) -> Option<(u64, u64, u64)> {
+    let out = std::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version_triple(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Extract the model selector from a profile's launch `args` so the pre-flight
+/// prime uses the *same* model as the pane it precedes (issue #235 f2). Handles
+/// both the split form (`--model opus` / `-m opus`) and the joined form
+/// (`--model=opus` / `-m=opus`); returns the argv fragment to reproduce it, or
+/// empty when the profile pins no model (the prime then uses the CLI default,
+/// exactly as the pane would). Deliberately reads `args` — not
+/// `effective_headless_args`, which drops the model when `headless_args` is
+/// unset and would revive the f2 hang on custom profiles.
+pub fn model_flag_from_args(args: &[String]) -> Vec<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--model" || a == "-m" {
+            if let Some(v) = it.next() {
+                return vec![a.clone(), v.clone()];
+            }
+            return Vec::new();
+        }
+        if a.starts_with("--model=") || a.starts_with("-m=") {
+            return vec![a.clone()];
+        }
+    }
+    Vec::new()
+}
+
+/// Whether an argv carries a yolo / skip-permissions flag — the marker of an
+/// unsafe pre-flight override (issue #235 f13) or an unsafe posture in general.
+pub fn args_carry_yolo(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "--dangerously-skip-permissions"
+            || a == "--yolo"
+            || a == "--permission-mode=bypassPermissions"
+    })
+}
+
+/// Resolve the argv for a profile's launch-time pre-flight prime, or an empty
+/// vec meaning "skip the prime" (issue #235 D1/D2).
+///
+/// An explicit non-empty `preflight` is used verbatim — a host opt-in, warned
+/// about at load if it carries yolo ([`warn_unsafe_preflight_overrides`]). An
+/// explicit `[]` is the opt-out sentinel (skip). Absent, a `claude` command at
+/// or above [`PREFLIGHT_MIN_CLAUDE_VERSION`] gets the safe default (the pane's
+/// `--model` if any, `--strict-mcp-config`, `--settings <deny.json>`, `-p
+/// <no-op>` — no yolo; folder trust needs none and the deny file makes the turn
+/// tool-free). Absent on an older/unknown `claude`, or on any other command,
+/// resolves to empty (skip).
+pub fn effective_preflight_args(
+    profile: &AgentProfile,
+    claude_version: Option<(u64, u64, u64)>,
+    deny_settings_path: &std::path::Path,
+) -> Vec<String> {
+    if let Some(explicit) = &profile.preflight {
+        return explicit.clone();
+    }
+    let base = std::path::Path::new(&profile.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&profile.command);
+    if base != "claude" {
+        return Vec::new();
+    }
+    match claude_version {
+        Some(v) if v >= PREFLIGHT_MIN_CLAUDE_VERSION => {}
+        _ => return Vec::new(),
+    }
+    let mut argv = model_flag_from_args(&profile.args);
+    argv.push("--strict-mcp-config".to_string());
+    argv.push("--settings".to_string());
+    argv.push(deny_settings_path.to_string_lossy().into_owned());
+    argv.push("-p".to_string());
+    argv.push(PREFLIGHT_NOOP_PROMPT.to_string());
+    argv
+}
+
+/// Log a warning for every profile whose explicit `preflight` override carries
+/// a yolo flag (issue #235 f13). The default prime is safe; an explicit
+/// override is a host opt-in that bypasses the all-tool deny, so a yolo one
+/// lets a hostile `CLAUDE.md` drive tools before the pane starts. Host config
+/// is inside the trust boundary (ADR 0011), so this warns rather than blocks.
+pub fn warn_unsafe_preflight_overrides(cfg: &Config) {
+    let check = |name: &str, profile: &AgentProfile| {
+        if let Some(pf) = &profile.preflight
+            && args_carry_yolo(pf)
+        {
+            tracing::warn!(
+                profile = name,
+                "[preflight] override carries a yolo/skip-permissions flag — the pre-flight \
+                 prime will run tool-enabled and is injection-unsafe (a hostile CLAUDE.md can \
+                 drive tools before the pane starts). This is your explicit opt-in."
+            );
+        }
+    };
+    check("default", &cfg.agent);
+    if let Some(agents) = &cfg.agents {
+        for (name, profile) in &agents.profiles {
+            check(name, profile);
+        }
+    }
+}
+
 /// The built-in profiles baked in alongside the recommendation table, so
 /// `[routing] mode = "auto"` works with no other config. A user
 /// `[agents.profiles.<same-name>]` overrides the builtin.
@@ -300,6 +446,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         },
     );
     m.insert(
@@ -316,6 +463,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         },
     );
     m.insert(
@@ -330,6 +478,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             direct_args: vec!["exec".into()],
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         },
     );
     m
@@ -1027,6 +1176,7 @@ args = ["--foo"]
             direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         };
         // Rule 3: unset + known CLI (default profile is `claude`) → its default.
         assert_eq!(
@@ -1336,5 +1486,153 @@ args = ["--permission-mode", "acceptEdits"]
         );
         let p = profile_by_name(&cfg, DEFAULT_PROFILE).unwrap();
         assert_eq!(p.args, vec!["--permission-mode", "acceptEdits"]);
+    }
+
+    // ---- pre-flight prime resolution (issue #235) ----
+
+    fn deny() -> std::path::PathBuf {
+        std::path::PathBuf::from("/home/u/.meguri/preflight/deny.json")
+    }
+
+    fn supported() -> Option<(u64, u64, u64)> {
+        Some(PREFLIGHT_MIN_CLAUDE_VERSION)
+    }
+
+    #[test]
+    fn parse_version_triple_reads_the_numeric_prefix() {
+        assert_eq!(parse_version_triple("claude 1.2.3 (abc)"), Some((1, 2, 3)));
+        assert_eq!(parse_version_triple("v2.0"), Some((2, 0, 0)));
+        assert_eq!(parse_version_triple("7"), Some((7, 0, 0)));
+        assert_eq!(parse_version_triple("no digits here"), None);
+    }
+
+    #[test]
+    fn model_flag_from_args_handles_split_and_joined_and_none() {
+        assert_eq!(
+            model_flag_from_args(&[
+                "--dangerously-skip-permissions".into(),
+                "--model".into(),
+                "opus".into()
+            ]),
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+        assert_eq!(
+            model_flag_from_args(&["-m".into(), "haiku".into()]),
+            vec!["-m".to_string(), "haiku".to_string()]
+        );
+        assert_eq!(
+            model_flag_from_args(&["--model=sonnet".into()]),
+            vec!["--model=sonnet".to_string()]
+        );
+        assert!(model_flag_from_args(&["--dangerously-skip-permissions".into()]).is_empty());
+    }
+
+    #[test]
+    fn args_carry_yolo_detects_the_known_forms() {
+        assert!(args_carry_yolo(&["--dangerously-skip-permissions".into()]));
+        assert!(args_carry_yolo(&["--yolo".into()]));
+        assert!(args_carry_yolo(&[
+            "--permission-mode=bypassPermissions".into()
+        ]));
+        assert!(!args_carry_yolo(&[
+            "--permission-mode".into(),
+            "acceptEdits".into()
+        ]));
+        assert!(!args_carry_yolo(&["--model".into(), "opus".into()]));
+    }
+
+    #[test]
+    fn preflight_default_keeps_model_adds_deny_and_no_yolo() {
+        // builtin claude-opus carries `--model opus` in args.
+        let profile = builtin_profiles().remove("claude-opus").unwrap();
+        let argv = effective_preflight_args(&profile, supported(), &deny());
+        assert_eq!(
+            argv,
+            vec![
+                "--model".to_string(),
+                "opus".to_string(),
+                "--strict-mcp-config".to_string(),
+                "--settings".to_string(),
+                deny().to_string_lossy().into_owned(),
+                "-p".to_string(),
+                PREFLIGHT_NOOP_PROMPT.to_string(),
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn preflight_default_carries_custom_profile_model_without_headless_args() {
+        // f2: a custom profile with the model only in `args` (no headless_args)
+        // must still prime with that model, not the CLI default.
+        let profile = AgentProfile {
+            command: "claude".into(),
+            args: vec![
+                "--dangerously-skip-permissions".into(),
+                "--model".into(),
+                "haiku".into(),
+            ],
+            ..Default::default()
+        };
+        let argv = effective_preflight_args(&profile, supported(), &deny());
+        assert_eq!(&argv[0..2], &["--model".to_string(), "haiku".to_string()]);
+        assert!(argv.contains(&"--strict-mcp-config".to_string()));
+        assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn preflight_without_model_omits_the_model_flag() {
+        let profile = AgentProfile {
+            command: "claude".into(),
+            args: vec!["--dangerously-skip-permissions".into()],
+            ..Default::default()
+        };
+        let argv = effective_preflight_args(&profile, supported(), &deny());
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("--strict-mcp-config")
+        );
+        assert!(!argv.iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn preflight_skips_below_floor_and_unknown_and_non_claude() {
+        let claude = AgentProfile {
+            command: "claude".into(),
+            ..Default::default()
+        };
+        // Below the floor.
+        assert!(effective_preflight_args(&claude, Some((0, 9, 9)), &deny()).is_empty());
+        // Unknown version.
+        assert!(effective_preflight_args(&claude, None, &deny()).is_empty());
+        // Non-claude.
+        let codex = AgentProfile {
+            command: "codex".into(),
+            ..Default::default()
+        };
+        assert!(effective_preflight_args(&codex, supported(), &deny()).is_empty());
+    }
+
+    #[test]
+    fn preflight_explicit_override_is_verbatim_and_empty_opts_out() {
+        let override_profile = AgentProfile {
+            command: "claude".into(),
+            preflight: Some(vec![
+                "--dangerously-skip-permissions".into(),
+                "-p".into(),
+                "ok".into(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_preflight_args(&override_profile, supported(), &deny()),
+            vec!["--dangerously-skip-permissions", "-p", "ok"]
+        );
+        let opt_out = AgentProfile {
+            command: "claude".into(),
+            preflight: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(effective_preflight_args(&opt_out, supported(), &deny()).is_empty());
     }
 }

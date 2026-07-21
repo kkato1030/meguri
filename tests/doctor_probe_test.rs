@@ -32,6 +32,7 @@ fn profile_for(command: PathBuf) -> AgentProfile {
         direct_args: vec![],
         herdr_agent_hint: None,
         session_dir: None,
+        preflight: None,
     }
 }
 

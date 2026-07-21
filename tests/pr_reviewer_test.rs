@@ -729,6 +729,7 @@ async fn setup_direct(script_dir: &Path) -> TestEnv {
             direct_args: vec![],
             herdr_agent_hint: None,
             session_dir: None,
+            preflight: None,
         };
     })
     .await
