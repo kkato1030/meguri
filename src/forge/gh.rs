@@ -21,6 +21,28 @@ const FAILED_LOG_TAIL_LINES: usize = 200;
 /// The generic color for a meguri label with no scheme entry.
 const DEFAULT_LABEL_COLOR: &str = "1D76DB";
 
+/// The merge-tail informer-cache observe (issue #221, ADR 0012 decision 3):
+/// one GraphQL query folding every per-PR signal the old sweeps read (merge
+/// state, arm-marker comments, review threads, check rollup) into a single
+/// round-trip. `comments(last:100)` covers all but the chattiest PRs in one
+/// shot; `totalCount` detects when the window clipped older comments so the
+/// arm marker (the durable idempotency / human-override key) is never missed —
+/// a clipped marker would let a human-disarmed head look unarmed and get
+/// wrongly re-armed (f1). Kept as a const so a unit test can parse-check it:
+/// FakeForge tests never execute this string, so an unbalanced brace here
+/// reaches production silently and kills every merge-tail sweep.
+const MERGE_TAIL_OBSERVE_QUERY: &str = "query($owner:String!,$name:String!){\
+     rateLimit{cost}\
+     repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
+     number title body url headRefName headRefOid isDraft state \
+     labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
+     autoMergeRequest{enabledAt} \
+     comments(last:100){totalCount pageInfo{startCursor} nodes{id body createdAt viewerDidAuthor}} \
+     reviewThreads(first:100){totalCount nodes{isResolved comments(last:1){nodes{author{login} body}}}} \
+     commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
+     ... on CheckRun{name status conclusion detailsUrl} \
+     ... on StatusContext{context state targetUrl}}}}}}}}}}}";
+
 /// Scheme color (hex, no `#`) and description for a known meguri label — the
 /// color encodes the two-axis model (ADR 0005): phase labels by stage
 /// (plan/ready = blue, speccing = purple, implementing = green) and ball
@@ -1620,28 +1642,17 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        // `comments(last:100)` covers all but the chattiest PRs in one shot;
-        // `totalCount` lets us detect when the window clipped older comments and
-        // paginate them in, so the arm marker (the durable idempotency /
-        // human-override key) is never missed — a clipped marker would let a
-        // human-disarmed head look unarmed and get wrongly re-armed (f1).
-        let query = "query($owner:String!,$name:String!){\
-             rateLimit{cost}\
-             repository(owner:$owner,name:$name){pullRequests(first:50,states:OPEN){nodes{\
-             number title body url headRefName headRefOid isDraft state \
-             labels(first:100){totalCount nodes{name}} mergeable mergeStateStatus \
-             autoMergeRequest{enabledAt} \
-             comments(last:100){totalCount pageInfo{startCursor} nodes{id body createdAt viewerDidAuthor}} \
-             reviewThreads(first:100){totalCount nodes{isResolved comments(last:1){nodes{author{login} body}}}} \
-             commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename \
-             ... on CheckRun{name status conclusion detailsUrl} \
-             ... on StatusContext{context state targetUrl}}}}}}}}}}}}";
+        // The query is the module-level `MERGE_TAIL_OBSERVE_QUERY` const so a
+        // unit test can parse-check its braces (issue #242); this branch (#223)
+        // extended it with each comment's `id`/`viewerDidAuthor` (claim
+        // authenticity) and each thread's last comment (the Fixer arm's
+        // trigger), plus `pageInfo` for the >100-comment pagination fallback.
         let raw = self
             .gh(&[
                 "api",
                 "graphql",
                 "-f",
-                &format!("query={query}"),
+                &format!("query={MERGE_TAIL_OBSERVE_QUERY}"),
                 "-f",
                 &format!("owner={owner}"),
                 "-f",
@@ -1811,6 +1822,25 @@ impl Forge for GhForge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FakeForge tests never execute the real observe query, so a syntax slip
+    // here (an unbalanced brace killed every merge-tail sweep in production
+    // on 2026-07-21) only surfaces via this parse-level check.
+    #[test]
+    fn merge_tail_observe_query_braces_balance() {
+        let mut depth = 0i64;
+        for (i, c) in MERGE_TAIL_OBSERVE_QUERY.chars().enumerate() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    assert!(depth >= 0, "extra closing brace at index {i}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "{depth} unclosed brace(s) in the observe query");
+    }
 
     #[test]
     fn fold_comment_pages_preserves_author_and_id_across_pages() {
