@@ -94,6 +94,15 @@ open PR が既に無いか」を見ない。両方マージされていたら AD
   インフラ故障が「人間の TODO リスト」(needs-human フィルタ)を占拠する。
 - config 編集中の一瞬、run が pin していた profile が消え escalation(22:29)。
 
+### 3-F. 停止した run の `meguri:working` が PR に残留し、後続 loop を塞ぐ
+
+`meguri stop` で run を止めても、その run が claim 時に PR へ付けた `meguri:working`
+は残る。working 付き PR は touchability 判定で「claim 済み」として skip されるため、
+spec-ready へ進めた PR の spec_worker takeover や pr-reviewer の再 claim が
+**静かに始まらない**(本ランで2回発生: #243 / #244。いずれも人間が手でラベルを
+外して復旧)。stop の finalize に「その run が claim した PR/issue の working 解除」を
+含めるべき。
+
 ## 4. 改善設計(優先度順)
 
 ### P1: セッション健全性 — 「開くか」でなく「会話できるか」を resume の条件にする
@@ -192,6 +201,15 @@ FakeForge はこの文字列を実行しないため CI でも検出不能だっ
 
 **受け入れ基準**: sweep を強制失敗させる fixture で、K 回連続失敗後に通知イベントが
 1回だけ(冪等)出ること。
+
+### P6.7: `meguri stop` の finalize で claim 痕跡を掃除する(3-F)
+
+**設計**: run の cancel/finalize 経路で、その run が付けた `meguri:working` を
+PR/issue から外す(best-effort + 次 sweep での stale claim 回収は #223 の
+run-liveness 判定が既に担う)。
+
+**受け入れ基準**: FakeForge で「claim → stop」後、次の discovery が同じ PR を
+再 claim できること。
 
 ### P6: インフラ故障の escalation を needs-human と分ける
 
