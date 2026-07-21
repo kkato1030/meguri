@@ -538,6 +538,10 @@ async fn doctor_schedules(cfg: &Config) -> bool {
                         project.id
                     );
                 }
+                Diagnostic::RepoScheduleDropped { detail } => {
+                    ok = false;
+                    println!("  ❌ {} — repo schedule dropped: {detail}", project.id);
+                }
                 Diagnostic::RepoUnavailable { detail } => println!(
                     "  ⚠️  {} — repo schedules unavailable this check (fetch): {detail}",
                     project.id

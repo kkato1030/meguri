@@ -88,8 +88,14 @@ pub enum Diagnostic {
     /// A repo schedule was dropped because a host schedule owns the name (D5).
     Shadowed { name: String },
     /// The repo schedule set was dropped whole: a TOML/host-only-key parse
-    /// error or a duplicate name (a collection-level error, D6).
+    /// error, a wrong-shaped `schedules` field, or a duplicate name (a
+    /// collection-level error, D6).
     RepoInvalid { detail: String },
+    /// A single repo schedule entry was dropped (a missing required field or a
+    /// per-schedule validation failure) while the rest survive (D6 / f1). Kept
+    /// distinct from `RepoInvalid` so it is visible in doctor / CLI rather than
+    /// silently warned, without dropping the whole set.
+    RepoScheduleDropped { detail: String },
     /// The repo-schedule layer abstained this tick: the freshness fetch failed
     /// or timed out (fail-closed, ADR 0026).
     RepoUnavailable { detail: String },
@@ -105,6 +111,7 @@ impl Diagnostic {
         match self {
             Self::Shadowed { name } => format!("shadowed:{name}"),
             Self::RepoInvalid { detail } => format!("repo_invalid:{detail}"),
+            Self::RepoScheduleDropped { detail } => format!("repo_schedule_dropped:{detail}"),
             Self::RepoUnavailable { detail } => format!("repo_unavailable:{detail}"),
         }
     }
@@ -114,7 +121,9 @@ impl Diagnostic {
     fn event_kind(&self) -> &'static str {
         match self {
             Self::Shadowed { .. } => "schedule.shadowed",
-            Self::RepoInvalid { .. } => "repo_config.invalid",
+            // An invalid whole-set and a dropped entry are both invalid repo
+            // config; the payload detail distinguishes them.
+            Self::RepoInvalid { .. } | Self::RepoScheduleDropped { .. } => "repo_config.invalid",
             Self::RepoUnavailable { .. } => "schedule.repo_unavailable",
         }
     }
@@ -223,10 +232,23 @@ async fn resolve_repo_schedules(
         }
     };
 
-    // Type each entry; a per-entry type error drops just that entry (D6).
-    let (mut typed, entry_errs) = manifest.typed_schedules();
+    // Interpret the `schedules` field. A wrong *shape* (not an array of tables)
+    // is a collection error → drop the whole set (D6 / f2); a bad *entry* drops
+    // just itself but is surfaced as a diagnostic so doctor / CLI see it, not a
+    // silent warn (D6 / f1).
+    let (typed, entry_errs) = match manifest.typed_schedules() {
+        Ok(v) => v,
+        Err(e) => {
+            diagnostics.push(Diagnostic::RepoInvalid {
+                detail: format!("{e:#}"),
+            });
+            return Vec::new();
+        }
+    };
     for e in &entry_errs {
-        tracing::warn!("repo schedule dropped (unparseable): {e:#}");
+        diagnostics.push(Diagnostic::RepoScheduleDropped {
+            detail: format!("{e:#}"),
+        });
     }
 
     // Collection-level duplicate names → drop the whole set (D6).
@@ -237,14 +259,18 @@ async fn resolve_repo_schedules(
         return Vec::new();
     }
 
-    // Per-schedule validation → drop only the offending entries (D6).
-    typed.retain(|s| match crate::config::validate_schedule(mode, s) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!("repo schedule {:?} dropped (invalid): {e:#}", s.name);
-            false
+    // Per-schedule validation → drop only the offending entries (D6), each
+    // surfaced as a diagnostic (f1).
+    let mut kept = Vec::new();
+    for s in typed {
+        match crate::config::validate_schedule(mode, &s) {
+            Ok(()) => kept.push(s),
+            Err(e) => diagnostics.push(Diagnostic::RepoScheduleDropped {
+                detail: format!("schedule {:?}: {e:#}", s.name),
+            }),
         }
-    });
+    }
+    let typed = kept;
 
     // Host-wins merge: a repo schedule whose name a host schedule already owns
     // is shadowed (D5).
@@ -403,6 +429,10 @@ async fn emit_diagnostics_edge_triggered(
                     deps.project.id
                 );
                 json!({ "project": deps.project.id, "error": detail })
+            }
+            Diagnostic::RepoScheduleDropped { detail } => {
+                tracing::warn!("repo schedule dropped for {}: {detail}", deps.project.id);
+                json!({ "project": deps.project.id, "error": detail, "scope": "entry" })
             }
             Diagnostic::RepoUnavailable { detail } => {
                 tracing::warn!(

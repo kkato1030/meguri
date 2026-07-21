@@ -827,3 +827,58 @@ async fn crash_between_enqueue_and_record_refires_at_least_once() {
     sweep(&deps, ts("2026-07-13T09:31:00Z")).await.unwrap();
     assert_eq!(issue_count(&forge), 2, "a recorded window is not re-fired");
 }
+
+#[tokio::test]
+async fn repo_schedule_missing_required_field_is_dropped_and_surfaced() {
+    // f1: an entry missing a required field (title) is dropped from firing but
+    // surfaced as a diagnostic (a repo_config.invalid event), not silently
+    // warned — so doctor / CLI can see it. The sibling entry still fires.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"good\"\ncron = \"0 9 * * *\"\ntitle = \"good {{date}}\"\nbody = \"g\"\n\
+         [[schedules]]\nname = \"bad\"\ncron = \"0 9 * * *\"\nbody = \"b\"\n",
+        "one entry missing title",
+    );
+    let store = Store::open_in_memory().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(store.clone(), forge.clone(), repo.work(), vec![]);
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed good, drop+surface bad
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // good fires
+
+    {
+        let issues = forge.issues.lock().unwrap();
+        assert_eq!(issues.len(), 1, "only the well-formed entry fired");
+        assert_eq!(issues[0].title, "good 2026-07-13");
+    }
+    assert!(
+        store.count_events("repo_config.invalid").unwrap() >= 1,
+        "the dropped entry is surfaced, not silently warned"
+    );
+}
+
+#[tokio::test]
+async fn wrong_shaped_repo_schedules_field_drops_set_but_host_fires() {
+    // f2: a `schedules` field of the wrong shape is a schedule-layer collection
+    // error — the repo set is dropped and surfaced, and the host schedule fires
+    // unaffected (the completion-contract pin isolation is covered in config).
+    let repo = remote_repo();
+    repo.push_file("meguri.toml", "schedules = \"not-an-array\"\n", "bad shape");
+    let store = Store::open_in_memory().unwrap();
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        store.clone(),
+        forge.clone(),
+        repo.work(),
+        vec![sched("host-daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire
+
+    {
+        let issues = forge.issues.lock().unwrap();
+        assert_eq!(issues.len(), 1, "only the host schedule fired");
+        assert_eq!(issues[0].title, "host-daily 2026-07-13");
+    }
+    assert!(store.count_events("repo_config.invalid").unwrap() >= 1);
+}

@@ -1490,11 +1490,13 @@ impl RepoConfig {
 /// - `deny_unknown_fields` over the *complete* key set detects a host-only key
 ///   (`repo_slug`, `agent`, …) as a parse error, while still accepting the
 ///   legitimate `check_command` / `language` / `pr`.
-/// - `schedules` is a tolerant `Vec<toml::Value>`: a malformed `[[schedules]]`
-///   entry (e.g. a missing `title`) does NOT fail the envelope parse, so it can
-///   never blank the completion-contract pin. The typed re-parse of each entry
-///   into a [`ScheduleConfig`] happens later, in the resolver, where a single
-///   bad entry drops just itself.
+/// - `schedules` is a fully shape-tolerant `Option<toml::Value>`: neither a
+///   malformed `[[schedules]]` entry NOR a wrong-shaped `schedules` field
+///   (`schedules = "x"`, `[schedules]`) fails the envelope parse, so nothing on
+///   the schedule layer can ever blank the completion-contract pin (issue #222
+///   f2). The typed interpretation happens later, in [`typed_schedules`] /
+///   the resolver: a wrong shape is a schedule-layer collection error and a bad
+///   entry drops just itself (issue #222 f1) — the pin survives both.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoManifest {
@@ -1504,8 +1506,10 @@ pub struct RepoManifest {
     pub check_command: Option<String>,
     #[serde(default)]
     pub pr: Option<RepoPrConfig>,
+    /// The raw `schedules` value, if present, in any shape. Interpreted by
+    /// [`typed_schedules`], never by the pin.
     #[serde(default)]
-    pub schedules: Vec<toml::Value>,
+    pub schedules: Option<toml::Value>,
 }
 
 impl RepoManifest {
@@ -1515,7 +1519,8 @@ impl RepoManifest {
     }
 
     /// Derive the completion-contract pin (the run-flow keys only). `schedules`
-    /// is dropped here — the run never reads it.
+    /// is dropped here — the run never reads it, and (crucially) its shape can
+    /// never make this fail: the pin is immune to schedule-layer errors.
     pub fn pinned(&self) -> RepoConfig {
         RepoConfig {
             language: self.language.clone(),
@@ -1524,19 +1529,29 @@ impl RepoManifest {
         }
     }
 
-    /// Type each raw `[[schedules]]` entry into a [`ScheduleConfig`]. Returns the
-    /// entries that parse and the errors for those that do not, so the resolver
-    /// can drop a single malformed entry while keeping the rest (issue #222 D6).
-    pub fn typed_schedules(&self) -> (Vec<ScheduleConfig>, Vec<anyhow::Error>) {
+    /// Interpret the raw `schedules` value into typed [`ScheduleConfig`]s.
+    /// - `Ok((entries, entry_errors))`: `schedules` is a well-formed array;
+    ///   `entries` parsed and `entry_errors` are the per-entry drops the resolver
+    ///   surfaces individually (a missing `title` etc., issue #222 f1).
+    /// - `Err(_)`: the `schedules` field has the wrong shape (not an array of
+    ///   tables) — a schedule-layer collection error. The pin is unaffected
+    ///   because it does not go through here (issue #222 f2).
+    pub fn typed_schedules(&self) -> Result<(Vec<ScheduleConfig>, Vec<anyhow::Error>)> {
+        let Some(value) = &self.schedules else {
+            return Ok((Vec::new(), Vec::new())); // absent = opt-out
+        };
+        let toml::Value::Array(items) = value else {
+            anyhow::bail!("`schedules` must be an array of tables (`[[schedules]]`)");
+        };
         let mut ok = Vec::new();
         let mut errs = Vec::new();
-        for (i, v) in self.schedules.iter().enumerate() {
+        for (i, v) in items.iter().enumerate() {
             match v.clone().try_into() {
                 Ok(s) => ok.push(s),
                 Err(e) => errs.push(anyhow::anyhow!("schedule entry #{i}: {e}")),
             }
         }
-        (ok, errs)
+        Ok((ok, errs))
     }
 }
 
@@ -3881,14 +3896,40 @@ allow_overlap = true
     #[test]
     fn manifest_typed_schedules_drops_only_the_bad_entry() {
         // A valid entry and a malformed one (missing title): the good one types,
-        // the bad one is reported — the resolver drops just it (issue #222 D6).
+        // the bad one is reported — the resolver drops just it (issue #222 D6/f1).
         let raw = "[[schedules]]\nname = \"ok\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
                    [[schedules]]\nname = \"bad\"\ncron = \"0 9 * * *\"\n";
         let manifest = RepoManifest::parse_str(raw).unwrap();
-        let (ok, errs) = manifest.typed_schedules();
+        let (ok, errs) = manifest.typed_schedules().expect("array shape is fine");
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].name, "ok");
         assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn wrong_shaped_schedules_field_does_not_blank_the_pin() {
+        // issue #222 f2: a `schedules` field of the wrong shape (a string, or a
+        // single `[schedules]` table instead of `[[schedules]]`) is a
+        // schedule-layer error, NOT a pin error — `check_command` survives, and
+        // `typed_schedules` reports the shape problem for the resolver to drop.
+        for bad in [
+            "check_command = \"cargo test\"\nschedules = \"not-an-array\"\n",
+            "check_command = \"cargo test\"\n[schedules]\nname = \"x\"\n",
+        ] {
+            let manifest = RepoManifest::parse_str(bad).expect("pin parse must not fail");
+            assert_eq!(
+                manifest.pinned().check_command.as_deref(),
+                Some("cargo test"),
+                "the completion contract survives a schedule-shape error"
+            );
+            // And the shape error is reported (collection-level), not a panic.
+            assert!(manifest.typed_schedules().is_err(), "{bad}");
+            // The pin path used by the run flow also succeeds.
+            assert_eq!(
+                RepoConfig::parse_str(bad).unwrap().check_command.as_deref(),
+                Some("cargo test")
+            );
+        }
     }
 
     #[test]

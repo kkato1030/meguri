@@ -1557,6 +1557,9 @@ pub async fn cmd_schedules(project: Option<&str>) -> Result<()> {
             Diagnostic::RepoInvalid { detail } => {
                 println!("⚠️  repo meguri.toml schedules invalid: {detail}")
             }
+            Diagnostic::RepoScheduleDropped { detail } => {
+                println!("⚠️  repo schedule dropped: {detail}")
+            }
             Diagnostic::RepoUnavailable { detail } => {
                 println!("⚠️  repo schedules unavailable this listing (fetch): {detail}")
             }
