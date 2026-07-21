@@ -355,13 +355,14 @@ fn spawn_pty_probe_inner(target: &GateTarget, timeout: Duration) -> Result<PtyCa
     };
     let pid = child.id() as libc::pid_t;
 
-    set_nonblocking(master)?;
-    let capture = read_until_decisive_or_timeout(master, timeout);
-
+    // From here on the child exists: every path — including an error from
+    // set_nonblocking — must go through kill/reap, or a failed probe leaves
+    // an orphan interactive CLI running after every doctor sweep.
+    let capture = set_nonblocking(master).map(|()| read_until_decisive_or_timeout(master, timeout));
     kill_and_reap_with_deadline(&mut child, pid);
     drop(master_guard);
 
-    Ok(capture)
+    capture
 }
 
 /// How long to wait for the killed probe child to be reapable before giving
