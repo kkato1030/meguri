@@ -980,19 +980,46 @@ pub(crate) fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
         .and_then(|cp| cp.pr_number)
 }
 
+/// Loop kinds whose `Flavor` claims a PR by adding `meguri:working` to it
+/// (mirrors the `Flavor::release_claim` overrides in each of these modules).
+/// `worker`/`planner` also stamp `Checkpoint::pr_number` once their PR opens,
+/// but that PR is claimed through the *issue's* label, never the PR's — so
+/// they must NOT be treated as PR claimers here (issue #252 review finding
+/// f1): an interrupted worker run stopped after some other loop later
+/// claimed its PR would otherwise strip that unrelated run's live claim.
+fn claims_pr_by_label(loop_kind: &str) -> bool {
+    loop_kind == super::fixer::KIND
+        || loop_kind == super::ci_fixer::KIND
+        || loop_kind == super::conflict_resolver::KIND
+        || loop_kind == super::spec_fixer::KIND
+        || loop_kind == super::spec_worker::KIND
+        || loop_kind == super::pr_reviewer::KIND
+}
+
 /// `meguri stop` on a run with no live driver (queued/interrupted — issue
 /// #252): `cmd_stop` finalizes right there in the CLI process, without ever
 /// reaching the loop's `Flavor`, so it cannot call `Flavor::release_claim`
 /// the way [`finalize_cancelled`] (a live driver noticing `desired_state`)
 /// does. A PR-claiming loop's [`Checkpoint::pr_number`] is loop-agnostic
 /// (every `Flavor` that claims a PR stores it there), so this reads straight
-/// from the checkpoint and drops `meguri:working` from that PR itself.
-/// Best-effort and a no-op when the run never claimed a PR (issue-claim
-/// loops release through the task source instead); a failed removal is
-/// still swept up by #223's run-liveness check on the next discovery.
+/// from the checkpoint and drops `meguri:working` from that PR itself —
+/// gated to loops that actually claim by PR label ([`claims_pr_by_label`]).
+/// Best-effort and a no-op when the run never claimed a PR, isn't a
+/// PR-claiming loop, or this project has no forge (local mode — review
+/// finding f2: `Deps::forge` panics on `None`, and a local-mode project can
+/// still have a leftover github-mode checkpoint after a mode switch).
+/// Issue-claim loops release through the task source instead; a failed
+/// removal is still swept up by #223's run-liveness check on the next
+/// discovery.
 pub(crate) async fn release_stray_pr_claim(deps: &Deps, run: &RunRecord) {
+    if !claims_pr_by_label(&run.loop_kind) {
+        return;
+    }
+    let Some(forge) = deps.forge.as_ref() else {
+        return;
+    };
     if let Some(pr) = claimed_pr(deps, &run.id) {
-        let _ = deps.forge().remove_pr_label(pr, forge::LABEL_WORKING).await;
+        let _ = forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
     }
 }
 
@@ -3432,6 +3459,136 @@ mod tests {
             "{:?}",
             forge.pr_labels(pr)
         );
+    }
+
+    /// Review finding f1: `worker`/`planner` stamp `Checkpoint::pr_number`
+    /// once their own PR opens, but they never claim that PR by label — the
+    /// issue's `meguri:working` is their claim, released through the task
+    /// source. If a *different* run later claims the PR (e.g. a pr-reviewer
+    /// run) and someone then stops the stale interrupted worker run, this
+    /// must not strip the pr-reviewer's still-live claim.
+    #[tokio::test]
+    async fn release_stray_pr_claim_ignores_worker_runs_even_with_a_pr_number() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::worker::KIND, 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        // The worker's own PR — currently claimed by some other (unrelated)
+        // run, e.g. a pr-reviewer, not by this worker run.
+        let pr = forge.push_pr("meguri/7-work-aaa111", "Work (#7)", &[forge::LABEL_WORKING]);
+        let cp = Checkpoint {
+            pr_number: Some(pr),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+
+        release_stray_pr_claim(&deps, &run).await;
+
+        assert!(
+            forge
+                .pr_labels(pr)
+                .contains(&forge::LABEL_WORKING.to_string()),
+            "a worker run must never release a claim it does not own: {:?}",
+            forge.pr_labels(pr)
+        );
+    }
+
+    /// Review finding f2: `Deps::forge` panics when absent (local mode).
+    /// `meguri stop`'s driverless finalize path is shared by every project
+    /// mode, and a local-mode project can still carry a leftover
+    /// `pr_number` checkpoint (e.g. after switching a project from github to
+    /// local mode) — `release_stray_pr_claim` must no-op, not panic.
+    #[tokio::test]
+    async fn release_stray_pr_claim_is_a_no_op_without_a_forge() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 7, "Test issue")
+            .unwrap();
+        let cp = Checkpoint {
+            pr_number: Some(1),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: None,
+            mode: crate::config::ProjectMode::Local,
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let task_source: std::sync::Arc<dyn crate::tasks::TaskSource> = std::sync::Arc::new(
+            crate::tasks::LocalTaskSource::new(store.clone(), project.id.clone()),
+        );
+        let deps = Deps {
+            store,
+            mux: std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge: None,
+            task_source,
+            notifier: crate::notify::fake::recording_notifier().0,
+            forge_factory: std::sync::Arc::new(crate::forge::gh::GhForgeFactory),
+            config: crate::config::Config::default(),
+            project,
+            open_prs: Default::default(),
+        };
+
+        // Must not panic.
+        release_stray_pr_claim(&deps, &run).await;
     }
 
     #[tokio::test]
