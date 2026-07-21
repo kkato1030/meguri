@@ -102,6 +102,19 @@ const REPLY_REVIEW_THREAD_MUTATION: &str = "mutation($threadId:ID!,$body:String!
      addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
      {comment{id}}}";
 
+/// The linked-PR cross-reference query (issue #249, [`Forge::linked_open_prs`]):
+/// GitHub's issue timeline, filtered to `CrossReferencedEvent`s whose source
+/// is a PR. Kept as a const for the same reason as
+/// [`MERGE_TAIL_OBSERVE_QUERY`]: FakeForge tests never execute this string,
+/// so a parse-level brace-balance check is the only thing that would catch a
+/// syntax slip before production.
+const LINKED_OPEN_PRS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+     repository(owner:$owner,name:$name){issue(number:$number){\
+     timelineItems(first:100,itemTypes:[CROSS_REFERENCED_EVENT]){\
+     nodes{... on CrossReferencedEvent{source{... on PullRequest{\
+     number title body url headRefName headRefOid state isDraft \
+     labels(first:20){nodes{name}}}}}}}}}}";
+
 /// Scheme color (hex, no `#`) and description for a known meguri label — the
 /// color encodes the two-axis model (ADR 0005): phase labels by stage
 /// (plan/ready = blue, speccing = purple, implementing = green) and ball
@@ -455,6 +468,56 @@ impl GhForge {
                 .to_lowercase(),
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             labels: Self::labels_from_json(v),
+        })
+    }
+
+    /// Like [`Self::pr_from_json`], but for a raw GraphQL PR node (as
+    /// opposed to `gh`'s REST-shaped `--json` output): `state` is
+    /// GraphQL's uppercase enum and `labels` is a `{nodes:[...]}`
+    /// connection rather than a flat array. An empty `source` object (a
+    /// cross-reference from something other than a PR, or a PR meguri's
+    /// token cannot read) yields `None`, silently dropped by the caller.
+    fn pr_from_cross_reference_json(v: &Value) -> Option<PullRequest> {
+        Some(PullRequest {
+            number: v.get("number")?.as_i64()?,
+            title: v.get("title")?.as_str()?.to_string(),
+            body: v
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            url: v
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            head_branch: v
+                .get("headRefName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            head_sha: v
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            state: v
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("OPEN")
+                .to_lowercase(),
+            is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+            labels: v
+                .pointer("/labels/nodes")
+                .and_then(Value::as_array)
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|l| l.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -1177,6 +1240,45 @@ impl Forge for GhForge {
         Ok(Some(
             Self::pr_from_json(&v).with_context(|| format!("unexpected PR shape: {raw}"))?,
         ))
+    }
+
+    /// Open PRs the forge's timeline cross-references to `issue` (GitHub's
+    /// "Development" linkage: any PR whose body/comment mentions `#issue`,
+    /// closing-keyword or not). One page of 100 is generous for this —
+    /// worker/planner call it once right before opening a PR, never in a
+    /// hot loop, so the bounded-window idioms `observe_open_prs` needs
+    /// (incomplete-tracking, pagination) would be overkill here.
+    async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>> {
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
+        let raw = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={LINKED_OPEN_PRS_QUERY}"),
+                "-f",
+                &format!("owner={owner}"),
+                "-f",
+                &format!("name={name}"),
+                "-F",
+                &format!("number={issue}"),
+            ])
+            .await?;
+        let v: Value = serde_json::from_str(&raw).context("parsing linked-PRs GraphQL")?;
+        let nodes = v
+            .pointer("/data/repository/issue/timelineItems/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(nodes
+            .iter()
+            .filter_map(|n| n.pointer("/source"))
+            .filter_map(Self::pr_from_cross_reference_json)
+            .filter(|pr| pr.state == "open")
+            .collect())
     }
 
     /// GitHub computes mergeability lazily; `mergeable` is "MERGEABLE",
@@ -1969,6 +2071,11 @@ mod tests {
     #[test]
     fn reply_review_thread_mutation_braces_balance() {
         assert_braces_balance("REPLY_REVIEW_THREAD_MUTATION", REPLY_REVIEW_THREAD_MUTATION);
+    }
+
+    #[test]
+    fn linked_open_prs_query_braces_balance() {
+        assert_braces_balance("LINKED_OPEN_PRS_QUERY", LINKED_OPEN_PRS_QUERY);
     }
 
     #[test]

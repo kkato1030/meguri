@@ -606,6 +606,13 @@ pub trait Forge: Send + Sync {
     /// merged ones. The reaper uses the merged state to recognize squash and
     /// rebase merges, whose branch tips never become ancestors of the base.
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
+    /// Open PRs the forge already cross-references to `issue` (GitHub's own
+    /// "Development"/timeline linkage — not a meguri label or comment). The
+    /// worker/planner check this immediately before opening a new PR (issue
+    /// #249, docs/design/needs-human-friction-and-delivery-speed.md §3-D/§P5)
+    /// so a rail-external PR that already covers the issue is never
+    /// duplicated.
+    async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
     /// The PR's merge-readiness snapshot for merge-watch (auto-merge 2/3, #42):
