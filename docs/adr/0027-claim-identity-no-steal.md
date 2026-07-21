@@ -54,6 +54,15 @@ release は run 終端時にマーカーを node `id` で tombstone 編集する
 tombstone の成否に依存しない** —— 生存判定が本線なので、編集失敗・instance 名変更・別 instance でも
 永久停止しない。instance id は `[reconciler] instance`(既定 = `mux.session`)。
 
+## reconciler の busy gate は run-liveness
+
+reconciler が「この issue は今 誰かが処理中か」を判定する gate も、`meguri:working` **ラベルではなく
+run の生存**で決める(author lane の live run が 1 本でもあれば PR に触らない。`pr-reviewer` は別 lane・
+detached worktree なので除外)。ラベルで gate すると、クラッシュした run が残した stale な `working` が
+永久に PR をブロックし、fixer arm だけでなく budget escalation・stuck backstop まで止まって自動復旧
+できなくなる。run が terminal / 消失なら not-busy と読むので、クラッシュ後も次 resync で自然に arm 可能へ
+戻る。`meguri:working` は付け外しを続ける表示射影にすぎない。
+
 ## Consequences
 
 - 単一 instance では家族横断インデックスが実効の排他。マーカーはその forge 射影で、Phase-4 の共有 DB で

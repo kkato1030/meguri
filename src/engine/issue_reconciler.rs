@@ -224,12 +224,13 @@ pub struct Snapshot {
     /// The spec worker owns this branch (combined delivery + `spec-ready`); no
     /// fixer-family arm may touch it (`pr_is_touchable`'s spec-ready gate).
     pub spec_worker_owns: bool,
-    /// The PR carries `meguri:working` — some loop (a fixer-family recipe in
-    /// flight, or an external loop like spec_fixer) has claimed it. The
-    /// reconciler must not enqueue over it: the family index only excludes the
-    /// three fixer `loop_kind`s, so an external claim would otherwise churn (the
-    /// recipe's `pr_is_touchable` would then Skip, never advancing backoff).
-    pub externally_claimed: bool,
+    /// A live author-lane run already owns this issue (any branch-editing loop,
+    /// including a fixer-family recipe in flight). The reconciler stays off the
+    /// PR while one runs. This is keyed on **run liveness, not the
+    /// `meguri:working` label** (f3): a stale label from a crashed run must not
+    /// deadlock recovery — a terminal / missing run reads as not-busy, so the
+    /// arms, budget escalation, and the stuck backstop all resume.
+    pub issue_busy: bool,
     /// A review thread has the ball in meguri's court (unresolved, last comment
     /// not meguri's reply marker) — the Fixer arm's trigger.
     pub awaits_fixer_thread: bool,
@@ -288,12 +289,14 @@ pub fn next_step(s: &Snapshot) -> Step {
     if s.spec_worker_owns {
         return Step::Skip("spec worker owns the branch");
     }
-    // Some loop already claimed the PR (`meguri:working`). The family index only
-    // covers the three fixer loop_kinds, so an external claim (e.g. spec_fixer)
-    // must be respected here or the reconciler would re-enqueue every sweep only
-    // for the recipe's `pr_is_touchable` to Skip it (no success → no backoff).
-    if s.externally_claimed {
-        return Step::Skip("claimed by a loop (meguri:working)");
+    // A live author-lane run already owns this issue (a fixer-family recipe in
+    // flight, or an external loop like spec_fixer). Stay off it — they share the
+    // author pane / worktree. Run-liveness, not the `meguri:working` label, so a
+    // stale label from a crashed run cannot deadlock recovery (f3): this gate
+    // also fronts the budget escalation and stuck backstop below, so those only
+    // fire once nothing is actively working the issue.
+    if s.issue_busy {
+        return Step::Skip("a live run owns the issue");
     }
 
     // Fixer family (ADR 0007 supersede completed): the two S1 placeholder Skips
@@ -519,11 +522,13 @@ async fn build_snapshot(
     // A `spec-ready` PR under combined delivery is the spec worker's branch — no
     // fixer-family arm touches it (`pr_is_touchable`'s spec-ready gate).
     let spec_worker_owns = Labels.spec_worker_owns(pr, is_combined(deps));
-    let externally_claimed = pr.has_label(forge::LABEL_WORKING);
+    let issue = canonical_key(pr);
+    let issue_busy = deps
+        .store
+        .issue_has_active_author_run(&deps.project.id, issue)?;
     // Fixer-family budgets: the arm escalates (parks) once it has spent its
     // successful rounds and the symptom persists (issue #176 order — the arm is
     // only reached while the symptom is still observed).
-    let issue = canonical_key(pr);
     let conflict_exhausted =
         deps.store
             .succeeded_run_count(&deps.project.id, super::conflict_resolver::KIND, issue)?
@@ -555,7 +560,7 @@ async fn build_snapshot(
         stale,
         rollup_failure,
         spec_worker_owns,
-        externally_claimed,
+        issue_busy,
         awaits_fixer_thread,
         conflict_exhausted,
         ci_exhausted,
@@ -1533,7 +1538,7 @@ mod tests {
             stale: false,
             rollup_failure: false,
             spec_worker_owns: false,
-            externally_claimed: false,
+            issue_busy: false,
             awaits_fixer_thread: false,
             conflict_exhausted: false,
             ci_exhausted: false,
@@ -1756,11 +1761,12 @@ mod tests {
     }
 
     #[test]
-    fn externally_claimed_pr_is_skipped() {
-        // A PR another loop claimed (meguri:working) is left alone even with a
-        // live fixer symptom, so the reconciler does not churn (f1).
+    fn busy_issue_is_skipped_even_with_a_live_symptom() {
+        // A PR whose issue has a live author-lane run is left alone even with a
+        // live fixer symptom, so the reconciler does not churn (f1). This is
+        // keyed on run liveness, not the working label (f3).
         let conflicting = Snapshot {
-            externally_claimed: true,
+            issue_busy: true,
             merge: Some(merge(
                 MergeStateStatus::Dirty,
                 MergeableState::Conflicting,
@@ -1770,7 +1776,7 @@ mod tests {
         };
         assert_eq!(
             next_step(&conflicting),
-            Step::Skip("claimed by a loop (meguri:working)")
+            Step::Skip("a live run owns the issue")
         );
     }
 

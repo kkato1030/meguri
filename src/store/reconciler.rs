@@ -129,6 +129,30 @@ impl Store {
             Ok(active)
         })
     }
+
+    /// Whether a live **author-lane** run exists for an issue — the reconciler's
+    /// run-liveness "busy" gate (ADR 0027 / f3): the branch-editing loops
+    /// (worker / planner / spec-worker / spec-fixer / fixer / ci-fixer /
+    /// conflict-resolver) share the issue's author pane + worktree, so the
+    /// reconciler must not act while one is running. `pr-reviewer` is excluded —
+    /// it runs in its own lane on a detached worktree, so it never conflicts.
+    /// Keying on the run (not the `meguri:working` label) means a stale label
+    /// left by a crashed run never deadlocks recovery: a terminal / missing run
+    /// reads as not-busy, so the arms, budget escalation, and the stuck backstop
+    /// all resume.
+    pub fn issue_has_active_author_run(&self, project_id: &str, issue_number: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let active: bool = c
+                .prepare(
+                    "SELECT 1 FROM runs
+                      WHERE project_id = ?1 AND issue_number = ?2
+                        AND status IN ('queued', 'running', 'interrupted')
+                        AND loop_kind != 'pr-reviewer'",
+                )?
+                .exists(params![project_id, issue_number])?;
+            Ok(active)
+        })
+    }
 }
 
 #[cfg(test)]

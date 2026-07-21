@@ -487,6 +487,43 @@ async fn fixer_skips_quietly_when_pr_flips_spec_ready_after_discovery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reconciler_recovers_after_a_crashed_run_left_a_stale_working_label() {
+    // f3: the busy gate keys on run liveness, not the `meguri:working` label, so
+    // a stale label left by a crashed/terminal run cannot deadlock the PR.
+    let env = setup(None).await;
+    let run = create_fixer_run(&env);
+    // A round started: the recipe added `meguri:working`.
+    env.forge.add_pr_label(1, LABEL_WORKING).await.unwrap();
+
+    // While the run is live, the issue is busy — no re-enqueue (no churn).
+    env.deps
+        .store
+        .update_run_status(&run.id, RunStatus::Running, None)
+        .unwrap();
+    assert!(
+        reconciler_fixer_targets(&env).await.is_empty(),
+        "a live run makes the issue busy"
+    );
+
+    // The run crashes to a terminal state but the `working` label lingers (its
+    // removal never ran). Run-liveness — not the stale label — is the gate, so
+    // the PR becomes arm-able again and recovery is not deadlocked.
+    env.deps
+        .store
+        .update_run_status(&run.id, RunStatus::Failed, None)
+        .unwrap();
+    assert!(
+        env.forge.pr_labels(1).contains(&LABEL_WORKING.to_string()),
+        "the stale working label is still present"
+    );
+    assert_eq!(
+        reconciler_fixer_targets(&env).await,
+        vec![9],
+        "a stale working label from a crashed run must not deadlock recovery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     let env = setup(None).await;
     let run = create_fixer_run(&env);
