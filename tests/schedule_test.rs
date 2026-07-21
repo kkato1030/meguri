@@ -6,12 +6,21 @@ use std::sync::Arc;
 
 use meguri::config::{Config, ProjectConfig, ProjectMode, ScheduleConfig, ScheduleKind};
 use meguri::engine::Deps;
-use meguri::engine::scheduler_fire::sweep;
+use meguri::engine::schedule::{DiagMemory, sweep as sweep_impl};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{LABEL_PLAN, LABEL_READY};
 use meguri::mux::fake::FakeMux;
 use meguri::store::{Store, parse_ts};
 use meguri::tasks::{LocalTaskSource, TaskKind, TaskSource};
+
+/// The pre-#222 `sweep(deps, now)` shape, wrapped over the reconciler's
+/// `sweep(deps, now, &mut DiagMemory)` with a throwaway diagnostic memory — the
+/// existing cases don't assert on edge-triggered emission, so a fresh memory
+/// per call is fine (the edge-triggered case builds its own shared memory).
+async fn sweep(deps: &Deps, now: u64) -> anyhow::Result<()> {
+    let mut diag = DiagMemory::new();
+    sweep_impl(deps, now, &mut diag).await
+}
 
 fn ts(s: &str) -> u64 {
     parse_ts(s).unwrap()
@@ -504,4 +513,145 @@ async fn unwatched_label_does_not_notify() {
         gw.delivered().iter().all(|n| n.event != "label"),
         "no watched label matched"
     );
+}
+
+// --- repo-side schedules (issue #222 / ADR 0026) ---------------------------
+
+/// A bare `origin`, a `pusher` clone that publishes commits to it, and a `work`
+/// clone whose `origin/main` the resolver reads (a deliberately stale mirror,
+/// so a fetch is what makes a freshly-pushed schedule visible).
+struct RemoteRepo {
+    _origin: tempfile::TempDir,
+    pusher: tempfile::TempDir,
+    parent: tempfile::TempDir,
+}
+
+fn remote_repo() -> RemoteRepo {
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "--bare", "-b", "main"]);
+    let url = origin.path().to_str().unwrap().to_string();
+
+    let pusher = tempfile::tempdir().unwrap();
+    git(pusher.path(), &["init", "-b", "main"]);
+    git(pusher.path(), &["config", "user.email", "t@example.com"]);
+    git(pusher.path(), &["config", "user.name", "t"]);
+    std::fs::write(pusher.path().join("README.md"), "seed").unwrap();
+    git(pusher.path(), &["add", "."]);
+    git(pusher.path(), &["commit", "-m", "seed"]);
+    git(pusher.path(), &["remote", "add", "origin", &url]);
+    git(pusher.path(), &["push", "-u", "origin", "main"]);
+
+    let parent = tempfile::tempdir().unwrap();
+    git(parent.path(), &["clone", &url, "work"]);
+    RemoteRepo {
+        _origin: origin,
+        pusher,
+        parent,
+    }
+}
+
+impl RemoteRepo {
+    fn work(&self) -> std::path::PathBuf {
+        self.parent.path().join("work")
+    }
+
+    /// Publish a file on origin's `main`. The `work` clone stays stale until the
+    /// resolver fetches.
+    fn push_file(&self, rel: &str, content: &str, msg: &str) {
+        let p = self.pusher.path().join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, content).unwrap();
+        git(self.pusher.path(), &["add", rel]);
+        git(self.pusher.path(), &["commit", "-m", msg]);
+        git(self.pusher.path(), &["push", "origin", "main"]);
+    }
+}
+
+#[tokio::test]
+async fn repo_only_schedule_is_fetched_seeded_then_fires() {
+    // 芯4/芯5 + f1: a stale managed clone with no host schedules. The schedule
+    // lives only in the remote default branch's meguri.toml. The resolver's
+    // fetch makes it visible; the first sweep only seeds (no backfill); the next
+    // window fires.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"repo-daily\"\ncron = \"0 9 * * *\"\ntitle = \"repo {{date}}\"\nbody = \"do it\"\n",
+        "add repo schedule",
+    );
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge.clone(),
+        repo.work(),
+        vec![], // no host schedules — repo-only
+    );
+
+    // sweep-1: fetch + observe + seed, no fire (no-backfill).
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap();
+    assert_eq!(issue_count(&forge), 0);
+
+    // sweep-2 after 09:00: fires exactly one issue from the repo schedule.
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap();
+    let issues = forge.issues.lock().unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].title, "repo 2026-07-13");
+    assert!(issues[0].has_label(LABEL_READY));
+    assert!(
+        issues[0]
+            .body
+            .contains("<!-- meguri:schedule name=repo-daily -->")
+    );
+}
+
+#[tokio::test]
+async fn host_schedule_shadows_a_repo_schedule_of_the_same_name() {
+    // D5: a host and a repo schedule share a name → host wins, repo dropped.
+    // Firing once (the host one) proves there is no double-fire on the shared
+    // sqlite key.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "[[schedules]]\nname = \"daily\"\ncron = \"0 9 * * *\"\ntitle = \"REPO {{date}}\"\nbody = \"repo\"\n",
+        "add repo schedule",
+    );
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge.clone(),
+        repo.work(),
+        vec![sched("daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire
+    let issues = forge.issues.lock().unwrap();
+    assert_eq!(issues.len(), 1, "exactly one fire (host wins, no double)");
+    // The host schedule's title ("daily {{date}}"), not the repo's "REPO ...".
+    assert_eq!(issues[0].title, "daily 2026-07-13");
+}
+
+#[tokio::test]
+async fn broken_repo_meguri_toml_still_lets_host_schedules_fire() {
+    // D6 / f2: a host-only key in the repo meguri.toml is a collection error —
+    // the whole repo set is dropped, but the host schedule fires unaffected.
+    let repo = remote_repo();
+    repo.push_file(
+        "meguri.toml",
+        "repo_slug = \"me/x\"\n[[schedules]]\nname = \"repo-daily\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n",
+        "add invalid repo config",
+    );
+    let forge = Arc::new(FakeForge::default());
+    let deps = github_deps_on(
+        Store::open_in_memory().unwrap(),
+        forge.clone(),
+        repo.work(),
+        vec![sched("host-daily", "0 9 * * *", ScheduleKind::Ready, false)],
+    );
+    sweep(&deps, ts("2026-07-13T00:00:00Z")).await.unwrap(); // seed
+    sweep(&deps, ts("2026-07-13T09:30:00Z")).await.unwrap(); // fire
+    let issues = forge.issues.lock().unwrap();
+    assert_eq!(issues.len(), 1, "only the host schedule fired");
+    assert_eq!(issues[0].title, "host-daily 2026-07-13");
 }

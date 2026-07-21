@@ -1,5 +1,5 @@
 //! The `schedule_state` table: per-schedule cron bookkeeping (issue #146). The
-//! firing logic lives out-of-band in [`engine::scheduler_fire`](crate::engine::scheduler_fire);
+//! firing logic lives out-of-band in [`engine::schedule`](crate::engine::schedule);
 //! this module only persists the "last consumed window" and the last-created
 //! issue/task key, so a restart folds catch-up to a single fire and the
 //! overlap guard has a cheap openness check to make.

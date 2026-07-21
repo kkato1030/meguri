@@ -645,7 +645,15 @@ pub async fn read_file_at_default_branch(
     default_branch: &str,
     rel: &str,
 ) -> Result<DefaultBranchFile> {
-    let base = if run_git(
+    let base = default_branch_ref(repo_path, default_branch).await;
+    read_file_at_ref(repo_path, &base, rel).await
+}
+
+/// The readable ref for the default branch: `origin/<default_branch>` when that
+/// remote-tracking ref exists, else the local branch name — the same base
+/// resolution [`read_file_at_default_branch`] and [`fetch_base_tip`] use.
+async fn default_branch_ref(repo_path: &Path, default_branch: &str) -> String {
+    if run_git(
         repo_path,
         &["rev-parse", "--verify", &format!("origin/{default_branch}")],
     )
@@ -655,8 +663,33 @@ pub async fn read_file_at_default_branch(
         format!("origin/{default_branch}")
     } else {
         default_branch.to_string()
-    };
+    }
+}
 
+/// Resolve the default branch to a fixed commit SHA — `origin/<default_branch>`
+/// when that ref exists, else the local `<default_branch>`. The schedule
+/// resolver pins this once so a fire's `meguri.toml` and every `body_file` are
+/// read from one immutable snapshot even if a concurrent fetch moves the branch
+/// (issue #222 f5).
+pub async fn resolve_default_branch_sha(repo_path: &Path, default_branch: &str) -> Result<String> {
+    let base = default_branch_ref(repo_path, default_branch).await;
+    run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )
+    .await
+    .with_context(|| format!("resolving {base} to a commit"))
+}
+
+/// Read a repo-relative path's contents at a fixed ref (a branch, tag, or SHA),
+/// blob-direct (not the working tree). The ref-pinned core of
+/// [`read_file_at_default_branch`]; the schedule resolver calls it with a pinned
+/// SHA so config and body come from one snapshot (issue #222 f5).
+pub async fn read_file_at_ref(
+    repo_path: &Path,
+    base: &str,
+    rel: &str,
+) -> Result<DefaultBranchFile> {
     // One entry, exact-path match. `--full-tree` makes the pathspec
     // root-relative; `:(literal)` disables pathspec magic/globbing; the absence
     // of `-r` means a directory returns its own tree entry, not its children.
@@ -668,7 +701,7 @@ pub async fn read_file_at_default_branch(
             "--full-tree",
             "-z",
             "--format=%(objectmode) %(objecttype) %(objectname) %(path)",
-            &base,
+            base,
             "--",
             &literal,
         ],
@@ -833,6 +866,55 @@ pub async fn fetch_base_tip(repo_path: &Path, base_branch: &str) -> Result<Strin
     )
     .await
     .with_context(|| format!("base branch {base_branch} exists neither on origin nor locally"))
+}
+
+/// How long the schedule resolver's freshness fetch may run before it counts
+/// as a failure. `run_git` has no timeout, so a stuck credential helper / SSH
+/// would otherwise block the serial scheduler indefinitely (issue #222 f4).
+const SCHEDULE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Bounded refresh of `origin/<default_branch>` for the schedule resolver
+/// (issue #222 f1/f4). Unlike [`fetch_base_tip`] the outcome is reported so the
+/// caller can abstain (ADR 0026):
+/// - no `origin` remote → `Ok(())` (nothing to fetch; the local branch is the
+///   only authority — no staleness is possible).
+/// - fetch succeeded within [`SCHEDULE_FETCH_TIMEOUT`] → `Ok(())`.
+/// - fetch failed, or timed out → `Err` (the caller skips the repo-schedule
+///   layer this tick; host schedules are unaffected).
+///
+/// The child is killed on drop, so a timed-out fetch does not linger.
+pub async fn fetch_default_branch(repo_path: &Path, default_branch: &str) -> Result<()> {
+    if run_git(repo_path, &["remote", "get-url", "origin"])
+        .await
+        .is_err()
+    {
+        return Ok(()); // no remote: local branch is authoritative
+    }
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .args(["fetch", "origin", default_branch])
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::time::timeout(SCHEDULE_FETCH_TIMEOUT, cmd.output())
+        .await
+        .with_context(|| {
+            format!(
+                "git fetch origin {default_branch} timed out after {}s",
+                SCHEDULE_FETCH_TIMEOUT.as_secs()
+            )
+        })?
+        .context("spawning git fetch")?;
+    if !out.status.success() {
+        bail!(
+            "git fetch origin {default_branch} (in {}) failed: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Fetch a PR head branch from origin and return its freshly-fetched tip sha
