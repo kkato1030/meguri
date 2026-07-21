@@ -79,6 +79,9 @@ impl Scheduler {
         // run_id → slot weight (issue #111): most runs weigh 1, a collab-advisor
         // run weighs 2. The budget is the sum, not the count.
         let mut active_run_ids: HashMap<String, usize> = HashMap::new();
+        // Per-project memory for edge-triggered schedule diagnostics (issue
+        // #222 f6): lives across ticks so a persisting condition emits once.
+        let mut schedule_diag: super::schedule::DiagMemory = HashMap::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -143,7 +146,7 @@ impl Scheduler {
             // out-of-band enqueue like the sweeps below — it creates an
             // issue/task that the loops above discover next tick. `now` is
             // sampled once so every project's schedules see the same instant.
-            let now = super::scheduler_fire::epoch_now();
+            let now = super::schedule::epoch_now();
 
             // Ride the poll: reclaim panes and worktrees whose issue closed
             // (the issue is the unit of lifetime — one author pane plus one
@@ -155,7 +158,7 @@ impl Scheduler {
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
-                if let Err(e) = super::scheduler_fire::sweep(deps, now).await {
+                if let Err(e) = super::schedule::sweep(deps, now, &mut schedule_diag).await {
                     tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
                 }
                 if let Err(e) = super::reaper::sweep(deps).await {

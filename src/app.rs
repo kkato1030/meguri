@@ -1413,7 +1413,7 @@ fn cmd_tasks_local(project: &ProjectConfig, all: bool) -> Result<()> {
         println!("no {}tasks", if all { "" } else { "open " });
         return Ok(());
     }
-    let now = crate::engine::scheduler_fire::epoch_now();
+    let now = crate::engine::schedule::epoch_now();
     println!("{:>4}  {:<6} {:<12} TITLE", "ID", "KIND", "STATUS");
     for t in tasks {
         let flag = if t.status == "needs_human" {
@@ -1526,29 +1526,62 @@ fn format_disposition(disposition: &crate::cadence::Disposition) -> String {
     }
 }
 
-/// `meguri schedules`: list a project's cron schedules with their definition,
-/// last fire (from sqlite `schedule_state`), and next fire (computed from the
-/// cron expression, UTC). Times are UTC, matching the cron interpretation.
-pub fn cmd_schedules(project: Option<&str>) -> Result<()> {
+/// `meguri schedules`: list a project's *effective* cron schedules — host
+/// `[[projects.schedules]]` ∪ the repo's own `meguri.toml` on the default branch
+/// (issue #222) — with their source, definition, last fire (from sqlite
+/// `schedule_state`), and next fire (computed from the cron expression, UTC).
+/// Uses the same resolver the sweep uses, so what is listed is what fires (ADR
+/// 0026). Times are UTC, matching the cron interpretation.
+pub async fn cmd_schedules(project: Option<&str>) -> Result<()> {
+    use crate::engine::schedule::{Diagnostic, resolve_effective_schedules};
+
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
-    if project.schedules.is_empty() {
+    let store = open_store()?;
+    let now = crate::engine::schedule::epoch_now();
+    let resolved = resolve_effective_schedules(
+        &cfg.repo_path_for(project),
+        &project.default_branch,
+        project.mode,
+        &project.schedules,
+    )
+    .await;
+
+    // Surface repo-side diagnostics as lines above the table (reading only —
+    // `meguri schedules` never emits events, issue #222 f6).
+    for d in &resolved.diagnostics {
+        match d {
+            Diagnostic::Shadowed { name } => {
+                println!("⚠️  repo schedule {name:?} is shadowed by a host schedule (host wins)")
+            }
+            Diagnostic::RepoInvalid { detail } => {
+                println!("⚠️  repo meguri.toml schedules invalid: {detail}")
+            }
+            Diagnostic::RepoScheduleDropped { detail } => {
+                println!("⚠️  repo schedule dropped: {detail}")
+            }
+            Diagnostic::RepoUnavailable { detail } => {
+                println!("⚠️  repo schedules unavailable this listing (fetch): {detail}")
+            }
+        }
+    }
+
+    if resolved.schedules.is_empty() {
         println!("no schedules configured for {}", project.id);
         return Ok(());
     }
-    let store = open_store()?;
-    let now = crate::engine::scheduler_fire::epoch_now();
     println!(
-        "{:<16} {:<6} {:<16} {:<21} {:<21}",
-        "NAME", "KIND", "CRON", "LAST FIRE (UTC)", "NEXT FIRE (UTC)"
+        "{:<16} {:<6} {:<6} {:<16} {:<21} {:<21}",
+        "NAME", "SOURCE", "KIND", "CRON", "LAST FIRE (UTC)", "NEXT FIRE (UTC)"
     );
-    for s in &project.schedules {
-        let state = store.get_schedule_state(&project.id, &s.name)?;
+    for s in &resolved.schedules {
+        let c = &s.config;
+        let state = store.get_schedule_state(&project.id, &c.name)?;
         let last = state
             .as_ref()
             .and_then(|st| st.last_fired_at.clone())
             .unwrap_or_else(|| "-".into());
-        let next = match crate::cron::Cron::parse(&s.cron) {
+        let next = match crate::cron::Cron::parse(&c.cron) {
             Ok(cron) => cron
                 .next_after(now)
                 .map(crate::store::format_epoch)
@@ -1556,10 +1589,11 @@ pub fn cmd_schedules(project: Option<&str>) -> Result<()> {
             Err(e) => format!("invalid cron: {e}"),
         };
         println!(
-            "{:<16} {:<6} {:<16} {:<21} {:<21}",
-            s.name,
-            s.kind.as_str(),
-            s.cron,
+            "{:<16} {:<6} {:<6} {:<16} {:<21} {:<21}",
+            c.name,
+            s.source.as_str(),
+            c.kind.as_str(),
+            c.cron,
             last,
             next
         );
