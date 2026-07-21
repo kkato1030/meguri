@@ -17,6 +17,14 @@
 //! Every helper emits an `escalation.raised` event so "which site called a
 //! human, and how often" is observable — a regression in the aggregation
 //! (a forgotten label) shows up as a missing event.
+//!
+//! A fourth destination, [`escalate_infra`], deliberately does NOT hand the
+//! task to a human. A run that fails because forge/mux itself is unreachable
+//! (a stopped mux, a dropped connection) says nothing about the issue — it is
+//! retryable once the dependency recovers, and must not occupy the
+//! needs-human queue (design doc §3-E / P6, issue #250). [`infra_reason`]
+//! classifies a run failure as this kind of fault; [`super::flow::run_flow`]
+//! routes to `escalate_infra` instead of `Flavor::escalate` when it applies.
 
 use serde_json::json;
 
@@ -88,6 +96,64 @@ pub async fn escalate_pr(deps: &Deps, pr: i64, comment: &str) {
         json!({ "target": "pr", "pr": pr }),
     );
     deps.notifier.notify(&Notification::escalation_pr(pr)).await;
+}
+
+/// Classify a run failure as a forge/mux command fault rather than something
+/// a human must judge (issue #250). Looks for a [`crate::mux::MuxError`] (a
+/// stopped mux, a dead pane, a command it refused) or a raw `io::Error` (e.g.
+/// a failed `gh`/`curl` spawn) anywhere in the error chain — both say "a
+/// command to a dependency failed", never "the agent needs a decision".
+/// Everything else (including forge's own business-logic failures, which
+/// carry no distinct type) keeps escalating to needs-human as before — only
+/// the connection/transport layer is reclassified here.
+pub fn infra_reason(err: &anyhow::Error) -> Option<&'static str> {
+    for cause in err.chain() {
+        if let Some(mux_err) = cause.downcast_ref::<crate::mux::MuxError>() {
+            return Some(mux_infra_reason(mux_err));
+        }
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return Some("command_spawn_failed");
+        }
+    }
+    None
+}
+
+fn mux_infra_reason(err: &crate::mux::MuxError) -> &'static str {
+    use crate::mux::MuxError;
+    match err {
+        MuxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::ConnectionRefused => {
+            "mux_connection_refused"
+        }
+        MuxError::Io(_) => "mux_io_error",
+        MuxError::CommandFailed { .. } => "mux_command_failed",
+        MuxError::WaitTimeout(_) => "mux_wait_timeout",
+        MuxError::PaneNotFound(_) => "mux_pane_not_found",
+        MuxError::Other(_) => "mux_other",
+    }
+}
+
+/// Record a forge/mux command fault without touching needs-human (issue
+/// #250). The caller has already released the run's claim (`Flavor::escalate`
+/// would have dropped it too, via `escalate_task`/`escalate_issue`) so the
+/// next sweep can simply retry once the dependency is back. Emits
+/// `infra.raised` on every occurrence (for the full history), but the
+/// notification's dedup key is `reason` alone — not per issue/run — so N
+/// issues tripping the same fault collapse into one page inside the
+/// notifier's throttle window ("同一 reason は backoff 付きで1本化").
+pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: &str) {
+    let key = run.task_key();
+    let target = match key {
+        TaskKey::Issue(_) => "issue",
+        TaskKey::Local(_) => "local",
+    };
+    let _ = deps.store.emit(
+        Some(&run.id),
+        "infra.raised",
+        json!({ "target": target, "id": key.number(), "reason": reason, "detail": detail }),
+    );
+    deps.notifier
+        .notify(&Notification::infra(reason, detail))
+        .await;
 }
 
 /// The standard needs-human PR comment. `lead` is the site-specific clause
@@ -168,6 +234,67 @@ mod tests {
         let (deps, gw) = deps_with(forge, &["awaiting_human"]);
 
         escalate_issue(&deps, 7, "ci red").await;
+
+        assert!(gw.delivered().is_empty());
+    }
+
+    #[test]
+    fn infra_reason_classifies_mux_connection_refused() {
+        let mux_err = crate::mux::MuxError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "boom",
+        ));
+        let err = anyhow::Error::new(mux_err).context("ensuring mux session");
+        assert_eq!(infra_reason(&err), Some("mux_connection_refused"));
+    }
+
+    #[test]
+    fn infra_reason_classifies_mux_command_failed() {
+        let mux_err = crate::mux::MuxError::CommandFailed {
+            kind: "tmux",
+            detail: "no server running".into(),
+        };
+        let err = anyhow::Error::new(mux_err);
+        assert_eq!(infra_reason(&err), Some("mux_command_failed"));
+    }
+
+    #[test]
+    fn infra_reason_is_none_for_needs_human_style_failures() {
+        let err = anyhow::anyhow!("agent reported needs_human: could not resolve the ask");
+        assert_eq!(infra_reason(&err), None);
+    }
+
+    #[tokio::test]
+    async fn escalate_infra_never_touches_needs_human_and_pages_once_per_reason() {
+        let forge = Arc::new(FakeForge::default());
+        forge.add_issue(7, "t", "b", &[forge::LABEL_WORKING]);
+        let (deps, gw) = deps_with(forge.clone(), &["infra"]);
+        let run = deps.store.create_run("proj", 7, "t").unwrap();
+
+        escalate_infra(&deps, &run, "mux_connection_refused", "connection refused").await;
+
+        let labels = forge.labels_of(7);
+        assert!(!labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()));
+        assert!(forge.comments_of(7).is_empty());
+
+        let events = deps.store.events_for_run(&run.id, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "infra.raised"));
+
+        let delivered = gw.delivered();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].event, "infra");
+        assert_eq!(delivered[0].dedup_key, "infra:mux_connection_refused");
+    }
+
+    #[tokio::test]
+    async fn escalate_infra_is_silent_when_infra_not_subscribed() {
+        let forge = Arc::new(FakeForge::default());
+        forge.add_issue(7, "t", "b", &[]);
+        // Default allowlist (awaiting_human only): infra must not page.
+        let (deps, gw) = deps_with(forge, &["awaiting_human"]);
+        let run = deps.store.create_run("proj", 7, "t").unwrap();
+
+        escalate_infra(&deps, &run, "mux_connection_refused", "boom").await;
 
         assert!(gw.delivered().is_empty());
     }
