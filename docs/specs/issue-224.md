@@ -118,10 +118,20 @@ single-owner に反する — どちらも破綻する。
   PR を含む別 bulk observation を持つ。
 - **決定**: **(A)**。現 `plan_handoff::process_issue` がまさに「planner が記録した spec-PR branch を
   引き当て、state == merged を確認する」targeted read をしており、`speccing` issue は少数なので
-  per-issue の追加取得で十分。`IssueSnapshot` に `spec_pr_state: Option<PrState>`(open / merged /
-  closed-unmerged)を持たせ、`next_step_issue` が **merged → `Op(Handoff)`(→ ready)** /
-  **open → `Wait("spec PR in review")`** / **closed-unmerged → `Skip`(人手領域、handoff しない)**
-  を返す。open/merged/closed-unmerged の3状態 handoff テストを追加する。
+  per-issue の追加取得で十分。
+- **所有境界との整合(finding 3)**: handoff は本質的に **spec PR が merged**(= もう open でない)
+  ときの遷移である。open な spec PR は `observe_open_prs` に現れ、所有境界では **PR 側**が所有する
+  (spec review 進行中 = pr_reviewer / spec_fixer arm の領分)。よって:
+  - spec PR が **open** の `speccing` issue → issue 側は `Skip("owned by its open PR")`(所有境界の
+    とおり。前案の issue 側 `Wait("spec PR in review")` は **到達不能なので削除**)。待機は PR 側の
+    spec 段階 arm がすでに担う。
+  - spec PR が **merged**(open PR 無し)→ issue 側 `Op(Handoff)`(→ ready)。
+  - spec PR が **closed-unmerged**(open PR 無し)→ issue 側 `Skip`(人手領域)。
+  つまり `spec_pr_state` は **open PR を持たない `speccing` issue** について merged / closed-unmerged
+  を区別するためだけに使う(open は所有境界が PR 側に振るので issue 側の判断に入れない)。
+- **テスト**: (a) open spec PR → issue 側 `Skip`(PR 側所有、ownership property test と同一規則)/
+  (b) merged → `Op(Handoff)` / (c) closed-unmerged → `Skip`。ownership property test と handoff test が
+  **同じ規則**(open は PR 側、merged/closed は issue 側)を検証する。
 
 ### 既存 discovery の安全ゲートを漏れなく保持する(finding 3)
 
@@ -317,9 +327,12 @@ required、複数不可):
 - 型付きなので issue 番号・PR 番号・run id・local task id が同値でも曖昧にならない(解決優先順は
   不要)。run id は実在形式 `run-<8hex>`(`src/store/runs.rs`)。`--project` は複数 project の
   曖昧さ解消のみ(identity ではない、決定6 finding 8 と整合)。
-- **canonical 化**: どのフラグも1つの内部 identity に解決する。`--pr N` は PR の canonical_key で
-  issue に、`--run id` は run の `issue_number` / `task_id` に、`--task id` は local identity に
-  畳む(既存 `canonical_key` / `runs` 参照を使う)。
+- **セレクタ種別は捨てない(finding 1)**: `--pr` / `--run` の identity を **issue に潰さない**。所有
+  境界(決定1)は「open な meguri PR は PR 側 `next_step` が所有」なので、PR identity を canonical
+  issue に畳んで `next_step_issue` に送ると、conflict の open PR に `run --pr` しても issue 側は
+  `owned by its open PR` で止まり PR 側 arm も呼ばれない、という欠落が出る。よって **run / why は
+  セレクタ種別を保って所有 decider へルーティングする**(下記各節)。`attach` だけはペイン解決に
+  canonical issue を使ってよい(所有 decider に依らずペインは identity で決まる)。
 - **後方互換**: 既存の `meguri run --issue N`(ADR 0011 の手動 run 契約)と `meguri attach <位置引数>`
   はそのまま受理し、新セレクタはそれを含む上位集合として足す(既存フローを壊さない)。
 
@@ -329,17 +342,30 @@ required、複数不可):
 固定し `run_worker` を直接呼ぶ。ADR 0016 の「役割を指定せず reconciler が次の役割を決める」に反する
 (worker 固定なので `plan` フェーズの issue にも worker を起こす)。
 
-- **決定**: `run` は上記セレクタを受け、identity を canonical 化して **fresh observe → decide → その
-  arm を dispatch** する(役割非指定)。契約:
-  - PR / run / task の各フラグは canonical issue(または local)identity に畳んでから observe。
-  - その identity を fresh observe し `next_step_issue`(local なら `next_step_local`)を回す。
-  - `Agent(arm)` なら **その arm** の run を作って dispatch(worker 固定をやめる)。
-  - `Op` / `Wait` / `Skip` はその Step と理由を表示して終わる(起こす agent が無い)。
-  - **ADR 0011 との関係**: 手動 run の既存契約(cadence 窓ゲートを迂回する人間 override、ただし
-    `create_run_for_loop_cadence` で bucket を stamp し消費に数える = 同日 `watch` の二重消費防止)は
-    **そのまま維持**。セレクタは「どう identity を指すか」を広げるだけで、run の意味は変えない。
-  - local project の扱い: 現 `cmd_run` は local を bail していたが、`--task` セレクタ経由で
-    `next_step_local` を回せるようにする(local identity の入力経路を開ける)。
+- **決定**: `run` は上記セレクタを受け、**所有 decider を選んで** fresh observe → decide → その
+  arm を dispatch する(役割非指定)。ルーティング(finding 1):
+  - `--pr N` → その PR を fresh observe し **PR 側 `next_step`** を回す。`Agent(arm)`(ConflictResolver
+    / CiFixer / Fixer / SpecWorker / PrReviewer / SpecFixer)を dispatch。
+  - `--run <id>` → その run の **保存 `loop_kind` を保持**する。既存 run を対象にするので、その run を
+    resume/redispatch する(loop_kind を捨てて issue 側へ送らない)。
+  - `--issue N` → 所有境界に従う: その issue に **open な meguri PR があれば PR 側**、無ければ
+    **issue 側 `next_step_issue`**。
+  - `--task <id>` → **`next_step_local`**(local project も入力経路を開ける。現 `cmd_run` の local
+    bail をやめる)。
+  - `Agent(arm)` はその arm の run を作って dispatch。`Op` / `Wait` / `Skip` はその Step と理由を
+    表示して終わる(起こす agent が無い)。
+- **手動 override が bypass するゲート(finding 2)**: 既存 `meguri run --issue N` は discovery の
+  **`already_shipped` 抑止を迂回**し(`src/store/runs.rs`)、**cadence 窓も bypass**(ADR 0011)して
+  run を作る。fresh observe をそのまま通すと、成功済み・本文未変更・cadence 窓満杯の issue で
+  `Skip`/`Wait` になり **再実行できなくなる**。よって decider に **観測モード**を渡す:
+  - `next_step_issue(snapshot, Mode)`。`Mode::ManualRun` では **discovery throttle** ゲート
+    (`already_shipped` / cadence 窓 / not-before)を **skip** し、phase が示す arm を返す。
+  - `Mode::Reconcile`(watch の通常経路)では従来どおり全ゲートを適用。
+  - **手動でも保持する安全ゲート**: `hold` / `needs-human`(人間の停止宣言、spec 軸)と `issue_busy`
+    (二重起動防止)は ManualRun でも尊重する。cadence は **stamp して消費に数える**
+    (`create_run_for_loop_cadence`、同日 `watch` の二重消費防止)のは不変 — bypass するのは「窓が
+    満杯なら止める」判定だけで、消費計上は残す。
+  - つまり **override = discovery throttle の迂回**、**保持 = 人間停止 + 二重起動 + 消費計上**。
 
 ### `attach` に identity セレクタを足す(finding 1)
 
@@ -353,7 +379,7 @@ required、複数不可):
   PR / task フラグに広げる。書き込みは無い(現状どおり)。
 - 変更箇所・受け入れ10 に `run` / `attach` のセレクタ対応を含める。
 
-### `why` を新設(finding 2 / 旧 f6)
+### `why` を新設(旧 f6)
 
 読み取り専用の観測窓。上記の共有 identity セレクタを取る(旧案の位置引数 `<id>` + `--pr` は clap で
 解析不能だった)。
@@ -361,7 +387,11 @@ required、複数不可):
 - **入力**: 共有セレクタ `meguri why (--issue|--pr|--run|--task <id>) [--project <P>]`。
 - **例**: `meguri why --issue 224` / `meguri why --pr 231` / `meguri why --run run-1a2b3c4d` /
   `meguri why --task 42 --project foo`。
-- **観測方式**: **fresh observation**(informer cache でなく1回きりの observe を今回す)。
+- **所有 decider へルーティング(finding 1)**: `run` と同じ規則で、セレクタ種別と所有境界に従って
+  **実際に所有する decider の Snapshot / Step を表示**する。`--pr` は PR 側 `next_step`、`--run` は
+  その run の loop_kind の文脈、`--issue` は open PR の有無で PR 側 / issue 側、`--task` は local。
+  issue に潰して常に issue 側判断を出す、ということはしない。
+- **観測方式**: **fresh observation**(informer cache でなく1回きりの observe を今回す)。read-only。
 - **出力**: 解決した identity、所有する Kind / decider、`next_step` が返した Step、その理由文字列を
   人間可読で出す(issue/PR は Snapshot の主要フィールドも)。
 - **read-only 検証**: CLI テストで `why` が forge 書き込みも run 生成もしないことを assert
@@ -398,10 +428,13 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
   act として保ち、scheduler の独立呼び出しを撤去。
 - `src/config.rs` — `StepPolicyConfig` に新 arm の bool を追加。
 - `src/cli.rs` / `src/main.rs` / `src/app.rs` — 共有 identity セレクタ
-  `(--issue|--pr|--run|--task)` を `Why`(新設)/ `Run` / `Attach` に足す(finding 1)。`cmd_run` を
-  worker 固定から **観測 arm の dispatch** に変更(cadence stamp は維持、local は `--task` 経由で
-  `next_step_local`)。`resolve_attach_pane` を PR / task フラグに拡張。既存の `run --issue` /
-  `attach <位置引数>` は後方互換で維持。
+  `(--issue|--pr|--run|--task)` を `Why`(新設)/ `Run` / `Attach` に足す(finding 1)。`cmd_run` /
+  `cmd_why` は **所有 decider へルーティング**(`--pr` は PR 側、`--run` は保存 loop_kind を保持、
+  `--issue` は open PR の有無、`--task` は local)し、issue に潰さない。`cmd_run` は worker 固定を
+  やめ観測 arm を dispatch、`Mode::ManualRun` で discovery throttle(already_shipped / cadence 窓 /
+  not-before)を bypass しつつ hold/needs-human と cadence 消費計上は保持(finding 2)。
+  `resolve_attach_pane` を PR / task フラグに拡張。既存の `run --issue` / `attach <位置引数>` は
+  後方互換で維持。
 - `src/tasks.rs` — planner / worker arm が使う **ゲート述語**(`already_shipped` / not-before /
   `blocked_by` / cadence `evaluate`)を単一 issue snapshot に効かせる接続。per-label discover は
   使わず、issue-wide 予約(`issue_has_active_author_run`)と arm-tagged claim で二重取りを防ぐ
@@ -434,8 +467,10 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
    ことの回帰テストがある(単一 snapshot で phase を1本に畳む契約)。
 7. **f1**: local mode(forge 無し)で `TaskKey::Local` の `ready` 相当タスクが `next_step_local` →
    `Agent(Worker)` で enqueue・drive され、`Loop` trait 撤去後も回帰しない回帰テストがある。
-8. **f3**: `speccing` issue の spec PR が open / merged / closed-unmerged の3状態で、それぞれ
-   `Wait` / `Op(Handoff)`(→ ready)/ `Skip` になる handoff テストがある。
+8. **f3 / finding 3(handoff の所有整合)**: `speccing` issue の spec PR が open / merged /
+   closed-unmerged の3状態で、それぞれ **open → issue 側 `Skip`(PR 側所有)** / **merged →
+   `Op(Handoff)`(→ ready)** / **closed-unmerged → `Skip`** になる handoff テストがある。ownership
+   property test と同じ規則(open は PR 側、merged/closed は issue 側)を検証する。
 9. **f4**: closed issue に live な pane/worktree が残る状態から `Op(Finalize)` が発火し、pane /
    worktree / merged branch が回収される回帰テストがある。
 9b. **finding 4**: (a) local mode(forge 無し)/ `TaskKey::Local` の worktree・branch は open issue が
@@ -458,6 +493,14 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
 14. **finding 3(body-edit)**: `reconcile_body_edits` は arm ではなく毎-resync の signal act であり、
    open な実装 PR がある `implementing` issue で body を変えても signal が **1 resync に1回しか出ない**
    (二重実行しない)回帰テストがある。
+15. **finding 1(PR identity のルーティング)**: `--pr` / `--run` の identity を issue に潰さず所有
+   decider へ送る。回帰テスト: conflict の open PR に `meguri run --pr N` で **PR 側 `ConflictResolver`
+   arm** が dispatch される / `meguri why --pr N` が **PR 側 Snapshot / Step** を表示する /
+   `meguri run --run <fixer run>` が保存 `loop_kind` を保って resume する(issue 側へ流れない)。
+16. **finding 2(手動 run の override)**: 成功済み・本文未変更・cadence 窓満杯の issue で
+   `meguri run --issue N` が **`Skip`/`Wait` にならず arm を dispatch** する(`Mode::ManualRun` が
+   discovery throttle を bypass)。ただし `hold`/`needs-human` の issue では **起動しない**(人間停止を
+   尊重)、かつ cadence は **消費に計上**される、を回帰テストで固定する。
 
 ## 移行とロールバック(veto により必須)
 
@@ -493,12 +536,14 @@ snapshot の trigger 条件として温存**する(bool へ潰さない — conf
 - **挙動保存**: 各 loop の既存ユニット/挙動テストを、enqueue 経路を reconciler に差し替えても
   緑のまま通す(planner は `meguri:plan` で発火、worker の needs_plan ping-pong ガード、
   spec_fixer の budget escalation、cleaner/triage の scan cadence、等)。
-- **新規テスト**: local mode worker(f1、受け入れ7)/ spec-PR handoff の3状態(f3、受け入れ8)/
-  closed-issue の Finalize 回収(f4、受け入れ9)/ 非 Finalize: local 資源 + closed×open-PR
-  (finding 4、受け入れ9b)/ `why` の read-only + 型付きフラグ解析、`run` の観測 arm dispatch、
-  `attach` の 4 identity 解決(finding 1・2、受け入れ10)/ `plan`+`ready` 併記で1本しか立たない
-  (finding 2、受け入れ6)/ discovery ゲート保持(finding 3、受け入れ13)/ body-edit signal の
-  非二重実行(finding 3、受け入れ14)。
+- **新規テスト**: local mode worker(f1、受け入れ7)/ spec-PR handoff(open→PR 側 Skip / merged→
+  Handoff / closed→Skip、finding 3、受け入れ8)/ closed-issue の Finalize 回収(f4、受け入れ9)/
+  非 Finalize: local 資源 + closed×open-PR(finding 4、受け入れ9b)/ `why` の read-only、`run` の
+  観測 arm dispatch、`attach` の 4 identity 解決(受け入れ10)/ **PR identity のルーティング**
+  (`run --pr`→PR arm、`why --pr`→PR Snapshot、`--run` が loop_kind 保持、finding 1、受け入れ15)/
+  **手動 override**(shipped/cadence 満杯でも dispatch、hold は起動せず、finding 2、受け入れ16)/
+  `plan`+`ready` 併記で1本しか立たない(受け入れ6)/ discovery ゲート保持(受け入れ13)/
+  body-edit signal の非二重実行(受け入れ14)。
 - **統合**(`tests/*.rs`): `Loop` trait 撤去後の通し(受け入れ11)。
 - **回帰ガード**: 受け入れ1–4 を満たす grep/compile ベースのアサーション(sweep 呼び出し・
   `Loop`・`default_loops` が消えたことの機械的確認)。
