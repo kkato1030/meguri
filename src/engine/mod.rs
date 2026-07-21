@@ -10,7 +10,7 @@ pub mod plan_handoff;
 pub mod planner;
 pub mod pr_reviewer;
 pub mod reaper;
-pub mod reconcile;
+pub mod reconcile_body_edits;
 pub mod routing_drift;
 pub mod schedule;
 pub mod scheduler;

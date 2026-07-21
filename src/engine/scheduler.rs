@@ -196,8 +196,11 @@ impl Scheduler {
                 // Notice body edits on already-shipped issues the label-filtered
                 // discovery can no longer see (issue #142, half B) and leave a
                 // re-attention signal. Light API sweep, no run record.
-                if let Err(e) = super::reconcile::sweep(deps).await {
-                    tracing::warn!("reconcile sweep failed for {}: {e:#}", deps.project.id);
+                if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
+                    tracing::warn!(
+                        "reconcile_body_edits sweep failed for {}: {e:#}",
+                        deps.project.id
+                    );
                 }
             }
 

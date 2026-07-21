@@ -3,7 +3,8 @@
 //! signal comment) was emitted, so a body edit waiting to be reprocessed does
 //! not re-fire the event/comment on every poll tick. Both half A (the discover
 //! guard in [`crate::tasks::LabelTaskSource`]) and half B (the poll sweep in
-//! [`crate::engine::reconcile`]) gate on it and share the same row per issue.
+//! [`crate::engine::reconcile_body_edits`]) gate on it and share the same row
+//! per issue.
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
