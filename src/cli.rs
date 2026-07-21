@@ -18,7 +18,9 @@ pub enum Command {
     /// Check environment: gh auth, mux availability, git
     Doctor {
         /// Also fire a one-shot live probe per agent profile to verify each
-        /// model alias still resolves (spends a few hundred tokens of quota)
+        /// model alias still resolves (spends a few hundred tokens of quota),
+        /// and a short interactive PTY probe per pane-launched profile to
+        /// check the bypass-permissions gate is already accepted
         #[arg(long)]
         probe: bool,
     },
