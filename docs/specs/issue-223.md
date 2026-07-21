@@ -281,7 +281,8 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
   - `run_id` が **active**(`queued`/`running`/`interrupted`)→ **skip**。PR は fixer 家族の誰かが処理中
     (Fixer 実行中は CiFixer も止まる = 家族横断排他が forge 側にも見える)。他 instance の active run
     なら no-steal。
-  - `run_id` が **terminal**(succeeded/failed/stopped)/ 見つからない → マーカーは **stale**。無視して
+  - `run_id` が **terminal**(`is_active()==false` —— succeeded/failed/cancelled/skipped/needs_plan/
+    decomposed)/ 見つからない → マーカーは **stale**。無視して
     **reclaim**(自分の新 run で上書き)。tombstone 編集に失敗して古いマーカーが残っても、instance 名を
     変えた再起動や将来の別 instance が引っかかって永久停止する事故は起きない —— 生存判定が run を見るからだ。
 - **release の契約と再試行**: run 終端時に claim comment を node `id`(§1.5)で tombstone 編集する。
@@ -333,10 +334,21 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
      複数 `interrupted` が残っていると、そのまま `CREATE UNIQUE INDEX` すると **migration 全体が失敗し
      store 起動が止まる**(`mod.rs:142-143`)。よって index を張る前に、各 `(project_id, issue_number)`
      群の active な fixer 家族 run を **1 本だけ残して残りを terminal 化**する UPDATE を先に流す。
-     残す 1 本は「生きているものを優先」(`running` > `interrupted` > `queued`、同格は新しい方=最大 id)。
-     残りは `status='stopped'`, `reason='superseded by reconciler family exclusion (migration 0016)'`
-     にする —— **`succeeded` にはしない**(予算 `succeeded_run_count` を汚さない)。既存の
-     `runs_active_issue`(loop 単位)により arm ごとには元々 1 本なので、1 群の候補は最大 3(各 arm 1 本)。
+     - **残す 1 本 = 一番新しい run(finding 2 の決定)**。run id は `run-`+UUID 先頭8文字で生成される
+       (`runs.rs:279-281`)ので**最大 id は最新ではない**。よって順序は **`created_at DESC` を第一キー、
+       `started_at DESC` を第二キー、同時刻の最終 tie-breaker だけ `id`** とする(決定的)。どれを残しても
+       症状が残れば次 resync が index を尊重して再 enqueue するので正しさは不変 —— ここで要るのは
+       「決定的であること」。
+     - **残りは既存の run 契約に合わせて terminal 化する(finding 1 の決定)**。現行 `RunStatus` に
+       `Stopped` は無く(`runs.rs:8-61`)、未知値は `parse` が `Failed` に落ちる(`runs.rs:209`)。理由の
+       担体列も `reason` ではなく **`error`**(`0007_tasks.sql:50`)。そこで
+       `status='cancelled'`(既存の終端 status。`succeeded` ではないので予算 `succeeded_run_count` を
+       汚さない)、`error='superseded by reconciler family exclusion (migration 0016)'`、
+       `finished_at=<UTC RFC3339>`(`update_run_status` の終端書き込み規約に合わせる。SQL は
+       `strftime('%Y-%m-%dT%H:%M:%fZ','now')` 等)を書く。`cancelled` は `is_active()==false`・
+       `redispatch` 対象外なので、余剰 run が復活することもない。
+     - 既存の `runs_active_issue`(loop 単位)により arm ごとには元々 1 本なので、1 群の候補は最大 3
+       (各 arm 1 本)。
   2. **② CREATE UNIQUE INDEX** `runs(project_id, issue_number) WHERE loop_kind IN
      ('conflict-resolver','ci-fixer','fixer') AND status IN ('queued','running','interrupted')
      AND issue_number IS NOT NULL`。①のあとなので違反ゼロで必ず通る。
@@ -424,11 +436,13 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    planner=7 < cleaner=8 < triage=9 を返す(純粋・全順序)。`queued` run がこの rank 順・同 rank は
    issue 番号昇順で dispatch され、**`spec_fixer` の相対順(fixer の直後 / worker より前)が今日と一致**
    することを assert(既存の `spec_fixer_sits_in_the_fixer_family_above_new_work` を rank ベースへ移植)。
-9. **migration の前進安全性(finding 2)**: **既存重複を含む DB を fixture にした migration test** ——
-   upgrade 前に `(project, issue)` へ Fixer と CiFixer を同時 active、かつ arm 違いの `interrupted` を
-   複数仕込んだ store を開き、(a) migration 0016 が**失敗せず適用**され store 起動が通る、(b) 各群に
-   active な fixer 家族 run が**ちょうど 1 本**残り「生存優先」で選ばれる、(c) terminal 化された余剰は
-   `succeeded` ではない(予算不変)、(d) 適用後 `runs_active_fixer_family` が新規重複を弾く、を assert。
+9. **migration の前進安全性(finding 2 / finding 1)**: **既存重複を含む DB を fixture にした migration
+   test** —— upgrade 前に `(project, issue)` へ **created_at をずらした** Fixer と CiFixer を同時 active、
+   かつ arm 違いの `interrupted` を複数仕込んだ store を開き、(a) migration 0016 が**失敗せず適用**され
+   store 起動が通る、(b) 各群に active な fixer 家族 run が**ちょうど 1 本**残り、**残るのは
+   `created_at` が最新のもの**(started_at → id が tie-breaker)、(c) terminal 化された余剰は
+   `status='cancelled'`・`error` に理由・`finished_at` あり(**`succeeded` ではない**ので予算不変)、
+   (d) 適用後 `runs_active_fixer_family` が新規重複を弾く、を assert。
 10. **非回帰**: 既存 `tests/*fixer*` の discovery テストは reconciler の arm 判定へ書き換え。
    `scheduler_test.rs` / `issue_reconciler`(旧 merge_tail)の property は破壊しない。`spec_fixer` は
    S3 で無変更(挙動・順位とも)。統合テスト(`tests/fixtures/fake_agent.sh`)で fixer arm が実 tmux /
@@ -498,10 +512,11 @@ finding f3 の急所: PR コメントは(公開リポジトリでは)**誰でも
    - **100 件超 comment の pagination は `fold_comment_pages` の GhForge-level test で担保**(FakeForge 不可)
      —— `pageInfo`/`endCursor` を辿り全ページで `viewerDidAuthor`/`id` が保たれ、2 ページ目の claim
      マーカーが拾えること(f8)。
-8. **migration 0016 の前進安全性(finding 2)**: Fixer と CiFixer を同 issue に同時 active・arm 違いの
-   `interrupted` 複数を含む既存 DB を fixture にした migration test が緑 —— ①クリーンアップが余剰 active を
-   `succeeded` 以外で terminal 化し各群に active 1 本を残す、②その後 `CREATE UNIQUE INDEX` が成功して
-   store 起動が通る。
+8. **migration 0016 の前進安全性(finding 2 / finding 1)**: Fixer と CiFixer を同 issue に同時 active・
+   arm 違いの `interrupted` 複数を含む既存 DB を fixture にした migration test が緑 —— ①クリーンアップが
+   余剰 active を **`cancelled`**(既存 `RunStatus`。`succeeded` ではないので予算不変)+ `error` 理由 +
+   `finished_at` で terminal 化し、各群に **`created_at` 最新の** active 1 本を残す、②その後
+   `CREATE UNIQUE INDEX` が成功して store 起動が通る。
 9. **`dispatch_rank` が全 loop を順序づけ、`spec_fixer` の相対順が今日と一致**する(finding 4)。
    `spec_fixer` は S3 で挙動・順位とも無変更。
 10. 既存テスト(特に `issue_reconciler`(旧 `merge_tail`)property / `scheduler_test.rs` / 統合テスト)が
