@@ -275,6 +275,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // active drift the watch's sweep recorded. Read-only, all-project.
             if let Some(store) = &store {
                 doctor_drift(store);
+                // Sweep failures in the last hour (issue #251, design doc
+                // P6.5 item 3): the same events `sweep_health.rs` emits on
+                // every failure, read here purely for visibility.
+                doctor_sweep_health(store, cfg);
             }
             doctor_workspaces(cfg);
             // Managed clones (issue #195): show each project's clone state
@@ -1136,6 +1140,58 @@ fn doctor_drift(store: &Store) {
             "  ⚠️  [{}] {}/{} の成績が悪化 — CLI 更新かモデル変更の影響の可能性",
             d.project_id, d.loop_kind, profile
         );
+    }
+}
+
+/// Doctor's sweep-health section (issue #251, design doc P6.5 item 3): the
+/// per-(project, sweep) `sweep.failed` **rate** over the last hour, read
+/// straight from `events` — no dedicated state table, since `sweep_health.rs`
+/// already emits one event per failure. Read-only and never fails doctor;
+/// this is visibility into an ongoing outage, not a precondition check.
+///
+/// `events` alone has no denominator — sweeps that succeed leave no trace,
+/// on purpose (an event per success, every ~`poll_interval_secs`, for every
+/// sweep × project, would be pure event-log noise for a number doctor can
+/// derive instead). So the denominator is computed from config: one sweep
+/// attempt per project per tick, and `window_secs / poll_interval_secs` ticks
+/// fit in the window (issue #251 self-review f3 — a bare failure *count*
+/// means something different at a 30s poll interval than a 5-minute one, and
+/// says nothing about a sweep that has been failing every single tick versus
+/// one that fails only occasionally).
+fn doctor_sweep_health(store: &Store, cfg: &Config) {
+    const WINDOW_SECS: u64 = 3600;
+    let since = meguri::store::format_epoch(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(WINDOW_SECS),
+    );
+    let failures = match store.events_since("sweep.failed", &since) {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("sweep-health read failed: {e:#}");
+            return;
+        }
+    };
+    if failures.is_empty() {
+        return;
+    }
+    // Every ready project runs every sweep once per tick (`scheduler.rs`), so
+    // this is the same expected attempt count for every (project, sweep) pair
+    // — an approximation (a project not yet cloned, or a daemon restart mid-
+    // window, attempts fewer), always erring toward *understating* the rate.
+    let expected_attempts = (WINDOW_SECS / cfg.scheduler.poll_interval_secs.max(1)).max(1);
+    let mut counts: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for e in &failures {
+        let project = e.data["project"].as_str().unwrap_or("?").to_string();
+        let sweep = e.data["sweep"].as_str().unwrap_or("?").to_string();
+        *counts.entry((project, sweep)).or_default() += 1;
+    }
+    println!("\nsweep 失敗率 (直近1時間、想定 {expected_attempts} 回試行):");
+    for ((project, sweep), n) in counts {
+        let rate = n as f64 / expected_attempts as f64 * 100.0;
+        println!("  ⚠️  [{project}] {sweep}: {n}/{expected_attempts} 回 ({rate:.0}%)");
     }
 }
 

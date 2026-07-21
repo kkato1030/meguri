@@ -58,6 +58,50 @@ const MERGE_TAIL_OBSERVE_QUERY: &str = "query($owner:String!,$name:String!){\
      ... on CheckRun{name status conclusion detailsUrl} \
      ... on StatusContext{context state targetUrl}}}}}}}}}}}";
 
+/// Paginated conversation-comment fallback used when the bulk observe's
+/// `comments(last:100)` window clipped older comments ([`GhForge::paginate_pr_comments`]).
+/// Kept as a const so the brace-balance unit test below covers it too (issue
+/// #251, design doc P6.5 item 2 — the same class of silent-failure bug #227
+/// hit in [`MERGE_TAIL_OBSERVE_QUERY`] can hide in any hand-written GraphQL
+/// string, not just that one).
+const COMMENT_PAGINATION_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} \
+     nodes{id body createdAt viewerDidAuthor}}}}}";
+
+/// Checks + classic commit statuses for one PR's head commit
+/// ([`GhForge::pr_check_rollup`]). Kept as a const for the same parse-level
+/// brace check as the other GraphQL strings (issue #251).
+const CHECK_ROLLUP_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     commits(last:1){nodes{commit{statusCheckRollup{\
+     contexts(first:100){nodes{__typename \
+     ... on CheckRun{name status conclusion detailsUrl} \
+     ... on StatusContext{context state targetUrl}}}}}}}}}}";
+
+/// Review-thread resolution state for one PR ([`GhForge::list_review_threads`]).
+/// Kept as a const for the same parse-level brace check as the other GraphQL
+/// strings (issue #251).
+const REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+     repository(owner:$owner,name:$name){pullRequest(number:$number){\
+     reviewThreads(first:100){nodes{id isResolved path line \
+     comments(first:100){nodes{author{login} body}}}}}}}";
+
+/// Edit a PR conversation comment by node id ([`GhForge::update_comment`]).
+/// Kept as a const for the same parse-level brace check as the read-side
+/// GraphQL strings above — a mutation typo is invisible to `FakeForge` tests
+/// just like a query typo is (issue #251 self-review f1: the brace check had
+/// only covered `query`s, not `mutation`s, leaving the same class of bug
+/// #227 hit reachable through either of the two mutations below).
+const UPDATE_COMMENT_MUTATION: &str = "mutation($id:ID!,$body:String!){\
+     updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+
+/// Reply to a PR review thread ([`GhForge::reply_review_thread`]). Kept as a
+/// const for the same parse-level brace check (issue #251 self-review f1).
+const REPLY_REVIEW_THREAD_MUTATION: &str = "mutation($threadId:ID!,$body:String!){\
+     addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
+     {comment{id}}}";
+
 /// The linked-PR cross-reference query (issue #249, [`Forge::linked_open_prs`]):
 /// GitHub's issue timeline, filtered to `CrossReferencedEvent`s whose source
 /// is a PR. Kept as a const for the same reason as
@@ -712,10 +756,7 @@ impl GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} \
-             nodes{id body createdAt viewerDidAuthor}}}}}";
+        let query = COMMENT_PAGINATION_QUERY;
         let mut pages: Vec<Value> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut requests: u32 = 0;
@@ -1315,12 +1356,7 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             commits(last:1){nodes{commit{statusCheckRollup{\
-             contexts(first:100){nodes{__typename \
-             ... on CheckRun{name status conclusion detailsUrl} \
-             ... on StatusContext{context state targetUrl}}}}}}}}}}";
+        let query = CHECK_ROLLUP_QUERY;
         let raw = self
             .gh(&[
                 "api",
@@ -1484,8 +1520,7 @@ impl Forge for GhForge {
     async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
         // GraphQL `updateIssueComment` edits a PR conversation comment by its
         // node id (the id the bulk observe folded in, §1.5).
-        let query = "mutation($id:ID!,$body:String!){\
-             updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}";
+        let query = UPDATE_COMMENT_MUTATION;
         self.gh(&[
             "api",
             "graphql",
@@ -1623,10 +1658,7 @@ impl Forge for GhForge {
             .repo
             .split_once('/')
             .with_context(|| format!("repo slug `{}` is not owner/name", self.repo))?;
-        let query = "query($owner:String!,$name:String!,$number:Int!){\
-             repository(owner:$owner,name:$name){pullRequest(number:$number){\
-             reviewThreads(first:100){nodes{id isResolved path line \
-             comments(first:100){nodes{author{login} body}}}}}}}";
+        let query = REVIEW_THREADS_QUERY;
         let raw = self
             .gh(&[
                 "api",
@@ -1718,9 +1750,7 @@ impl Forge for GhForge {
     }
 
     async fn reply_review_thread(&self, _pr: i64, thread_id: &str, body: &str) -> Result<()> {
-        let mutation = "mutation($threadId:ID!,$body:String!){\
-             addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body})\
-             {comment{id}}}";
+        let mutation = REPLY_REVIEW_THREAD_MUTATION;
         self.gh(&[
             "api",
             "graphql",
@@ -1992,32 +2022,60 @@ impl Forge for GhForge {
 mod tests {
     use super::*;
 
-    // FakeForge tests never execute these real GraphQL queries, so a syntax
-    // slip here (an unbalanced brace killed every merge-tail sweep in
-    // production on 2026-07-21) only surfaces via this parse-level check.
-    fn assert_braces_balance(query: &str) {
+    // FakeForge tests never execute these hand-written GraphQL strings, so a
+    // syntax slip in one of them (an unbalanced brace killed every merge-tail
+    // sweep in production on 2026-07-21, #227) only surfaces via this
+    // parse-level check — hence every literal query *and mutation* is a
+    // module-level const covered here, not just the one #242 fixed (issue
+    // #251, design doc P6.5 item 2; self-review f1 added the two mutations).
+    fn assert_braces_balance(name: &str, query: &str) {
         let mut depth = 0i64;
         for (i, c) in query.chars().enumerate() {
             match c {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    assert!(depth >= 0, "extra closing brace at index {i}");
+                    assert!(depth >= 0, "{name}: extra closing brace at index {i}");
                 }
                 _ => {}
             }
         }
-        assert_eq!(depth, 0, "{depth} unclosed brace(s) in the query");
+        assert_eq!(depth, 0, "{name}: {depth} unclosed brace(s)");
     }
 
     #[test]
     fn merge_tail_observe_query_braces_balance() {
-        assert_braces_balance(MERGE_TAIL_OBSERVE_QUERY);
+        assert_braces_balance("MERGE_TAIL_OBSERVE_QUERY", MERGE_TAIL_OBSERVE_QUERY);
+    }
+
+    #[test]
+    fn comment_pagination_query_braces_balance() {
+        assert_braces_balance("COMMENT_PAGINATION_QUERY", COMMENT_PAGINATION_QUERY);
+    }
+
+    #[test]
+    fn check_rollup_query_braces_balance() {
+        assert_braces_balance("CHECK_ROLLUP_QUERY", CHECK_ROLLUP_QUERY);
+    }
+
+    #[test]
+    fn review_threads_query_braces_balance() {
+        assert_braces_balance("REVIEW_THREADS_QUERY", REVIEW_THREADS_QUERY);
+    }
+
+    #[test]
+    fn update_comment_mutation_braces_balance() {
+        assert_braces_balance("UPDATE_COMMENT_MUTATION", UPDATE_COMMENT_MUTATION);
+    }
+
+    #[test]
+    fn reply_review_thread_mutation_braces_balance() {
+        assert_braces_balance("REPLY_REVIEW_THREAD_MUTATION", REPLY_REVIEW_THREAD_MUTATION);
     }
 
     #[test]
     fn linked_open_prs_query_braces_balance() {
-        assert_braces_balance(LINKED_OPEN_PRS_QUERY);
+        assert_braces_balance("LINKED_OPEN_PRS_QUERY", LINKED_OPEN_PRS_QUERY);
     }
 
     #[test]
