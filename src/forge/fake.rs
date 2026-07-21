@@ -133,6 +133,10 @@ pub struct FakeForge {
     /// PRs whose `observe_open_prs` reports its thread set as clipped
     /// (`review_threads_complete = false`).
     pub incomplete_threads: Mutex<HashSet<i64>>,
+    /// PRs whose `observe_open_prs` reports its conversation as truncated
+    /// (`comments_complete = false`) — exercises the engine's park-on-
+    /// truncation fallback for the real forge's comment page budget.
+    pub incomplete_comments: Mutex<HashSet<i64>>,
 }
 
 impl FakeForge {
@@ -552,6 +556,12 @@ impl FakeForge {
     /// Report a PR's observed review-thread set as clipped.
     pub fn mark_threads_incomplete(&self, pr: i64) {
         self.incomplete_threads.lock().unwrap().insert(pr);
+    }
+
+    /// Report a PR's observed conversation as truncated (the real forge's
+    /// comment page budget or a stalled cursor cut the pagination short).
+    pub fn mark_comments_incomplete(&self, pr: i64) {
+        self.incomplete_comments.lock().unwrap().insert(pr);
     }
 
     /// How many times `update_branch` was called for a PR (BEHIND fix tests).
@@ -1205,6 +1215,7 @@ impl Forge for FakeForge {
                 // conservative fallback.
                 labels_complete: !self.incomplete_labels.lock().unwrap().contains(&number),
                 review_threads_complete: !self.incomplete_threads.lock().unwrap().contains(&number),
+                comments_complete: !self.incomplete_comments.lock().unwrap().contains(&number),
             });
         }
         // One bulk read regardless of PR count (issue #221): the informer-cache

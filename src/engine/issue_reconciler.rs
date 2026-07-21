@@ -505,8 +505,11 @@ async fn build_snapshot(
     // write slip the human stop), and an unresolved thread hidden past the thread
     // window must never be missed (it would let an arm slip the review gate). So
     // an incomplete label set reads as a human stop, and an incomplete thread set
-    // reads as "has an unresolved thread".
-    let human_stop = Labels.human_stop(pr, obs.labels_complete);
+    // reads as "has an unresolved thread". A truncated conversation (the comment
+    // page budget / a stalled cursor) also reads as a human stop: an arm or
+    // claim marker hidden past the truncation must never be missed, and a
+    // pathologically chatty PR parks instead of re-paginating every resync.
+    let human_stop = Labels.human_stop(pr, obs.labels_complete) || !obs.comments_complete;
     let has_unresolved_thread =
         obs.review_threads.iter().any(|t| !t.resolved) || !obs.review_threads_complete;
     // The Fixer arm launches a heavy agent, so on an incomplete thread window we
@@ -1264,6 +1267,7 @@ mod tests {
             pr_review: None,
             labels_complete: true,
             review_threads_complete: true,
+            comments_complete: true,
         }
     }
 

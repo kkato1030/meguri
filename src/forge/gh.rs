@@ -21,6 +21,14 @@ const FAILED_LOG_TAIL_LINES: usize = 200;
 /// The generic color for a meguri label with no scheme entry.
 const DEFAULT_LABEL_COLOR: &str = "1D76DB";
 
+/// Page budget for the per-PR comment overflow pagination (100 comments per
+/// page, on top of the bulk window's last-100). Anyone who can comment on a
+/// public PR controls the conversation's length, so an unbounded walk would
+/// let one chatty PR spend arbitrary API cost on every resync; past this
+/// budget the observation is marked incomplete and the engine parks the PR
+/// (safe side) instead of re-paginating forever.
+const MAX_COMMENT_PAGES: u32 = 10;
+
 /// The merge-tail informer-cache observe (issue #221, ADR 0012 decision 3):
 /// one GraphQL query folding every per-PR signal the old sweeps read (merge
 /// state, arm-marker comments, review threads, check rollup) into a single
@@ -584,6 +592,9 @@ impl GhForge {
             pr_review,
             labels_complete,
             review_threads_complete,
+            // The bulk window is complete unless the overflow pagination (the
+            // caller) says otherwise.
+            comments_complete: true,
         })
     }
 
@@ -591,8 +602,13 @@ impl GhForge {
     /// `id` + `viewerDidAuthor` survive on every page (f6). Used only when the
     /// bulk observe's comment window clipped older comments, so the arm marker
     /// and any self-authored claim marker are never missed. Returns the folded
-    /// comments plus the number of HTTP round-trips it took (for the cost).
-    async fn paginate_pr_comments(&self, number: i64) -> Result<(Vec<PrComment>, u32)> {
+    /// comments, the number of HTTP round-trips it took (for the cost), and
+    /// whether the conversation was read to the end: the walk stops at
+    /// [`MAX_COMMENT_PAGES`] or on a non-advancing cursor, because a
+    /// pathologically chatty PR (anyone can comment on a public PR) must not
+    /// be able to spend unbounded API cost on every resync — the caller marks
+    /// the observation incomplete and the engine parks the PR instead.
+    async fn paginate_pr_comments(&self, number: i64) -> Result<(Vec<PrComment>, u32, bool)> {
         let (owner, name) = self
             .repo
             .split_once('/')
@@ -604,7 +620,7 @@ impl GhForge {
         let mut pages: Vec<Value> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut requests: u32 = 0;
-        loop {
+        let complete = loop {
             let mut args: Vec<String> = vec![
                 "api".into(),
                 "graphql".into(),
@@ -633,16 +649,23 @@ impl GhForge {
                 .pointer("/pageInfo/hasNextPage")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            cursor = conn
+            let next_cursor = conn
                 .pointer("/pageInfo/endCursor")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let advanced = next_cursor.is_some() && next_cursor != cursor;
+            cursor = next_cursor;
             pages.push(conn);
-            if !has_next || cursor.is_none() {
-                break;
+            if !has_next {
+                break true;
             }
-        }
-        Ok((fold_comment_pages(&pages), requests))
+            // hasNextPage with a missing or stalled cursor: a malformed
+            // response would otherwise re-read the same page forever.
+            if !advanced || requests >= MAX_COMMENT_PAGES {
+                break false;
+            }
+        };
+        Ok((fold_comment_pages(&pages), requests, complete))
     }
 
     /// The workflow run id inside a check's details URL
@@ -1684,8 +1707,9 @@ impl Forge for GhForge {
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
             if total > obs.comments.len() {
-                let (all, reqs) = self.paginate_pr_comments(obs.pr.number).await?;
+                let (all, reqs, complete) = self.paginate_pr_comments(obs.pr.number).await?;
                 obs.comments = all;
+                obs.comments_complete = complete;
                 requests += reqs;
             }
             prs.push(obs);

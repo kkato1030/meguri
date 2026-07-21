@@ -196,6 +196,13 @@ pub struct PrObservation {
     /// when a bounded window clipped some; the engine then assumes an unresolved
     /// thread exists (arm waits) rather than arming past a hidden one.
     pub review_threads_complete: bool,
+    /// Whether [`Self::comments`] is the PR's *complete* conversation. False
+    /// when the overflow pagination hit its page budget or a non-advancing
+    /// cursor (a pathologically chatty PR must not be able to spend unbounded
+    /// API cost every resync). The engine then treats the PR as a human stop:
+    /// an arm/claim marker hidden past the truncation can never be missed, and
+    /// the chatty PR parks instead of being re-paginated forever.
+    pub comments_complete: bool,
 }
 
 /// The whole merge tail's observation for one sweep, plus the API cost it took
