@@ -143,6 +143,20 @@ fn mux_infra_reason(err: &crate::mux::MuxError) -> &'static str {
     }
 }
 
+/// Retry cap for [`escalate_infra`]: once one target has tripped this many
+/// infra faults inside [`INFRA_FAULT_WINDOW_SECS`], the fault stops cycling
+/// as retryable and escalates to needs-human. Each retry costs a run record,
+/// a worktree and an agent spawn, and an open issue's worktree is never
+/// reaped — so a *permanently* broken mux/gh (a bad config, an uninstalled
+/// binary) must not be allowed to grow disk and API spend on every poll
+/// forever.
+const MAX_INFRA_FAULTS_PER_WINDOW: usize = 5;
+
+/// The sliding window for [`MAX_INFRA_FAULTS_PER_WINDOW`]. Wide enough that a
+/// flaky-but-recovering dependency (an overnight outage) stays classified as
+/// infra, narrow enough that a permanent fault reaches a human within a day.
+const INFRA_FAULT_WINDOW_SECS: u64 = 24 * 3600;
+
 /// Record a forge/mux command fault without touching needs-human (issue
 /// #250). The caller has already released the run's claim (`Flavor::escalate`
 /// would have dropped it too, via `escalate_task`/`escalate_issue`) so the
@@ -151,6 +165,11 @@ fn mux_infra_reason(err: &crate::mux::MuxError) -> &'static str {
 /// notification's dedup key is `reason` alone — not per issue/run — so N
 /// issues tripping the same fault collapse into one page inside the
 /// notifier's throttle window ("同一 reason は backoff 付きで1本化").
+///
+/// Bounded: past [`MAX_INFRA_FAULTS_PER_WINDOW`] faults for the same target
+/// inside the window, the fault is no longer treated as transient and falls
+/// back to the standard needs-human escalation ([`escalate_task`]) — the cap
+/// that keeps a permanently broken dependency from retrying forever.
 pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: &str) {
     let key = run.task_key();
     let target = match key {
@@ -162,6 +181,28 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
         "infra.raised",
         json!({ "target": target, "id": key.number(), "reason": reason, "detail": detail }),
     );
+    let since = crate::store::format_epoch(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(INFRA_FAULT_WINDOW_SECS),
+    );
+    let recent = deps
+        .store
+        .infra_raised_since(target, key.number(), &since)
+        .unwrap_or(0);
+    if recent >= MAX_INFRA_FAULTS_PER_WINDOW {
+        escalate_task(
+            deps,
+            run,
+            &format!(
+                "infra fault persisted after {recent} retries within 24h                  ({reason}): {detail} — the dependency looks permanently                  broken, retrying stops until a human clears it"
+            ),
+        )
+        .await;
+        return;
+    }
     deps.notifier
         .notify(&Notification::infra(reason, detail))
         .await;
@@ -315,6 +356,34 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].event, "infra");
         assert_eq!(delivered[0].dedup_key, "infra:mux_connection_refused");
+    }
+
+    #[tokio::test]
+    async fn escalate_infra_caps_retries_then_hands_the_target_to_a_human() {
+        let forge = Arc::new(FakeForge::default());
+        forge.add_issue(7, "t", "b", &[forge::LABEL_WORKING]);
+        let (deps, _gw) = deps_with(forge.clone(), &["infra"]);
+        let run = deps.store.create_run("proj", 7, "t").unwrap();
+
+        // Up to the cap: infra only — no needs-human.
+        for _ in 0..MAX_INFRA_FAULTS_PER_WINDOW - 1 {
+            escalate_infra(&deps, &run, "mux_connection_refused", "refused").await;
+        }
+        assert!(
+            !forge
+                .labels_of(7)
+                .contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            "below the cap the fault must stay classified as infra"
+        );
+
+        // The capping fault: no longer transient — a human takes over.
+        escalate_infra(&deps, &run, "mux_connection_refused", "refused").await;
+        assert!(
+            forge
+                .labels_of(7)
+                .contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
+            "past the cap the target must escalate to needs-human"
+        );
     }
 
     #[tokio::test]
