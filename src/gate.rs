@@ -110,6 +110,21 @@ pub fn pane_gate_targets(cfg: &Config, detect: &dyn Fn(&str) -> bool) -> Vec<Gat
 /// verdict meaningless (issue #234 self-review f2), so this resolves the
 /// same way spawning does, not the reaper's lookup path — and deliberately
 /// ignores the profile entirely, since none of it affects this.
+///
+/// Known gap (self-review f7, waived — see `.meguri/self-review-fix.json`):
+/// this reads *doctor's own* environment and cwd, but a real pane is
+/// launched by `meguri watch` through an already-running tmux/herdr server,
+/// whose captured environment (and the `PaneSpec` worktree cwd) can differ
+/// from doctor's — e.g. a `$CLAUDE_CONFIG_DIR` exported after the mux server
+/// started, or a relative `$CLAUDE_CONFIG_DIR` (resolved against different
+/// cwds by doctor vs. the pane). Same shape of gap as this issue's D1 (the
+/// probe runs before the worktree exists and inherits doctor's cwd, not the
+/// real launch's), which the parent spec already deferred to a future
+/// launch-time pre-flight check rather than doctor. Closing it here would
+/// mean either querying the mux server's own environment (backend-specific,
+/// and still wouldn't cover doctor-process vs. watch-daemon-process drift)
+/// or teaching `spawn_agent_pane` to pass an explicit env doctor cannot see
+/// in advance — both bigger than this probe.
 fn pane_effective_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(dir);
@@ -381,6 +396,14 @@ fn read_until_decisive_or_timeout(master: RawFd, timeout: Duration) -> PtyCaptur
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR (e.g. SIGWINCH) is not evidence of anything — retry
+                // rather than cutting the settle window short and false-
+                // greening a bypass dialog that was about to appear (issue
+                // #234 self-review f6).
+                continue;
+            }
             return if settle_deadline.is_some() {
                 PtyCapture::Output(String::from_utf8_lossy(&buf).into_owned())
             } else {
