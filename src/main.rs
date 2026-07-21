@@ -940,7 +940,54 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
     }
 
     ok &= doctor_launch(cfg);
+    if probe {
+        ok &= doctor_gate(cfg, &meguri::gate::spawn_pty_probe);
+    }
     ok &= doctor_collab(cfg);
+    ok
+}
+
+/// Bypass-permissions gate probe (issue #234): for every profile a `Pane`
+/// launch would actually reach (`meguri::gate::pane_gate_targets`), fire a
+/// short interactive PTY launch and classify the screen against known
+/// dialog/ready text. Only runs under `--probe`, alongside the model-alias
+/// probe — like that one, it launches a real CLI rather than just checking
+/// `--version`. `launch` is the injected PTY seam so this stays unit-
+/// testable without a real subprocess.
+fn doctor_gate(
+    cfg: &Config,
+    launch: &dyn Fn(&meguri::gate::GateTarget) -> meguri::gate::PtyCapture,
+) -> bool {
+    use meguri::{gate, routing};
+
+    let targets = gate::pane_gate_targets(cfg, &routing::detect_command);
+    if targets.is_empty() {
+        return true;
+    }
+    println!("\nbypass gate (pane-launched profiles):");
+    let mut ok = true;
+    for target in &targets {
+        let labels = target.labels.join(", ");
+        match gate::probe_gate(target, launch) {
+            gate::GateOutcome::Clear => {
+                println!("  ✅ {labels} [{}]: bypass gate accepted", target.command);
+            }
+            gate::GateOutcome::Blocked => {
+                println!(
+                    "  ❌ {labels} [{}]: bypass 受諾ダイアログで停止 — {}",
+                    target.command,
+                    gate::remediation_line(target),
+                );
+                ok = false;
+            }
+            gate::GateOutcome::Inconclusive => {
+                println!(
+                    "  ⚠️  {labels} [{}]: probe inconclusive (timeout/unknown output) — doctor は fail させない",
+                    target.command,
+                );
+            }
+        }
+    }
     ok
 }
 
@@ -1129,6 +1176,32 @@ mod tests {
         let p = fake_profile();
         let bad = |_: &config::AgentProfile| ProbeOutcome::ModelInvalid;
         assert!(!doctor_probe("default", &p, &bad));
+    }
+
+    #[test]
+    fn doctor_gate_fails_on_a_blocked_target_and_stays_green_when_clear() {
+        // Legacy config collapses every pane role onto the `default` profile
+        // (see gate::pane_gate_targets tests), so exactly one target is
+        // probed here.
+        let cfg = Config::default();
+        let blocked = |_: &meguri::gate::GateTarget| {
+            meguri::gate::PtyCapture::Output("Bypass Permissions mode".to_string())
+        };
+        assert!(!doctor_gate(&cfg, &blocked));
+
+        let clear = |_: &meguri::gate::GateTarget| {
+            meguri::gate::PtyCapture::Output("Welcome to Claude Code!".to_string())
+        };
+        assert!(doctor_gate(&cfg, &clear));
+    }
+
+    #[test]
+    fn doctor_gate_does_not_fail_on_inconclusive_outcomes() {
+        let cfg = Config::default();
+        let timeout = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::Timeout;
+        assert!(doctor_gate(&cfg, &timeout));
+        let spawn_failed = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::SpawnFailed;
+        assert!(doctor_gate(&cfg, &spawn_failed));
     }
 
     #[test]
