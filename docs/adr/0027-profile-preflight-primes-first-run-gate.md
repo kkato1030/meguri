@@ -36,22 +36,27 @@ CLI 自身の形式で永続化させる。** meguri は `~/.claude.json` を一
 - **prime の担当はフォルダ信頼だけ（親 spec D1 に忠実）**。初回ゲートは bypass 受諾（config-dir 単位）と
   フォルダ信頼（パス単位）の2つ。親 spec D1 は前者を doctor（#234、既マージ）＋人間の一度きり受諾に、
   後者を本 prime に割り当てている。prime は bypass を書かせない。
-- claude の既定 pre-flight は **`[pane と同じ --model]（あれば）＋ 全ツール deny フラグ ＋ no-op プロンプト`**
-  を headless `-p` で対象 cwd に走らせる。headless `-p` は唯一ゲートを素通りする経路で、その一回で当該パスの
-  フォルダ信頼を CLI 自身が書き残す。以降、同じパスへの対話 pane 起動はフォルダ信頼ゲートに当たらない。
+- claude の既定 pre-flight は **`[pane と同じ --model]（あれば）＋ `--strict-mcp-config --settings
+  <deny.json> -p <no-op>`** を headless で対象 cwd に走らせる。headless `-p` は唯一ゲートを素通りする経路で、
+  その一回で当該パスのフォルダ信頼を CLI 自身が書き残す。以降、同じパスへの対話 pane 起動はフォルダ信頼ゲートに
+  当たらない。
 - **モデルは `profile.args` から引き継ぐ（plan review f2）**。prime が pane と別モデルになると、CLI 既定
   モデルが未認証のとき失敗し claim-once で再試行されず pane が hang する。`effective_headless_args` は
   `headless_args` 未設定時に `["-p"]` を返すだけで `args` の `--model` を拾わないため（custom profile で
   破綻）、pane の実モデル源である `profile.args` の `--model`/`-m` を直接抽出して引き継ぐ。builtin も custom も
   pane==prime モデルが保証される。
-- **安全は「全ツール面を塞ぐ deny を injection test で証明して」担保（plan review f1）**。「非 yolo だから
-  安全」も `--permission-mode plan`（Read と read-only Bash を許す）も `--allowedTools`（許可ではなく自動承認
-  リスト）も不十分だと分かった。継承 `settings.json` の allow ルールはモードの上に乗るため、CLI フラグで
-  allow を無効化する前提は成り立たない。よって prime は built-in tools・Bash・MCP を **deny で塞いだ完全な
-  argv／設定**（候補: `--disallowedTools`＋MCP ロード禁止、足りなければ meguri 所有 `--settings` の
-  `permissions.deny` 全ツール）で走らせ、その「ツールを一切実行しない」を **permissive config × 全ツール面の
-  実機 injection test で証明** する。どうしても全面 deny を証明できなければ、yolo を足すのではなく安全でない
-  prime を出さず meguri 所有 config-dir 案（後述 rejected 案 2）へ切り替える。
+- **安全は meguri 所有の deny-all `--settings` ＋ MCP 完全遮断で担保（plan review f1、方式を1つに確定）**。
+  「非 yolo だから安全」も `--permission-mode plan`（Read と read-only Bash を許す）も `--allowedTools`
+  （許可ではなく自動承認リスト）も不十分。継承 `settings.json` の allow はモードの上に乗るので、CLI フラグで
+  allow を無効化する前提は成り立たない。よって **prime だけに meguri が書いた deny-all settings ファイル
+  （`~/.meguri/preflight/deny.json`、`0600`。`permissions.deny` = 全 built-in tool ＋ `mcp__*`、
+  `defaultMode: "plan"`）を `--settings` で渡し、`--strict-mcp-config`（`--mcp-config` なし）で MCP を一つも
+  ロードさせない**。deny は allow に優先するので permissive な config-dir でもツールは通らない。ファイル内容は
+  meguri が完全に握るので決定的で、単体テストの期待値も injection test の合否も書ける。この方式は
+  `--settings`／`--strict-mcp-config`／`permissions.deny` を持つ claude を要し、injection test が通る最小版を
+  `PREFLIGHT_MIN_CLAUDE_VERSION` に固定。**それ未満・版不明では prime を skip して pane をそのまま起動**する
+  （今日と同じ状態＝安全側フォールバック。安全でない prime は決して走らせない）。この skip でも不足なら
+  meguri 所有 config-dir 案（後述 rejected 案 2）が将来のハードニングだが、本 issue の実装はこの方式で完結する。
 - **明示 override は危険な opt-in（f13）**。`preflight` に非空値を書くと argv はそのまま実行され、既定の
   全ツール deny（および非 yolo）縛りを迂回できる。host は信頼境界の内側（ADR 0011）なのでブロックはしないが、
   yolo 相当フラグを含む override は config ロード時に警告し、README で「injection 無防備・自己責任」と明示する。
