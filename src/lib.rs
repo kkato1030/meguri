@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod engine;
 pub mod events;
 pub mod forge;
+pub mod gate;
 pub mod gitops;
 pub mod launch;
 pub mod mux;
