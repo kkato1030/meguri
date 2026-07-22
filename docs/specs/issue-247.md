@@ -33,6 +33,9 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
    byte-for-byte 不変(追加フィールドは `Option` + `skip_serializing_if`)。
 7. anchor の `path` が worktree 外(絶対パス・`..`・symlink 越え)を指す finding は stale に倒し、
    worktree 外のファイルを読まない・プロンプトへ流さない。
+8. anchor confirmation の overrule findings も照合される(照合を素通りする経路を残さない)。
+9. `anchor_verified=Some(false)` の open entry は cap→final-fix publish 時に PR `<details>` に表示される。
+10. `anchor_verified=Some(false)` の entry は rollback 用 pending に写らず、旧 binary が actionable 扱いしない。
 
 ## 触るファイル
 
@@ -43,7 +46,10 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   **新規は台帳から棄却・再リストは `Open` + `anchor_verified=Some(false)` で保持し fixer 対象集合から除外**。
   `update_ledger_from_review` は「listed だが anchor 失敗」を第3状態として扱い、omission 解消に落とさない。
   `round1_parallel_review` は **merge 前に reviewer 別に照合**し stale を棄却してから union-merge(f8)。
-  fix file 検証の母集団を actionable set(open ∧ anchor_verified≠Some(false))にする。
+  `anchor_confirm` の overrule findings(`merge_reviews` の `extra`)も **merge 前に anchor turn 内で照合**し、
+  専用の anchor index で `anchor_checked` を emit(f11)。fix file 検証の母集団を actionable set
+  (open ∧ anchor_verified≠Some(false))にする。`mirror_open_to_pending` は `anchor_verified=Some(false)` の
+  entry を pending に写さない(f13。rollback で旧 binary が actionable 扱いしないため)。
   `self_review.anchor_checked` イベント新設(照合を走らせた reviewer ターンにつき1回)。
   review プロンプト(`review_prompt` 系)に `quote` 必須・再リストも再照合・照合ルールを明記。
 - `src/gitops.rs` — HEAD の tracked blob を repo-relative path で読むヘルパ(`git show HEAD:<path>` 相当)と、
@@ -52,6 +58,8 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   `self_review_lane_for`(常に false)で設定。reviewer ターンは spawn 前に lane の生存 pane を release/kill
   してから resume 引数なしで素の spawn を行う(`ensure_pane` の adopt を回避)。`spawn_direct_process` も
   `reuse_session == false` のとき session id を `--resume` に読まない。session id の**保存**は継続。
+  `self_review_details_with_outcome`(PR body の `<details>` renderer)に、`anchor_verified=Some(false)` の
+  open entry を「anchor 未照合の open」として1行出す描画を追加(f12。現行は round ごとの件数しか出さない)。
 - `src/config.rs` — `[review]` に `anchor_verification`(既定 true)のトグル。rollback レバー。
 - `src/store/stats.rs` — `self_review.anchor_checked` の payload を合計し
   stale 率 = Σ`stale_count` / Σ`findings_total` を集計。**Σ`findings_total`=0 は N/A 表示(ゼロ除算回避)**。
@@ -79,13 +87,20 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
      に至らない。残れば max_rounds → cap→final-fix publish に落ち(needs-human でない)、PR `<details>` に
      「anchor 未照合の open」として出る(透明性)。
    fix file 検証の「open には disposition 必須」は **actionable set**(open ∧ anchor_verified≠Some(false))を母集団にする。
-4. **stale の扱い(round 1 parallel)**: **merge 前に reviewer 別に照合**する(f8)。union-merge 後だと
-   reviewer 境界が消え `reviewer_index` 帰属と `findings_total`/`stale_count` の分割ができない。各 `self-review#N`
-   が自分の findings を照合して stale を棄却してから union-merge(全 finding が新規なので棄却で済む)。
-   verified な他 reviewer の finding は影響を受けない。reviewer 別 corrective-turn retry は持たない。
-5. **anchor_verified**: `LedgerEntry.anchor_verified: Option<bool>`(`skip_serializing_if = "Option::is_none"`)。
-   照合が走ったら `Some(true)`、無効時・decision 免除は `None`(serialize されない)→ byte-for-byte 不変。
-   監査/表示専用で open/fixed 判定には使わない。stale 率は台帳ではなくイベントから導出(§observability)。
+4. **stale の扱い(round 1 parallel + anchor overrule)**: **merge 前に reviewer 別に照合**する(f8)。
+   union-merge 後だと reviewer 境界が消え `reviewer_index` 帰属と `findings_total`/`stale_count` の分割が
+   できない。各 `self-review#N` が自分の findings を照合して stale を棄却してから union-merge(全 finding が
+   新規なので棄却で済む)。verified な他 reviewer の finding は影響を受けない。reviewer 別 corrective-turn retry
+   は持たない。**anchor confirmation の overrule findings(`merge_reviews` の `extra`)も同様に merge 前に
+   anchor turn 内で照合**し、専用の anchor index で `anchor_checked` を emit(f11。ここを外すと overrule 経路が
+   照合を素通りする)。
+5. **anchor_verified は status と直交する制御フラグ**(f14): `LedgerEntry.anchor_verified: Option<bool>`
+   (`skip_serializing_if = "Option::is_none"`)。3値 — `None`(照合なし: 無効時・decision 免除)/
+   `Some(true)`(通過)/`Some(false)`(再リストが差し戻し後もなお stale)。**収束軸は `status` のまま**
+   (収束 = open 数ゼロ)で `anchor_verified` は status を動かさない。ただし `Some(false)` は entry を
+   **非 actionable** にし、(a) fixer 対象集合、(b) fix file の disposition 必須検証、から除く制御状態として使う
+   — 単なる監査フラグではない。open/fixed の遷移は `status` だけが担い、`anchor_verified` は actionability と
+   表示を制御する、と境界を定める。stale 率は台帳ではなくイベントから導出(§observability)。
 6. **fresh session の対象**: reviewer ロール = `self-reviewer`(self-review / self-review#N / self-review-anchor
    lane)と `pr-reviewer`(pr-review lane)。author lane(worker/planner/spec-worker + 相乗りする
    fixer/spec-fixer/ci-fixer)は resume 継続。判定は `Lane.reuse_session` に集約し、ロープ名の直 match を避ける。
@@ -99,8 +114,14 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
 ## 移行 / rollback(veto rule: schema/contract 変更のため必須)
 
 - **前方移行**: `quote` / `anchor_verified` は `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]`
-  の追加フィールド。既存 checkpoint(in-flight run)は None で読める。`anchor_verified` は監査/表示専用で
-  open/fixed 判定には使わないので、None のエントリが fixer/収束ロジックに影響しない。
+  の追加フィールド。既存 checkpoint(in-flight run)は None で読める。`None` の entry は照合が走っていない
+  = 従来どおりの actionable な open として扱われるので、新 binary が旧 checkpoint を読んでも挙動は変わらない。
+- **stale 第3状態の rollback(f13)**: `anchor_verified=Some(false)` の open entry は `mirror_open_to_pending` で
+  pending(`Vec<Finding>`、旧 binary 用の後方互換スナップショット)に **写さない**。写すと `Finding` に
+  印が無いため、#247 前の binary が stale entry を通常の actionable finding として fixer に渡し、元の
+  ping-pong を再発させてしまう。非 actionable な第3状態は pending から落とす(= rollback 時は消える)。
+  これらは元々 fixer を回さない entry なので、消えても ping-pong を生まない。新 binary 側は台帳の
+  `anchor_verified` を正として扱うので pending の欠落に影響されない。
 - **byte-for-byte 不変の範囲**: 常時 serialize される裸の `bool` だと単一 reviewer 経路の checkpoint が
   変わってしまう。`Option` + `skip_serializing_if` にすることで、`anchor_verification = false`(照合を
   走らせない)なら両フィールドは None のまま **serialize されず byte-for-byte 不変**。照合が走る経路では
@@ -122,6 +143,9 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   `N/A(照合 finding 0件)` と表示**(0.0% ではない)。`findings_total=0` でもイベントは emit(coverage を数える)。
   CLI 表示は「anchor stale: X.X%(失敗 N / 照合 M)」、M=0 は「anchor stale: N/A(照合 0件)」。
   terminal phase 依存の既存 `review_stats` 母集団とは別に、この専用イベントを分子・分母の唯一のソースにする。
+- **透明性(f12)**: `anchor_verified=Some(false)` の open entry は、PR body の self-review `<details>` に
+  「anchor 未照合の open finding」として1行出す(`self_review_details_with_outcome` を拡張)。cap→final-fix
+  publish 時にこの entry が残るので、human merge gate が「照合できなかった指摘がある」ことを見られる。
 - fresh session は既存の `pane.resume_failed` とは別で、resume を試みない経路なのでイベント追加は不要
   (`direct.spawned` / spawn の `resumed:false`、および reviewer lane の pane release で観測できる)。
 
@@ -134,9 +158,15 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   照合を通れば open 継続、fix でコードが消え reviewer が drop すれば解消。
   (f) round 1 parallel: **merge 前に reviewer 別照合** — 1 reviewer が stale、他が verified → stale だけ棄却、
   verified は union に入り `reviewer_index` が保たれる。(g) `path` が絶対/`..`/symlink で worktree 外 → stale、外を読まない。
+  (l) **anchor overrule findings も照合される(f11)** — `anchor_confirm` の overrule に stale finding を混ぜ、
+  merge 前に棄却され union に残らないこと、anchor index で `anchor_checked` が出ること。
+  (m) **pending mirror 除外(f13)** — `anchor_verified=Some(false)` の open entry が `mirror_open_to_pending` の
+  結果 `self_review_pending` に含まれないこと(open で actionable な entry は従来どおり含まれること)。
 - **unit(stats.rs)**: (h) Σ`findings_total`>0 で率が出る。(i) **Σ`findings_total`=0 → ゼロ除算せず N/A 表示**。
 - **unit(flow.rs)**: (j) `Lane.reuse_session` が role で正しく分岐。(k) reviewer lane は spawn 前に生存 pane を
   release し、resume 引数なしで spawn する(pane・direct 両モードで、前ターン session に接続しないこと)。
+  (n) **`<details>` 描画(f12)** — `anchor_verified=Some(false)` の open entry を持つ checkpoint で
+  `self_review_details_with_outcome` が「anchor 未照合の open」行を出すこと。
 - **統合1(#231 再現・pr-reviewer / B)**: fake_agent が resume 前提で旧 head の stale finding を再主張する
   シナリオを組み、fresh session 既定で pr-reviewer が現 head を読み直し clean → spec-ready 昇格、
   needs-human に落ちないことを検証。
