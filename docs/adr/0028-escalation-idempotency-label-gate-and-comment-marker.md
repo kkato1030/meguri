@@ -35,13 +35,24 @@ meguri のエスカレーション（PR を `meguri:needs-human` に park する
 人間向けコメントを分離させない — ラベルが付かない限りコメントは 1 件も出ない。
 これで「書けていないのにコメントだけ出る」故障モードが消える。
 
-**claim を先に外す**。needs-human を付ける前に `remove_pr_label(working)` を best-effort で
-外す。`pr_is_touchable`（`src/engine/mod.rs`）は `working` を `needs-human` より**先に**見て
-「claim 済み」で skip するため、`working` を残したまま needs-human 追加が失敗すると、次 sweep の
-再試行そのものが塞がれてしまう。claim を先に解放しておけば、追加が失敗しても次 sweep は
-working なし・needs-human なしを見てクリーンに再エスカレーションできる。`remove_pr_label`
-自身が失敗して `working` が残る二重失敗は、run-liveness ベースの stale-claim 回収（ADR 0027）が
-担う（escalate する run は terminal へ向かうので claim は stale）。
+**claim 解放とラベル付けの順序**。成功経路では **needs-human を先に付けてから
+`remove_pr_label(working)`** を best-effort で外す。逆（working を先に外す）にすると、外してから
+needs-human を付けるまでの間 PR が「未 claim かつ未 escalate」に見え、別ループがそれを掴んで
+新しい run を走らせた直後に元の escalation が needs-human を付け、**動いている run の PR を
+人間待ちで止める**競合が起きる。needs-human を先に付ければこの窓は生じない（間に読んだ
+ループは needs-human を見て掴まない）。
+
+なお「動いている run のいる PR を escalate しない」第一の保証は、reconciler の `issue_busy`
+（run-liveness）ゲート — `next_step` は live run のいる issue を Skip する（`issue_reconciler.rs`）。
+上の順序はそれを狭めないための二次的な担保である。
+
+失敗経路、すなわち `add_pr_label(needs-human)` が失敗したときだけ claim を best-effort で外す。
+この経路では needs-human が付かないので上の競合は起きず、外す狙いは別にある: `pr_is_touchable`
+（`src/engine/mod.rs`）は `working` を `needs-human` より先に見て「claim 済み」で skip するため、
+`working` を残すと discovery ベースの再試行が塞がれる。claim を落としておけば次 sweep /
+discovery がクリーンに再エスカレーションできる。`remove_pr_label` 自身が失敗して `working` が
+残る二重失敗は、run-liveness ベースの stale-claim 回収（ADR 0027）が担う（escalate する run は
+terminal へ向かうので claim は stale）。
 
 ### ゲート2: head×reason のコメントマーカーで dedup
 
@@ -57,6 +68,16 @@ ADR 0027）と同じ「コメント自身をマーカーにする」イディオ
 同一 head・同一 reason のマーカーが既にあれば**コメントも通知も skip** する。
 これでラベルの stale 読みが起きても、コメントは head×reason ごとに高々 1 件になる。
 
+**全ページを読み、読み切れなければ defer する**。dedup の読みは全コメントを対象にする必要が
+ある — 100 件超の PR で古いページに自著マーカーがあるのに部分結果だけで判定すると、マーカーを
+見落として重複投稿する。既存の全ページ GraphQL helper（`paginate_pr_comments`、
+`viewerDidAuthor` を各ページで埋め、`MAX_COMMENT_PAGES` 到達や非前進カーソルで
+「読み切っていない」を返す）を使い、**読み切れていない（`complete=false`）ときは判定せず
+`Deferred`** にする。これは reconciler が `!comments_complete` の PR を `human_stop`（park）に
+倒すのと同じ方針（過度にチャットの多い PR は API コストの上限で読みを止め、park する）。
+読み（get_pr / 全ページ読み）と label 書き込みは、read-after-write と同じく、いずれかが
+失敗・不完全なら escalation 全体を defer し、ラベルとコメントを常に結合させる。
+
 - **head でキーする理由**: 新しい head が push されたら状況は変わりうる（同じ reason でも
   再エスカレーションが正当）。head をキーに含めることで、arm マーカーと同型に「現 head では
   一度だけ、head が動けば再評価」になる。head は **stale になりうる観測キャッシュではなく
@@ -69,11 +90,14 @@ ADR 0027）と同じ「コメント自身をマーカーにする」イディオ
 
 第三者が公開リポジトリでマーカー入りコメントを偽造して escalation を抑止する可能性がある
 （ADR 0027 の no-steal と同じ injection 面）。dedup 判定は **`viewer_did_author` が真の
-コメントだけ**を信頼する。偽造コメントでは escalation は抑止されない。
+コメントだけ**を信頼する。偽造コメントでは escalation は抑止されない。`viewerDidAuthor` は
+上記の全ページ GraphQL helper が各コメントに埋める（単発の `gh pr view --json comments` は
+これを返さないため、そちらは使わない）。
 
-read（`get_pr` / `pr_comments_meta`）が forge エラーで読めないときは、書き込みと同様に
-**escalation 全体を defer**（return）する。ラベルとコメントを常に結合させ、次 sweep が
-クリーンに再試行できるようにする。
+read（`get_pr` / 全ページコメント読み）が forge エラーまたは不完全で読めないときは、書き込みと
+同様に **escalation 全体を defer**（return）する。読み → ラベル → コメントの順にして、mutate
+する前にしか defer しないので、defer はいつでもクリーンに再試行できる。ラベルとコメントは
+常に結合する。
 
 ## Consequences
 
