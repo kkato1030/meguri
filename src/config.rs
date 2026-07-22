@@ -4,14 +4,41 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Root of all meguri state: `~/.meguri`.
+/// Root of all meguri state: `~/.meguri`, or `$MEGURI_HOME` if set.
 pub fn meguri_home() -> PathBuf {
-    if let Ok(home) = std::env::var("MEGURI_HOME") {
-        return PathBuf::from(home);
+    normalize_meguri_home(
+        std::env::var("MEGURI_HOME").ok(),
+        std::env::current_dir().ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// Pure core of [`meguri_home`], factored out so its normalization is testable
+/// without mutating process env. An absolute `$MEGURI_HOME` passes through; a
+/// relative one is joined onto `cwd` (issue #235 f2: `preflight_dir()` /
+/// `deny_settings_path()` are contracted to be absolute, but a relative
+/// `MEGURI_HOME` — e.g. `state` — used to pass straight through. The daemon
+/// then wrote `deny.json` relative to *its own* cwd, while `run_preflight`
+/// changes the child's cwd to the worktree before passing the same relative
+/// `--settings <path>` argv, so the prime looks for the file under the
+/// worktree instead and fails — permanently, since a failure is claim-once and
+/// never retried). An unset value falls back to `home/.meguri`.
+fn normalize_meguri_home(
+    env_value: Option<String>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    if let Some(value) = env_value {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return path;
+        }
+        return match cwd {
+            Some(cwd) => cwd.join(path),
+            None => path,
+        };
     }
-    dirs::home_dir()
-        .expect("cannot resolve home directory")
-        .join(".meguri")
+    home.expect("cannot resolve home directory").join(".meguri")
 }
 
 pub fn config_path() -> PathBuf {
@@ -2375,6 +2402,48 @@ mod tests {
         assert_eq!(
             normalize_config_dir(None, Some(Path::new("/cwd")), Some(Path::new("/home/u"))),
             PathBuf::from("/home/u/.claude")
+        );
+    }
+
+    #[test]
+    fn meguri_home_normalization() {
+        // Absolute passes through.
+        assert_eq!(
+            normalize_meguri_home(
+                Some("/abs/state".into()),
+                Some(Path::new("/daemon/cwd")),
+                Some(Path::new("/home/u"))
+            ),
+            PathBuf::from("/abs/state")
+        );
+        // Relative is joined onto cwd, so `preflight_dir()`/`deny_settings_path()`
+        // stay absolute even under a relative `MEGURI_HOME` (issue #235 f2) — the
+        // prime writes `deny.json` and passes `--settings <path>` from the same
+        // resolved root regardless of which cwd the subprocess later runs under.
+        assert_eq!(
+            normalize_meguri_home(
+                Some("state".into()),
+                Some(Path::new("/daemon/cwd")),
+                Some(Path::new("/home/u"))
+            ),
+            PathBuf::from("/daemon/cwd/state")
+        );
+        assert!(
+            normalize_meguri_home(
+                Some("state".into()),
+                Some(Path::new("/daemon/cwd")),
+                Some(Path::new("/home/u"))
+            )
+            .is_absolute()
+        );
+        // Unset falls back to ~/.meguri.
+        assert_eq!(
+            normalize_meguri_home(
+                None,
+                Some(Path::new("/daemon/cwd")),
+                Some(Path::new("/home/u"))
+            ),
+            PathBuf::from("/home/u/.meguri")
         );
     }
 

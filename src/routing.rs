@@ -294,7 +294,9 @@ pub const PREFLIGHT_NOOP_PROMPT: &str = "reply ok and make no changes";
 /// is skipped there and the pane launches as before. The floor is deliberately
 /// conservative: `--settings` / `--strict-mcp-config` are 1.x-era flags, so a
 /// major of `1` gates out the pre-1.0 line. The exact floor is confirmed by
-/// the all-surface injection test (spec test strategy) on real hardware.
+/// `tests/preflight_injection_test.rs` (issue #235 f1), a real-`claude`
+/// all-surface injection test gated behind `MEGURI_TEST_CLAUDE=1`; if the
+/// floor ever needs to move, that test is where it gets re-confirmed.
 pub const PREFLIGHT_MIN_CLAUDE_VERSION: (u64, u64, u64) = (1, 0, 0);
 
 /// Parse a `major.minor.patch` triple out of a `--version` line, e.g.
