@@ -46,9 +46,22 @@ pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [prime 仕様]). `deny` covers every current built-in tool plus `mcp__*`;
 /// `defaultMode: "plan"` is defence in depth; the two MCP keys disable project
 /// MCP servers (belt-and-suspenders with `--strict-mcp-config`).
+///
+/// This is an enumerated allowlist-of-names-to-deny, not a `"*"` wildcard —
+/// Claude Code's permission schema has no "deny everything, including tools
+/// added later" primitive, so the list must be kept in sync by hand with the
+/// CLI's actual built-in tool set (issue #235 f1: a name missing here, e.g.
+/// because a CLI release added a tool, would let that one tool run during the
+/// prime undetected — `deny_settings_is_valid_json_and_denies_every_surface`
+/// below only re-checks this list against itself, not against a real CLI).
+/// The list currently includes the background-shell pair (`BashOutput`,
+/// `KillShell`) and `SlashCommand`/`ExitPlanMode`, which a `Bash`-only deny
+/// would miss. `tests/preflight_injection_test.rs` (`MEGURI_TEST_CLAUDE=1`)
+/// is the actual cross-check against a real CLI; re-run it whenever the
+/// installed `claude` version changes and extend this list if it adds tools.
 const DENY_SETTINGS_JSON: &str = r#"{
   "permissions": {
-    "deny": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task", "NotebookEdit", "TodoWrite", "mcp__*"],
+    "deny": ["Bash", "BashOutput", "KillShell", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task", "NotebookEdit", "TodoWrite", "SlashCommand", "ExitPlanMode", "mcp__*"],
     "defaultMode": "plan"
   },
   "enableAllProjectMcpServers": false,
@@ -406,14 +419,45 @@ fn elapsed_ms(start: Instant) -> u64 {
 mod tests {
     use super::*;
 
+    /// The complete set of Claude Code built-in tool names the deny list must
+    /// cover (issue #235 f1). A name missing here is a silent gap: JSON
+    /// validity alone says nothing about whether every real tool is denied.
+    /// Kept in one place so adding a name only requires editing this array —
+    /// `deny_settings_is_valid_json_and_denies_every_surface` then fails loudly
+    /// if `DENY_SETTINGS_JSON` and this list drift apart in either direction.
+    const EXPECTED_DENIED_TOOLS: &[&str] = &[
+        "Bash",
+        "BashOutput",
+        "KillShell",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "NotebookEdit",
+        "TodoWrite",
+        "SlashCommand",
+        "ExitPlanMode",
+        "mcp__*",
+    ];
+
     #[test]
     fn deny_settings_is_valid_json_and_denies_every_surface() {
         let v: serde_json::Value = serde_json::from_str(DENY_SETTINGS_JSON).unwrap();
         let deny = v["permissions"]["deny"].as_array().unwrap();
         let names: Vec<&str> = deny.iter().map(|d| d.as_str().unwrap()).collect();
-        for tool in ["Bash", "Read", "Edit", "Write", "WebFetch", "mcp__*"] {
-            assert!(names.contains(&tool), "deny list missing {tool}");
+        for tool in EXPECTED_DENIED_TOOLS {
+            assert!(names.contains(tool), "deny list missing {tool}");
         }
+        assert_eq!(
+            names.len(),
+            EXPECTED_DENIED_TOOLS.len(),
+            "deny list has an entry not in EXPECTED_DENIED_TOOLS (or a duplicate) — \
+             update EXPECTED_DENIED_TOOLS alongside DENY_SETTINGS_JSON: {names:?}"
+        );
         assert_eq!(v["permissions"]["defaultMode"], "plan");
         assert_eq!(v["enableAllProjectMcpServers"], false);
     }
