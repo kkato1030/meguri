@@ -157,6 +157,11 @@ const MAX_INFRA_FAULTS_PER_WINDOW: usize = 5;
 /// infra, narrow enough that a permanent fault reaches a human within a day.
 const INFRA_FAULT_WINDOW_SECS: u64 = 24 * 3600;
 
+/// The `not_before` sentinel a capped *local* task is parked behind —
+/// effectively "until a human intervenes" (local discovery skips a future
+/// `not_before`; there is no hold label on the local surface).
+const INFRA_PARKED_UNTIL: &str = "9999-01-01T00:00:00Z";
+
 /// Record a forge/mux command fault without touching needs-human (issue
 /// #250). The caller has already released the run's claim (`Flavor::escalate`
 /// would have dropped it too, via `escalate_task`/`escalate_issue`) so the
@@ -206,16 +211,24 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
             ),
         )
         .await;
-        // needs-human alone is NOT a discovery stop for a ready/plan issue:
-        // discovery only skips hold/working, and the next claim clears
-        // needs-human ("a fresh claim supersedes the escalation"). Without a
-        // durable stop the capped issue would retry on the very next poll —
-        // hold is the label both discovery and claim respect. Local tasks
-        // need none of this: `status=needs_human` already stops their queue.
-        if let TaskKey::Issue(n) = key
-            && deps.forge.is_some()
-        {
-            let _ = deps.forge().add_label(n, forge::LABEL_HOLD).await;
+        // needs-human alone is NOT a discovery stop on either surface: github
+        // discovery only skips hold/working and the next claim clears
+        // needs-human; the local queue returns and re-claims needs_human rows
+        // too ("a re-claim un-escalates"). Without a durable stop the capped
+        // target retries on the very next poll. So: github gets `hold` (the
+        // label discovery and claim both respect — re-attempted on every
+        // capped fault, covering a transiently unwritable forge), local gets
+        // a far-future `not_before` (the store-side gate local discovery
+        // respects). A human resumes by removing the hold / clearing the gate.
+        match key {
+            TaskKey::Issue(n) => {
+                if deps.forge.is_some() {
+                    let _ = deps.forge().add_label(n, forge::LABEL_HOLD).await;
+                }
+            }
+            TaskKey::Local(id) => {
+                let _ = deps.store.park_task_until(id, INFRA_PARKED_UNTIL);
+            }
         }
         return;
     }
@@ -404,6 +417,34 @@ mod tests {
         assert!(
             labels.contains(&forge::LABEL_HOLD.to_string()),
             "past the cap the issue must be held so discovery stops re-dispatching"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_infra_cap_parks_a_local_task_behind_not_before() {
+        let forge = Arc::new(FakeForge::default());
+        let (deps, _gw) = deps_with(forge, &["infra"]);
+        let task_id = deps
+            .store
+            .create_task("proj", "work", "t", "b", "local")
+            .unwrap()
+            .id;
+        let run = deps
+            .store
+            .create_run_for_task("proj", "worker", task_id, "t")
+            .unwrap();
+
+        for _ in 0..MAX_INFRA_FAULTS_PER_WINDOW {
+            escalate_infra(&deps, &run, "mux_connection_refused", "refused").await;
+        }
+
+        // The local queue re-claims needs_human rows, so the durable stop is
+        // the far-future not_before gate local discovery respects.
+        let parked = deps.store.get_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            parked.not_before.as_deref(),
+            Some(INFRA_PARKED_UNTIL),
+            "a capped local task must be parked behind not_before"
         );
     }
 

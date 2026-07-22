@@ -145,6 +145,21 @@ impl Store {
         if claimed { self.get_task(id) } else { Ok(None) }
     }
 
+    /// Park a task behind a `not_before` gate (the infra retry cap, issue
+    /// #250): local discovery skips a future `not_before`, so this is the
+    /// store-side durable stop that `status=needs_human` is not (discovery
+    /// and claim both accept needs_human — a re-claim un-escalates). A human
+    /// resumes by clearing the gate or re-queuing the task.
+    pub fn park_task_until(&self, id: i64, not_before: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE tasks SET not_before = ?2 WHERE id = ?1",
+                params![id, not_before],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Release a claim: back to the queue (`meguri stop`, needs-plan demotion).
     pub fn release_task(&self, id: i64) -> Result<()> {
         self.with_conn(|c| {
