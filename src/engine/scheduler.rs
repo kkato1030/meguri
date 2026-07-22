@@ -305,20 +305,18 @@ impl Scheduler {
     /// spawned earlier in the same tick, or in a still-running previous
     /// tick, whose store status hasn't caught up to `running` yet.
     /// Materialize declared-but-missing managed clones and return the set of
-    /// project ids ready to process this tick. A project whose clone can't be
-    /// materialized is excluded (a `tracing::warn!` per failing tick, matching
-    /// the sweep-failure idiom; the event is emitted inside
-    /// [`super::ensure_project_clone`]) and retried next tick.
+    /// project ids ready to process this tick, via the Repo Kind reconcile's
+    /// first Op (ADR 0012 §決定6): `repo_reconciler::reconcile_ready` observes
+    /// the clone health, runs `Op(EnsureClone)` when needed, and reports
+    /// readiness. A project whose clone can't be materialized is excluded (the
+    /// `repo.clone.failed` event / warn are emitted inside `reconcile_ready`)
+    /// and retried next tick. This replaces the old scheduler-specific bootstrap
+    /// gate with the same readiness contract every Kind consumes.
     async fn ensure_projects_ready(&self) -> HashSet<String> {
         let mut ready = HashSet::with_capacity(self.projects.len());
         for deps in &self.projects {
-            match super::ensure_project_clone(deps).await {
-                Ok(()) => {
-                    ready.insert(deps.project.id.clone());
-                }
-                Err(e) => {
-                    tracing::warn!("clone prep failed for {}: {e:#}", deps.project.id);
-                }
+            if super::repo_reconciler::reconcile_ready(deps).await {
+                ready.insert(deps.project.id.clone());
             }
         }
         ready

@@ -103,9 +103,87 @@ pub fn clone_ready(h: Option<&CloneHealth>) -> bool {
     matches!(h, None | Some(CloneHealth::Healthy))
 }
 
+/// Observe one project's managed-clone health, or `None` when it is not a
+/// managed clone (an explicit `repo_path`, or non-github mode) — there is
+/// nothing to ensure, so it is always ready.
+pub async fn observe_clone_health(deps: &super::Deps) -> Option<CloneHealth> {
+    if deps.project.mode != crate::config::ProjectMode::Github
+        || !deps.config.is_managed_clone(&deps.project)
+    {
+        return None;
+    }
+    let slug = deps.project.repo_slug.clone()?;
+    Some(crate::gitops::clone_health(&deps.repo_path(), &slug).await)
+}
+
+/// 決定6's single readiness contract: evaluate the `EnsureClone` Op for one
+/// project and return whether it is ready for `repo_path` work this tick. This
+/// is the Repo Kind reconcile's first Op, run before every other Kind — the
+/// level-triggered replacement for the scheduler's old bootstrap gate. A
+/// not-healthy managed clone runs the act (`ensure_project_clone`); the project
+/// is ready iff `Healthy` afterwards (a `Broken` remnant or a failed clone
+/// stays not-ready, its reason emitted on `repo.clone.failed` for `doctor`).
+pub async fn reconcile_ready(deps: &super::Deps) -> bool {
+    // observe → decide (the EnsureClone part of `next_step_repo`).
+    let health = observe_clone_health(deps).await;
+    if !clone_needs_ensure(health.as_ref()) {
+        return true; // Healthy or non-managed — ready without acting.
+    }
+    // act: `Op(EnsureClone)`. `ensure_project_clone` re-checks and clones an
+    // `Absent`, bails on a `Broken`, and emits `repo.cloned` / `repo.clone.failed`
+    // itself. Ready iff it succeeds (→ `Healthy`).
+    match super::ensure_project_clone(deps).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("clone prep failed for {}: {e:#}", deps.project.id);
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn non_managed_project_is_ready_without_acting() {
+        // A project pinning `repo_path` is not a managed clone: observe returns
+        // None, so reconcile_ready is ready without running any EnsureClone act.
+        use crate::config::{Config, ProjectConfig};
+        use crate::store::Store;
+        use std::sync::Arc;
+        let project = ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some("/tmp/unused".into()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = super::super::Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(crate::mux::fake::FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            Config::default(),
+            project,
+        );
+        assert!(observe_clone_health(&deps).await.is_none());
+        assert!(reconcile_ready(&deps).await);
+    }
 
     fn snap(
         clone_health: Option<CloneHealth>,
