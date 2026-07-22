@@ -432,7 +432,16 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                 .update_run_status(run_id, RunStatus::Failed, Some(&msg))?;
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
-            flavor.escalate(deps, &run, &msg).await;
+            // A forge/mux command fault (stopped mux, dropped connection) says
+            // nothing about the issue — release the claim so the next sweep
+            // just retries, instead of parking it on needs-human (issue #250).
+            match super::escalation::infra_reason(&e) {
+                Some(reason) => {
+                    flavor.release_claim(deps, &run).await;
+                    super::escalation::escalate_infra(deps, &run, reason, &msg).await;
+                }
+                None => flavor.escalate(deps, &run, &msg).await,
+            }
             Err(e)
         }
     }

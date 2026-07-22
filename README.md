@@ -408,7 +408,7 @@ throttle_secs = 10             # launchd ThrottleInterval (secs between restarts
 macos = true           # page awaiting_human via a macOS notification (osascript)
 # webhook_url = "https://hooks.slack.com/services/..."  # push events to a webhook; ${ENV} expanded. Omit to disable
 # kind = "slack"       # slack | ntfy | json. Omit to auto-detect from the URL host
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "sweep.degraded"]  # allowlist; default ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # allowlist; default ["awaiting_human"]
 throttle_secs = 60     # min seconds between notifications for the same key
 # [[projects]]
 #   notify = { labels = ["human:todo"] }  # also notify when meguri files an issue carrying one of these labels

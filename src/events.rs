@@ -71,6 +71,24 @@ impl Store {
         })
     }
 
+    /// How many `infra.raised` events name this target since `since_ts` — the
+    /// fault window backing the infra retry cap (issue #250): a permanently
+    /// broken mux/gh must eventually reach a human instead of retrying (and
+    /// growing runs, worktrees and API spend) forever.
+    pub fn infra_raised_since(&self, target: &str, id: i64, since_ts: &str) -> Result<usize> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'infra.raised' AND ts >= ?1
+                   AND json_extract(data_json, '$.target') = ?2
+                   AND json_extract(data_json, '$.id') = ?3",
+                params![since_ts, target, id],
+                |r| r.get(0),
+            )?;
+            Ok(n as usize)
+        })
+    }
+
     /// Events of `kind` at or after `since_ts` (RFC3339, string-sortable like
     /// every other `ts` column) — the read side of `meguri doctor`'s sweep
     /// failure-rate display (issue #251, design doc P6.5 item 3). Global, not

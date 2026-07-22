@@ -35,6 +35,7 @@ pub const NOTIFY_EVENT_TOKENS: &[&str] = &[
     "escalation",
     "schedule.failed",
     "schedule.skipped",
+    "infra",
     "sweep.degraded",
 ];
 
@@ -136,6 +137,22 @@ impl Notification {
             body: format!("PR #{pr} を needs-human にしました(人間のレビュー待ち)"),
             url: None,
             fields: json!({ "target": "pr", "pr": pr }),
+        }
+    }
+
+    /// A forge/mux command fault (issue #250) — deliberately NOT an
+    /// `escalation`: it says the dependency is unreachable, not that the
+    /// issue needs a human. `dedup_key` is `reason` alone (no issue/run id),
+    /// so every issue tripping the same fault collapses into one page inside
+    /// the throttle window instead of paging once per issue.
+    pub fn infra(reason: &str, detail: &str) -> Self {
+        Self {
+            event: "infra".into(),
+            dedup_key: format!("infra:{reason}"),
+            title: "meguri infra 故障".into(),
+            body: format!("forge/mux コマンドが失敗しています({reason}): {detail}"),
+            url: None,
+            fields: json!({ "reason": reason, "detail": detail }),
         }
     }
 
@@ -591,6 +608,17 @@ mod tests {
         let req = webhook_request(WebhookKind::Slack, &n);
         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
         assert!(v["text"].as_str().unwrap().contains("PR #12"));
+    }
+
+    #[test]
+    fn infra_dedup_key_is_reason_only_not_per_issue() {
+        // Two different issues hitting the same fault must share a dedup
+        // key, so the notifier's throttle collapses them into one page
+        // (issue #250) — an infra fault says nothing about which issue.
+        let a = Notification::infra("mux_connection_refused", "issue 7 detail");
+        let b = Notification::infra("mux_connection_refused", "issue 8 detail");
+        assert_eq!(a.dedup_key, b.dedup_key);
+        assert_eq!(a.event, "infra");
     }
 
     #[test]

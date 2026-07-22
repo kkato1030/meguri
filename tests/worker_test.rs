@@ -656,6 +656,53 @@ async fn worker_needs_human_escalates_on_forge() {
     assert!(comments[0].contains("needs a human"));
 }
 
+/// A stopped mux (herdr/tmux down) must fail the run but never occupy the
+/// needs-human queue — it says nothing about the issue and clears itself
+/// once the dependency is back (design doc §3-E / P6, issue #250).
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_mux_down_does_not_escalate_to_needs_human() {
+    let env = setup(None).await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+    env.mux.stop();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+
+    assert!(result.is_err(), "a stopped mux must fail the run");
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let labels = env.forge.labels_of(7);
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&LABEL_WORKING.to_string()),
+        "the claim must be released so the next sweep retries"
+    );
+    assert!(labels.contains(&LABEL_READY.to_string()));
+    assert!(
+        env.forge.comments_of(7).is_empty(),
+        "an infra fault must not leave a needs-human comment"
+    );
+
+    let events = env.deps.store.events_for_run(&run.id, 20).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "infra.raised"),
+        "events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "escalation.raised"),
+        "events: {events:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_needs_plan_hands_issue_to_planner() {
     let env = setup(None).await;

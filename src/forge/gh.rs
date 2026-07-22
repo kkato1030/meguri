@@ -15,6 +15,16 @@ use super::{
     ReviewComment, ReviewCommentDraft, ReviewThread, UpdateBranchOutcome,
 };
 
+/// The `gh` binary itself could not be started (missing, not executable, a
+/// bad PATH, ...) — as opposed to `gh` running and exiting non-zero. Kept
+/// distinct from a bare `std::io::Error` so `run_flow` can classify only
+/// this specific boundary as a retryable infra fault (issue #250 f1):
+/// every other `io::Error` in the codebase (git, direct-mode agent spawn,
+/// prompt/log file writes) must keep escalating to needs-human as before.
+#[derive(Debug, thiserror::Error)]
+#[error("spawning gh (is the GitHub CLI installed?): {0}")]
+pub struct GhSpawnFailed(#[from] std::io::Error);
+
 /// How much of each failed job log survives into the fix prompt (logs can be
 /// megabytes; the failure is almost always at the tail).
 const FAILED_LOG_TAIL_LINES: usize = 200;
@@ -173,7 +183,7 @@ pub async fn create_repo(slug: &str, public: bool) -> Result<()> {
         .args(["repo", "create", slug, visibility, "--add-readme"])
         .output()
         .await
-        .context("spawning gh (is the GitHub CLI installed?)")?;
+        .map_err(GhSpawnFailed)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -259,7 +269,7 @@ impl GhForge {
             .args(args)
             .output()
             .await
-            .context("spawning gh (is the GitHub CLI installed?)")?;
+            .map_err(GhSpawnFailed)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
         } else {
@@ -279,7 +289,7 @@ impl GhForge {
             .args(args)
             .output()
             .await
-            .context("spawning gh (is the GitHub CLI installed?)")?;
+            .map_err(GhSpawnFailed)?;
         if out.status.success() {
             Ok(Ok(String::from_utf8_lossy(&out.stdout)
                 .trim_end()
@@ -359,7 +369,7 @@ impl GhForge {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .context("spawning gh (is the GitHub CLI installed?)")?;
+            .map_err(GhSpawnFailed)?;
         child
             .stdin
             .take()

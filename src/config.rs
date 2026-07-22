@@ -90,7 +90,7 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://hooks.slack.com/services/..."  # 省略で webhook 無効。${ENV} 展開可
 # kind = "slack"                     # 省略で URL から自動判別(slack/ntfy/json)
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "sweep.degraded"]  # 既定は ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # 既定は ["awaiting_human"]
 # throttle_secs = 60                 # 同一通知キーの連続通知の最短間隔(秒)
 # [projects.notify]                  # per-project: 指定ラベルの issue 起票を通知(issue #205)
 # labels = ["human:todo"]
@@ -1120,8 +1120,8 @@ pub struct NotificationsConfig {
     #[serde(default)]
     pub kind: Option<WebhookKind>,
     /// Which event tokens are delivered (`awaiting_human` / `escalation` /
-    /// `schedule.failed` / `schedule.skipped` / `sweep.degraded`). Default
-    /// `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
+    /// `schedule.failed` / `schedule.skipped` / `infra` / `sweep.degraded`).
+    /// Default `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
     /// watching is configured separately via `[projects.notify]`, not here.
     #[serde(default = "default_notifications_events")]
     pub events: Vec<String>,

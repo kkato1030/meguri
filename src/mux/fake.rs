@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
@@ -42,6 +42,11 @@ pub struct FakeMux {
     dashboards: Mutex<HashMap<String, DashboardId>>,
     /// Commands launched via `run_in_pane`, in call order.
     ran_in_pane: Mutex<Vec<(PaneId, Vec<String>)>>,
+    /// Set by [`Self::stop`] (issue #250): emulates the mux daemon itself
+    /// being down (herdr not running). `ensure_session`/`spawn_pane` fail
+    /// with the same `MuxError::Io(ConnectionRefused)` a dead socket produces,
+    /// so tests can exercise the infra-escalation path without a real socket.
+    stopped: AtomicBool,
 }
 
 impl FakeMux {
@@ -56,7 +61,20 @@ impl FakeMux {
             tiled: Mutex::new(Vec::new()),
             dashboards: Mutex::new(HashMap::new()),
             ran_in_pane: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
         }
+    }
+
+    /// Simulate the mux daemon being stopped (issue #250): every subsequent
+    /// `ensure_session`/`spawn_pane` call fails with a connection-refused
+    /// `MuxError::Io`, matching a stopped herdr/tmux, until [`Self::start`].
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Undo [`Self::stop`] — the mux daemon is back.
+    pub fn start(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
     }
 
     pub fn set_state(&self, pane: &PaneId, state: AgentState) {
@@ -160,10 +178,16 @@ impl Multiplexer for FakeMux {
     }
 
     async fn ensure_session(&self) -> MuxResult<()> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(connection_refused());
+        }
         Ok(())
     }
 
     async fn spawn_pane(&self, spec: &PaneSpec) -> MuxResult<PaneId> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(connection_refused());
+        }
         if let Some(needle) = &*self.error_spawn_matching.lock().unwrap()
             && spec.command.iter().any(|arg| arg.contains(needle))
         {
@@ -312,4 +336,11 @@ impl Multiplexer for FakeMux {
     fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
         format!("echo fake dashboard {dashboard}")
     }
+}
+
+fn connection_refused() -> MuxError {
+    MuxError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "mux stopped (fake)",
+    ))
 }
