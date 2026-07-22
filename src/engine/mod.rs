@@ -504,6 +504,51 @@ pub fn default_loops() -> Vec<Arc<dyn Loop>> {
     ]
 }
 
+/// The scheduler's recipe dispatcher (ADR 0012 slice 4, 決定8): maps a queued
+/// run's `(deps, run_id, loop_kind)` to its recipe outcome. Production uses
+/// [`default_recipe`] (→ [`run_recipe`]); the scheduler holds one so dispatch is
+/// a pure kind→recipe map rather than a `dyn Loop` resolution.
+pub type RecipeFn = Arc<
+    dyn Fn(
+            Deps,
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerOutcome>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The production recipe dispatcher: route each run to its `run_*` entry point
+/// by `loop_kind` via [`run_recipe`].
+pub fn default_recipe() -> RecipeFn {
+    Arc::new(|deps, run_id, loop_kind| {
+        Box::pin(async move { run_recipe(&deps, &run_id, &loop_kind).await })
+    })
+}
+
+/// Dispatch a queued/interrupted run to its recipe by `loop_kind` (ADR 0012
+/// slice 4, 決定8). The level-triggered replacement for resolving a `dyn Loop`
+/// and calling its `drive`: enqueue is owned by the reconcilers, and the
+/// scheduler only routes a run back to the right `run_*` entry point.
+/// `dispatch_rank` still orders the workqueue. An unknown kind is a bug (no
+/// reconciler enqueues it) — surfaced as an error the scheduler logs.
+pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<WorkerOutcome> {
+    match loop_kind {
+        worker::KIND => worker::run_worker(deps, run_id).await,
+        planner::KIND => planner::run_planner(deps, run_id).await,
+        spec_worker::KIND => spec_worker::run_spec_worker(deps, run_id).await,
+        spec_fixer::KIND => spec_fixer::run_spec_fixer(deps, run_id).await,
+        pr_reviewer::KIND => pr_reviewer::run_pr_reviewer(deps, run_id).await,
+        conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
+        ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
+        fixer::KIND => fixer::run_fixer(deps, run_id).await,
+        cleaner::KIND => cleaner::run_cleaner(deps, run_id).await,
+        triage::KIND => triage::run_triage(deps, run_id).await,
+        other => anyhow::bail!("run {run_id}: unknown loop kind {other:?}"),
+    }
+}
+
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
 /// live turns converge to it and report state/events back. Additionally
 /// pages a human (via the throttled notifier) on `turn.awaiting_human`.
@@ -741,5 +786,55 @@ mod tests {
         deps.open_prs.clear().await;
         let third = deps.open_prs.get(&deps).await.unwrap();
         assert_eq!(third.len(), 2, "next tick re-fetches");
+    }
+
+    fn minimal_deps() -> Deps {
+        use crate::mux::fake::FakeMux;
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: Some("/tmp/unused".into()),
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            check_command: None,
+            worktree_root: None,
+            language: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        Deps::with_label_source(
+            Store::open_in_memory().unwrap(),
+            Arc::new(FakeMux::new(false)),
+            Arc::new(crate::forge::fake::FakeForge::default()),
+            Config::default(),
+            project,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_recipe_rejects_an_unknown_kind() {
+        // The kind→recipe map (決定8) surfaces an unknown loop_kind as an error
+        // (a bug — no reconciler enqueues one), the same signal the scheduler
+        // logs. Real kinds route to their `run_*` recipes, exercised end-to-end
+        // by the scheduler / worker integration tests.
+        let deps = minimal_deps();
+        let err = run_recipe(&deps, "run-x", "bogus-kind").await.unwrap_err();
+        assert!(err.to_string().contains("bogus-kind"), "{err}");
+        // default_recipe wraps the same map; its closure bails identically.
+        let recipe = default_recipe();
+        let err = recipe(deps, "run-x".into(), "bogus-kind".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bogus-kind"), "{err}");
     }
 }

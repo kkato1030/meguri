@@ -58,8 +58,14 @@ pub struct Reload {
 pub struct Scheduler {
     /// One Deps per configured project (mux/store shared via clones).
     pub projects: Vec<Deps>,
-    /// The loops to run; dispatch resolves a run's loop via `runs.loop_kind`.
+    /// The loops to run; `discover` still walks these. Dispatch no longer
+    /// resolves a `dyn Loop` — see `recipe` (ADR 0012 §決定8).
     pub loops: Vec<Arc<dyn Loop>>,
+    /// The recipe dispatcher (ADR 0012 §決定8). `Some(_)` routes each run to its
+    /// `run_*` entry by `loop_kind` (production: `default_recipe()`). `None` is
+    /// the transitional test seam that still dispatches via the injected
+    /// `loops`' `drive` — removed once the `Loop` trait is (決定7).
+    pub recipe: Option<super::RecipeFn>,
     pub poll_interval: Duration,
     pub max_concurrent: usize,
     /// Config hot reload (issue #73), polled once per tick before discovery:
@@ -397,23 +403,34 @@ impl Scheduler {
             return;
         };
         let weight = run_weight(&deps, run);
-        let Some(lp) = self
-            .loops
-            .iter()
-            .find(|l| l.kind() == run.loop_kind)
-            .cloned()
-        else {
-            tracing::warn!("run {} references unknown loop {}", run.id, run.loop_kind);
-            return;
-        };
         let run_id = run.id.clone();
-        active.insert(run_id.clone(), weight);
-        running.spawn(async move {
-            if let Err(e) = lp.drive(&deps, &run_id).await {
-                tracing::warn!("run {run_id} failed: {e:#}");
-            }
-            run_id
-        });
+        let loop_kind = run.loop_kind.clone();
+
+        // ADR 0012 §決定8: dispatch is a kind→recipe map. Production holds a
+        // `recipe` (`default_recipe()` → `run_recipe`); `None` is the
+        // transitional test seam that dispatches via the injected `loops`'
+        // `drive`, removed once the `Loop` trait is (決定7).
+        if let Some(recipe) = self.recipe.clone() {
+            active.insert(run_id.clone(), weight);
+            running.spawn(async move {
+                if let Err(e) = recipe(deps, run_id.clone(), loop_kind).await {
+                    tracing::warn!("run {run_id} failed: {e:#}");
+                }
+                run_id
+            });
+        } else {
+            let Some(lp) = self.loops.iter().find(|l| l.kind() == loop_kind).cloned() else {
+                tracing::warn!("run {run_id} references unknown loop {loop_kind}");
+                return;
+            };
+            active.insert(run_id.clone(), weight);
+            running.spawn(async move {
+                if let Err(e) = lp.drive(&deps, &run_id).await {
+                    tracing::warn!("run {run_id} failed: {e:#}");
+                }
+                run_id
+            });
+        }
     }
 
     /// Startup recovery: every run left `running` by a dead orchestrator is
@@ -600,6 +617,7 @@ mod tests {
         Scheduler {
             projects: vec![],
             loops: vec![],
+            recipe: None,
             poll_interval: Duration::from_secs(1),
             max_concurrent: max,
             reload: None,

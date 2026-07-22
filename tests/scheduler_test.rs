@@ -165,6 +165,7 @@ async fn watch_discovers_and_completes_labeled_issue() {
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -225,6 +226,7 @@ async fn watch_skips_working_and_hold_issues() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -257,6 +259,7 @@ async fn watch_gates_on_open_blocker_until_closed_as_completed() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -321,6 +324,7 @@ async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -362,6 +366,7 @@ async fn watch_does_not_refile_issue_with_succeeded_run() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -416,6 +421,7 @@ async fn recovery_resumes_interrupted_run_to_success() {
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -468,6 +474,7 @@ async fn watch_dispatches_multiple_ready_issues_concurrently() {
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -517,6 +524,7 @@ async fn watch_reclaims_worktree_after_issue_closes() {
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -683,6 +691,7 @@ async fn watch_prioritizes_loops_in_list_order() {
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -710,6 +719,7 @@ async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 3).await;
@@ -746,6 +756,7 @@ async fn watch_prioritizes_loop_order_over_project_order() {
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
@@ -769,6 +780,7 @@ async fn watch_ticks_write_a_heartbeat() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -849,6 +861,7 @@ async fn drive_order(
         // One slot at a time so drive order mirrors dispatch priority.
         max_concurrent: 1,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -976,6 +989,7 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -1071,6 +1085,7 @@ async fn watch_applies_reloaded_config_to_new_runs() {
         // One slot: issue 71 drives before the "edit", issue 72 after it.
         max_concurrent: 1,
         reload: Some(reload),
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -1149,6 +1164,7 @@ async fn watch_redispatches_a_run_interrupted_after_watch_is_already_running() {
         poll_interval: Duration::from_millis(80),
         max_concurrent: 2,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -1235,6 +1251,7 @@ async fn watch_redispatch_respects_slots_and_avoids_double_dispatch() {
         poll_interval: Duration::from_millis(80),
         max_concurrent: 1,
         reload: None,
+        recipe: None,
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
