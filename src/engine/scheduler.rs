@@ -193,20 +193,12 @@ impl Scheduler {
                         deps.project.id
                     );
                 }
-                // Ride the poll: recompute routing outcome drift from run
-                // history and record any threshold crossing (routing 2/3,
-                // #65). Pure sqlite, no pane, no API.
-                if let Err(e) = super::routing_drift::sweep(deps) {
-                    tracing::warn!("routing drift sweep failed for {}: {e:#}", deps.project.id);
-                }
-                // Notice body edits on already-shipped issues the label-filtered
-                // discovery can no longer see (issue #142, half B) and leave a
-                // re-attention signal. Light API sweep, no run record.
-                if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
-                    tracing::warn!(
-                        "reconcile_body_edits sweep failed for {}: {e:#}",
-                        deps.project.id
-                    );
+                // Repo Kind per-resync pass (ADR 0012 §決定3): the routing-drift
+                // recompute Op, folded out of the tick's standalone sweep. The
+                // body-edit reconcile is now an Issue Kind per-resync act inside
+                // `issue_reconciler::sweep` above (ADR 0012 §決定4).
+                if let Err(e) = super::repo_reconciler::reconcile_repo(deps) {
+                    tracing::warn!("repo reconcile failed for {}: {e:#}", deps.project.id);
                 }
             }
 

@@ -141,6 +141,17 @@ pub async fn reconcile_ready(deps: &super::Deps) -> bool {
     }
 }
 
+/// The Repo Kind reconcile's per-resync pass over one ready project (ADR 0012
+/// §決定3). Runs the light `Op(RoutingDrift)` act — the pure-sqlite
+/// routing-drift recompute (`routing_drift::sweep`) — which recomputes every
+/// resync regardless of what else is due, so it is a per-resync act (like the
+/// Issue Kind's `reclaim_stale_claims`), not the single arm. Folding this here
+/// removes `routing_drift::sweep` from the scheduler tick's standalone sweep
+/// block. The cleaner / triage arm enqueue (via `next_step_repo`) folds in next.
+pub fn reconcile_repo(deps: &super::Deps) -> anyhow::Result<()> {
+    super::routing_drift::sweep(deps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -614,6 +614,15 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
             tracing::warn!("merge-tail failed for PR #{}: {e:#}", obs.pr.number);
         }
     }
+
+    // Issue Kind per-resync signal act (ADR 0012 §決定4 / finding 3): body-edit
+    // re-attention on `implementing` issues, folded out of the scheduler tick's
+    // standalone sweep. It never launches an agent nor enqueues — a signal only
+    // — so it sits outside the single-arm ownership partition (like
+    // `reclaim_stale_claims`), and runs exactly once per resync.
+    if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
+        tracing::warn!("body-edit reconcile failed for {}: {e:#}", deps.project.id);
+    }
     Ok(())
 }
 
