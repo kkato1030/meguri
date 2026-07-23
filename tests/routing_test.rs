@@ -181,11 +181,18 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
     let clone = init_origin_and_clone(root.path()).await;
     let worktree_root = root.path().join("worktrees");
 
+    // The claim re-verifies the arm against the phase label (ADR 0012 S4
+    // 決定1), so the trigger label must match the loop kind under test.
+    let trigger = if loop_kind == "planner" {
+        meguri::forge::LABEL_PLAN
+    } else {
+        LABEL_READY
+    };
     let forge = Arc::new(FakeForge::with_issue(
         7,
         "Add greeting file",
         "Create `greeting.txt` containing hello.",
-        &[LABEL_READY],
+        &[trigger],
     ));
     let mux = Arc::new(FakeMux::new(false));
     let project = ProjectConfig {

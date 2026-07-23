@@ -35,7 +35,6 @@ use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
-use crate::tasks::TaskKey;
 
 /// `runs.loop_kind` value for spec-worker runs.
 pub const KIND: &str = "spec-worker";
@@ -56,78 +55,12 @@ impl super::Loop for SpecWorkerLoop {
     /// (avoids a second takeover when the label lingers; humans can force a
     /// rerun with `meguri run --issue N`).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        // The branch-takeover morph is the *combined* delivery (ADR 0008). In
-        // separate delivery the spec PR is standalone (the handoff sweep flips
-        // the issue to `ready` and the worker implements in a fresh PR), so the
-        // spec worker stays out.
-        if deps.project.plan_delivery != crate::config::PlanDelivery::Combined {
-            return Ok(Vec::new());
-        }
-        let prs = deps
-            .forge()
-            .list_prs_with_label(forge::LABEL_SPEC_READY)
-            .await?;
-        let mut targets = Vec::new();
-        for pr in prs {
-            // needs-human parks the PR (issue #176): a failed takeover leaves
-            // spec-ready in place (settle never ran), so without this check the
-            // escalated PR would be rediscovered and retried every poll. The
-            // escalation path (`Flavor::escalate` below) puts the label on the
-            // PR; a human clears it to re-arm the takeover.
-            if pr.state != "open"
-                || pr.has_label(forge::LABEL_HOLD)
-                || pr.has_label(forge::LABEL_WORKING)
-                || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-            {
-                continue;
-            }
-            // A reviewed decomposition proposal is not implemented here — the
-            // materializer sweep files its children instead (issue #134).
-            if super::planner::is_decompose_proposal(&pr.body) {
-                continue;
-            }
-            let Some(issue) = gitops::issue_from_branch(&pr.head_branch) else {
-                continue; // human-made head: not meguri's to take over
-            };
-            // Body-aware suppression (issue #142, half A): a succeeded takeover
-            // suppresses re-discovery only while the issue body is unchanged.
-            // Editing the issue body lifts it (and signals the edit once), so a
-            // human re-triggering the spec-ready takeover after a body edit is
-            // no longer permanently blocked. `body_edits = false` restores the
-            // old permanent suppression.
-            if deps.config.reconcile.body_edits {
-                let digest = crate::tasks::body_digest(&deps.forge().get_issue(issue).await?.body);
-                if deps.store.issue_processed_current_body(
-                    &deps.project.id,
-                    KIND,
-                    issue,
-                    &digest,
-                )? {
-                    continue;
-                }
-                if deps
-                    .store
-                    .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
-                {
-                    deps.store
-                        .signal_body_changed_event(&deps.project.id, KIND, issue, &digest)?;
-                }
-            } else if deps
-                .store
-                .issue_has_succeeded_run(&deps.project.id, KIND, issue)?
-            {
-                continue;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(issue),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
+        // Discovery moved to the Issue Kind reconciler's PR side (ADR 0012 S4
+        // 決定2): the spec-stage arms are branches of `next_step` now. This
+        // stub keeps the transitional `Loop` registration dispatchable until
+        // 決定7 removes the trait.
+        let _ = deps;
+        Ok(Vec::new())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -644,7 +577,6 @@ mod tests {
 
     #[tokio::test]
     async fn discover_excludes_decompose_proposal_prs() {
-        use crate::engine::Loop;
         use std::sync::Arc;
         let forge = Arc::new(crate::forge::fake::FakeForge::default());
         // A proposal PR (marked) and an ordinary spec PR, both spec-ready on
@@ -679,13 +611,15 @@ mod tests {
             crate::config::Config::default(),
             project,
         );
-        let targets = SpecWorkerLoop.discover(&deps).await.unwrap();
-        let issues: Vec<i64> = targets
-            .iter()
-            .filter_map(|t| match t.key {
-                crate::tasks::TaskKey::Issue(n) => Some(n),
-                _ => None,
-            })
+        // The takeover is the SpecWorker branch of the PR-side reconciler now.
+        crate::engine::issue_reconciler::sweep(&deps).await.unwrap();
+        let issues: Vec<i64> = deps
+            .store
+            .list_runs(true)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.loop_kind == KIND)
+            .map(|r| r.issue_number)
             .collect();
         assert!(issues.contains(&6), "ordinary spec PR is picked up");
         assert!(!issues.contains(&5), "decompose proposal PR is excluded");

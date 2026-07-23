@@ -43,7 +43,6 @@ use super::{
 };
 use crate::forge::{self, CommitStatusState, PullRequest};
 use crate::store::RunRecord;
-use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for spec-fixer runs.
@@ -87,39 +86,12 @@ impl super::Loop for SpecFixerLoop {
     /// needs-human guard runs before the status poll, so the escalation fires
     /// once and later sweeps skip the PR cheaply.
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let combined = is_combined(deps);
-        let mut targets = Vec::new();
-        for pr in deps.open_prs.get(deps).await? {
-            if is_findings_target(&pr, combined).is_some() {
-                continue;
-            }
-            if deps
-                .forge()
-                .commit_status(&pr.head_sha, pr_reviewer::PR_REVIEW_STATUS)
-                .await?
-                != Some(CommitStatusState::Failure)
-            {
-                continue;
-            }
-            let issue = canonical_key(&pr);
-            if deps
-                .store
-                .succeeded_run_count(&deps.project.id, KIND, issue)?
-                >= MAX_SPEC_FIX_RUNS
-            {
-                escalate_budget_exhausted(deps, &pr).await;
-                continue;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(issue),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
+        // Discovery moved to the Issue Kind reconciler's PR side (ADR 0012 S4
+        // 決定2): the spec-stage arms are branches of `next_step` now. This
+        // stub keeps the transitional `Loop` registration dispatchable until
+        // 決定7 removes the trait.
+        let _ = deps;
+        Ok(Vec::new())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -137,7 +109,7 @@ pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> 
 /// plan-side parked-review page lives (ADR 0009 / issue #153): the base
 /// pr-reviewer defers findings to spec_fixer, so the page moved here — the
 /// budget is spent, the review is still red, so a real human wait exists.
-async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
+pub(crate) async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
     // Runs are keyed by the PR's canonical *issue* (issue #92), which the spec
     // PR's own number usually differs from — so the re-run hint must name the
     // issue, not the PR, or `meguri run --issue N` would target the wrong one.
@@ -394,7 +366,6 @@ impl Flavor for SpecFixerFlavor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Loop;
     use crate::forge::Forge;
     use crate::store::Store;
     use std::sync::Arc;
@@ -530,9 +501,18 @@ mod tests {
         );
 
         let deps = fake_deps(forge);
-        let targets = SpecFixerLoop.discover(&deps).await.unwrap();
-        assert_eq!(targets.len(), 1, "only #1 is a target: {targets:?}");
-        assert_eq!(targets[0].key, TaskKey::Issue(1));
+        // The spec-fixer arm is a branch of the PR-side reconciler now
+        // (ADR 0012 S4 決定2): one sweep enqueues its run for #1 only.
+        crate::engine::issue_reconciler::sweep(&deps).await.unwrap();
+        let runs: Vec<_> = deps
+            .store
+            .list_runs(true)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.loop_kind == KIND)
+            .collect();
+        assert_eq!(runs.len(), 1, "only #1 is a target: {runs:?}");
+        assert_eq!(runs[0].issue_number, 1);
     }
 
     #[tokio::test]
@@ -570,8 +550,15 @@ mod tests {
                 .unwrap();
         }
 
-        let targets = SpecFixerLoop.discover(&deps).await.unwrap();
-        assert!(targets.is_empty(), "budget spent → no target");
+        crate::engine::issue_reconciler::sweep(&deps).await.unwrap();
+        let queued: Vec<_> = deps
+            .store
+            .list_runs(true)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.loop_kind == KIND && r.status == crate::store::RunStatus::Queued)
+            .collect();
+        assert!(queued.is_empty(), "budget spent → no run enqueued");
 
         // The full escalation contract: needs-human label on the PR…
         assert!(
@@ -698,15 +685,26 @@ mod tests {
         let deps = fake_deps(forge.clone());
 
         // 1. spec-fixer picks it up; the pr-reviewer does not (h1 is already
-        //    reviewed).
-        let sf = SpecFixerLoop.discover(&deps).await.unwrap();
+        //    reviewed). Both are branches of the PR-side reconciler now.
+        let runs_of = |deps: &Deps, kind: &str| {
+            deps.store
+                .list_runs(true)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.loop_kind == kind && r.status == crate::store::RunStatus::Queued)
+                .collect::<Vec<_>>()
+        };
+        crate::engine::issue_reconciler::sweep(&deps).await.unwrap();
+        let sf = runs_of(&deps, KIND);
         assert_eq!(sf.len(), 1, "spec-fixer targets the parked PR");
-        deps.open_prs.clear().await;
-        let g = pr_reviewer::PrReviewerLoop.discover(&deps).await.unwrap();
         assert!(
-            g.is_empty(),
+            runs_of(&deps, pr_reviewer::KIND).is_empty(),
             "pr-reviewer skips the already-reviewed head h1"
         );
+        // Retire the queued run so the reservation frees for the later steps.
+        deps.store
+            .update_run_status(&sf[0].id, crate::store::RunStatus::Skipped, None)
+            .unwrap();
 
         // 2. After the spec-fixer settles, working is gone and spec-reviewing
         //    stays (nothing flips the label until the pr-reviewer re-reviews).
@@ -726,17 +724,26 @@ mod tests {
         let labels = forge.pr_labels(1);
         assert!(!labels.contains(&forge::LABEL_WORKING.to_string()));
         assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
+        // The settle run is done; retire it so step 3's assertions see only
+        // what the next sweep enqueues.
+        deps.store
+            .update_run_status(&run.id, crate::store::RunStatus::Succeeded, None)
+            .unwrap();
 
         // 3. The fix push moves the head to h2 (no review status yet): the
         //    spec-fixer no longer fires (head-sha dedup), the pr-reviewer now
         //    does.
         forge.set_pr_head(1, "h2");
-        deps.open_prs.clear().await;
-        let sf = SpecFixerLoop.discover(&deps).await.unwrap();
-        assert!(sf.is_empty(), "spec-fixer waits — h2 has no failing status");
-        deps.open_prs.clear().await;
-        let g = pr_reviewer::PrReviewerLoop.discover(&deps).await.unwrap();
-        assert_eq!(g.len(), 1, "pr-reviewer re-reviews the new head h2");
+        crate::engine::issue_reconciler::sweep(&deps).await.unwrap();
+        assert!(
+            runs_of(&deps, KIND).is_empty(),
+            "spec-fixer waits — h2 has no failing status"
+        );
+        assert_eq!(
+            runs_of(&deps, pr_reviewer::KIND).len(),
+            1,
+            "pr-reviewer re-reviews the new head h2"
+        );
 
         // 4. The pr-reviewer's clean settle on h2 flips spec-reviewing →
         //    spec-ready, covered by pr_reviewer.rs's

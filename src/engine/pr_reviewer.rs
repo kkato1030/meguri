@@ -42,11 +42,10 @@ use serde_json::json;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Kind, NeedsHuman, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
-use super::{Deps, Target, canonical_issue, canonical_key};
+use super::{Deps, Target, canonical_key};
 use crate::forge::{self, CheckState, CommitStatusState, PullRequest};
 use crate::gitops;
 use crate::store::{LANE_PR_REVIEW, RunRecord, RunStatus};
-use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for pr-reviewer runs.
@@ -187,29 +186,12 @@ impl super::Loop for PrReviewerLoop {
     /// (when the plan review is on); impl candidates are green,
     /// unlabeled-by-spec meguri PRs (when the impl review is on).
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let mut targets = Vec::new();
-        for pr in deps.forge().list_open_prs().await? {
-            if self.candidate_kind(deps, &pr).await?.is_none() {
-                continue;
-            }
-            // Degraded mode: unresolved canonical issue is observable, not fatal.
-            if canonical_issue(&pr).is_none() {
-                deps.store.emit(
-                    None,
-                    "canonical_issue.unresolved",
-                    json!({ "pr": pr.number, "head_branch": pr.head_branch }),
-                )?;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(canonical_key(&pr)),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
+        // Discovery moved to the Issue Kind reconciler's PR side (ADR 0012 S4
+        // 決定2): the spec-stage arms are branches of `next_step` now. This
+        // stub keeps the transitional `Loop` registration dispatchable until
+        // 決定7 removes the trait.
+        let _ = deps;
+        Ok(Vec::new())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

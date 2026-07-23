@@ -153,6 +153,27 @@ impl Store {
             Ok(active)
         })
     }
+
+    /// Whether one specific loop has an active run on the issue (ADR 0012 S4
+    /// 決定2): the pr-reviewer's own-lane dedup, where the author-lane
+    /// exclusion above deliberately does not apply.
+    pub fn issue_has_active_loop_run(
+        &self,
+        project_id: &str,
+        loop_kind: &str,
+        issue_number: i64,
+    ) -> Result<bool> {
+        self.with_conn(|c| {
+            let active: bool = c
+                .prepare(
+                    "SELECT 1 FROM runs
+                      WHERE project_id = ?1 AND loop_kind = ?2 AND issue_number = ?3
+                        AND status IN ('queued', 'running', 'interrupted')",
+                )?
+                .exists(params![project_id, loop_kind, issue_number])?;
+            Ok(active)
+        })
+    }
 }
 
 #[cfg(test)]
