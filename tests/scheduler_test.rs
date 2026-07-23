@@ -551,7 +551,15 @@ async fn watch_reclaims_worktree_after_issue_closes() {
         "worktree survives while the issue is open"
     );
 
-    // Closing the issue (PR merged) lets the watch sweep reclaim it.
+    // Closing the issue (PR merged) lets the watch sweep reclaim it. The PR
+    // must actually be terminal too: an *open* meguri PR keeps the identity's
+    // resources on the PR side (finding 4b), so mark it merged first.
+    forge
+        .prs
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .for_each(|p| p.state = "merged".into());
     forge.close_issue(31);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while worktree.exists() {

@@ -1043,7 +1043,10 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
     for project in projects {
         let deps = build_deps(&cfg, project, None)?;
         let mut states = reaper::IssueStates::default();
-        let pane_candidates = reaper::plan_panes(&deps, &mut states).await?;
+        // Manual prune honors the same open-PR ownership boundary as the
+        // automatic Finalize pass (finding 4b).
+        let open_pr_issues = reaper::open_meguri_pr_issues(&deps).await;
+        let pane_candidates = reaper::plan_panes(&deps, &mut states, &open_pr_issues).await?;
 
         // Panes go first so their worktrees become reclaimable in this same
         // pass (a closed issue's live pane no longer protects its worktree).
@@ -1070,7 +1073,7 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
             }
         }
 
-        let candidates = reaper::plan_with(&deps, &mut states).await?;
+        let candidates = reaper::plan_with(&deps, &mut states, &open_pr_issues).await?;
         if candidates.is_empty() {
             if pane_candidates.is_empty() {
                 println!("{}: no meguri panes or worktrees", project.id);

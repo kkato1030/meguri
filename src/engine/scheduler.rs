@@ -167,9 +167,6 @@ impl Scheduler {
                 if let Err(e) = super::schedule::sweep(deps, now, &mut schedule_diag).await {
                     tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
                 }
-                if let Err(e) = super::reaper::sweep(deps).await {
-                    tracing::warn!("worktree sweep failed for {}: {e:#}", deps.project.id);
-                }
                 // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
                 // informer-cache observe drives arm (ADR 0003) / orchestrator
                 // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the

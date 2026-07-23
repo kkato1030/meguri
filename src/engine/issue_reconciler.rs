@@ -582,7 +582,14 @@ async fn build_snapshot(
 /// retried next poll; it never aborts the sweep.
 pub async fn sweep(deps: &Deps) -> Result<()> {
     if deps.forge.is_none() {
-        return Ok(()); // no forge, no PRs (local mode)
+        // Local mode has no PRs, but the Finalize pass (決定4) still runs: it
+        // clears dead-pane mappings without a forge, and its worktree side
+        // parks everything as StateUnknown (finding 4a — a local deliverable
+        // is the branch + worktree, never reclaimed on "no open issue").
+        if let Err(e) = super::reaper::finalize(deps, &std::collections::HashSet::new()).await {
+            tracing::warn!("finalize failed for {}: {e:#}", deps.project.id);
+        }
+        return Ok(());
     }
     // The sweep runs whenever there is a forge: the fixer family (conflict / CI
     // / thread arms) is independent of auto-merge. Only the merge-tail Ops
@@ -613,6 +620,22 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
         if let Err(e) = process(deps, &am, obs, &mut policy_ok, now).await {
             tracing::warn!("merge-tail failed for PR #{}: {e:#}", obs.pr.number);
         }
+    }
+
+    // Issue Kind per-resync act (ADR 0012 §決定4): Op(Finalize) — reclaim the
+    // local resources (panes / worktrees / merged branches) of identities that
+    // reached terminal, folded out of the scheduler tick's standalone reaper
+    // sweep. The exclusion set is this resync's own observation: an identity
+    // with an *open* meguri PR is the PR side's (finding 4b), so its resources
+    // are never candidates even when the issue is closed.
+    let open_pr_issues: std::collections::HashSet<i64> = observation
+        .prs
+        .iter()
+        .filter(|o| o.pr.state == "open" && o.pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX))
+        .map(|o| super::canonical_key(&o.pr))
+        .collect();
+    if let Err(e) = super::reaper::finalize(deps, &open_pr_issues).await {
+        tracing::warn!("finalize failed for {}: {e:#}", deps.project.id);
     }
 
     // Issue Kind per-resync signal act (ADR 0012 §決定4 / finding 3): body-edit

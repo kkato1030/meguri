@@ -974,7 +974,9 @@ async fn issue_close_clears_the_park_via_reaper_sweep() {
     assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
 
     env.forge.close_issue(ISSUE);
-    reaper::sweep(&env.deps).await.unwrap();
+    reaper::finalize(&env.deps, &Default::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         env.deps
