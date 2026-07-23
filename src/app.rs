@@ -79,7 +79,6 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
         config: cfg.clone(),
         project: project.clone(),
-        open_prs: Default::default(),
     })
 }
 
@@ -980,9 +979,8 @@ pub async fn cmd_watch() -> Result<()> {
 
     let scheduler = Scheduler {
         projects,
-        loops: crate::engine::default_loops(),
         // ADR 0012 §決定8: production dispatches via the recipe table.
-        recipe: Some(crate::engine::default_recipe()),
+        recipe: crate::engine::default_recipe(),
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
         reload: Some(reload),

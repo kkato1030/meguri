@@ -36,9 +36,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
-use super::{Deps, Target};
 use crate::forge::{self, Forge};
 use crate::store::RunRecord;
 
@@ -99,29 +99,6 @@ pub const CHILDREN_FENCE_INFO: &str = "json meguri-children";
 /// slug-qualified parent (`owner/repo#N`) so the key is unique across repos.
 pub fn decompose_child_key(parent_ref: &str, idx: usize) -> String {
     format!("<!-- meguri:decompose-child parent={parent_ref} idx={idx} -->")
-}
-
-/// The planner as a schedulable loop: `meguri:plan` issues in, spec PRs out.
-pub struct PlannerLoop;
-
-#[async_trait]
-impl super::Loop for PlannerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // Discovery moved to the Issue Kind reconciler (ADR 0012 S4 決定1):
-        // `issue_reconciler::reconcile_issues` observes every open issue once
-        // and enqueues the planner arm itself. This stub keeps the transitional
-        // `Loop` registration dispatchable until 決定7 removes the trait.
-        let _ = deps;
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_planner(deps, run_id).await
-    }
 }
 
 pub async fn run_planner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

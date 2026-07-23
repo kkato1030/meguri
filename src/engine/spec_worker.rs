@@ -29,44 +29,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork, claimed_pr};
-use super::{Deps, Target};
 use crate::forge::{self, PullRequest};
 use crate::gitops;
 use crate::store::RunRecord;
 
 /// `runs.loop_kind` value for spec-worker runs.
 pub const KIND: &str = "spec-worker";
-
-/// The spec worker as a schedulable loop: `meguri:spec-ready` PRs in,
-/// implementation commits on the same PR out.
-pub struct SpecWorkerLoop;
-
-#[async_trait]
-impl super::Loop for SpecWorkerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Open spec-ready PRs that are actionable — not held, not claimed, on a
-    /// worker-convention branch (a takeover needs the branch to encode its
-    /// issue), and not already shipped by a succeeded run of this loop
-    /// (avoids a second takeover when the label lingers; humans can force a
-    /// rerun with `meguri run --issue N`).
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // Discovery moved to the Issue Kind reconciler's PR side (ADR 0012 S4
-        // 決定2): the spec-stage arms are branches of `next_step` now. This
-        // stub keeps the transitional `Loop` registration dispatchable until
-        // 決定7 removes the trait.
-        let _ = deps;
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_spec_worker(deps, run_id).await
-    }
-}
 
 pub async fn run_spec_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     flow::run_flow(deps, run_id, &SpecWorkerFlavor).await

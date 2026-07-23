@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, ReviewThread};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -49,30 +49,6 @@ pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
             .comments
             .last()
             .is_some_and(|c| !c.body.starts_with(FIXER_REPLY_MARKER))
-}
-
-/// The fixer as a schedulable loop: reviewed meguri PRs in, fix pushes out.
-pub struct FixerLoop;
-
-#[async_trait]
-impl super::Loop for FixerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Discovery moved to the Issue Kind reconciler (ADR 0012 slice 3): the
-    /// `awaits_fixer_thread` arm of `issue_reconciler::next_step` owns finding
-    /// review-thread work and enqueues this loop's runs. The `Loop`
-    /// registration is kept only so `Scheduler::dispatch` can route a
-    /// reconciler-created run to [`Self::drive`] (the S4 `Loop`-trait removal
-    /// deletes this shim).
-    async fn discover(&self, _deps: &Deps) -> Result<Vec<Target>> {
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_fixer(deps, run_id).await
-    }
 }
 
 pub async fn run_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

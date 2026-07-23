@@ -38,7 +38,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, MEGURI_BRANCH_PREFIX, Target, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, MEGURI_BRANCH_PREFIX, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, MergeableState};
 use crate::gitops;
 use crate::store::RunRecord;
@@ -50,32 +50,6 @@ pub const KIND: &str = "conflict-resolver";
 /// Successful resolves budgeted per PR; beyond this, discovery stays quiet
 /// (see the module docs on convergence).
 pub const MAX_RESOLVE_RUNS: i64 = 3;
-
-/// The conflict resolver as a schedulable loop: CONFLICTING meguri PRs in,
-/// pushed merge commits out.
-pub struct ConflictResolverLoop;
-
-#[async_trait]
-impl super::Loop for ConflictResolverLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Discovery moved to the Issue Kind reconciler (ADR 0012 slice 3): the
-    /// Conflicting arm of `issue_reconciler::next_step` owns conflicting PRs
-    /// (parking them via `Op(Escalate)` once the resolve budget is spent — the
-    /// #176 order is preserved by only escalating while still conflicting) and
-    /// enqueues this loop's runs. The `Loop` registration is kept only so
-    /// `Scheduler::dispatch` can route a reconciler-created run to
-    /// [`Self::drive`] (removed with the `Loop` trait in S4).
-    async fn discover(&self, _deps: &Deps) -> Result<Vec<Target>> {
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_conflict_resolver(deps, run_id).await
-    }
-}
 
 pub async fn run_conflict_resolver(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     flow::run_flow(deps, run_id, &ConflictResolverFlavor).await

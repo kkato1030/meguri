@@ -1,19 +1,18 @@
-//! The watch loop: startup recovery, per-loop discovery, slot-limited
-//! dispatch. Loops discover targets (e.g. labeled GitHub issues); sqlite
-//! only tracks runs, and `runs.loop_kind` routes each run to its loop.
+//! The watch loop: startup recovery, level-triggered reconcile passes, and
+//! slot-limited dispatch (ADR 0012). Enqueue is owned entirely by the
+//! reconcilers (issue / repo / schedule Kind); sqlite tracks runs, and
+//! `runs.loop_kind` routes each queued run to its recipe (決定8).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::{Deps, Loop};
+use super::Deps;
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
-use crate::tasks::TaskKey;
 
 /// The slot budget is spent by *weight*, not run count (issue #111, #214). Two
 /// phases spawn extra concurrent agents:
@@ -58,14 +57,10 @@ pub struct Reload {
 pub struct Scheduler {
     /// One Deps per configured project (mux/store shared via clones).
     pub projects: Vec<Deps>,
-    /// The loops to run; `discover` still walks these. Dispatch no longer
-    /// resolves a `dyn Loop` — see `recipe` (ADR 0012 §決定8).
-    pub loops: Vec<Arc<dyn Loop>>,
-    /// The recipe dispatcher (ADR 0012 §決定8). `Some(_)` routes each run to its
-    /// `run_*` entry by `loop_kind` (production: `default_recipe()`). `None` is
-    /// the transitional test seam that still dispatches via the injected
-    /// `loops`' `drive` — removed once the `Loop` trait is (決定7).
-    pub recipe: Option<super::RecipeFn>,
+    /// The recipe dispatcher (ADR 0012 §決定8): routes each run to its
+    /// `run_*` entry by `loop_kind`. Production is `default_recipe()`; tests
+    /// inject recording recipes.
+    pub recipe: super::RecipeFn,
     pub poll_interval: Duration,
     pub max_concurrent: usize,
     /// Config hot reload (issue #73), polled once per tick before discovery:
@@ -140,14 +135,6 @@ impl Scheduler {
                 tracing::warn!("redispatch failed: {e:#}");
             }
 
-            if active_weight(&active_run_ids) < self.max_concurrent
-                && let Err(e) = self
-                    .discover(&ready, &mut running, &mut active_run_ids)
-                    .await
-            {
-                tracing::warn!("discovery failed: {e:#}");
-            }
-
             // Ride the poll: fire due cron schedules (issue #146). An
             // out-of-band enqueue like the sweeps below — it creates an
             // issue/task that the loops above discover next tick. `now` is
@@ -199,84 +186,6 @@ impl Scheduler {
                 }
             }
         }
-    }
-
-    /// Ask every loop for actionable targets in every project and enqueue
-    /// them, respecting the slot budget. Loops are visited in priority order
-    /// (loop before project, so priority beats project order); within a loop,
-    /// targets go oldest-first (FIFO by issue/PR number).
-    async fn discover(
-        &self,
-        ready: &HashSet<String>,
-        running: &mut JoinSet<String>,
-        active: &mut HashMap<String, usize>,
-    ) -> Result<()> {
-        // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
-        // conflict_resolver) below share one `list_open_prs` call per
-        // project this tick instead of one each (issue #170).
-        for deps in &self.projects {
-            deps.open_prs.clear().await;
-        }
-        for lp in &self.loops {
-            for deps in &self.projects {
-                if active_weight(active) >= self.max_concurrent {
-                    return Ok(());
-                }
-                // Skip a project whose managed clone isn't ready this tick
-                // (`lp.discover` touches `repo_path`); it retries next tick.
-                if !ready.contains(&deps.project.id) {
-                    continue;
-                }
-                let mut targets = lp.discover(deps).await?;
-                // Sort by the coordination key: issue_number is no longer the
-                // only identity (local tasks have none), so the key gives a
-                // stable order across Issue/Local targets.
-                targets.sort_by_key(|t| t.key);
-                for target in targets {
-                    if active_weight(active) >= self.max_concurrent {
-                        return Ok(());
-                    }
-                    // Unique active run per (project, loop, target) — enforced
-                    // by the partial DB indexes; a violation just means
-                    // someone raced us. Run creation branches on the key so
-                    // the target travels from discovery through claim.
-                    let created = match target.key {
-                        TaskKey::Issue(n) => deps.store.create_run_for_loop_cadence(
-                            &deps.project.id,
-                            lp.kind(),
-                            n,
-                            &target.title,
-                            target.cadence_label.as_deref(),
-                        ),
-                        TaskKey::Local(id) => deps.store.create_run_for_task(
-                            &deps.project.id,
-                            lp.kind(),
-                            id,
-                            &target.title,
-                        ),
-                    };
-                    let run = match created {
-                        Ok(run) => run,
-                        Err(_) => continue,
-                    };
-                    deps.store.emit(
-                        Some(&run.id),
-                        "run.discovered",
-                        json!({ "key": format!("{:?}", target.key), "title": target.title,
-                                "loop": lp.kind() }),
-                    )?;
-                    // Admit by weight (issue #111): a collab-advisor run books 2
-                    // slots, so start it only if it fits the budget. A run that
-                    // doesn't fit stays `queued` for a later tick — head-of-line,
-                    // so a heavy run isn't starved by lighter ones behind it.
-                    if !self.admits(active, self.run_weight_for(&run)) {
-                        return Ok(());
-                    }
-                    self.dispatch(&run, running, active);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Redispatch runs left `interrupted` (pane died mid-execute) or
@@ -384,31 +293,15 @@ impl Scheduler {
         let run_id = run.id.clone();
         let loop_kind = run.loop_kind.clone();
 
-        // ADR 0012 §決定8: dispatch is a kind→recipe map. Production holds a
-        // `recipe` (`default_recipe()` → `run_recipe`); `None` is the
-        // transitional test seam that dispatches via the injected `loops`'
-        // `drive`, removed once the `Loop` trait is (決定7).
-        if let Some(recipe) = self.recipe.clone() {
-            active.insert(run_id.clone(), weight);
-            running.spawn(async move {
-                if let Err(e) = recipe(deps, run_id.clone(), loop_kind).await {
-                    tracing::warn!("run {run_id} failed: {e:#}");
-                }
-                run_id
-            });
-        } else {
-            let Some(lp) = self.loops.iter().find(|l| l.kind() == loop_kind).cloned() else {
-                tracing::warn!("run {run_id} references unknown loop {loop_kind}");
-                return;
-            };
-            active.insert(run_id.clone(), weight);
-            running.spawn(async move {
-                if let Err(e) = lp.drive(&deps, &run_id).await {
-                    tracing::warn!("run {run_id} failed: {e:#}");
-                }
-                run_id
-            });
-        }
+        // ADR 0012 §決定8: dispatch is a pure kind→recipe map.
+        let recipe = self.recipe.clone();
+        active.insert(run_id.clone(), weight);
+        running.spawn(async move {
+            if let Err(e) = recipe(deps, run_id.clone(), loop_kind).await {
+                tracing::warn!("run {run_id} failed: {e:#}");
+            }
+            run_id
+        });
     }
 
     /// Startup recovery: every run left `running` by a dead orchestrator is
@@ -453,6 +346,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
     use crate::forge::fake::FakeForge;
@@ -594,8 +489,7 @@ mod tests {
     fn empty_scheduler(max: usize) -> Scheduler {
         Scheduler {
             projects: vec![],
-            loops: vec![],
-            recipe: None,
+            recipe: super::super::default_recipe(),
             poll_interval: Duration::from_secs(1),
             max_concurrent: max,
             reload: None,

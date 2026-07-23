@@ -30,7 +30,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, CheckRollup, CheckState};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -59,30 +59,6 @@ fn without_meguri_statuses(rollup: CheckRollup) -> CheckRollup {
             .into_iter()
             .filter(|c| !c.name.starts_with(MEGURI_STATUS_PREFIX))
             .collect(),
-    }
-}
-
-/// The ci-fixer as a schedulable loop: red meguri PRs in, fix pushes out.
-pub struct CiFixerLoop;
-
-#[async_trait]
-impl super::Loop for CiFixerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Discovery moved to the Issue Kind reconciler (ADR 0012 slice 3): the
-    /// `Blocked && rollup_failure` arm of `issue_reconciler::next_step` owns
-    /// red-CI PRs (and parks them on budget exhaustion) and enqueues this
-    /// loop's runs. The `Loop` registration is kept only so
-    /// `Scheduler::dispatch` can route a reconciler-created run to
-    /// [`Self::drive`] (removed with the `Loop` trait in S4).
-    async fn discover(&self, _deps: &Deps) -> Result<Vec<Target>> {
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_ci_fixer(deps, run_id).await
     }
 }
 

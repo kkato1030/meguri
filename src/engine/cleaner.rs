@@ -20,13 +20,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
-use super::{Deps, Target};
 use crate::config::CleanConfig;
 use crate::forge;
 use crate::gitops;
@@ -252,32 +251,6 @@ pub async fn observe_scan_due(deps: &Deps) -> Result<Option<i64>> {
         return Ok(None);
     }
     Ok(Some(report.map(|i| i.number).unwrap_or(0)))
-}
-
-pub struct CleanerLoop;
-
-#[async_trait]
-impl super::Loop for CleanerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// One target at most: the project's report issue (or `0` when it does
-    /// not exist yet — settle creates it; discovery itself stays read-only).
-    /// Not `issue_has_succeeded_run`-guarded for the same reason as the
-    /// reviewer: the head marker is the dedup, succeeded sweeps must not
-    /// block future ones.
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // Discovery moved to the Repo Kind reconciler (ADR 0012 S4 決定3):
-        // `repo_reconciler::reconcile_repo` calls `observe_scan_due` and
-        // enqueues the arm itself. Stub until 決定7 removes the trait.
-        let _ = deps;
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_cleaner(deps, run_id).await
-    }
 }
 
 pub async fn run_cleaner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

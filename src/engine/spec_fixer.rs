@@ -38,9 +38,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{
-    Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable, pr_reviewer,
-};
+use super::{Deps, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable, pr_reviewer};
 use crate::forge::{self, CommitStatusState, PullRequest};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -64,39 +62,6 @@ fn is_findings_target(pr: &PullRequest, combined: bool) -> Option<String> {
         return Some(format!("PR #{} is not spec-reviewing", pr.number));
     }
     pr_is_touchable(pr, combined)
-}
-
-/// The spec-fixer as a schedulable loop: spec PRs whose plan review flagged
-/// findings in, revised specs pushed out.
-pub struct SpecFixerLoop;
-
-#[async_trait]
-impl super::Loop for SpecFixerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Open spec-reviewing PRs whose *current head* has a failing
-    /// `meguri/pr-review` status. Absent/`Pending` statuses wait (the head is
-    /// freshly pushed or the pr-reviewer is still running), escalated PRs wait
-    /// for a human, and a PR whose fix budget is spent while the review is
-    /// still red
-    /// escalates right here — its rounds all *succeeded* (revisions pushed), so
-    /// the flow's failure escalation never fired, yet a human must look. The
-    /// needs-human guard runs before the status poll, so the escalation fires
-    /// once and later sweeps skip the PR cheaply.
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // Discovery moved to the Issue Kind reconciler's PR side (ADR 0012 S4
-        // 決定2): the spec-stage arms are branches of `next_step` now. This
-        // stub keeps the transitional `Loop` registration dispatchable until
-        // 決定7 removes the trait.
-        let _ = deps;
-        Ok(Vec::new())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_spec_fixer(deps, run_id).await
-    }
 }
 
 pub async fn run_spec_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
