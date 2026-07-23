@@ -623,6 +623,19 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
         tracing::warn!("body-edit reconcile failed for {}: {e:#}", deps.project.id);
     }
+    // Separate-delivery plan→impl handoff (ADR 0012 §決定5): a merged spec PR
+    // advances its `speccing` issue to `ready`. Folded out of the tick's
+    // standalone sweep into the Issue Kind pass (the full `Op(Handoff)` branch of
+    // `next_step_issue` folds in with the issue-side observe).
+    if let Err(e) = super::plan_handoff::sweep(deps).await {
+        tracing::warn!("handoff reconcile failed for {}: {e:#}", deps.project.id);
+    }
+    // Approved decomposition proposals → child issues + dependencies (ADR 0012
+    // §決定4, decompose_materializer → PR-side act). Forge-only, like the merge
+    // tail; folded out of the tick's standalone sweep.
+    if let Err(e) = super::decompose_materializer::sweep(deps).await {
+        tracing::warn!("decompose reconcile failed for {}: {e:#}", deps.project.id);
+    }
     Ok(())
 }
 

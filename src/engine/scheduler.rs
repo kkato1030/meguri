@@ -176,22 +176,13 @@ impl Scheduler {
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
+                // The Issue Kind reconcile pass (ADR 0012): the merge tail plus
+                // the folded per-resync acts — body-edit re-attention (決定4),
+                // separate-delivery handoff (決定5), and decompose materialize
+                // (決定4) — all run inside `issue_reconciler::sweep` now, out of
+                // the tick's standalone sweep block.
                 if let Err(e) = super::issue_reconciler::sweep(deps).await {
-                    tracing::warn!("merge-tail sweep failed for {}: {e:#}", deps.project.id);
-                }
-                // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
-                // flips its issue speccing → ready so the worker implements it.
-                if let Err(e) = super::plan_handoff::sweep(deps).await {
-                    tracing::warn!("handoff sweep failed for {}: {e:#}", deps.project.id);
-                }
-                // Materialize approved decomposition proposals into child issues
-                // + dependencies (issue #134). Forge-only, like handoff — the
-                // adjacent spec-flow sweep that consumes spec-ready proposal PRs.
-                if let Err(e) = super::decompose_materializer::sweep(deps).await {
-                    tracing::warn!(
-                        "decompose materialize sweep failed for {}: {e:#}",
-                        deps.project.id
-                    );
+                    tracing::warn!("issue reconcile failed for {}: {e:#}", deps.project.id);
                 }
                 // Repo Kind per-resync pass (ADR 0012 §決定3): the routing-drift
                 // recompute Op, folded out of the tick's standalone sweep. The
