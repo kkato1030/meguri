@@ -15,6 +15,7 @@ pub mod gitops;
 pub mod launch;
 pub mod mux;
 pub mod notify;
+pub mod preflight;
 pub mod refine;
 pub mod routing;
 pub mod store;

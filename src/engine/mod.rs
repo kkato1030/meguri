@@ -60,6 +60,12 @@ pub struct Deps {
     pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
+    /// Whether launch-time pre-flight priming is active (issue #235). Production
+    /// (`app::build_deps`) sets it `true`; the test constructor
+    /// [`Deps::with_label_source`] leaves it `false`, so integration tests —
+    /// which pair a `FakeMux` (never executes the agent command) with the
+    /// default `claude` command — never fire a *real* `claude` prime subprocess.
+    pub preflight_enabled: bool,
 }
 
 impl Deps {
@@ -93,6 +99,8 @@ impl Deps {
             forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
+            // Test seam: never run a real prime subprocess in tests.
+            preflight_enabled: false,
         }
     }
 

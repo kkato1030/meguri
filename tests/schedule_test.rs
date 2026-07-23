@@ -104,6 +104,7 @@ fn local_deps(schedules: Vec<ScheduleConfig>) -> (Deps, tempfile::TempDir) {
         forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config: Config::default(),
         project,
+        preflight_enabled: false,
     };
     (deps, dir)
 }

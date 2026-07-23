@@ -777,7 +777,18 @@ async fn spawn_advisor_pane(
     let mut command = vec![profile.command.clone()];
     command.extend(profile.args.iter().cloned());
     command.push(seed);
-    let mut env = Vec::new();
+
+    // The advisor pane also launches an interactive CLI in a fresh directory,
+    // so it hits the same first-run folder-trust gate (issue #235 f9). Prime it
+    // with the same machinery, in the advisor cwd, and pin the config-dir so
+    // prime and pane agree (f1).
+    let config_dir = crate::config::effective_config_dir();
+    preflight_and_emit(deps, run, profile, profile_name, advisor_dir, &config_dir).await;
+
+    let mut env = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.to_string_lossy().into_owned(),
+    )];
     if let Some(hint) = &profile.herdr_agent_hint {
         env.push(("HERDR_AGENT".to_string(), hint.clone()));
     }
@@ -1466,6 +1477,49 @@ async fn ensure_pane(
     })
 }
 
+/// Run the launch-time pre-flight prime for a pane and emit its outcome as an
+/// event (issue #235). Best-effort: a failure or skip is recorded but never
+/// fatal — the pane launches regardless (spec D5). `cwd` is the directory whose
+/// folder trust the prime establishes (a worktree, or an advisor dir).
+async fn preflight_and_emit(
+    deps: &Deps,
+    run: &RunRecord,
+    profile: &crate::config::AgentProfile,
+    profile_name: &str,
+    cwd: &Path,
+    config_dir: &Path,
+) {
+    use crate::preflight::PreflightOutcome;
+    // Disabled in the test harness so a FakeMux run never fires a real prime
+    // subprocess against the default `claude` command (issue #235).
+    if !deps.preflight_enabled {
+        return;
+    }
+    let outcome = crate::preflight::ensure_preflight(profile, cwd, config_dir).await;
+    let (kind, data) = match &outcome {
+        PreflightOutcome::Ran { duration_ms } => (
+            "preflight.ran",
+            json!({ "profile": profile_name, "command": profile.command,
+                    "cwd": cwd.to_string_lossy(), "duration_ms": duration_ms }),
+        ),
+        PreflightOutcome::Failed {
+            reason,
+            duration_ms,
+        } => (
+            "preflight.failed",
+            json!({ "profile": profile_name, "command": profile.command,
+                    "reason": reason, "duration_ms": duration_ms }),
+        ),
+        PreflightOutcome::Skipped { reason } => (
+            "preflight.skipped",
+            json!({ "profile": profile_name, "command": profile.command, "reason": reason }),
+        ),
+        // Already primed once for this (identity, path): nothing to report.
+        PreflightOutcome::AlreadyDone => return,
+    };
+    let _ = deps.store.emit(Some(&run.id), kind, data);
+}
+
 /// The lane's saved session id, after the resume-health gate (issue #245):
 /// resume must mean "the conversation is still alive", not just "an id is on
 /// record". A transcript past the profile's size limit is the signature of a
@@ -1564,7 +1618,22 @@ async fn spawn_agent_pane(
     }
     command.push(initial_trigger.to_string());
 
-    let mut env = Vec::new();
+    // Resolve the config-dir once, absolute, and hand the exact same value to
+    // both the pre-flight prime and the pane (issue #235 f1): tmux/herdr spawn
+    // the pane through a long-lived server whose environment can differ from
+    // this daemon's, so an unset/relative `CLAUDE_CONFIG_DIR` would let the
+    // prime write folder trust somewhere the pane never reads.
+    let config_dir = crate::config::effective_config_dir();
+
+    // Pre-flight: prime the fresh worktree's folder trust before the
+    // interactive pane hits the first-run trust prompt (issue #235). Runs at
+    // most once per (identity, path); a failure or skip never kills the pane.
+    preflight_and_emit(deps, run, profile, profile_name, worktree, &config_dir).await;
+
+    let mut env = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        config_dir.to_string_lossy().into_owned(),
+    )];
     if let Some(hint) = &profile.herdr_agent_hint {
         env.push(("HERDR_AGENT".to_string(), hint.clone()));
     }
@@ -3824,6 +3893,7 @@ mod tests {
             forge_factory: std::sync::Arc::new(crate::forge::gh::GhForgeFactory),
             config: crate::config::Config::default(),
             project,
+            preflight_enabled: false,
         };
 
         // Must not panic.

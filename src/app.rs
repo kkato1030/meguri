@@ -79,6 +79,7 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
         config: cfg.clone(),
         project: project.clone(),
+        preflight_enabled: true,
     })
 }
 
@@ -837,6 +838,7 @@ pub async fn cmd_run(
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     crate::launch::validate(&cfg)?;
+    crate::routing::warn_unsafe_preflight_overrides(&cfg);
     crate::collab::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
     if project.mode == ProjectMode::Local
@@ -1174,6 +1176,7 @@ pub async fn cmd_watch() -> Result<()> {
     let cfg = reloader.current().clone();
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     crate::launch::validate(&cfg)?;
+    crate::routing::warn_unsafe_preflight_overrides(&cfg);
     crate::collab::validate(&cfg, &crate::routing::detect_command)?;
     if cfg.projects.is_empty() {
         bail!(
