@@ -83,6 +83,10 @@ impl Scheduler {
         // Per-project memory for edge-triggered schedule diagnostics (issue
         // #222 f6): lives across ticks so a persisting condition emits once.
         let mut schedule_diag: super::schedule::DiagMemory = HashMap::new();
+        // Consecutive-failure streaks for the sweeps below (issue #251): a
+        // streak past the configured threshold escalates once to
+        // `sweep.degraded` + a notification instead of staying a silent WARN.
+        let mut sweep_health = super::sweep_health::SweepHealth::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -151,30 +155,48 @@ impl Scheduler {
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
-                if let Err(e) = super::schedule::sweep(deps, now, &mut schedule_diag).await {
-                    tracing::warn!("schedule sweep failed for {}: {e:#}", deps.project.id);
-                }
+                // Every sweep below routes its outcome through `sweep_health`
+                // (issue #251, design doc P6.5) instead of a bare
+                // `tracing::warn!`: each failure is still logged and now also
+                // an event, and a streak that survives past the configured
+                // threshold escalates once to `sweep.degraded` + a
+                // notification — the silent-failure gap #227's GraphQL bug
+                // fell through (a sweep failing every poll for hours with no
+                // trace beyond the log).
+                sweep_health
+                    .record(
+                        deps,
+                        "schedule",
+                        super::schedule::sweep(deps, now, &mut schedule_diag).await,
+                    )
+                    .await;
                 // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
                 // informer-cache observe drives arm (ADR 0003) / orchestrator
                 // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
-                // The Issue Kind reconcile pass (ADR 0012): the merge tail plus
-                // the folded per-resync acts — body-edit re-attention (決定4),
-                // separate-delivery handoff (決定5), and decompose materialize
-                // (決定4) — all run inside `issue_reconciler::sweep` now, out of
-                // the tick's standalone sweep block.
-                if let Err(e) = super::issue_reconciler::sweep(deps).await {
-                    tracing::warn!("issue reconcile failed for {}: {e:#}", deps.project.id);
-                }
-                // Repo Kind per-resync pass (ADR 0012 §決定3): the routing-drift
-                // recompute Op, folded out of the tick's standalone sweep. The
-                // body-edit reconcile is now an Issue Kind per-resync act inside
-                // `issue_reconciler::sweep` above (ADR 0012 §決定4).
-                if let Err(e) = super::repo_reconciler::reconcile_repo(deps).await {
-                    tracing::warn!("repo reconcile failed for {}: {e:#}", deps.project.id);
-                }
+                // The Issue Kind reconcile pass (ADR 0012 S4): the merge tail
+                // plus every folded act/arm — body-edit re-attention,
+                // separate-delivery handoff, decompose materialize,
+                // Op(Finalize), and the issue-/local-side deciders' enqueue —
+                // one level-triggered pass per project.
+                sweep_health
+                    .record(
+                        deps,
+                        "issue-reconcile",
+                        super::issue_reconciler::sweep(deps).await,
+                    )
+                    .await;
+                // Repo Kind per-resync pass (ADR 0012 §決定3): routing-drift
+                // recompute + the cleaner/triage scan arms.
+                sweep_health
+                    .record(
+                        deps,
+                        "repo-reconcile",
+                        super::repo_reconciler::reconcile_repo(deps).await,
+                    )
+                    .await;
             }
 
             tokio::select! {

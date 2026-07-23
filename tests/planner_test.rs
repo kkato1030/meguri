@@ -879,6 +879,63 @@ async fn planner_needs_human_escalates_on_forge() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn planner_skips_spec_pr_when_rail_external_pr_already_linked_to_issue() {
+    // issue #249: the same double-delivery guard as the worker's, exercised
+    // on the planner's spec-PR path (design doc §P5 covers both explicitly).
+    let env = setup(Some("test -f docs/specs/issue-5.md")).await;
+    env.forge.add_pr(
+        42,
+        "Hand-written spec",
+        "",
+        &[],
+        "adr/0026-review-efficacy",
+        "c0ffee",
+    );
+    env.forge.link_pr_to_issue(5, 42);
+    let run = create_planner_run(&env);
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_spec(&wt).await;
+            write_result_with_subject(
+                &wt,
+                &turn_id,
+                "success",
+                Some("Write a spec for the caching layer"),
+            );
+        });
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_planner(&env.deps, &run.id))
+        .await
+        .expect("planner timed out");
+    agent.abort();
+
+    assert!(
+        result.is_err(),
+        "a rail-external linked PR must escalate, not succeed"
+    );
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let prs = env.forge.prs();
+    assert_eq!(
+        prs.len(),
+        1,
+        "planner must not open a duplicate spec PR: {prs:?}"
+    );
+    assert_eq!(prs[0].number, 42);
+
+    let labels = env.forge.labels_of(5);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn planner_skips_quietly_when_plan_label_removed_after_discovery() {
     let env = setup(None).await;
     let run = create_planner_run(&env);

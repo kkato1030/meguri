@@ -317,6 +317,66 @@ async fn worker_happy_path_issue_to_pr() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn worker_skips_pr_when_rail_external_pr_already_linked_to_issue() {
+    // issue #249: a human already opened a hand-written PR for this issue on
+    // a non-meguri branch (the #236/#237/#238 double-delivery scenario). The
+    // worker must not open a second PR — it escalates instead.
+    let env = setup(Some("test -f greeting.txt")).await;
+    env.forge.add_pr(
+        99,
+        "Hand-written fix",
+        "",
+        &[],
+        "adr/0026-review-efficacy",
+        "deadbeef",
+    );
+    env.forge.link_pr_to_issue(7, 99);
+
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+
+    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
+        let wt = wt.to_path_buf();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            commit_greeting(&wt).await;
+            write_result(&wt, &turn_id, "success");
+        });
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+    agent.abort();
+
+    assert!(
+        result.is_err(),
+        "a rail-external linked PR must escalate, not succeed"
+    );
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    // No second PR was opened — only the pre-existing hand-written one.
+    let prs = env.forge.prs();
+    assert_eq!(prs.len(), 1, "worker must not open a duplicate PR: {prs:?}");
+    assert_eq!(prs[0].number, 99);
+
+    let labels = env.forge.labels_of(7);
+    assert!(
+        labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+
+    let comments = env.forge.comments_of(7);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains('#'), "{}", comments[0]);
+    assert!(comments[0].contains("99"), "{}", comments[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn worker_uses_agent_pr_body_in_pr() {
     let env = setup(None).await;
     let run = env
@@ -594,6 +654,53 @@ async fn worker_needs_human_escalates_on_forge() {
     let comments = env.forge.comments_of(7);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
+}
+
+/// A stopped mux (herdr/tmux down) must fail the run but never occupy the
+/// needs-human queue — it says nothing about the issue and clears itself
+/// once the dependency is back (design doc §3-E / P6, issue #250).
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_mux_down_does_not_escalate_to_needs_human() {
+    let env = setup(None).await;
+    let run = env
+        .deps
+        .store
+        .create_run("proj", 7, "Add greeting file")
+        .unwrap();
+    env.mux.stop();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), run_worker(&env.deps, &run.id))
+        .await
+        .expect("worker timed out");
+
+    assert!(result.is_err(), "a stopped mux must fail the run");
+    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Failed);
+
+    let labels = env.forge.labels_of(7);
+    assert!(
+        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
+        "labels: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&LABEL_WORKING.to_string()),
+        "the claim must be released so the next sweep retries"
+    );
+    assert!(labels.contains(&LABEL_READY.to_string()));
+    assert!(
+        env.forge.comments_of(7).is_empty(),
+        "an infra fault must not leave a needs-human comment"
+    );
+
+    let events = env.deps.store.events_for_run(&run.id, 20).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "infra.raised"),
+        "events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "escalation.raised"),
+        "events: {events:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

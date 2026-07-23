@@ -41,6 +41,12 @@ pub struct PaneRecord {
     pub mux_pane_id: Option<String>,
     pub worktree_path: Option<String>,
     pub agent_session_id: Option<String>,
+    /// Consecutive agent_quiet strikes on this lane's session (issue #245):
+    /// bumped when a turn ends in `AgentQuiet`, reset to 0 by every completed
+    /// turn. 2 strikes rotate the session (fresh spawn), 3 escalate to a
+    /// human. Deliberately NOT reset when the strike-2 rotation clears the
+    /// session — resetting there would make strike 3 unreachable.
+    pub quiet_strikes: i64,
     pub created_at: String,
     pub updated_at: String,
     pub reclaimed_at: Option<String>,
@@ -56,6 +62,7 @@ fn pane_from_row(row: &Row<'_>) -> rusqlite::Result<PaneRecord> {
         mux_pane_id: row.get("mux_pane_id")?,
         worktree_path: row.get("worktree_path")?,
         agent_session_id: row.get("agent_session_id")?,
+        quiet_strikes: row.get("quiet_strikes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         reclaimed_at: row.get("reclaimed_at")?,
@@ -216,6 +223,50 @@ impl Store {
             c.execute(
                 "UPDATE panes SET mux_pane_id = NULL, reclaimed_at = ?4, updated_at = ?4
                  WHERE project_id = ?1 AND issue_number = ?2 AND lane = ?3",
+                params![project_id, issue_number, lane, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Bump the lane's consecutive agent_quiet strike counter and return the
+    /// new count (issue #245). Upserts so a lane that somehow lost its row
+    /// still counts from 1 instead of silently no-oping.
+    pub fn bump_pane_quiet_strikes(
+        &self,
+        project_id: &str,
+        issue_number: i64,
+        lane: &str,
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            let strikes = c.query_row(
+                "INSERT INTO panes (project_id, issue_number, lane, quiet_strikes,
+                                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?4)
+                 ON CONFLICT (project_id, issue_number, lane) DO UPDATE SET
+                   quiet_strikes = quiet_strikes + 1, updated_at = ?4
+                 RETURNING quiet_strikes",
+                params![project_id, issue_number, lane, now()],
+                |row| row.get(0),
+            )?;
+            Ok(strikes)
+        })
+    }
+
+    /// Reset the lane's agent_quiet strike counter — called on every
+    /// completed turn (the session proved it can still converse). No-op for
+    /// a lane with no row.
+    pub fn reset_pane_quiet_strikes(
+        &self,
+        project_id: &str,
+        issue_number: i64,
+        lane: &str,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE panes SET quiet_strikes = 0, updated_at = ?4
+                 WHERE project_id = ?1 AND issue_number = ?2 AND lane = ?3
+                   AND quiet_strikes != 0",
                 params![project_id, issue_number, lane, now()],
             )?;
             Ok(())
@@ -384,6 +435,62 @@ mod tests {
         assert_eq!(store.list_panes("a").unwrap().len(), 2);
         assert_eq!(store.panes_for_issue(1).unwrap().len(), 3);
         assert!(store.panes_for_issue(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quiet_strikes_bump_reset_and_upsert() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Upsert path: bumping a lane with no row starts the count at 1.
+        assert_eq!(
+            store
+                .bump_pane_quiet_strikes("demo", 7, LANE_AUTHOR)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .bump_pane_quiet_strikes("demo", 7, LANE_AUTHOR)
+                .unwrap(),
+            2
+        );
+        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
+        assert_eq!(pane.quiet_strikes, 2);
+
+        // A completed turn resets the count; the next quiet starts over at 1.
+        store
+            .reset_pane_quiet_strikes("demo", 7, LANE_AUTHOR)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_pane("demo", 7, LANE_AUTHOR)
+                .unwrap()
+                .unwrap()
+                .quiet_strikes,
+            0
+        );
+        assert_eq!(
+            store
+                .bump_pane_quiet_strikes("demo", 7, LANE_AUTHOR)
+                .unwrap(),
+            1
+        );
+
+        // Lanes count independently.
+        assert_eq!(
+            store
+                .bump_pane_quiet_strikes("demo", 7, LANE_PR_REVIEW)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_pane("demo", 7, LANE_AUTHOR)
+                .unwrap()
+                .unwrap()
+                .quiet_strikes,
+            1
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ Headless loops fail opaquely: the agent hits a permission prompt, stalls, or goe
 
 - **Blocked ≠ failed.** When the agent shows a permission/question dialog, meguri flags the run `awaiting_human` and tells you how to attach — timers stop, nothing is killed.
 - **Human input is never an error.** You can attach and type mid-run; the orchestrator only acts on durable signals (the result file, git state, labels), so it tolerates and absorbs your interventions.
-- **Silence is nudged, not punished.** A quiet agent gets a capped number of reminder lines, then a human is paged. meguri never auto-fails a run for being slow.
+- **Silence is nudged, not punished.** A quiet agent gets a capped number of reminder lines. If it stays quiet, meguri assumes the *session* (not the work) is broken and heals itself: one more try on the same session, then a fresh session, and only when even that stays quiet is a human paged — with a sanitized pane tail attached for diagnosis. Resumes are gated the same way: a session whose transcript outgrew its context window is never resumed into a 400-loop, and a pane whose agent exited to a bare shell is never typed into (ADR 0029). meguri never auto-fails a run for being slow.
 - **Takeover/handback.** `meguri takeover <run>` parks the orchestrator; you drive the same session; `meguri handback <run>` resumes the loop with your work in context.
 
 ## The completion contract
@@ -398,6 +398,7 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+sweep_degraded_threshold = 10  # consecutive sweep failures before sweep.degraded fires (issue #251)
 
 [daemon]
 restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
@@ -407,7 +408,7 @@ throttle_secs = 10             # launchd ThrottleInterval (secs between restarts
 macos = true           # page awaiting_human via a macOS notification (osascript)
 # webhook_url = "https://hooks.slack.com/services/..."  # push events to a webhook; ${ENV} expanded. Omit to disable
 # kind = "slack"       # slack | ntfy | json. Omit to auto-detect from the URL host
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped"]  # allowlist; default ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # allowlist; default ["awaiting_human"]
 throttle_secs = 60     # min seconds between notifications for the same key
 # [[projects]]
 #   notify = { labels = ["human:todo"] }  # also notify when meguri files an issue carrying one of these labels

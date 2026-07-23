@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Deps, StoreControl, WorkerOutcome, lane_for_loop};
+use super::{Deps, MEGURI_BRANCH_PREFIX, StoreControl, WorkerOutcome, lane_for_loop};
 use crate::agent_session;
 use crate::config::{Deliver, LaunchMode};
 use crate::forge;
@@ -432,7 +432,16 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                 .update_run_status(run_id, RunStatus::Failed, Some(&msg))?;
             deps.store
                 .emit(Some(run_id), "run.failed", json!({ "error": msg }))?;
-            flavor.escalate(deps, &run, &msg).await;
+            // A forge/mux command fault (stopped mux, dropped connection) says
+            // nothing about the issue — release the claim so the next sweep
+            // just retries, instead of parking it on needs-human (issue #250).
+            match super::escalation::infra_reason(&e) {
+                Some(reason) => {
+                    flavor.release_claim(deps, &run).await;
+                    super::escalation::escalate_infra(deps, &run, reason, &msg).await;
+                }
+                None => flavor.escalate(deps, &run, &msg).await,
+            }
             Err(e)
         }
     }
@@ -980,6 +989,49 @@ pub(crate) fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
         .and_then(|cp| cp.pr_number)
 }
 
+/// Loop kinds whose `Flavor` claims a PR by adding `meguri:working` to it
+/// (mirrors the `Flavor::release_claim` overrides in each of these modules).
+/// `worker`/`planner` also stamp `Checkpoint::pr_number` once their PR opens,
+/// but that PR is claimed through the *issue's* label, never the PR's — so
+/// they must NOT be treated as PR claimers here (issue #252 review finding
+/// f1): an interrupted worker run stopped after some other loop later
+/// claimed its PR would otherwise strip that unrelated run's live claim.
+fn claims_pr_by_label(loop_kind: &str) -> bool {
+    loop_kind == super::fixer::KIND
+        || loop_kind == super::ci_fixer::KIND
+        || loop_kind == super::conflict_resolver::KIND
+        || loop_kind == super::spec_fixer::KIND
+        || loop_kind == super::spec_worker::KIND
+        || loop_kind == super::pr_reviewer::KIND
+}
+
+/// `meguri stop` on a run with no live driver (queued/interrupted — issue
+/// #252): `cmd_stop` finalizes right there in the CLI process, without ever
+/// reaching the loop's `Flavor`, so it cannot call `Flavor::release_claim`
+/// the way [`finalize_cancelled`] (a live driver noticing `desired_state`)
+/// does. A PR-claiming loop's [`Checkpoint::pr_number`] is loop-agnostic
+/// (every `Flavor` that claims a PR stores it there), so this reads straight
+/// from the checkpoint and drops `meguri:working` from that PR itself —
+/// gated to loops that actually claim by PR label ([`claims_pr_by_label`]).
+/// Best-effort and a no-op when the run never claimed a PR, isn't a
+/// PR-claiming loop, or this project has no forge (local mode — review
+/// finding f2: `Deps::forge` panics on `None`, and a local-mode project can
+/// still have a leftover github-mode checkpoint after a mode switch).
+/// Issue-claim loops release through the task source instead; a failed
+/// removal is still swept up by #223's run-liveness check on the next
+/// discovery.
+pub(crate) async fn release_stray_pr_claim(deps: &Deps, run: &RunRecord) {
+    if !claims_pr_by_label(&run.loop_kind) {
+        return;
+    }
+    let Some(forge) = deps.forge.as_ref() else {
+        return;
+    };
+    if let Some(pr) = claimed_pr(deps, &run.id) {
+        let _ = forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
+    }
+}
+
 /// `meguri stop`: cancel the run, release the claim, release the pane (its
 /// session id is saved first, so the context stays resumable).
 async fn finalize_cancelled(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<()> {
@@ -1321,7 +1373,20 @@ async fn ensure_pane(
         if record.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
+            // Adopt gate (issue #245): "pane alive" is not "agent alive". A
+            // pane whose agent exited to a bare shell would swallow the
+            // trigger line as a shell command, so a definite absent retires
+            // the pane (kill + reclaim) and falls through to resume/fresh.
+            // None (mux can't tell) adopts as before — fail open.
+            if matches!(deps.mux.agent_present(&pane).await, Ok(Some(false))) {
+                deps.store.emit(
+                    Some(&run.id),
+                    "pane.agent_absent",
+                    json!({ "pane": pane.0, "lane": lane_name }),
+                )?;
+                super::reaper::release_pane(deps, run.issue_number, lane_name, "agent absent")
+                    .await;
+            } else if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
                 // Adopt the lane's live pane for this run.
                 deps.store.update_run_mux(
                     &run.id,
@@ -1334,12 +1399,14 @@ async fn ensure_pane(
                     freshly_spawned: false,
                     resumed: false,
                 });
+            } else {
+                // The lane moved to another worktree (e.g. a fresh branch):
+                // the old pane can't see it. Retire it — session id saved —
+                // and respawn below (the saved id makes the respawn a resume,
+                // so the context follows the lane into the new worktree).
+                super::reaper::release_pane(deps, run.issue_number, lane_name, "worktree moved")
+                    .await;
             }
-            // The lane moved to another worktree (e.g. a fresh branch): the
-            // old pane can't see it. Retire it — session id saved — and
-            // respawn below (the saved id makes the respawn a resume, so the
-            // context follows the lane into the new worktree).
-            super::reaper::release_pane(deps, run.issue_number, lane_name, "worktree moved").await;
         }
     }
 
@@ -1347,11 +1414,10 @@ async fn ensure_pane(
 
     // The lane's resumable context lives on the pane row (issue lifetime),
     // not the ephemeral run: written after every completed turn and before
-    // every reclamation.
-    let session_id = deps
-        .store
-        .get_pane(&deps.project.id, run.issue_number, lane_name)?
-        .and_then(|p| p.agent_session_id);
+    // every reclamation. Resuming it is conditional on the session still
+    // being conversable (issue #245) — the transcript-size gate clears a
+    // session that would only produce context-window 400s.
+    let session_id = gated_resume_session(deps, run, worktree, lane).await?;
     if let Some(session_id) = session_id {
         let resumed = match spawn_agent_pane(
             deps,
@@ -1398,6 +1464,81 @@ async fn ensure_pane(
         freshly_spawned: true,
         resumed: false,
     })
+}
+
+/// The lane's saved session id, after the resume-health gate (issue #245):
+/// resume must mean "the conversation is still alive", not just "an id is on
+/// record". A transcript past the profile's size limit is the signature of a
+/// session at its context limit — resuming it yields nothing but API 400s —
+/// so the gate retires the pane, clears the id, and lets the caller fall back
+/// to a fresh spawn with full re-injection (prompts are self-contained).
+///
+/// The gate is the single size authority and resolves the transcript root
+/// from the lane's pinned profile (spec f4) — id *acquisition* elsewhere
+/// (reaper rescans with the default root) stays best-effort precisely because
+/// any stale/mis-rooted id saved there is re-measured here before a resume.
+/// An unlocatable transcript fails open (`pane.resume_gate_skipped`): the
+/// quiet-strike ladder is the backstop for dead sessions it lets through.
+async fn gated_resume_session(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    lane: &Lane,
+) -> Result<Option<String>> {
+    let lane_name = lane.lane.as_str();
+    let Some(record) = deps
+        .store
+        .get_pane(&deps.project.id, run.issue_number, lane_name)?
+    else {
+        return Ok(None);
+    };
+    let Some(session_id) = record.agent_session_id else {
+        return Ok(None);
+    };
+    let limit = lane.profile.resume_transcript_limit_bytes;
+    if limit == 0 {
+        return Ok(Some(session_id));
+    }
+    // The transcript lives under the cwd the session actually ran in: the
+    // pane row's worktree when recorded (the lane may have moved since),
+    // else the current worktree.
+    let session_worktree = record
+        .worktree_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| worktree.to_path_buf());
+    let root = agent_session::session_root(&lane.profile);
+    match agent_session::transcript_len(&root, &session_worktree, &session_id) {
+        None => {
+            deps.store.emit(
+                Some(&run.id),
+                "pane.resume_gate_skipped",
+                json!({ "reason": "transcript_not_found",
+                        "lane": lane_name, "agent_session_id": session_id }),
+            )?;
+            Ok(Some(session_id))
+        }
+        Some(bytes) if bytes > limit => {
+            // Kill + reclaim BEFORE clearing the id: `release_pane` re-saves
+            // the freshest transcript id as its reversibility net, so the
+            // clear must come after to win. A pane-less lane makes the
+            // release a no-op and the clear still lands.
+            super::reaper::release_pane(deps, run.issue_number, lane_name, "transcript oversize")
+                .await;
+            deps.store
+                .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
+            deps.store.update_run_agent_session(&run.id, None)?;
+            deps.store.emit(
+                Some(&run.id),
+                "agent_session.cleared",
+                json!({ "reason": "transcript_oversize", "lane": lane_name,
+                        "bytes": bytes, "limit": limit,
+                        "agent_session_id": session_id }),
+            )?;
+            Ok(None)
+        }
+        Some(_) => Ok(Some(session_id)),
+    }
 }
 
 /// Spawn the agent pane (optionally resuming a native session) and persist
@@ -1926,16 +2067,7 @@ async fn run_turn_in(
         }
     };
 
-    record_agent_session(
-        deps,
-        run,
-        worktree,
-        lane.lane.as_str(),
-        pane.as_ref(),
-        resumed,
-        &outcome,
-    )
-    .await?;
+    record_agent_session(deps, run, worktree, lane, pane.as_ref(), resumed, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -1946,10 +2078,94 @@ async fn run_turn_in(
         ),
         TurnOutcome::Stopped => ("stopped".to_string(), None),
         TurnOutcome::PaneDied => ("pane_died".to_string(), None),
+        TurnOutcome::AgentQuiet { .. } => ("agent_quiet".to_string(), None),
     };
     deps.store
         .finish_turn(&prepared.turn_id, &outcome_str, result_json.as_deref())?;
+
+    // Normalize AgentQuiet here, at the single flow choke point (issue #245):
+    // callers keep seeing only Completed/Stopped/PaneDied. The strike ladder
+    // decides between "retry" (PaneDied → the usual Interrupted redispatch)
+    // and "hand to a human" (Err(NeedsHuman) → the flavor's escalate path).
+    if let TurnOutcome::AgentQuiet { tail } = outcome {
+        let outcome = handle_agent_quiet(deps, run, lane, &prepared.turn_id, tail).await?;
+        return Ok((outcome, prepared.turn_id));
+    }
     Ok((outcome, prepared.turn_id))
+}
+
+/// Strikes of consecutive agent_quiet before the session is rotated: the
+/// first quiet gets one more resume (a one-off hiccup deserves grace), the
+/// second proves the session dead.
+const QUIET_STRIKE_CLEAR: i64 = 2;
+/// Strikes before a human takes over: quiet even after a fresh session means
+/// the environment (profile, CLI, credentials), not the session, is broken —
+/// more rotations would loop forever.
+const QUIET_STRIKE_HUMAN: i64 = 3;
+
+/// The quiet-strike ladder (issue #245): count consecutive quiet turns per
+/// lane, rotate the session at [`QUIET_STRIKE_CLEAR`], escalate at
+/// [`QUIET_STRIKE_HUMAN`]. Owns all session/pane state for the quiet path —
+/// `record_agent_session` never sees an `AgentQuiet` (it no-ops on it), so
+/// the two can't double-clear. The counter is reset only by a completed turn;
+/// deliberately NOT by the rotation itself, which would reset the ladder and
+/// make the human rung unreachable.
+async fn handle_agent_quiet(
+    deps: &Deps,
+    run: &RunRecord,
+    lane: &Lane,
+    turn_id: &str,
+    tail: Vec<String>,
+) -> Result<TurnOutcome> {
+    let lane_name = lane.lane.as_str();
+    let strikes =
+        deps.store
+            .bump_pane_quiet_strikes(&deps.project.id, run.issue_number, lane_name)?;
+    // Raw tail stays inside the local trust boundary (the events table);
+    // anything leaving for the forge below goes through sanitize_pane_tail.
+    deps.store.emit(
+        Some(&run.id),
+        "turn.agent_quiet",
+        json!({ "turn_id": turn_id, "lane": lane_name, "strikes": strikes, "tail": tail }),
+    )?;
+
+    if strikes >= QUIET_STRIKE_HUMAN {
+        let diagnosis = if deps.config.limits.escalation_pane_tail {
+            format!(
+                "\n\npane tail (diagnosis only — success is still judged by the \
+                 result-file contract):\n{}",
+                super::escalation::sanitize_pane_tail(&tail)
+            )
+        } else {
+            String::new()
+        };
+        return Err(NeedsHuman(format!(
+            "agent went quiet {strikes} turns in a row on issue #{} ({lane_name} lane) — \
+             nudges and a fresh session did not revive it, so the profile/environment \
+             looks broken{diagnosis}",
+            run.issue_number
+        ))
+        .into());
+    }
+    if strikes >= QUIET_STRIKE_CLEAR {
+        // Kill + reclaim first, clear the id second (`release_pane` re-saves
+        // the freshest transcript id, so the clear must come after): the next
+        // dispatch then has nothing to adopt and nothing to resume — a
+        // guaranteed fresh spawn with full re-injection.
+        super::reaper::release_pane(deps, run.issue_number, lane_name, "quiet loop").await;
+        deps.store
+            .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
+        deps.store.update_run_agent_session(&run.id, None)?;
+        deps.store.emit(
+            Some(&run.id),
+            "agent_session.cleared",
+            json!({ "reason": "quiet_loop", "lane": lane_name, "strikes": strikes }),
+        )?;
+    }
+    // Strike 1 keeps pane and session: the next dispatch adopts/resumes and
+    // may simply recover. Either way the run takes the usual Interrupted
+    // redispatch path.
+    Ok(TurnOutcome::PaneDied)
 }
 
 /// Spawn one direct-mode turn (issue #169): `{command} {args} {direct_args}
@@ -1971,10 +2187,9 @@ async fn spawn_direct_process(
     let lane_name = lane.lane.as_str();
     let profile = &lane.profile;
 
-    let session_id = deps
-        .store
-        .get_pane(&deps.project.id, run.issue_number, lane_name)?
-        .and_then(|p| p.agent_session_id);
+    // Same resume-health gate as the pane path (issue #245): an oversized
+    // transcript is cleared instead of resumed.
+    let session_id = gated_resume_session(deps, run, worktree, lane).await?;
 
     let mut args = profile.args.clone();
     args.extend(profile.direct_args.iter().cloned());
@@ -2028,18 +2243,28 @@ async fn spawn_direct_process(
 /// `runs.agent_session_id` is still written for observability. A resumed
 /// executor dying without a result means the stored id no longer restores a
 /// working session, so drop it rather than resume-loop on it forever.
+///
+/// The transcript root comes from the lane's pinned profile (issue #245,
+/// spec f4) — a named profile with its own `session_dir` would otherwise
+/// have its sessions recorded from (and misjudged against) the default
+/// agent's directory. An `AgentQuiet` outcome is deliberately a no-op here:
+/// [`handle_agent_quiet`] owns that path's session state.
 async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
-    lane_name: &str,
+    lane: &Lane,
     pane: Option<&PaneId>,
     resumed: bool,
     outcome: &TurnOutcome,
 ) -> Result<()> {
+    let lane_name = lane.lane.as_str();
     match outcome {
         TurnOutcome::Completed(r) => {
-            let session_root = agent_session::session_root(&deps.config.agent);
+            // The session answered — the lane's quiet-strike ladder resets.
+            deps.store
+                .reset_pane_quiet_strikes(&deps.project.id, run.issue_number, lane_name)?;
+            let session_root = agent_session::session_root(&lane.profile);
             let session_id = match agent_session::latest_session_id(&session_root, worktree) {
                 Some(id) => Some(id),
                 None => match &r.agent_session_id {
@@ -2117,6 +2342,12 @@ async fn execute(
             TurnOutcome::Stopped => return Ok(StepFlow::Stopped),
             TurnOutcome::PaneDied => {
                 return Ok(StepFlow::Interrupted("pane died during execute".into()));
+            }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(StepFlow::Interrupted(
+                    "agent went quiet during execute".into(),
+                ));
             }
         };
 
@@ -2316,6 +2547,12 @@ pub(crate) async fn validate(
             TurnOutcome::PaneDied => {
                 return Ok(StepFlow::Interrupted("pane died during validate".into()));
             }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(StepFlow::Interrupted(
+                    "agent went quiet during validate".into(),
+                ));
+            }
         }
     }
 }
@@ -2351,6 +2588,35 @@ async fn deliver(
     }
 }
 
+/// Duplicate-delivery guard (issue #249, design doc §3-D/§P5): right before
+/// the worker/planner open a *new* PR for an issue, check whether the forge
+/// already cross-references an open PR on a non-meguri branch. If one
+/// exists, a human already has (or is running) a rail-external delivery for
+/// this issue — opening a second one risks shipping the same change twice
+/// under different file names, as #236/#237/#238 did. Only meguri's own
+/// branches (`meguri/...`) are exempt: a resumed run's own PR, or a sibling
+/// meguri loop's, must never trip this. Local tasks (no github issue) are
+/// exempt — there is nothing on a forge to cross-reference.
+async fn reject_rail_external_duplicate(deps: &Deps, run: &RunRecord) -> Result<()> {
+    let TaskKey::Issue(issue) = run.task_key() else {
+        return Ok(());
+    };
+    let linked = deps.forge().linked_open_prs(issue).await?;
+    let mut rail_external = linked
+        .iter()
+        .filter(|pr| !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX));
+    if let Some(pr) = rail_external.next() {
+        return Err(NeedsHuman(format!(
+            "issue #{issue} already has an open PR outside meguri's rails \
+             (#{} on branch `{}`, {}). adopt it or close it — a human must \
+             decide before meguri opens another PR for this issue.",
+            pr.number, pr.head_branch, pr.url
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// open-pr: push, create the PR, settle labels. All side effects here are
 /// idempotent enough to re-run after an interruption.
 async fn open_pr(
@@ -2375,6 +2641,7 @@ async fn open_pr(
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
     } else {
+        reject_rail_external_duplicate(deps, run).await?;
         let title = flavor.pr_title(run, cp);
         let body = compose_pr_body(run, cp, lenses, close);
         // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
@@ -3359,6 +3626,208 @@ mod tests {
             project,
         );
         (deps, run)
+    }
+
+    /// `meguri stop` on a queued/interrupted run finalizes straight in the
+    /// CLI process (`app::cmd_stop`) and never reaches a `Flavor`, so it
+    /// cannot rely on `Flavor::release_claim` the way a live driver's
+    /// `finalize_cancelled` does (issue #252 / P6.7 design doc §3-F). A
+    /// PR-claiming loop (fixer family, spec_worker, pr-reviewer) still
+    /// stamps the claimed PR into `Checkpoint::pr_number` before doing
+    /// anything else, so `release_stray_pr_claim` can drop `meguri:working`
+    /// from that PR straight from the checkpoint. Acceptance: after
+    /// claim → stop, the next discovery can re-claim the same PR.
+    #[tokio::test]
+    async fn release_stray_pr_claim_drops_working_after_a_driverless_stop() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        let pr = forge.push_pr("meguri/7-fix-aaa111", "Fix (#7)", &[forge::LABEL_WORKING]);
+        // What the fixer's `prepare_work` does at claim time: label the PR,
+        // then stamp its number into the checkpoint.
+        let cp = Checkpoint {
+            pr_number: Some(pr),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+
+        release_stray_pr_claim(&deps, &run).await;
+
+        assert!(
+            !forge
+                .pr_labels(pr)
+                .contains(&forge::LABEL_WORKING.to_string()),
+            "{:?}",
+            forge.pr_labels(pr)
+        );
+    }
+
+    /// Review finding f1: `worker`/`planner` stamp `Checkpoint::pr_number`
+    /// once their own PR opens, but they never claim that PR by label — the
+    /// issue's `meguri:working` is their claim, released through the task
+    /// source. If a *different* run later claims the PR (e.g. a pr-reviewer
+    /// run) and someone then stops the stale interrupted worker run, this
+    /// must not strip the pr-reviewer's still-live claim.
+    #[tokio::test]
+    async fn release_stray_pr_claim_ignores_worker_runs_even_with_a_pr_number() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::worker::KIND, 7, "Test issue")
+            .unwrap();
+        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::with_issue(
+            7,
+            "Test issue",
+            "body",
+            &[],
+        ));
+        // The worker's own PR — currently claimed by some other (unrelated)
+        // run, e.g. a pr-reviewer, not by this worker run.
+        let pr = forge.push_pr("meguri/7-work-aaa111", "Work (#7)", &[forge::LABEL_WORKING]);
+        let cp = Checkpoint {
+            pr_number: Some(pr),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: Some("me/proj".into()),
+            mode: Default::default(),
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let deps = Deps::with_label_source(
+            store,
+            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge.clone(),
+            crate::config::Config::default(),
+            project,
+        );
+
+        release_stray_pr_claim(&deps, &run).await;
+
+        assert!(
+            forge
+                .pr_labels(pr)
+                .contains(&forge::LABEL_WORKING.to_string()),
+            "a worker run must never release a claim it does not own: {:?}",
+            forge.pr_labels(pr)
+        );
+    }
+
+    /// Review finding f2: `Deps::forge` panics when absent (local mode).
+    /// `meguri stop`'s driverless finalize path is shared by every project
+    /// mode, and a local-mode project can still carry a leftover
+    /// `pr_number` checkpoint (e.g. after switching a project from github to
+    /// local mode) — `release_stray_pr_claim` must no-op, not panic.
+    #[tokio::test]
+    async fn release_stray_pr_claim_is_a_no_op_without_a_forge() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let run = store
+            .create_run_for_loop("proj", super::super::fixer::KIND, 7, "Test issue")
+            .unwrap();
+        let cp = Checkpoint {
+            pr_number: Some(1),
+            ..Default::default()
+        };
+        store
+            .update_run_step(&run.id, STEP_EXECUTE, &serde_json::to_string(&cp).unwrap())
+            .unwrap();
+
+        let project = crate::config::ProjectConfig {
+            id: "proj".into(),
+            repo_path: None,
+            repo_slug: None,
+            mode: crate::config::ProjectMode::Local,
+            deliver: None,
+            default_branch: "main".into(),
+            language: None,
+            check_command: None,
+            worktree_root: None,
+            pr: None,
+            clean: None,
+            triage: None,
+            plan_delivery: Default::default(),
+            review: None,
+            worktree_setup: Default::default(),
+            schedules: Vec::new(),
+            autonomy: None,
+            cadence: Vec::new(),
+            prompts: Default::default(),
+            notify: None,
+        };
+        let task_source: std::sync::Arc<dyn crate::tasks::TaskSource> = std::sync::Arc::new(
+            crate::tasks::LocalTaskSource::new(store.clone(), project.id.clone()),
+        );
+        let deps = Deps {
+            store,
+            mux: std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
+            forge: None,
+            task_source,
+            notifier: crate::notify::fake::recording_notifier().0,
+            forge_factory: std::sync::Arc::new(crate::forge::gh::GhForgeFactory),
+            config: crate::config::Config::default(),
+            project,
+        };
+
+        // Must not panic.
+        release_stray_pr_claim(&deps, &run).await;
     }
 
     #[tokio::test]

@@ -137,6 +137,12 @@ pub struct FakeForge {
     /// (`comments_complete = false`) — exercises the engine's park-on-
     /// truncation fallback for the real forge's comment page budget.
     pub incomplete_comments: Mutex<HashSet<i64>>,
+    /// GitHub's cross-reference ("Development") linkage: issue → PR numbers
+    /// mentioning it, real or rail-external (issue #249). Seeded via
+    /// [`FakeForge::link_pr_to_issue`]; `linked_open_prs` looks the numbers
+    /// up in `prs` and reports only the still-open ones, like the real
+    /// forge's timeline query would.
+    pub linked_prs: Mutex<HashMap<i64, Vec<i64>>>,
 }
 
 impl FakeForge {
@@ -258,6 +264,19 @@ impl FakeForge {
             head_sha: head_sha.into(),
             state: "open".into(),
         });
+    }
+
+    /// Seed a GitHub-style cross-reference from `pr` to `issue` (issue #249
+    /// tests): a rail-external PR mentioning the issue, or one meguri itself
+    /// opened. `linked_open_prs(issue)` reports `pr` back while it stays
+    /// open in `self.prs`.
+    pub fn link_pr_to_issue(&self, issue: i64, pr: i64) {
+        self.linked_prs
+            .lock()
+            .unwrap()
+            .entry(issue)
+            .or_default()
+            .push(pr);
     }
 
     pub fn set_pr_diff(&self, number: i64, diff: &str) {
@@ -874,6 +893,22 @@ impl Forge for FakeForge {
             .find(|p| p.state == "open")
             .or(matching.last())
             .map(|p| Self::pr_to_public(p)))
+    }
+
+    async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>> {
+        let numbers = self
+            .linked_prs
+            .lock()
+            .unwrap()
+            .get(&issue)
+            .cloned()
+            .unwrap_or_default();
+        let prs = self.prs.lock().unwrap();
+        Ok(prs
+            .iter()
+            .filter(|p| p.state == "open" && numbers.contains(&p.number))
+            .map(Self::pr_to_public)
+            .collect())
     }
 
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
