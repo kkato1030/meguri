@@ -857,6 +857,25 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     Ok(())
 }
 
+/// The PR-side observation for one PR number, reduced to (Snapshot, Step) —
+/// the operator surface's read-only window (`meguri why --pr` / manual
+/// `run --pr`, ADR 0016). `None` when the PR is not in the open set.
+pub async fn observe_pr_step(deps: &Deps, number: i64) -> Result<Option<(Snapshot, Step)>> {
+    let am = deps.config.pr_for(&deps.project).auto_merge.clone();
+    let observation = deps.forge().observe_open_prs(PR_REVIEW_STATUS).await?;
+    let Some(obs) = observation.prs.iter().find(|o| o.pr.number == number) else {
+        return Ok(None);
+    };
+    let policy_ok = if am.enabled {
+        resolve_policy_ok(deps, &am).await
+    } else {
+        false
+    };
+    let snap = build_snapshot(deps, &am, obs, policy_ok, epoch_now()).await?;
+    let step = apply_policy(next_step(&snap), &deps.config.reconciler.policy);
+    Ok(Some((snap, step)))
+}
+
 /// One PR through observe-reduce → next_step → act.
 async fn process(
     deps: &Deps,
@@ -2614,6 +2633,55 @@ async fn process_issue_identity(
     open_pr_issues: &std::collections::HashSet<i64>,
     remaining: &mut std::collections::HashMap<String, i64>,
 ) -> Result<()> {
+    let (snap, cadence_label) =
+        build_issue_snapshot(deps, issue, open_pr_issues, remaining).await?;
+    match next_step_issue(&snap, Mode::Reconcile) {
+        IssueStep::Agent(arm) => {
+            // The issue-wide reservation was read into `issue_busy`; the
+            // per-loop unique run index is the atomic backstop — a create
+            // failure is a benign race, retried next resync.
+            if let Ok(run) = deps.store.create_run_for_loop_cadence(
+                &deps.project.id,
+                arm.loop_kind(),
+                issue.number,
+                &issue.title,
+                cadence_label.as_deref(),
+            ) {
+                deps.store.emit(
+                    Some(&run.id),
+                    "run.discovered",
+                    json!({ "key": format!("Issue({})", issue.number),
+                            "title": issue.title, "loop": arm.loop_kind() }),
+                )?;
+                deps.store.emit(
+                    Some(&run.id),
+                    "reconciler.enqueued",
+                    json!({ "arm": arm.loop_kind(), "issue": issue.number }),
+                )?;
+            }
+        }
+        IssueStep::Op(IssueOp::Handoff) => {
+            // The act re-verifies (merged spec PR, not a decompose proposal)
+            // before flipping speccing → ready — defense in depth against a
+            // drifted observation.
+            super::plan_handoff::handoff_issue(deps, issue.number, &issue.labels).await?;
+        }
+        IssueStep::Wait(reason) | IssueStep::Skip(reason) => {
+            tracing::debug!("issue #{}: reconciler — {reason}", issue.number);
+        }
+    }
+    Ok(())
+}
+
+/// Reduce one open issue to the pure [`IssueSnapshot`] plus the cadence stamp
+/// its enqueue would carry. Shared by the reconcile pass and the operator
+/// surface (`meguri why` / manual `run`, ADR 0016).
+pub async fn build_issue_snapshot(
+    deps: &Deps,
+    issue: &forge::Issue,
+    open_pr_issues: &std::collections::HashSet<i64>,
+    remaining: &mut std::collections::HashMap<String, i64>,
+) -> Result<(IssueSnapshot, Option<String>)> {
     let has = |l: &str| issue.has_label(l);
     let mut snap = IssueSnapshot {
         human_stop: has(forge::LABEL_HOLD) || has(forge::LABEL_NEEDS_HUMAN),
@@ -2684,43 +2752,7 @@ async fn process_issue_identity(
     {
         snap.spec_pr_state = observe_spec_pr_state(deps, issue.number).await?;
     }
-
-    match next_step_issue(&snap, Mode::Reconcile) {
-        IssueStep::Agent(arm) => {
-            // The issue-wide reservation was read into `issue_busy`; the
-            // per-loop unique run index is the atomic backstop — a create
-            // failure is a benign race, retried next resync.
-            if let Ok(run) = deps.store.create_run_for_loop_cadence(
-                &deps.project.id,
-                arm.loop_kind(),
-                issue.number,
-                &issue.title,
-                cadence_label.as_deref(),
-            ) {
-                deps.store.emit(
-                    Some(&run.id),
-                    "run.discovered",
-                    json!({ "key": format!("Issue({})", issue.number),
-                            "title": issue.title, "loop": arm.loop_kind() }),
-                )?;
-                deps.store.emit(
-                    Some(&run.id),
-                    "reconciler.enqueued",
-                    json!({ "arm": arm.loop_kind(), "issue": issue.number }),
-                )?;
-            }
-        }
-        IssueStep::Op(IssueOp::Handoff) => {
-            // The act re-verifies (merged spec PR, not a decompose proposal)
-            // before flipping speccing → ready — defense in depth against a
-            // drifted observation.
-            super::plan_handoff::handoff_issue(deps, issue.number, &issue.labels).await?;
-        }
-        IssueStep::Wait(reason) | IssueStep::Skip(reason) => {
-            tracing::debug!("issue #{}: reconciler — {reason}", issue.number);
-        }
-    }
-    Ok(())
+    Ok((snap, cadence_label))
 }
 
 /// The terminal state of a `speccing` issue's recorded spec PR (決定5 / f3):

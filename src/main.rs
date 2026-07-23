@@ -52,8 +52,24 @@ async fn main() -> Result<()> {
         Command::Run {
             project,
             issue,
+            pr,
+            run,
+            task,
             mux,
-        } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
+        } => {
+            let sel = app::selector(issue, pr, run, task)?;
+            app::cmd_run(project.as_deref(), sel, mux.as_deref()).await
+        }
+        Command::Why {
+            project,
+            issue,
+            pr,
+            run,
+            task,
+        } => {
+            let sel = app::selector(issue, pr, run, task)?;
+            app::cmd_why(project.as_deref(), sel).await
+        }
         Command::Add {
             text,
             project,
@@ -89,7 +105,14 @@ async fn main() -> Result<()> {
             interval,
         } => app::cmd_top_status(mux.as_deref(), &dashboard, interval).await,
         Command::Logs { run } => app::cmd_logs(&run).await,
-        Command::Attach { run, review } => app::cmd_attach(&run, review),
+        Command::Attach {
+            run,
+            issue,
+            pr,
+            run_id,
+            task,
+            review,
+        } => app::cmd_attach(run.as_deref(), issue, pr, run_id.as_deref(), task, review).await,
         Command::Pause { run } => app::cmd_pause(&run),
         Command::Resume { run } => app::cmd_resume(&run),
         Command::Takeover { run } => app::cmd_takeover(&run),

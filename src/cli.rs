@@ -88,17 +88,46 @@ pub enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Run the worker loop once for a single issue
+    /// Run one identity now: the owning reconciler decides the role
+    /// (ADR 0016). Exactly one of --issue / --pr / --run / --task.
     Run {
         /// Project id from config.toml (defaults to the sole configured project)
         #[arg(long)]
         project: Option<String>,
-        /// Issue number to work on
+        /// Issue number (issue identity; an open meguri PR re-routes to it)
         #[arg(long)]
-        issue: i64,
+        issue: Option<i64>,
+        /// PR number (PR identity — the PR-side decider)
+        #[arg(long)]
+        pr: Option<i64>,
+        /// Existing run id (resumes with its stored loop kind)
+        #[arg(long)]
+        run: Option<String>,
+        /// Local task id (local identity)
+        #[arg(long)]
+        task: Option<i64>,
         /// Multiplexer override: herdr | tmux
         #[arg(long)]
         mux: Option<String>,
+    },
+    /// Explain what the owning reconciler would do next for one identity —
+    /// read-only (ADR 0016). Exactly one of --issue / --pr / --run / --task.
+    Why {
+        /// Project id from config.toml (defaults to the sole configured project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Issue number (issue identity)
+        #[arg(long)]
+        issue: Option<i64>,
+        /// PR number (PR identity)
+        #[arg(long)]
+        pr: Option<i64>,
+        /// Run id
+        #[arg(long)]
+        run: Option<String>,
+        /// Local task id
+        #[arg(long)]
+        task: Option<i64>,
     },
     /// List local tasks (needs_human is highlighted)
     Tasks {
@@ -152,10 +181,22 @@ pub enum Command {
     },
     /// Show events (and recent pane output) for a run
     Logs { run: String },
-    /// Attach your terminal to an issue's pane (or a run's)
+    /// Attach your terminal to an identity's live pane (ADR 0016)
     Attach {
-        /// Issue number or run id
-        run: String,
+        /// Issue number or run id (positional, back-compat)
+        run: Option<String>,
+        /// Issue number (issue identity)
+        #[arg(long)]
+        issue: Option<i64>,
+        /// PR number — resolved to its canonical issue's pane
+        #[arg(long)]
+        pr: Option<i64>,
+        /// Run id
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+        /// Local task id — resolved to its latest run's pane
+        #[arg(long)]
+        task: Option<i64>,
         /// Attach the issue's review-lane pane instead of the author pane
         #[arg(long)]
         review: bool,

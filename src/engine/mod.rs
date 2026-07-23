@@ -339,6 +339,17 @@ fn closes_issue(body: &str) -> Option<i64> {
     None
 }
 
+/// The open PR with this number, or `None` (the operator surface's PR
+/// lookup, ADR 0016).
+pub async fn open_pr_by_number(deps: &Deps, number: i64) -> Result<Option<PullRequest>> {
+    Ok(deps
+        .forge()
+        .list_open_prs()
+        .await?
+        .into_iter()
+        .find(|pr| pr.number == number))
+}
+
 /// The single open PR whose [`canonical_key`] is `issue`, re-resolved at
 /// prepare-work time (the run only carries the issue number). None when no
 /// open PR matches — or when more than one does, which the caller treats as
