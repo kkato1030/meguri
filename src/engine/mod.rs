@@ -405,8 +405,8 @@ pub enum WorkerOutcome {
 
 /// The dispatch priority of a `runs.loop_kind` (ADR 0001 → ADR 0012 §5): the
 /// smaller the rank, the closer to merge, the earlier it dispatches. The
-/// explicit form of the old "registration order is priority" (the removed
-/// `default_loops` ordering): every run is enqueued by a reconciler and the
+/// explicit form of the old "registration order is priority": every run is
+/// enqueued by a reconciler and the
 /// scheduler sorts the whole workqueue by this key rather than by creation
 /// order. An unknown loop_kind sorts last (kept stable, never panics).
 pub fn dispatch_rank(loop_kind: &str) -> u8 {
