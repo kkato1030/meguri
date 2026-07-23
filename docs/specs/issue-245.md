@@ -34,10 +34,23 @@ fresh spawn + full re-injection に落とす。プロンプトは自己完結し
 - transcript の実体は `agent_session.rs` が既に知っている:
   `<session_root>/projects/<munged cwd>/<session-id>.jsonl`。
   ここに `transcript_path()` と `transcript_len() -> Option<u64>` を足す。
+- **session_root は lane の pinned profile から解決する（f4）。** 現行の
+  `session_root(&deps.config.agent)` は常に既定 agent を見るため、named profile
+  が独自の `session_dir` を持つと transcript を見失い、oversize が gate を
+  すり抜ける。ゲートは `session_root(&lane.profile)` を使う。同じ理由で
+  `record_agent_session` の session 探索（`flow.rs:2069`）も lane profile で
+  解決するよう揃える（run はターン開始時に profile を pin 済み。§契約参照）。
+- **transcript を特定できない場合は fail-open。** custom CLI で jsonl レイアウトが
+  違う・ファイルが無い等で `transcript_len()` が `None` のときは resume を止めない
+  （既存挙動を維持）。取りこぼした死にセッションは栓3の strike backstop が
+  境界を張る。この分岐は
+  `pane.resume_gate_skipped { reason: "transcript_not_found" }` で可観測にする。
 - ゲートは resume を試みる直前（`ensure_pane` の session_id 取得後、
-  `spawn_agent_pane(..., Some(id))` の前）。超過なら saved session を消し、
+  `spawn_agent_pane(..., Some(id))` の前）。超過なら **pane を kill/reclaim して
+  から** saved session を消し（順序は §栓2「adopt ゲート」と同じ理由。live pane を
+  残すと次 dispatch が adopt する）、
   `agent_session.cleared { reason: "transcript_oversize", bytes, limit }` を
-  emit して fresh spawn へ落ちる（既存の resume 失敗フォールバックと同じ経路）。
+  emit して fresh spawn へ落ちる。
 - 8.8MB の実例は 5MB 閾値で初回 resume すら起きず、400 ループは発生前に消える。
 
 ### 栓2: agent 不在 pane では nudge しない（②の対策）
@@ -58,8 +71,27 @@ mux に問い、不在が確定したら nudge せず即 `PaneDied` を返す。
   起きうるのはこの一点だけ）。`Some(false)` のとき
   `turn.pane_died { turn_id, reason: "agent_absent" }` を emit して
   `TurnOutcome::PaneDied` を返す。`None`/`Some(true)` は従来どおり nudge。
-- `PaneDied` は `record_agent_session`（`flow.rs:2094`）で resumed 時に
-  session をクリアするので、次 spawn は fresh になる。
+- **adopt ゲート（f2）。** `ensure_pane` の live-pane 採用分岐は現状
+  `pane_alive` だけで adopt し trigger を送る。素のシェルに落ちた pane も
+  「生きている」ので adopt され、シェルへ trigger を打ち込む — 栓2 の nudge 対策を
+  すり抜ける同じ穴が adopt 側にある。よって adopt する前に `agent_present` を見て、
+  `Some(false)` なら adopt せず `release_pane`（kill + reclaim）して resume/fresh
+  経路へ落とす。`Some(true)`/`None` は従来どおり adopt。
+- **kill してから session を消す。** `PaneDied`/agent_absent で session を捨てる際、
+  session id を消すだけでは `mux_pane_id` が残り次 dispatch が同じ pane を adopt
+  する。`release_pane`（kill + `mark_pane_reclaimed` で mux_pane_id を消す）を先に
+  呼び、その後 `save_pane_session(None)` で session を消す。順序が逆だと
+  `release_pane` が transcript を再スキャンして死に session を再保存してしまう
+  （`reaper.rs:498-510`）。これで次 dispatch は adopt 対象を持たず、resume する
+  session も無いので確実に fresh spawn になる。
+- **TOCTOU は許容し自己修復に委ねる（f3）。** `agent_present` 検査と `send_line` は
+  別の mux 呼び出しなので、`Some(true)` の直後に agent が終了すると1回だけ nudge が
+  シェルへ届きうる。これは明示的に許容する: (a) 窓は mux 1往復ぶんと短い、
+  (b) シェルへ 1 行届いてもコマンドが `command not found` になるだけで害は無い、
+  (c) 次 poll の `agent_present` 検査が `Some(false)` を返し1 interval 以内に
+  `PaneDied` へ収束する。受け入れ基準2「不在が確定した pane に nudge を打たない」は
+  送信直前の検査で決定的に満たす（FakeMux テストで担保）。mux 側の原子的
+  send-if-present は herdr に該当プリミティブが無く、over-engineering として見送る。
 
 ### 栓3: 同一セッションの agent_quiet を数え、2回で捨て3回で人間へ（①の恒久対策）
 
@@ -75,15 +107,40 @@ orchestrator 再起動の `recover` が同じ session を resume し直すから
   `TurnOutcome::AgentQuiet { tail: Vec<String> }` を返す（`read_tail(pane, 30)`
   を1回読んで同梱。これが栓4の診断になる）。
 - `panes` に `quiet_strikes INTEGER NOT NULL DEFAULT 0` を足す。
-- flow 層に共有ヘルパ `handle_agent_quiet(deps, run, lane, tail) -> Result<StepFlow>`:
+- **AgentQuiet は `run_turn_in` の内部で正規化し、呼び出し側へは漏らさない（f1）。**
+  `TurnEngine::await_completion` は `pub` で `Result<TurnOutcome>` を返すので、
+  variant 追加は公開 enum の変更である。だが production の呼び出しは**全て**
+  `flow::run_turn`（→ `run_turn_in`）を経由する（`cleaner.rs:615` /
+  `flow.rs:2141,2318` / `pr_reviewer.rs:670` / `self_review.rs:1317` /
+  `triage.rs:947`）。`await_completion` を直接叩くのはテストだけで、いずれも
+  `matches!` なので非網羅 match で壊れない。よって:
+  - `run_turn_in` は `await_completion` から `AgentQuiet` を受けたら、
+    `record_agent_session` へ渡す前に共有ヘルパ `handle_agent_quiet` を呼んで
+    strike を処理し、**呼び出し側へは既存の3 variant のみを返す**
+    （strike<3 は `PaneDied` 相当、strike≥3 は `Err(NeedsHuman)` を伝播）。
+    `run_turn` の戻り型 `(TurnOutcome, String)` は変えず、返す TurnOutcome が
+    `AgentQuiet` になることは無い。
+  - したがって上記6 呼び出し側の `match TurnOutcome { Completed / Stopped /
+    PaneDied }` は**そのまま**でよい（新 arm 不要）。ただし `record_agent_session`
+    と `run_turn_in` 内の `outcome_str` match（`flow.rs:1967`）には
+    `AgentQuiet` arm を足す（同一関数内なので網羅漏れはここだけ）。
+    `record_agent_session` の `AgentQuiet` arm は strike を触らない
+    （strike 処理は `handle_agent_quiet` が所有）。
+- 共有ヘルパ `handle_agent_quiet(deps, run, lane, tail) -> Result<TurnOutcome>`:
   - `n = bump_pane_quiet_strikes(...)`（+1 して新値を返す）
-  - `n < 2` → `StepFlow::Interrupted`（session 温存 → 次 dispatch で再 resume。
-    一過性の沈黙に猶予を1回与える）
-  - `n == 2` → saved session を消し
-    `agent_session.cleared { reason: "quiet_loop" }` を emit → `Interrupted`
-    （次 dispatch は fresh spawn）
-  - `n >= 3` → `Err(NeedsHuman(reason))`（reason に tail を同梱 → 既存の
-    `flavor.escalate` 経路がコメントを投稿）
+  - `n < 2` → session 温存のまま `Ok(TurnOutcome::PaneDied)`（次 dispatch で
+    再 resume。一過性の沈黙に猶予を1回与える）
+  - `n == 2` → **`release_pane`（kill + reclaim）してから** `save_pane_session(None)`
+    で session を消し（§栓2 と同じ kill→clear 順）、
+    `agent_session.cleared { reason: "quiet_loop" }` を emit → `Ok(PaneDied)`
+    （次 dispatch は adopt 対象も resume 先も無く fresh spawn）
+  - `n >= 3` → `Err(NeedsHuman(reason))`（reason に**サニタイズ済み** tail を同梱
+    → 既存の `flavor.escalate` 経路がコメントを投稿。§栓4）
+  - 返した `PaneDied` は呼び出し側で `Interrupted` にマップされ run が再 dispatch
+    される（既存の PaneDied 経路）。ただし `record_agent_session` の
+    `PaneDied if resumed` による session クリアと二重にならないよう、
+    `handle_agent_quiet` は session を自分で管理し、`run_turn_in` は AgentQuiet を
+    `record_agent_session` に渡さない（Completed/Stopped/PaneDied のみ渡す）。
 - reset: `TurnOutcome::Completed` を `record_agent_session` で処理するとき
   `reset_pane_quiet_strikes(...)` で 0 に戻す。**session を消す `n==2` では
   reset しない** — reset すると fresh 後にまた quiet ったとき strike が 1 に
@@ -93,10 +150,30 @@ orchestrator 再起動の `recover` が同じ session を resume し直すから
 ### 栓4: agent_quiet の escalation に pane tail を同梱（受け入れ基準3）
 
 栓3の `n >= 3` で `NeedsHuman` に載せる reason へ、pane 末尾 N=30 行を
-fenced block で埋める。読むのは診断のためで**成否裁定には使わない** —
-ADR 0026 の「read するが裁定しない」と同じ立て付け。overview の「画面を読んで
-成否判定しない」原則は破らない。`flavor.escalate` はこの reason をそのまま
-コメント本文にするので、追加の配線は要らない。
+埋める。読むのは診断のためで**成否裁定には使わない** — ADR 0026 の
+「read するが裁定しない」と同じ立て付け。overview の「画面を読んで成否判定
+しない」原則は破らない。
+
+- **外部へ出す前にサニタイズする（f5）。** raw tail をそのまま Forge コメントへ
+  流すと credential・PII・任意 Markdown・`@mention`/`#ref`・埋め込み ``` による
+  fence 脱出・ANSI/制御文字を外部公開する。新ヘルパ
+  `sanitize_pane_tail(lines, max_lines=30, max_bytes=4000) -> String` を通す:
+  1. ANSI エスケープ列と制御文字を除去（印字可能 + 改行/タブのみ残す）。
+  2. コードフェンスで囲む。GitHub はコードブロック内の `@`/`#` を通知・リンク化
+     しないので、`@mention`/`#ref` の暴発はフェンスで無害化される。
+  3. fence 脱出防止: 本文中の最長バッククォート連（``` ``` ``` 等）より1本長い
+     フェンスで囲む（本文に4連があれば5連フェンス）。
+  4. 行数 30・バイト 4000 で切り詰め、超過は `…(truncated)` を付す。
+- **raw tail はローカル event 限定。** `turn.awaiting_human` / `turn.pane_died`
+  等のイベント data には raw のまま載せてよい（DB 内・信頼境界内）。外部
+  コメントへ出るのは常にサニタイズ後の文字列だけ。
+- **credential/PII の完全 scrub は行わない（明示）。** tail は diff と同じ信頼
+  境界（meguri 自身の PR）の診断抜粋であり、DLP は本 issue の範囲外。気にする
+  運用のために config `escalation.pane_tail = true`（既定）を置き、`false` で
+  コメントへの tail 添付を止めて event 限定に切り替えられる。既定 true が
+  受け入れ基準3を満たす。
+- `flavor.escalate` はサニタイズ済み reason をそのままコメント本文にするので、
+  追加の配線は要らない。
 
 ## 決めた論点（A/B を後回しにしない）
 
@@ -120,25 +197,50 @@ ADR 0026 の「read するが裁定しない」と同じ立て付け。overview 
 6. **agent_quiet を返り値にする是非**: park 継続ではなく返す。park のままだと
    同一プロセス内で strike 2/3 へ進めず、自動復帰が起きない（受け入れ基準1が
    満たせない）。
-7. **`TurnOutcome::AgentQuiet` を全 match 箇所へ**: `flow.rs`（execute/validate）・
-   `pr_reviewer.rs`・`self_review.rs`・`cleaner.rs` の各 `match TurnOutcome` で
-   共有ヘルパ `handle_agent_quiet` を呼ぶ。pr-reviewer lane が実際の事故現場
-   なので、ここを外さない。
+7. **`AgentQuiet` の正規化境界（f1）**: 公開 enum に variant を足すが、
+   `run_turn_in` が唯一の消費点となり呼び出し側へは漏らさない。production は
+   全て `run_turn` 経由（6 箇所を確認）、直接 `await_completion` を叩くのは
+   `matches!` を使うテストのみ。よって6 呼び出し側の `match` は無改変で網羅を
+   保ち、`AgentQuiet` arm が要るのは `run_turn_in` 内の2 match（`outcome_str` と
+   `record_agent_session`）だけ。「公開境界で正規化する」を選んだ（全 call site
+   に arm を撒くより変更が閉じる）。
+8. **adopt ゲート（f2）**: `ensure_pane` の live-pane 採用を `pane_alive` だけで
+   なく `agent_present != Some(false)` でもゲートする。素のシェル pane の
+   trigger 打ち込みを塞ぐ。
+9. **kill→clear の順序（f2）**: 死に session を捨てる全経路（transcript_oversize /
+   quiet_loop / agent_absent）で `release_pane`（kill + reclaim）→
+   `save_pane_session(None)` の順に統一。逆順だと `release_pane` が死に session を
+   再保存する。次 dispatch が adopt も resume もできない状態にして fresh を保証。
+10. **TOCTOU の扱い（f3）**: 送信直前検査 + 自己修復で許容。原子的 send は
+    見送り。受け入れ基準2 は決定的検査で満たす。
+11. **session_root の解決（f4）**: gate と `record_agent_session` は lane の
+    pinned profile から `session_root` を解決する。transcript を特定できない
+    ときは fail-open（resume 続行）+ `pane.resume_gate_skipped` event、栓3 が
+    backstop。
+12. **pane tail のサニタイズ（f5）**: 外部コメントへは `sanitize_pane_tail`
+    （ANSI/制御除去・フェンス脱出防止・行数/バイト上限）を通した文字列のみ。
+    raw はローカル event 限定。`escalation.pane_tail = false` で添付停止可。
+    credential の完全 scrub は範囲外（tail は diff と同信頼境界の診断抜粋）。
 
 ## 変更箇所
 
 - `src/agent_session.rs` — `transcript_path()` / `transcript_len()` を追加。
-- `src/config.rs` — `AgentProfile.resume_transcript_limit_bytes`（default 5MiB）。
+- `src/config.rs` — `AgentProfile.resume_transcript_limit_bytes`（default 5MiB）、
+  `escalation.pane_tail`（default true）。
 - `src/mux/mod.rs` — `Multiplexer::agent_present()`（既定 `Ok(None)`）。
 - `src/mux/herdr.rs` / `src/mux/tmux.rs` — `agent_present` 実装。
 - `src/mux/fake.rs` — `agent_present` を setter で制御（`set_agent_present`）。
 - `src/turn/mod.rs` — nudge 前の `agent_present` 検査 → `PaneDied`；
   quiet 上限で `TurnOutcome::AgentQuiet { tail }` を返す（park しない）。
-- `src/engine/flow.rs` — `ensure_pane` / `spawn_direct_process` に transcript
-  ゲート；`handle_agent_quiet` ヘルパ；`record_agent_session` で Completed 時
-  reset・AgentQuiet の strike 処理；`run_turn` の `outcome_str` 追加。
-- `src/engine/pr_reviewer.rs` / `self_review.rs` / `cleaner.rs` — 新 variant を
-  `handle_agent_quiet` へ配線。
+  `sanitize_pane_tail()` はここか `src/engine/escalation.rs` に置く。
+- `src/engine/flow.rs` — `ensure_pane` に adopt ゲート（`agent_present`）と
+  transcript ゲート（lane profile で session_root 解決 + kill→clear）；
+  `spawn_direct_process` に transcript ゲート；`handle_agent_quiet` ヘルパ
+  （run_turn_in が唯一の消費点、呼び出し側へ AgentQuiet を漏らさない）；
+  `record_agent_session` で Completed 時 reset + `AgentQuiet` arm（strike は
+  触らない）；`run_turn_in` の `outcome_str` に `AgentQuiet` arm。
+- `src/engine/reaper.rs` — `release_pane` を死に session クリア経路から再利用
+  （新規追加は無し。呼び順の契約のみ）。
 - `src/store/panes.rs` — `PaneRecord.quiet_strikes`、`bump_/reset_` メソッド。
 - `src/store/migrations/0017_pane_quiet_strikes.sql`（+ `mod.rs` の MIGRATIONS）。
 - `docs/adr/00NN-session-health-converse-not-just-open.md` — 決定の記録
@@ -147,9 +249,10 @@ ADR 0026 の「read するが裁定しない」と同じ立て付け。overview 
 ## architecture impact
 
 turn engine の契約に `TurnOutcome` の1 variant が増える（park→return の意味変更を
-含む）。mux 抽象に1メソッド増える。この2つは公開契約だが、いずれも既定実装
-（`agent_present` は `Ok(None)`、AgentQuiet は各所で `handle_agent_quiet` に集約）で
-後方互換に足せる。resume 判定は「開くか」から「会話できるか」へ拡張される
+含む）。mux 抽象に1メソッド増える。この2つは公開契約だが、いずれも後方互換に
+足せる: `agent_present` は既定 `Ok(None)`、`AgentQuiet` は `run_turn_in` が唯一の
+消費点として吸収し呼び出し側へは既存3 variant のみを返す（f1）。resume 判定は
+「開くか」から「会話できるか」へ拡張される
 （設計書 §P1 の核）。ADR 0023 の異種モデル路線で小さい context window の
 プロファイルが増えるほど効くので、前提整備として位置づける。
 
@@ -171,8 +274,9 @@ turn engine の契約に `TurnOutcome` の1 variant が増える（park→return
   `SELECT *`（`panes.rs:146`）なので列追加は `pane_from_row` に1行足すだけ。
   config の新フィールドは `#[serde(default)]` で既存 `meguri.toml` を素通し。
 - **rollback**: 追加列は無害なので旧バイナリに戻しても放置で足りる（読まれない）。
-  `TurnOutcome::AgentQuiet` / `agent_present` は新バイナリ内だけの型で外部契約に
-  漏れない。破壊的 down-migration は不要（このリポジトリは forward-only）。
+  `TurnOutcome::AgentQuiet` は公開 enum に増えるが `run_turn_in` で吸収され
+  呼び出し側の型・DB・forge へは漏れないので、旧バイナリへ戻しても互換上の
+  残骸は無い。破壊的 down-migration は不要（このリポジトリは forward-only）。
   緊急時は `resume_transcript_limit_bytes = 0` で栓1を、strike 分岐は定数を
   十分大きくすれば実質無効化できる（キルスイッチ相当）。
 
@@ -189,12 +293,23 @@ turn engine の契約に `TurnOutcome` の1 variant が増える（park→return
 - **単体（FakeMux/FakeForge）**:
   - 受け入れ基準2: `set_agent_present(Some(false))` の pane で quiet になっても
     `sent_lines` に nudge が無く、outcome が `PaneDied` であること。
+  - adopt ゲート（f2）: `agent_present==Some(false)` の live pane がある状態で
+    `ensure_pane` を呼び、adopt されず（trigger が `sent_lines` に入らず）
+    `release_pane` 経由で pane row の `mux_pane_id` が消え、次 spawn の argv が
+    fresh（`--resume` 無し）であることを、**spawn 済み argv と pane row 両方**で
+    検証（f2 の指摘どおり）。
   - 栓3: 同一 lane で quiet を3回起こし、1回目 Interrupted / 2回目
-    `agent_session.cleared(quiet_loop)`＋session 消去 / 3回目 needs-human＋
-    コメントに tail、を検証。成功 turn で strike が 0 に戻ること。
+    `agent_session.cleared(quiet_loop)`＋`mux_pane_id` 消去＋session 消去 /
+    3回目 needs-human＋コメントに（サニタイズ済み）tail、を検証。成功 turn で
+    strike が 0 に戻り、`n==2` の clear では戻らないことも。
   - 栓1: 閾値超の transcript を seed し、resume されず fresh spawn（`--resume` を
-    含まない spawn コマンド）になること。`resume_transcript_limit_bytes=0` で
-    ゲート無効も1本。
+    含まない spawn コマンド）＋ pane row が reclaim 済みになること。
+    `resume_transcript_limit_bytes=0` でゲート無効も1本。named profile の
+    `session_dir` を設定し、その配下の transcript でゲートが効くこと（f4）。
+    transcript 不在で fail-open（resume 続行 + `pane.resume_gate_skipped`）も1本。
+  - サニタイズ（f5）: 埋め込み ``` ``` ```・ANSI 列・`@here`・巨大行を含む tail を
+    `sanitize_pane_tail` に通し、出力が fence 脱出しない／制御文字が無い／
+    バイト上限内／`@`・`#` がコードブロックに閉じ込められることを検証。
 - **統合（実 tmux + `tests/fixtures/fake_agent.sh`）**: 受け入れ基準1。
   fake_agent が resume 時に result を書かず沈黙 → 閾値超 transcript を事前配置
   →（人手なしに）fresh spawn が result を書いて復帰することを通しで確認。
@@ -205,10 +320,16 @@ turn engine の契約に `TurnOutcome` の1 variant が増える（park→return
 1. 400 恒久ループを fixture 化した統合テストで、人手なしに fresh spawn へ
    復帰する（栓1 が初回 resume を止める／栓3 が2回目で session を捨てる）。
 2. agent 不在 pane（`agent_present == Some(false)`）に nudge が打ち込まれない。
-3. agent_quiet の escalation コメント（strike 3）に pane tail が含まれる。
+   加えて、素のシェル pane が adopt されず（trigger が届かず）次 dispatch の
+   argv が fresh になる（f2）。
+3. agent_quiet の escalation コメント（strike 3）に pane tail が含まれ、その
+   tail は `sanitize_pane_tail` を通っている（fence 脱出・制御文字・上限超が無い、
+   f5）。
 4. 成功 turn 完了で `quiet_strikes` が 0 に戻る。`n==2` の session クリアでは
-   戻らない（3 到達性の担保）。
-5. `resume_transcript_limit_bytes = 0` でゲートが無効、既存挙動のまま。
+   戻らない（3 到達性の担保）。session を捨てる全経路で pane row の
+   `mux_pane_id` が消える（次 dispatch が adopt しない、f2）。
+5. `resume_transcript_limit_bytes = 0` でゲートが無効、既存挙動のまま。named
+   profile の `session_dir` 配下の transcript でもゲートが効く（f4）。
 6. 既存テスト（`turn_engine_test.rs` / `pr_reviewer_test.rs` /
    `scheduler_test.rs` / `resume_test.rs`）が全通し。
 
