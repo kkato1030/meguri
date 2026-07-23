@@ -37,9 +37,23 @@ fresh spawn + full re-injection に落とす。プロンプトは自己完結し
 - **session_root は lane の pinned profile から解決する（f4）。** 現行の
   `session_root(&deps.config.agent)` は常に既定 agent を見るため、named profile
   が独自の `session_dir` を持つと transcript を見失い、oversize が gate を
-  すり抜ける。ゲートは `session_root(&lane.profile)` を使う。同じ理由で
+  すり抜ける。**サイズ判定を握るゲートが唯一の権威**であり、run 内にいて
+  `lane.profile` を持つので `session_root(&lane.profile)` で解決する。同じ理由で
   `record_agent_session` の session 探索（`flow.rs:2069`）も lane profile で
-  解決するよう揃える（run はターン開始時に profile を pin 済み。§契約参照）。
+  揃える（run はターン開始時に profile を pin 済み）。
+- **reaper の session 再スキャンは best-effort に格下げし、ゲートが backstop に
+  なる（f4）。** reaper（`reaper.rs:498`）は run の外で動くため lane profile を
+  持たず、`deps.config.agent` の既定 root しか使えない。ここは3点で安全化する:
+  1. reaper の再スキャンは「pane 行にまだ session id が無い」ときの最後の網に
+     限る。turn パス（`record_agent_session`、上で lane profile に是正済み）が
+     毎ターン正しい root で id を保存するので、通常 reaper の推測は使われない。
+  2. root がプロファイル差で外れても `latest_session_id` が `None` を返すだけで、
+     既存の id は**上書きしない**（`if let Some(session)` ガード。`reaper.rs:507`）。
+     誤った id を掴むのではなく「保存しない」に倒れる。
+  3. **たとえ誤った・古い id が行に載っても、resume 時にゲートが `lane.profile`
+     の正しい root でサイズを測り直す**ので、oversize は resume に至らない。
+     つまり id 取得経路の解決ミスはゲートが必ず捕まえる — これが「共有契約」の
+     実体（id 取得は best-effort、サイズ裁定は lane profile のゲートが一手に持つ）。
 - **transcript を特定できない場合は fail-open。** custom CLI で jsonl レイアウトが
   違う・ファイルが無い等で `transcript_len()` が `None` のときは resume を止めない
   （既存挙動を維持）。取りこぼした死にセッションは栓3の strike backstop が
@@ -159,19 +173,25 @@ orchestrator 再起動の `recover` が同じ session を resume し直すから
   fence 脱出・ANSI/制御文字を外部公開する。新ヘルパ
   `sanitize_pane_tail(lines, max_lines=30, max_bytes=4000) -> String` を通す:
   1. ANSI エスケープ列と制御文字を除去（印字可能 + 改行/タブのみ残す）。
-  2. コードフェンスで囲む。GitHub はコードブロック内の `@`/`#` を通知・リンク化
+  2. **トークン形の credential をマスクする。** 既知の高信号パターンを
+     `‹redacted›` に置換する: `gh[pousr]_[A-Za-z0-9]{20,}`（GitHub token）・
+     `sk-[A-Za-z0-9]{20,}`（OpenAI 系）・`AKIA[0-9A-Z]{16}`（AWS key id）・
+     `xox[baprs]-[A-Za-z0-9-]{10,}`（Slack）・`(?i)(authorization|bearer|api[_-]?key|token|secret|password)\s*[:=]\s*\S+`（key=value 形）・
+     40 桁以上連続の hex/base64 ラン。best-effort（全 credential の保証ではない）
+     だが、tail に漏れやすい形は確実に落ちる。
+  3. コードフェンスで囲む。GitHub はコードブロック内の `@`/`#` を通知・リンク化
      しないので、`@mention`/`#ref` の暴発はフェンスで無害化される。
-  3. fence 脱出防止: 本文中の最長バッククォート連（``` ``` ``` 等）より1本長い
+  4. fence 脱出防止: 本文中の最長バッククォート連（``` ``` ``` 等）より1本長い
      フェンスで囲む（本文に4連があれば5連フェンス）。
-  4. 行数 30・バイト 4000 で切り詰め、超過は `…(truncated)` を付す。
+  5. 行数 30・バイト 4000 で切り詰め、超過は `…(truncated)` を付す。
 - **raw tail はローカル event 限定。** `turn.awaiting_human` / `turn.pane_died`
   等のイベント data には raw のまま載せてよい（DB 内・信頼境界内）。外部
   コメントへ出るのは常にサニタイズ後の文字列だけ。
-- **credential/PII の完全 scrub は行わない（明示）。** tail は diff と同じ信頼
-  境界（meguri 自身の PR）の診断抜粋であり、DLP は本 issue の範囲外。気にする
-  運用のために config `escalation.pane_tail = true`（既定）を置き、`false` で
-  コメントへの tail 添付を止めて event 限定に切り替えられる。既定 true が
-  受け入れ基準3を満たす。
+- **多層防御。** ①トークンマスク ②event 限定の raw ③config
+  `escalation.pane_tail = true`（既定）を `false` にすると tail 添付を完全に止め
+  event 限定へ切り替え。完全な DLP は本 issue の範囲外（tail は diff と同じ
+  meguri 自身の PR という信頼境界の診断抜粋）だが、上の3層で漏洩面を実務的に
+  抑える。既定 true + マスクが受け入れ基準3を満たす。
 - `flavor.escalate` はサニタイズ済み reason をそのままコメント本文にするので、
   追加の配線は要らない。
 
@@ -213,14 +233,18 @@ orchestrator 再起動の `recover` が同じ session を resume し直すから
    再保存する。次 dispatch が adopt も resume もできない状態にして fresh を保証。
 10. **TOCTOU の扱い（f3）**: 送信直前検査 + 自己修復で許容。原子的 send は
     見送り。受け入れ基準2 は決定的検査で満たす。
-11. **session_root の解決（f4）**: gate と `record_agent_session` は lane の
-    pinned profile から `session_root` を解決する。transcript を特定できない
-    ときは fail-open（resume 続行）+ `pane.resume_gate_skipped` event、栓3 が
-    backstop。
-12. **pane tail のサニタイズ（f5）**: 外部コメントへは `sanitize_pane_tail`
-    （ANSI/制御除去・フェンス脱出防止・行数/バイト上限）を通した文字列のみ。
-    raw はローカル event 限定。`escalation.pane_tail = false` で添付停止可。
-    credential の完全 scrub は範囲外（tail は diff と同信頼境界の診断抜粋）。
+11. **session_root の解決（f4）**: サイズ裁定を握る gate と `record_agent_session`
+    は lane の pinned profile から `session_root` を解決する。reaper は run 外で
+    profile を持たないので既定 root のまま best-effort（`None` は上書きしない）に
+    格下げし、**resume 時のゲートが lane profile で測り直す**ことで id 取得経路の
+    解決ミスを必ず捕まえる（これが3点共有契約の実体）。transcript 特定不能は
+    fail-open + `pane.resume_gate_skipped`、栓3 が backstop。
+12. **pane tail のサニタイズ（f5）**: 外部コメントへは `sanitize_pane_tail` を
+    通した文字列のみ。多層防御 = ①トークン形 credential のマスク（`ghp_`/`sk-`/
+    `AKIA`/`token=` 等 →`‹redacted›`）②ANSI/制御除去・フェンス脱出防止・
+    行数/バイト上限 ③raw はローカル event 限定・`escalation.pane_tail=false` で
+    添付停止。完全 DLP は範囲外（tail は diff と同信頼境界）だが漏洩面を実務的に
+    抑える。
 
 ## 変更箇所
 
@@ -240,7 +264,8 @@ orchestrator 再起動の `recover` が同じ session を resume し直すから
   `record_agent_session` で Completed 時 reset + `AgentQuiet` arm（strike は
   触らない）；`run_turn_in` の `outcome_str` に `AgentQuiet` arm。
 - `src/engine/reaper.rs` — `release_pane` を死に session クリア経路から再利用
-  （新規追加は無し。呼び順の契約のみ）。
+  （呼び順の契約）。session 再スキャンは best-effort と明記（run 外なので既定
+  root のまま、`None` は上書きしない。誤り id は resume 時のゲートが捕まえる、f4）。
 - `src/store/panes.rs` — `PaneRecord.quiet_strikes`、`bump_/reset_` メソッド。
 - `src/store/migrations/0017_pane_quiet_strikes.sql`（+ `mod.rs` の MIGRATIONS）。
 - `docs/adr/00NN-session-health-converse-not-just-open.md` — 決定の記録
@@ -307,9 +332,14 @@ turn engine の契約に `TurnOutcome` の1 variant が増える（park→return
     `resume_transcript_limit_bytes=0` でゲート無効も1本。named profile の
     `session_dir` を設定し、その配下の transcript でゲートが効くこと（f4）。
     transcript 不在で fail-open（resume 続行 + `pane.resume_gate_skipped`）も1本。
-  - サニタイズ（f5）: 埋め込み ``` ``` ```・ANSI 列・`@here`・巨大行を含む tail を
-    `sanitize_pane_tail` に通し、出力が fence 脱出しない／制御文字が無い／
-    バイト上限内／`@`・`#` がコードブロックに閉じ込められることを検証。
+  - ゲート backstop（f4）: pane 行に oversize な session id が載った状態で
+    resume を試み、`lane.profile` の root でサイズが測り直されて resume されず
+    fresh に落ちること（id 取得経路の解決ミスをゲートが捕まえる、を実証）。
+  - サニタイズ（f5）: 埋め込み ``` ``` ```・ANSI 列・`@here`・巨大行に加え、
+    `ghp_`／`sk-`／`AKIA…`／`token=…` を含む tail を `sanitize_pane_tail` に
+    通し、出力が fence 脱出しない／制御文字が無い／バイト上限内／`@`・`#` が
+    コードブロックに閉じ込められ／**トークン形が `‹redacted›` にマスクされる**
+    ことを検証。
 - **統合（実 tmux + `tests/fixtures/fake_agent.sh`）**: 受け入れ基準1。
   fake_agent が resume 時に result を書かず沈黙 → 閾値超 transcript を事前配置
   →（人手なしに）fresh spawn が result を書いて復帰することを通しで確認。
@@ -323,8 +353,8 @@ turn engine の契約に `TurnOutcome` の1 variant が増える（park→return
    加えて、素のシェル pane が adopt されず（trigger が届かず）次 dispatch の
    argv が fresh になる（f2）。
 3. agent_quiet の escalation コメント（strike 3）に pane tail が含まれ、その
-   tail は `sanitize_pane_tail` を通っている（fence 脱出・制御文字・上限超が無い、
-   f5）。
+   tail は `sanitize_pane_tail` を通っている（fence 脱出・制御文字・上限超が無く、
+   トークン形 credential が `‹redacted›` にマスクされる、f5）。
 4. 成功 turn 完了で `quiet_strikes` が 0 に戻る。`n==2` の session クリアでは
    戻らない（3 到達性の担保）。session を捨てる全経路で pane row の
    `mux_pane_id` が消える（次 dispatch が adopt しない、f2）。
