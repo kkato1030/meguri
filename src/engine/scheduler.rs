@@ -185,7 +185,7 @@ impl Scheduler {
                 // recompute Op, folded out of the tick's standalone sweep. The
                 // body-edit reconcile is now an Issue Kind per-resync act inside
                 // `issue_reconciler::sweep` above (ADR 0012 §決定4).
-                if let Err(e) = super::repo_reconciler::reconcile_repo(deps) {
+                if let Err(e) = super::repo_reconciler::reconcile_repo(deps).await {
                     tracing::warn!("repo reconcile failed for {}: {e:#}", deps.project.id);
                 }
             }

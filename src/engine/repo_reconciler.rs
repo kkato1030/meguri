@@ -142,14 +142,73 @@ pub async fn reconcile_ready(deps: &super::Deps) -> bool {
 }
 
 /// The Repo Kind reconcile's per-resync pass over one ready project (ADR 0012
-/// §決定3). Runs the light `Op(RoutingDrift)` act — the pure-sqlite
-/// routing-drift recompute (`routing_drift::sweep`) — which recomputes every
-/// resync regardless of what else is due, so it is a per-resync act (like the
-/// Issue Kind's `reclaim_stale_claims`), not the single arm. Folding this here
-/// removes `routing_drift::sweep` from the scheduler tick's standalone sweep
-/// block. The cleaner / triage arm enqueue (via `next_step_repo`) folds in next.
-pub fn reconcile_repo(deps: &super::Deps) -> anyhow::Result<()> {
-    super::routing_drift::sweep(deps)
+/// §決定3): the light `Op(RoutingDrift)` act (the pure-sqlite routing-drift
+/// recompute, every resync), then the scan observation → [`next_step_repo`] →
+/// the cleaner / triage arm enqueue. The caller (`Scheduler`) only runs this
+/// on a `ready` project, so the clone health is already `Healthy`/non-managed
+/// — the snapshot reflects that with `None`.
+pub async fn reconcile_repo(deps: &super::Deps) -> anyhow::Result<()> {
+    super::routing_drift::sweep(deps)?;
+    if deps.forge.is_none() {
+        return Ok(()); // the scan arms are forge-driven; local mode has none
+    }
+    // observe: the two scan-due predicates (the old discovers' read-only
+    // bodies), each carrying its report-issue key.
+    let cleaner_report = super::cleaner::observe_scan_due(deps).await?;
+    let triage_report = super::triage::observe_scan_due(deps).await?;
+    let snap = RepoSnapshot {
+        clone_health: None,
+        cleaner_due: cleaner_report.is_some(),
+        triage_due: triage_report.is_some(),
+    };
+    // decide + step policy (決定10): a disabled arm waits, exactly one owner.
+    let step = match next_step_repo(&snap) {
+        RepoStep::Agent(arm) => {
+            let p = &deps.config.reconciler.policy;
+            let allowed = match arm {
+                RepoArm::Cleaner => p.cleaner,
+                RepoArm::Triage => p.triage,
+            };
+            if allowed {
+                RepoStep::Agent(arm)
+            } else {
+                deps.store.emit(
+                    None,
+                    "reconciler.policy_disabled",
+                    serde_json::json!({ "arm": arm.loop_kind() }),
+                )?;
+                RepoStep::Wait("policy disabled")
+            }
+        }
+        other => other,
+    };
+    // act: enqueue the arm's run keyed to its report issue (or 0 before the
+    // first report exists) — the same key the old discovery used. The unique
+    // (project, loop, issue) run index dedups.
+    if let RepoStep::Agent(arm) = step {
+        let (report, title) = match arm {
+            RepoArm::Cleaner => (cleaner_report, super::cleaner::REPORT_TITLE),
+            RepoArm::Triage => (triage_report, super::triage::REPORT_TITLE),
+        };
+        let issue = report.unwrap_or(0);
+        if let Ok(run) =
+            deps.store
+                .create_run_for_loop(&deps.project.id, arm.loop_kind(), issue, title)
+        {
+            deps.store.emit(
+                Some(&run.id),
+                "run.discovered",
+                serde_json::json!({ "key": format!("Issue({issue})"), "title": title,
+                        "loop": arm.loop_kind() }),
+            )?;
+            deps.store.emit(
+                Some(&run.id),
+                "reconciler.enqueued",
+                serde_json::json!({ "arm": arm.loop_kind(), "issue": issue }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
