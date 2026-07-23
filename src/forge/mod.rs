@@ -153,7 +153,7 @@ pub enum UpdateBranchOutcome {
     HeadMoved,
 }
 
-/// The API cost of one [`Forge::observe_merge_tail`] call — the measured value
+/// The API cost of one [`Forge::observe_open_prs`] call — the measured value
 /// ADR 0012 (decision 3) wants observable (issue #221). `requests` counts the
 /// HTTP round-trips the observe took; `graphql_cost` is GitHub's own
 /// `rateLimit.cost` when the query returned it, `None` otherwise.
@@ -168,7 +168,7 @@ pub struct ObserveCost {
 /// `next_step` reduces them to its decision Snapshot. The arm marker and the
 /// pr-review context are engine vocabulary, so the forge stays free of them:
 /// the marker is read by the engine out of [`Self::comments`], and the
-/// pr-review status is the context the caller passed to `observe_merge_tail`.
+/// pr-review status is the context the caller passed to `observe_open_prs`.
 #[derive(Debug, Clone)]
 pub struct PrObservation {
     pub pr: PullRequest,
@@ -196,6 +196,13 @@ pub struct PrObservation {
     /// when a bounded window clipped some; the engine then assumes an unresolved
     /// thread exists (arm waits) rather than arming past a hidden one.
     pub review_threads_complete: bool,
+    /// Whether [`Self::comments`] is the PR's *complete* conversation. False
+    /// when the overflow pagination hit its page budget or a non-advancing
+    /// cursor (a pathologically chatty PR must not be able to spend unbounded
+    /// API cost every resync). The engine then treats the PR as a human stop:
+    /// an arm/claim marker hidden past the truncation can never be missed, and
+    /// the chatty PR parks instead of being re-paginated forever.
+    pub comments_complete: bool,
 }
 
 /// The whole merge tail's observation for one sweep, plus the API cost it took
@@ -454,12 +461,20 @@ impl PullRequest {
 /// One PR conversation comment with its creation time (RFC3339 UTC, as GitHub
 /// returns `createdAt`). merge-watch reads the #41 arm marker's `createdAt` to
 /// know how long a PR has been armed (arm-since) without any local state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PrComment {
     pub body: String,
     /// GitHub's `createdAt`, e.g. `2026-07-13T09:00:00Z`; empty when the forge
     /// did not supply one (`store::parse_ts` then yields None → never stale).
     pub created_at: String,
+    /// The comment's GraphQL node id — how the reconciler edits its own claim
+    /// marker to a tombstone on release (ADR 0027 / §7). Empty when the forge
+    /// did not supply one.
+    pub id: String,
+    /// Whether the viewer (meguri's token) authored this comment. The claim
+    /// marker is trusted only when self-authored, so a third party cannot forge
+    /// a claim to freeze no-steal (ADR 0027 / §7). False for a lossy source.
+    pub viewer_did_author: bool,
 }
 
 /// One comment inside a review thread.
@@ -560,6 +575,11 @@ pub trait Forge: Send + Sync {
     async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>>;
     /// Post a conversation comment on a pull request.
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
+    /// Edit a conversation comment by its node id — how the reconciler
+    /// tombstones its own claim marker on release (ADR 0027 / §7). Best-effort:
+    /// correctness does not depend on it (a stale marker is reclaimed by
+    /// run-liveness), so callers log a failure rather than abort.
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
     /// Bodies of an issue's conversation comments, oldest first (triage
     /// advise's hidden-marker lookup, issue #87 — the per-issue mirror of
@@ -586,6 +606,13 @@ pub trait Forge: Send + Sync {
     /// merged ones. The reaper uses the merged state to recognize squash and
     /// rebase merges, whose branch tips never become ancestors of the base.
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
+    /// Open PRs the forge already cross-references to `issue` (GitHub's own
+    /// "Development"/timeline linkage — not a meguri label or comment). The
+    /// worker/planner check this immediately before opening a new PR (issue
+    /// #249, docs/design/needs-human-friction-and-delivery-speed.md §3-D/§P5)
+    /// so a rail-external PR that already covers the issue is never
+    /// duplicated.
+    async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>>;
     /// Whether the PR can merge into its base (conflict-resolver discovery).
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
     /// The PR's merge-readiness snapshot for merge-watch (auto-merge 2/3, #42):
@@ -645,7 +672,7 @@ pub trait Forge: Send + Sync {
     /// arming (`meguri/pr-review`, ADR 0008); the caller supplies it so the
     /// forge stays free of engine vocabulary, exactly as [`Forge::commit_status`]
     /// takes its context.
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
     /// Close a pull request **without merging** (`gh pr close`). The decompose

@@ -31,7 +31,7 @@ Headless loops fail opaquely: the agent hits a permission prompt, stalls, or goe
 
 - **Blocked ≠ failed.** When the agent shows a permission/question dialog, meguri flags the run `awaiting_human` and tells you how to attach — timers stop, nothing is killed.
 - **Human input is never an error.** You can attach and type mid-run; the orchestrator only acts on durable signals (the result file, git state, labels), so it tolerates and absorbs your interventions.
-- **Silence is nudged, not punished.** A quiet agent gets a capped number of reminder lines, then a human is paged. meguri never auto-fails a run for being slow.
+- **Silence is nudged, not punished.** A quiet agent gets a capped number of reminder lines. If it stays quiet, meguri assumes the *session* (not the work) is broken and heals itself: one more try on the same session, then a fresh session, and only when even that stays quiet is a human paged — with a sanitized pane tail attached for diagnosis. Resumes are gated the same way: a session whose transcript outgrew its context window is never resumed into a 400-loop, and a pane whose agent exited to a bare shell is never typed into (ADR 0029). meguri never auto-fails a run for being slow.
 - **Takeover/handback.** `meguri takeover <run>` parks the orchestrator; you drive the same session; `meguri handback <run>` resumes the loop with your work in context.
 
 ## The completion contract
@@ -334,6 +334,8 @@ Per-loop lifetimes at a glance:
 | cleaner (standalone) | report issue + default-branch movement | report issue | read-only detached | report issue rewritten | self-reclaimed |
 | triage (standalone) | report issue + default-branch/new-issue movement (opt-in) | report issue | read-only detached | report issue rewritten | self-reclaimed |
 
+The **fixer family** (`fixer` / `ci-fixer` / `conflict-resolver`) no longer self-discovers per loop. Their triggers are now **arms of one level-triggered reconciler** (ADR 0012 slice 3): a single `next_step` observes every open PR once (informer cache) and owns each state exactly once — conflict → conflict-resolver, red required CI → ci-fixer, an unresolved thread awaiting meguri → fixer, and the merge tail (arm / update-branch / stuck) — so a state can never fall between loops or be double-owned (a property test proves it). Dispatch is **workqueue + resync**: the reconciler enqueues a `queued` run per arm, dispatched by merge-proximity priority, spaced by an exponential backoff after a fix round that doesn't resolve the symptom, and — for the fixer family — held to one active run per PR by a family-wide DB index. That claim is projected onto the PR as an instance-named marker comment (`<!-- meguri:claim … -->`, trusted only when meguri authored it); `meguri:working` stays only as a human-facing display label (ADR 0026 / 0027).
+
 ### Auto-merge (opt-in)
 
 meguri never decides "safe to merge" — it arms GitHub-native auto-merge (`gh pr merge --auto`) on eligible PRs and lets GitHub (branch protection + required checks) decide when to merge (see `docs/adr/0003-auto-merge-github-native-arm-only.md`). It is off by default and gated behind two opt-ins: the master switch `[pr.auto_merge].enabled`, and (unless `opt_in = "all"`) the `meguri:automerge` label. Put the label on an *issue* and the worker copies it onto the PR (opening that PR non-draft); put it straight on a PR and it works too.
@@ -397,6 +399,7 @@ validate_turns = 3          # fix attempts for a failing check_command
 [scheduler]
 poll_interval_secs = 60
 max_concurrent_runs = 2
+sweep_degraded_threshold = 10  # consecutive sweep failures before sweep.degraded fires (issue #251)
 
 [daemon]
 restart_policy = "on-failure"  # launchd KeepAlive: never | on-failure | always
@@ -406,7 +409,7 @@ throttle_secs = 10             # launchd ThrottleInterval (secs between restarts
 macos = true           # page awaiting_human via a macOS notification (osascript)
 # webhook_url = "https://hooks.slack.com/services/..."  # push events to a webhook; ${ENV} expanded. Omit to disable
 # kind = "slack"       # slack | ntfy | json. Omit to auto-detect from the URL host
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped"]  # allowlist; default ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # allowlist; default ["awaiting_human"]
 throttle_secs = 60     # min seconds between notifications for the same key
 # [[projects]]
 #   notify = { labels = ["human:todo"] }  # also notify when meguri files an issue carrying one of these labels

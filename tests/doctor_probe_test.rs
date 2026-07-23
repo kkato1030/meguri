@@ -33,6 +33,7 @@ fn profile_for(command: PathBuf) -> AgentProfile {
         herdr_agent_hint: None,
         session_dir: None,
         preflight: None,
+        resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
     }
 }
 

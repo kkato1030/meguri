@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{AgentProfile, Config, LaunchMode, PlanDelivery, ProjectConfig};
+use meguri::engine::issue_reconciler;
 use meguri::engine::pr_reviewer::{
-    self, DIFF_FILE, PR_REVIEW_STATUS, PrReviewerLoop, REVIEW_FILE, run_pr_reviewer,
+    self, DIFF_FILE, PR_REVIEW_STATUS, REVIEW_FILE, run_pr_reviewer,
 };
-use meguri::engine::spec_fixer::SpecFixerLoop;
-use meguri::engine::{Deps, Loop, WorkerOutcome, reaper};
+use meguri::engine::{Deps, WorkerOutcome, reaper};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     CommitStatusState, Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY,
@@ -259,6 +259,19 @@ where
     })
 }
 
+/// Queued runs of `kind` after one PR-side reconcile pass (the discovery path
+/// since ADR 0012 S4 決定2).
+async fn reconciled_runs(env: &TestEnv, kind: &str) -> Vec<meguri::store::RunRecord> {
+    issue_reconciler::sweep(&env.deps).await.unwrap();
+    env.deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.loop_kind == kind && r.status == RunStatus::Queued)
+        .collect()
+}
+
 /// pr-reviewer(Plan) clean: spec-reviewing → spec-ready, a success pr-review
 /// status, a folded body `<details>`, and NO inline threads or comments —
 /// the fixer never reacts (criterion 3, 3a).
@@ -384,17 +397,17 @@ async fn plan_review_findings_defer_to_spec_fixer_without_escalating() {
 
     // pr_reviewer itself does not re-review a head it already settled...
     assert!(
-        PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        reconciled_runs(&env, pr_reviewer::KIND).await.is_empty(),
         "an already-reviewed head is not re-reviewed"
     );
-    // ...but spec_fixer's discover fires on the very next poll (issue #192,
+    // ...but the spec-fixer arm fires on the very next resync (issue #192,
     // acceptance criterion 1): no needs-human means it is free to pick up
     // the PR whose head pr-review status it just saw settle to Failure.
-    let targets = SpecFixerLoop.discover(&env.deps).await.unwrap();
+    let runs = reconciled_runs(&env, meguri::engine::spec_fixer::KIND).await;
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
         vec![ISSUE],
-        "spec_fixer must discover the findings PR now that it is not escalated"
+        "spec_fixer must be enqueued now that the PR is not escalated"
     );
 }
 
@@ -510,7 +523,7 @@ async fn impl_advisory_settles_green_and_does_not_escalate() {
 async fn impl_review_off_discovers_nothing() {
     let env = setup(&[LABEL_IMPLEMENTING], false).await;
     assert!(
-        PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        reconciled_runs(&env, pr_reviewer::KIND).await.is_empty(),
         "impl review is off by default"
     );
 }
@@ -543,15 +556,19 @@ async fn discovery_filters_hold_claimed_and_reviewed_heads() {
     env.forge
         .set_commit_status_direct("sha15", PR_REVIEW_STATUS, CommitStatusState::Failure);
 
-    let targets = PrReviewerLoop.discover(&env.deps).await.unwrap();
+    let runs = reconciled_runs(&env, pr_reviewer::KIND).await;
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
         vec![ISSUE]
     );
+    env.deps
+        .store
+        .update_run_status(&runs[0].id, RunStatus::Skipped, None)
+        .unwrap();
 
     // Plan review off → the spec PR is not discovered either.
     env.deps.config.review.guard.plan = false;
-    assert!(PrReviewerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(reconciled_runs(&env, pr_reviewer::KIND).await.is_empty());
 }
 
 /// A benign race (label removed after discovery) skips quietly.
@@ -730,6 +747,7 @@ async fn setup_direct(script_dir: &Path) -> TestEnv {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
         };
     })
     .await
@@ -975,7 +993,9 @@ async fn issue_close_clears_the_park_via_reaper_sweep() {
     assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
 
     env.forge.close_issue(ISSUE);
-    reaper::sweep(&env.deps).await.unwrap();
+    reaper::finalize(&env.deps, &Default::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         env.deps

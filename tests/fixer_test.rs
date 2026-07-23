@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::fixer::{self, FIXER_REPLY_MARKER, FixerLoop, run_fixer};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::fixer::{self, FIXER_REPLY_MARKER, run_fixer};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
@@ -129,6 +129,38 @@ fn create_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
         .store
         .create_run_for_loop("proj", fixer::KIND, 9, "Add feature (#9)")
         .unwrap()
+}
+
+/// Run the Issue Kind reconciler once and return the canonical issues that got
+/// a queued fixer run — the S3 replacement for `FixerLoop.discover()` (discovery
+/// moved to the `awaits_fixer_thread` arm of `issue_reconciler::next_step`).
+async fn reconciler_fixer_targets(env: &TestEnv) -> Vec<i64> {
+    meguri::engine::issue_reconciler::sweep(&env.deps)
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = env
+        .deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.loop_kind == fixer::KIND && r.status == RunStatus::Queued)
+        .map(|r| r.issue_number)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The single queued fixer run the reconciler just created (drive it directly).
+fn queued_fixer_run(env: &TestEnv) -> meguri::store::RunRecord {
+    env.deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.loop_kind == fixer::KIND && r.status == RunStatus::Queued)
+        .expect("reconciler enqueued a fixer run")
 }
 
 fn find_worktree(worktree_root: &Path) -> Option<PathBuf> {
@@ -283,7 +315,7 @@ async fn fixer_happy_path_pushes_fix_to_pr_branch_and_replies() {
     let labels = env.forge.pr_labels(1);
     assert!(!labels.contains(&LABEL_WORKING.to_string()), "{labels:?}");
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
-    assert!(FixerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(reconciler_fixer_targets(&env).await.is_empty());
 
     // The prompt carried the review comment and the no-push rule.
     let wt = find_worktree(&env.worktree_root).unwrap();
@@ -311,13 +343,9 @@ async fn fixer_reviewer_ping_pong_converges() {
         });
     });
 
-    // Round 1: the reviewer's comment gets fixed and pushed.
-    let targets = FixerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![9]
-    );
-    let run1 = create_fixer_run(&env);
+    // Round 1: the reconciler's Fixer arm enqueues the awaiting-thread PR.
+    assert_eq!(reconciler_fixer_targets(&env).await, vec![9]);
+    let run1 = queued_fixer_run(&env);
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_fixer(&env.deps, &run1.id))
         .await
         .expect("fixer round 1 timed out")
@@ -325,16 +353,19 @@ async fn fixer_reviewer_ping_pong_converges() {
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
     let tip_round1 = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;
 
-    // Parked: awaiting re-review, discovery stays quiet.
-    assert!(FixerLoop.discover(&env.deps).await.unwrap().is_empty());
+    // Parked: awaiting re-review, the arm stays quiet (thread reply marker).
+    assert!(reconciler_fixer_targets(&env).await.is_empty());
 
     // Round 2: the reviewer pushes back on the same thread.
     env.forge
         .add_thread_comment(1, "t1", "reviewer", "Closer, but still wrong.");
-    let targets = FixerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(targets.len(), 1, "reviewer reply must reopen the ping-pong");
+    assert_eq!(
+        reconciler_fixer_targets(&env).await,
+        vec![9],
+        "reviewer reply must reopen the ping-pong"
+    );
 
-    let run2 = create_fixer_run(&env);
+    let run2 = queued_fixer_run(&env);
     assert_ne!(run1.id, run2.id, "each round is its own run");
     let outcome = tokio::time::timeout(Duration::from_secs(60), run_fixer(&env.deps, &run2.id))
         .await
@@ -349,7 +380,7 @@ async fn fixer_reviewer_ping_pong_converges() {
     // The reviewer accepts: the thread resolves and the loop converges.
     env.forge.resolve_thread(1, "t1");
     assert!(
-        FixerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        reconciler_fixer_targets(&env).await.is_empty(),
         "resolved threads must end the ping-pong"
     );
 
@@ -392,12 +423,23 @@ async fn fixer_discovery_skips_spec_ready_merged_held_needs_human_and_foreign_pr
         .push_pr("meguri/14-held-aaa111", "Held (#14)", &[LABEL_HOLD]);
     env.forge
         .add_review_thread(pr, "t-held", "y.txt", "reviewer", "fix");
-    // PR #6: already claimed by another host.
+    // PR #6: already being worked by another fixer-family arm (ADR 0027: the
+    // `working` label is now only a display projection — the family-wide
+    // active-run index is the exclusion, so an *active run* is what blocks).
     let pr = env
         .forge
         .push_pr("meguri/15-busy-bbb222", "Busy (#15)", &[LABEL_WORKING]);
     env.forge
         .add_review_thread(pr, "t-busy", "z.txt", "reviewer", "fix");
+    let busy = env
+        .deps
+        .store
+        .create_run_for_loop("proj", "conflict-resolver", 15, "Busy (#15)")
+        .unwrap();
+    env.deps
+        .store
+        .update_run_status(&busy.id, RunStatus::Running, None)
+        .unwrap();
     // PR #7: escalated — waits for a human to clear the label (issue #170:
     // the fixer used to carry no needs-human gate at all, unlike ci-fixer
     // and the conflict resolver).
@@ -409,11 +451,11 @@ async fn fixer_discovery_skips_spec_ready_merged_held_needs_human_and_foreign_pr
     env.forge
         .add_review_thread(pr, "t-stuck", "w.txt", "reviewer", "fix");
 
-    let targets = FixerLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        reconciler_fixer_targets(&env).await,
         vec![9],
-        "only the open, unclaimed, unescalated meguri PR with an awaiting thread is actionable"
+        "only the open, unclaimed, unescalated meguri PR with an awaiting thread \
+         and no active family run is actionable"
     );
 }
 
@@ -442,6 +484,43 @@ async fn fixer_skips_quietly_when_pr_flips_spec_ready_after_discovery() {
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
     assert!(env.forge.comments_of(1).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciler_recovers_after_a_crashed_run_left_a_stale_working_label() {
+    // f3: the busy gate keys on run liveness, not the `meguri:working` label, so
+    // a stale label left by a crashed/terminal run cannot deadlock the PR.
+    let env = setup(None).await;
+    let run = create_fixer_run(&env);
+    // A round started: the recipe added `meguri:working`.
+    env.forge.add_pr_label(1, LABEL_WORKING).await.unwrap();
+
+    // While the run is live, the issue is busy — no re-enqueue (no churn).
+    env.deps
+        .store
+        .update_run_status(&run.id, RunStatus::Running, None)
+        .unwrap();
+    assert!(
+        reconciler_fixer_targets(&env).await.is_empty(),
+        "a live run makes the issue busy"
+    );
+
+    // The run crashes to a terminal state but the `working` label lingers (its
+    // removal never ran). Run-liveness — not the stale label — is the gate, so
+    // the PR becomes arm-able again and recovery is not deadlocked.
+    env.deps
+        .store
+        .update_run_status(&run.id, RunStatus::Failed, None)
+        .unwrap();
+    assert!(
+        env.forge.pr_labels(1).contains(&LABEL_WORKING.to_string()),
+        "the stale working label is still present"
+    );
+    assert_eq!(
+        reconciler_fixer_targets(&env).await,
+        vec![9],
+        "a stale working label from a crashed run must not deadlock recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,11 +559,6 @@ async fn fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     assert_eq!(threads[0].comments.len(), 1);
 
     // The unresolved, unparked thread would otherwise re-trigger the fixer
-    // forever (issue #170: the fixer used to have no needs-human gate at
-    // all, unlike ci-fixer and the conflict resolver); the escalation must
-    // still park discovery.
-    assert!(
-        FixerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "an escalated PR must wait for a human, not re-trigger"
-    );
+    // forever — the reconciler's human-stop gate parks it (covered by the
+    // next_step property tests; the old Loop::discover is gone, ADR 0012 決定7).
 }

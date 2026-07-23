@@ -577,6 +577,35 @@ impl Multiplexer for HerdrMux {
             .map(str::to_string))
     }
 
+    /// Agent presence from the pane's foreground process list (`pane
+    /// process-info`, issue #245): every process a shell → the agent exited
+    /// and the pane fell back to a bare prompt (`Some(false)`); any non-shell
+    /// process (the agent CLI or its MCP children) → `Some(true)`; a missing
+    /// pane or an unreadable list → `None` (cannot tell, fail open).
+    async fn agent_present(&self, pane: &PaneId) -> MuxResult<Option<bool>> {
+        let result = match self
+            .herdr_json(&["pane", "process-info", "--pane", &pane.0])
+            .await
+        {
+            Ok(result) => result,
+            Err(MuxError::CommandFailed { detail, .. }) if detail.contains("not found") => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(processes) = result
+            .pointer("/process_info/foreground_processes")
+            .and_then(Value::as_array)
+        else {
+            return Ok(None);
+        };
+        Ok(super::classify_foreground_processes(
+            processes
+                .iter()
+                .filter_map(|p| p.pointer("/name").and_then(Value::as_str)),
+        ))
+    }
+
     /// Native wait: the event subscription reacts within milliseconds of a
     /// transition; `herdr wait agent-status` (one racing process per target)
     /// covers a missing subscription; tolerant polling covers a dead herdr —

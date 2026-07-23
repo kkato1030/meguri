@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
@@ -21,6 +21,9 @@ pub struct FakePane {
     pub alive: bool,
     pub tail: Vec<String>,
     pub agent_session: Option<String>,
+    /// What `agent_present` reports for this pane (issue #245); None (the
+    /// default) = the mux cannot tell, like a real mux without the capability.
+    pub agent_present: Option<bool>,
 }
 
 pub struct FakeMux {
@@ -42,6 +45,13 @@ pub struct FakeMux {
     dashboards: Mutex<HashMap<String, DashboardId>>,
     /// Commands launched via `run_in_pane`, in call order.
     ran_in_pane: Mutex<Vec<(PaneId, Vec<String>)>>,
+    /// Set by [`Self::stop`] (issue #250): emulates the mux daemon itself
+    /// being down (herdr not running). `ensure_session`/`spawn_pane` fail
+    /// with the same `MuxError::Io(ConnectionRefused)` a dead socket produces,
+    /// so tests can exercise the infra-escalation path without a real socket.
+    stopped: AtomicBool,
+    /// `agent_present` answer stamped on every future spawn (issue #245).
+    default_agent_present: Mutex<Option<bool>>,
 }
 
 impl FakeMux {
@@ -56,7 +66,21 @@ impl FakeMux {
             tiled: Mutex::new(Vec::new()),
             dashboards: Mutex::new(HashMap::new()),
             ran_in_pane: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            default_agent_present: Mutex::new(None),
         }
+    }
+
+    /// Simulate the mux daemon being stopped (issue #250): every subsequent
+    /// `ensure_session`/`spawn_pane` call fails with a connection-refused
+    /// `MuxError::Io`, matching a stopped herdr/tmux, until [`Self::start`].
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Undo [`Self::stop`] — the mux daemon is back.
+    pub fn start(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
     }
 
     pub fn set_state(&self, pane: &PaneId, state: AgentState) {
@@ -101,6 +125,21 @@ impl FakeMux {
         }
     }
 
+    /// What `agent_present` reports for the pane (issue #245):
+    /// `Some(false)` emulates a pane whose agent exited to a bare shell.
+    pub fn set_agent_present(&self, pane: &PaneId, present: Option<bool>) {
+        let mut panes = self.panes.lock().unwrap();
+        if let Some(p) = panes.get_mut(pane) {
+            p.agent_present = present;
+        }
+    }
+
+    /// Make every FUTURE spawn come up with this `agent_present` answer
+    /// (issue #245) — for tests where the pane id is not known in advance.
+    pub fn set_default_agent_present(&self, present: Option<bool>) {
+        *self.default_agent_present.lock().unwrap() = present;
+    }
+
     /// Make future spawns whose command contains `needle` come up dead.
     pub fn fail_spawns_matching(&self, needle: &str) {
         *self.dead_spawn_matching.lock().unwrap() = Some(needle.to_string());
@@ -141,6 +180,7 @@ impl FakeMux {
                 alive: true,
                 tail: Vec::new(),
                 agent_session: None,
+                agent_present: None,
             },
         );
         pane
@@ -160,10 +200,16 @@ impl Multiplexer for FakeMux {
     }
 
     async fn ensure_session(&self) -> MuxResult<()> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(connection_refused());
+        }
         Ok(())
     }
 
     async fn spawn_pane(&self, spec: &PaneSpec) -> MuxResult<PaneId> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(connection_refused());
+        }
         if let Some(needle) = &*self.error_spawn_matching.lock().unwrap()
             && spec.command.iter().any(|arg| arg.contains(needle))
         {
@@ -191,6 +237,7 @@ impl Multiplexer for FakeMux {
                 alive,
                 tail: Vec::new(),
                 agent_session: None,
+                agent_present: *self.default_agent_present.lock().unwrap(),
             },
         );
         Ok(id)
@@ -250,6 +297,15 @@ impl Multiplexer for FakeMux {
             .unwrap()
             .get(pane)
             .and_then(|p| p.agent_session.clone()))
+    }
+
+    async fn agent_present(&self, pane: &PaneId) -> MuxResult<Option<bool>> {
+        Ok(self
+            .panes
+            .lock()
+            .unwrap()
+            .get(pane)
+            .and_then(|p| p.agent_present))
     }
 
     async fn kill_pane(&self, pane: &PaneId) -> MuxResult<()> {
@@ -312,4 +368,11 @@ impl Multiplexer for FakeMux {
     fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
         format!("echo fake dashboard {dashboard}")
     }
+}
+
+fn connection_refused() -> MuxError {
+    MuxError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "mux stopped (fake)",
+    ))
 }

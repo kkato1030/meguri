@@ -12,7 +12,7 @@ use crate::config::{self, Config, ProjectConfig, ProjectMode};
 use crate::daemon;
 use crate::engine::reaper;
 use crate::engine::scheduler::{Reload, Scheduler};
-use crate::engine::worker::{WorkerOutcome, run_worker};
+use crate::engine::worker::WorkerOutcome;
 use crate::engine::{self, Deps};
 use crate::forge::Forge;
 use crate::forge::gh::GhForge;
@@ -79,7 +79,6 @@ fn build_deps(cfg: &Config, project: &ProjectConfig, mux_override: Option<&str>)
         forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
         config: cfg.clone(),
         project: project.clone(),
-        open_prs: Default::default(),
         preflight_enabled: true,
     })
 }
@@ -813,65 +812,235 @@ pub async fn gh_viewer_permission(slug: &str) -> Result<String> {
     }
 }
 
-pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&str>) -> Result<()> {
+/// The typed identity selector the three operator verbs share (ADR 0016):
+/// exactly one of issue / PR / run / local task.
+#[derive(Debug, Clone)]
+pub enum RunSelector {
+    Issue(i64),
+    Pr(i64),
+    RunId(String),
+    Task(i64),
+}
+
+/// `meguri run` (ADR 0016): role-agnostic — resolve the selector to its
+/// owning decider, freshly observe, and dispatch the arm the decider picks.
+/// `--run` resumes with the run's stored loop kind; `--pr` routes to the
+/// PR-side decider; `--issue` follows the ownership boundary (an open meguri
+/// PR owns the identity); `--task` is the local decider. A manual run
+/// bypasses the discovery throttles (already-shipped / cadence window) but
+/// never the safety gates (hold/needs-human, busy, not-before) — and still
+/// stamps the cadence bucket so the window's consumption is counted.
+pub async fn cmd_run(
+    project: Option<&str>,
+    sel: RunSelector,
+    mux_override: Option<&str>,
+) -> Result<()> {
     let cfg = Config::load()?;
     crate::routing::validate(&cfg, &crate::routing::detect_command)?;
     crate::launch::validate(&cfg)?;
     crate::routing::warn_unsafe_preflight_overrides(&cfg);
     crate::collab::validate(&cfg, &crate::routing::detect_command)?;
     let project = pick_project(&cfg, project)?;
-    if project.mode == ProjectMode::Local {
+    if project.mode == ProjectMode::Local
+        && !matches!(sel, RunSelector::Task(_) | RunSelector::RunId(_))
+    {
         bail!(
-            "`meguri run --issue` is for github-mode projects; \
-             for a local project use `meguri add` and let `meguri watch` pick it up"
+            "a local project has no issues/PRs; use `meguri run --task <id>`              (or `meguri add` and let `meguri watch` pick it up)"
         );
     }
     let deps = build_deps(&cfg, project, mux_override)?;
+    if project.mode != ProjectMode::Local {
+        // Materialize the managed bare clone before anything touches
+        // `repo_path` (ADR 0018) — the one-shot counterpart of the tick gate.
+        engine::ensure_project_clone(&deps).await?;
+    }
 
-    // Materialize the managed bare clone before anything touches `repo_path`
-    // (ADR 0018) — the one-shot counterpart of the scheduler's tick-top hook.
-    engine::ensure_project_clone(&deps).await?;
-
-    let gh_issue = deps.forge().get_issue(issue).await?;
-    // Manual run bypasses the cadence gate (it is a human's explicit override —
-    // always run it), but if the issue falls under a cadence rule the run must
-    // still count toward the window, or a same-day `watch` would consume the
-    // bucket a second time. Conflicting rules are the one case we refuse: a
-    // single `cadence_label` cannot count two buckets, so a human must pick.
-    let cadence_label = match crate::cadence::cadence_bucket(&gh_issue.labels, &project.cadence) {
-        Ok(bucket) => bucket,
-        Err(labels) => bail!(
-            "issue #{issue} matches multiple cadence rules ({}); a run can only count \
-             toward one — remove all but one of these labels",
-            labels.join(", ")
-        ),
-    };
-    let run = match deps.store.create_run_for_loop_cadence(
-        &project.id,
-        "worker",
-        issue,
-        &gh_issue.title,
-        cadence_label.as_deref(),
-    ) {
-        Ok(run) => run,
-        Err(_) => {
-            // An active run exists (possibly interrupted): resume it.
-            let existing = deps
+    match sel {
+        RunSelector::RunId(id) => {
+            // Keep the stored loop kind (finding 1): an existing run resumes
+            // its own recipe, never re-routed through the issue side.
+            let run = deps
                 .store
-                .list_runs(true)?
-                .into_iter()
-                .find(|r| r.project_id == project.id && r.issue_number == issue)
-                .context("an active run exists but could not be loaded")?;
-            println!("resuming run {} (step {})", existing.id, existing.step);
-            existing
+                .find_run(&id)?
+                .with_context(|| format!("no run matches {id:?}"))?;
+            println!(
+                "resuming run {} ({}, step {}) — watch with: meguri attach {}",
+                run.id, run.loop_kind, run.step, run.id
+            );
+            let outcome = engine::run_recipe(&deps, &run.id, &run.loop_kind).await?;
+            print_run_outcome(outcome)
         }
-    };
+        RunSelector::Pr(n) => run_pr_side(&deps, n).await,
+        RunSelector::Task(id) => run_local_task(&deps, id).await,
+        RunSelector::Issue(n) => {
+            // Ownership boundary (決定1): an open meguri PR owns the identity,
+            // so `run --issue` on such an issue drives the PR-side decider.
+            if let Some(pr) = engine::open_pr_for_issue(&deps, n).await? {
+                println!(
+                    "issue #{n} is owned by its open PR #{} — routing to the PR side",
+                    pr.number
+                );
+                return run_pr_side(&deps, pr.number).await;
+            }
+            run_issue_side(&deps, n).await
+        }
+    }
+}
 
-    println!(
-        "run {} — issue #{} {:?} — watch with: meguri attach {}",
-        run.id, issue, gh_issue.title, run.id
-    );
-    match run_worker(&deps, &run.id).await? {
+/// PR-side manual run: fresh observe → the PR decider's step. An `Agent` arm
+/// dispatches; anything else is explained and nothing launches.
+async fn run_pr_side(deps: &engine::Deps, pr: i64) -> Result<()> {
+    use crate::engine::issue_reconciler::{self, Step};
+    let Some((_, step)) = issue_reconciler::observe_pr_step(deps, pr).await? else {
+        bail!("PR #{pr} is not an open PR of this project");
+    };
+    match step {
+        Step::Agent(arm) => {
+            let obs_pr = engine::open_pr_by_number(deps, pr)
+                .await?
+                .with_context(|| format!("PR #{pr} vanished between observe and dispatch"))?;
+            let issue = engine::canonical_key(&obs_pr);
+            let run = match deps.store.create_run_for_loop(
+                &deps.project.id,
+                arm.loop_kind(),
+                issue,
+                &obs_pr.title,
+            ) {
+                Ok(run) => run,
+                Err(_) => resume_existing(deps, issue)?,
+            };
+            println!(
+                "run {} — PR #{pr} → {} — watch with: meguri attach {}",
+                run.id,
+                arm.loop_kind(),
+                run.id
+            );
+            let outcome = engine::run_recipe(deps, &run.id, arm.loop_kind()).await?;
+            print_run_outcome(outcome)
+        }
+        other => {
+            println!("nothing to launch for PR #{pr}: {other:?}");
+            Ok(())
+        }
+    }
+}
+
+/// Issue-side manual run (`Mode::ManualRun`): the decider's arm with the
+/// discovery throttles bypassed, the safety gates kept, and the cadence
+/// bucket stamped for consumption.
+async fn run_issue_side(deps: &engine::Deps, issue: i64) -> Result<()> {
+    use crate::engine::issue_reconciler::{self, IssueStep, Mode};
+    let gh_issue = deps.forge().get_issue(issue).await?;
+    let open_prs = engine::reaper::open_meguri_pr_issues(deps).await;
+    let mut remaining = std::collections::HashMap::new();
+    let (snap, _) =
+        issue_reconciler::build_issue_snapshot(deps, &gh_issue, &open_prs, &mut remaining).await?;
+    match issue_reconciler::next_step_issue(&snap, Mode::ManualRun) {
+        IssueStep::Agent(arm) => {
+            // Manual runs bypass the cadence *window* but still count toward
+            // it (ADR 0011): stamp the bucket straight from the labels.
+            // Conflicting rules are the one refusal — one stamp, one bucket.
+            let cadence_label = match crate::cadence::cadence_bucket(
+                &gh_issue.labels,
+                &deps.project.cadence,
+            ) {
+                Ok(bucket) => bucket,
+                Err(labels) => bail!(
+                    "issue #{issue} matches multiple cadence rules ({}); a run can only                          count toward one — remove all but one of these labels",
+                    labels.join(", ")
+                ),
+            };
+            let run = match deps.store.create_run_for_loop_cadence(
+                &deps.project.id,
+                arm.loop_kind(),
+                issue,
+                &gh_issue.title,
+                cadence_label.as_deref(),
+            ) {
+                Ok(run) => run,
+                Err(_) => resume_existing(deps, issue)?,
+            };
+            println!(
+                "run {} — issue #{issue} {:?} → {} — watch with: meguri attach {}",
+                run.id,
+                gh_issue.title,
+                arm.loop_kind(),
+                run.id
+            );
+            let outcome = engine::run_recipe(deps, &run.id, &run.loop_kind).await?;
+            print_run_outcome(outcome)
+        }
+        other => {
+            println!("nothing to launch for issue #{issue}: {other:?}");
+            Ok(())
+        }
+    }
+}
+
+/// Local-task manual run (`next_step_local`, ADR 0016): local mode's input
+/// path — no more bail for local projects.
+async fn run_local_task(deps: &engine::Deps, task_id: i64) -> Result<()> {
+    use crate::engine::issue_reconciler::{
+        LocalArm, LocalSnapshot, LocalStep, Mode, next_step_local,
+    };
+    let task = deps
+        .store
+        .get_task(task_id)?
+        .with_context(|| format!("no local task {task_id}"))?;
+    let snap = LocalSnapshot {
+        human_stop: false,
+        issue_busy: false,
+        already_shipped: false,
+        not_before_wait: false,
+        deps_unmet: false,
+        cadence_full: false,
+    };
+    match next_step_local(&snap, Mode::ManualRun) {
+        LocalStep::Agent(LocalArm::Worker) => {
+            let run = match deps.store.create_run_for_task(
+                &deps.project.id,
+                engine::worker::KIND,
+                task_id,
+                &task.title,
+            ) {
+                Ok(run) => run,
+                Err(_) => {
+                    let existing = deps
+                        .store
+                        .list_runs(true)?
+                        .into_iter()
+                        .find(|r| r.project_id == deps.project.id && r.task_id == Some(task_id))
+                        .context("an active run exists but could not be loaded")?;
+                    println!("resuming run {} (step {})", existing.id, existing.step);
+                    existing
+                }
+            };
+            println!("run {} — task {task_id} {:?}", run.id, task.title);
+            let outcome = engine::run_recipe(deps, &run.id, engine::worker::KIND).await?;
+            print_run_outcome(outcome)
+        }
+        other => {
+            println!("nothing to launch for task {task_id}: {other:?}");
+            Ok(())
+        }
+    }
+}
+
+/// Resume the active run of `issue` when creation hit the unique index.
+fn resume_existing(deps: &engine::Deps, issue: i64) -> Result<crate::store::RunRecord> {
+    let existing = deps
+        .store
+        .list_runs(true)?
+        .into_iter()
+        .find(|r| r.project_id == deps.project.id && r.issue_number == issue)
+        .context("an active run exists but could not be loaded")?;
+    println!("resuming run {} (step {})", existing.id, existing.step);
+    Ok(existing)
+}
+
+/// The human-facing outcome of a synchronously-driven run.
+fn print_run_outcome(outcome: WorkerOutcome) -> Result<()> {
+    match outcome {
         WorkerOutcome::Succeeded { pr_url } => {
             println!("✅ PR: {pr_url}");
             Ok(())
@@ -881,7 +1050,9 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
             Ok(())
         }
         WorkerOutcome::Interrupted(reason) => {
-            bail!("run interrupted: {reason} — rerun `meguri run --issue {issue}` to resume");
+            bail!(
+                "run interrupted: {reason} — rerun `meguri run` with the same selector to resume"
+            );
         }
         WorkerOutcome::Skipped(reason) => {
             println!("⏭️  skipped: {reason}");
@@ -899,6 +1070,105 @@ pub async fn cmd_run(project: Option<&str>, issue: i64, mux_override: Option<&st
             Ok(())
         }
     }
+}
+
+/// `meguri why` (ADR 0016): the read-only observation window. Resolves the
+/// selector to its owning decider, runs one fresh observe, and prints the
+/// Step and its reason — no forge writes, no run creation.
+pub async fn cmd_why(project: Option<&str>, sel: RunSelector) -> Result<()> {
+    let cfg = Config::load()?;
+    let project = pick_project(&cfg, project)?;
+    let deps = build_deps(&cfg, project, None)?;
+    println!("{}", why_text(&deps, &sel).await?);
+    Ok(())
+}
+
+/// The `why` view, separated for tests (read-only assertion, f6).
+pub async fn why_text(deps: &engine::Deps, sel: &RunSelector) -> Result<String> {
+    use crate::engine::issue_reconciler::{self, Mode};
+    Ok(match sel {
+        RunSelector::Pr(n) => match issue_reconciler::observe_pr_step(deps, *n).await? {
+            Some((snap, step)) => format!(
+                "identity: PR #{n} (project {})
+owner: Issue Kind — PR-side decider
+                 step: {step:?}
+snapshot: {snap:#?}",
+                deps.project.id
+            ),
+            None => format!("PR #{n} is not an open PR of project {}", deps.project.id),
+        },
+        RunSelector::Issue(n) => {
+            if let Some(pr) = engine::open_pr_for_issue(deps, *n).await? {
+                let view = Box::pin(why_text(deps, &RunSelector::Pr(pr.number))).await?;
+                format!(
+                    "identity: issue #{n} (project {})
+owner: its open PR #{} (決定1 boundary)
+
+{view}",
+                    deps.project.id, pr.number
+                )
+            } else {
+                let gh_issue = deps.forge().get_issue(*n).await?;
+                let open_prs = engine::reaper::open_meguri_pr_issues(deps).await;
+                let mut remaining = std::collections::HashMap::new();
+                let (snap, _) = issue_reconciler::build_issue_snapshot(
+                    deps,
+                    &gh_issue,
+                    &open_prs,
+                    &mut remaining,
+                )
+                .await?;
+                let step = issue_reconciler::next_step_issue(&snap, Mode::Reconcile);
+                format!(
+                    "identity: issue #{n} (project {})
+owner: Issue Kind — issue-side decider
+                     step: {step:?}
+snapshot: {snap:#?}",
+                    deps.project.id
+                )
+            }
+        }
+        RunSelector::RunId(id) => {
+            let run = deps
+                .store
+                .find_run(id)?
+                .with_context(|| format!("no run matches {id:?}"))?;
+            format!(
+                "identity: run {} (project {})
+owner: recipe {} (stored loop kind)
+                 status: {} / step: {}
+error: {}",
+                run.id,
+                run.project_id,
+                run.loop_kind,
+                run.status.as_str(),
+                run.step,
+                run.error.as_deref().unwrap_or("-")
+            )
+        }
+        RunSelector::Task(id) => {
+            let task = deps
+                .store
+                .get_task(*id)?
+                .with_context(|| format!("no local task {id}"))?;
+            let snap = issue_reconciler::LocalSnapshot {
+                human_stop: false,
+                issue_busy: false,
+                already_shipped: false,
+                not_before_wait: false,
+                deps_unmet: false,
+                cadence_full: false,
+            };
+            let step = issue_reconciler::next_step_local(&snap, Mode::Reconcile);
+            format!(
+                "identity: local task {id} (project {})
+owner: Issue Kind — local decider
+                 status: {} / title: {:?}
+step: {step:?}",
+                deps.project.id, task.status, task.title
+            )
+        }
+    })
 }
 
 pub async fn cmd_watch() -> Result<()> {
@@ -983,7 +1253,8 @@ pub async fn cmd_watch() -> Result<()> {
 
     let scheduler = Scheduler {
         projects,
-        loops: crate::engine::default_loops(),
+        // ADR 0012 §決定8: production dispatches via the recipe table.
+        recipe: crate::engine::default_recipe(),
         poll_interval: Duration::from_secs(cfg.scheduler.poll_interval_secs),
         max_concurrent: cfg.scheduler.max_concurrent_runs as usize,
         reload: Some(reload),
@@ -1016,7 +1287,7 @@ async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
         .merge_policy(&deps.project.default_branch, am.require_branch_protection)
         .await
         .with_context(|| format!("cannot read merge settings for {slug} to validate auto-merge"))?;
-    if let Err(problems) = crate::engine::merge_tail::validate_policy(am, &policy) {
+    if let Err(problems) = crate::engine::issue_reconciler::validate_policy(am, &policy) {
         bail!(
             "auto-merge is enabled for project `{}` ({}) but the repository cannot \
              honor it:\n  - {}",
@@ -1044,7 +1315,10 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
     for project in projects {
         let deps = build_deps(&cfg, project, None)?;
         let mut states = reaper::IssueStates::default();
-        let pane_candidates = reaper::plan_panes(&deps, &mut states).await?;
+        // Manual prune honors the same open-PR ownership boundary as the
+        // automatic Finalize pass (finding 4b).
+        let open_pr_issues = reaper::open_meguri_pr_issues(&deps).await;
+        let pane_candidates = reaper::plan_panes(&deps, &mut states, &open_pr_issues).await?;
 
         // Panes go first so their worktrees become reclaimable in this same
         // pass (a closed issue's live pane no longer protects its worktree).
@@ -1071,7 +1345,7 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
             }
         }
 
-        let candidates = reaper::plan_with(&deps, &mut states).await?;
+        let candidates = reaper::plan_with(&deps, &mut states, &open_pr_issues).await?;
         if candidates.is_empty() {
             if pane_candidates.is_empty() {
                 println!("{}: no meguri panes or worktrees", project.id);
@@ -1416,7 +1690,7 @@ fn cmd_tasks_local(project: &ProjectConfig, all: bool) -> Result<()> {
         println!("no {}tasks", if all { "" } else { "open " });
         return Ok(());
     }
-    let now = crate::engine::scheduler_fire::epoch_now();
+    let now = crate::engine::schedule::epoch_now();
     println!("{:>4}  {:<6} {:<12} TITLE", "ID", "KIND", "STATUS");
     for t in tasks {
         let flag = if t.status == "needs_human" {
@@ -1529,29 +1803,62 @@ fn format_disposition(disposition: &crate::cadence::Disposition) -> String {
     }
 }
 
-/// `meguri schedules`: list a project's cron schedules with their definition,
-/// last fire (from sqlite `schedule_state`), and next fire (computed from the
-/// cron expression, UTC). Times are UTC, matching the cron interpretation.
-pub fn cmd_schedules(project: Option<&str>) -> Result<()> {
+/// `meguri schedules`: list a project's *effective* cron schedules — host
+/// `[[projects.schedules]]` ∪ the repo's own `meguri.toml` on the default branch
+/// (issue #222) — with their source, definition, last fire (from sqlite
+/// `schedule_state`), and next fire (computed from the cron expression, UTC).
+/// Uses the same resolver the sweep uses, so what is listed is what fires (ADR
+/// 0026). Times are UTC, matching the cron interpretation.
+pub async fn cmd_schedules(project: Option<&str>) -> Result<()> {
+    use crate::engine::schedule::{Diagnostic, resolve_effective_schedules};
+
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
-    if project.schedules.is_empty() {
+    let store = open_store()?;
+    let now = crate::engine::schedule::epoch_now();
+    let resolved = resolve_effective_schedules(
+        &cfg.repo_path_for(project),
+        &project.default_branch,
+        project.mode,
+        &project.schedules,
+    )
+    .await;
+
+    // Surface repo-side diagnostics as lines above the table (reading only —
+    // `meguri schedules` never emits events, issue #222 f6).
+    for d in &resolved.diagnostics {
+        match d {
+            Diagnostic::Shadowed { name } => {
+                println!("⚠️  repo schedule {name:?} is shadowed by a host schedule (host wins)")
+            }
+            Diagnostic::RepoInvalid { detail } => {
+                println!("⚠️  repo meguri.toml schedules invalid: {detail}")
+            }
+            Diagnostic::RepoScheduleDropped { detail } => {
+                println!("⚠️  repo schedule dropped: {detail}")
+            }
+            Diagnostic::RepoUnavailable { detail } => {
+                println!("⚠️  repo schedules unavailable this listing (fetch): {detail}")
+            }
+        }
+    }
+
+    if resolved.schedules.is_empty() {
         println!("no schedules configured for {}", project.id);
         return Ok(());
     }
-    let store = open_store()?;
-    let now = crate::engine::scheduler_fire::epoch_now();
     println!(
-        "{:<16} {:<6} {:<16} {:<21} {:<21}",
-        "NAME", "KIND", "CRON", "LAST FIRE (UTC)", "NEXT FIRE (UTC)"
+        "{:<16} {:<6} {:<6} {:<16} {:<21} {:<21}",
+        "NAME", "SOURCE", "KIND", "CRON", "LAST FIRE (UTC)", "NEXT FIRE (UTC)"
     );
-    for s in &project.schedules {
-        let state = store.get_schedule_state(&project.id, &s.name)?;
+    for s in &resolved.schedules {
+        let c = &s.config;
+        let state = store.get_schedule_state(&project.id, &c.name)?;
         let last = state
             .as_ref()
             .and_then(|st| st.last_fired_at.clone())
             .unwrap_or_else(|| "-".into());
-        let next = match crate::cron::Cron::parse(&s.cron) {
+        let next = match crate::cron::Cron::parse(&c.cron) {
             Ok(cron) => cron
                 .next_after(now)
                 .map(crate::store::format_epoch)
@@ -1559,10 +1866,11 @@ pub fn cmd_schedules(project: Option<&str>) -> Result<()> {
             Err(e) => format!("invalid cron: {e}"),
         };
         println!(
-            "{:<16} {:<6} {:<16} {:<21} {:<21}",
-            s.name,
-            s.kind.as_str(),
-            s.cron,
+            "{:<16} {:<6} {:<6} {:<16} {:<21} {:<21}",
+            c.name,
+            s.source.as_str(),
+            c.kind.as_str(),
+            c.cron,
             last,
             next
         );
@@ -2063,10 +2371,75 @@ pub async fn cmd_logs(needle: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_attach(needle: &str, review: bool) -> Result<()> {
+/// Fold the four selector flags into exactly one [`RunSelector`] (ADR 0016).
+pub fn selector(
+    issue: Option<i64>,
+    pr: Option<i64>,
+    run: Option<String>,
+    task: Option<i64>,
+) -> Result<RunSelector> {
+    let mut picked: Vec<RunSelector> = Vec::new();
+    if let Some(n) = issue {
+        picked.push(RunSelector::Issue(n));
+    }
+    if let Some(n) = pr {
+        picked.push(RunSelector::Pr(n));
+    }
+    if let Some(id) = run {
+        picked.push(RunSelector::RunId(id));
+    }
+    if let Some(id) = task {
+        picked.push(RunSelector::Task(id));
+    }
+    match picked.len() {
+        1 => Ok(picked.remove(0)),
+        0 => bail!("pass exactly one of --issue / --pr / --run / --task"),
+        _ => bail!("--issue / --pr / --run / --task are mutually exclusive"),
+    }
+}
+
+/// `meguri attach` (ADR 0016): resolve any of the four identities to its live
+/// pane. The positional issue-number/run-id argument stays for back-compat;
+/// `--pr` resolves the PR's canonical issue (pane lanes are issue-keyed) and
+/// `--task` the task's latest run.
+pub async fn cmd_attach(
+    needle: Option<&str>,
+    issue: Option<i64>,
+    pr: Option<i64>,
+    run_id: Option<&str>,
+    task: Option<i64>,
+    review: bool,
+) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
-    let (kind, pane) = resolve_attach_pane(&store, needle, review)?;
+    let needle: String = if let Some(n) = needle {
+        n.to_string()
+    } else if let Some(n) = issue {
+        n.to_string()
+    } else if let Some(id) = run_id {
+        id.to_string()
+    } else if let Some(n) = pr {
+        // A pane lane is keyed by the canonical issue, so resolve the PR to
+        // it through the forge (the one selector that needs a read).
+        let project = pick_project(&cfg, None)?;
+        let deps = build_deps(&cfg, project, None)?;
+        let pr_obj = engine::open_pr_by_number(&deps, n)
+            .await?
+            .with_context(|| format!("no open PR #{n}"))?;
+        engine::canonical_key(&pr_obj).to_string()
+    } else if let Some(id) = task {
+        // Local runs have no issue number; their panes hang off the run.
+        let run = store
+            .list_runs(false)?
+            .into_iter()
+            .filter(|r| r.task_id == Some(id))
+            .max_by(|a, b| a.created_at.cmp(&b.created_at))
+            .with_context(|| format!("no runs for local task {id}"))?;
+        run.id
+    } else {
+        bail!("pass an issue/run id, or one of --issue / --pr / --run-id / --task");
+    };
+    let (kind, pane) = resolve_attach_pane(&store, &needle, review)?;
     // Attach addresses an existing pane by id; the tmux attach command resolves
     // the pane's own session, so no project-scoped label is needed here.
     let mux = mux::from_kind(&kind, &cfg.mux.session, None)?;
@@ -2201,6 +2574,14 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                 // whatever this run targets (github: the working label; local:
                 // back to queued).
                 let _ = deps.task_source.release(&run.task_key()).await;
+                // A PR-claiming loop (fixer family, spec_worker, pr-reviewer)
+                // tracks its claim in the run's checkpoint, not the
+                // coordination layer above — the live-driver finalize path
+                // (`engine::flow::finalize_cancelled` / pr_reviewer's own)
+                // knows to drop it via each loop's `Flavor`, but this
+                // no-driver path never reaches a `Flavor`. Mirror that
+                // release directly (issue #252).
+                engine::flow::release_stray_pr_claim(&deps, &run).await;
                 released.is_some()
             }
             Err(_) => false,

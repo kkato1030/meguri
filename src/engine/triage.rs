@@ -51,18 +51,17 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
-use super::{Deps, Target};
 use crate::config::{TriageAction, TriageConfig, TriageMode};
 use crate::forge::{self, Issue};
 use crate::gitops;
 use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
-use crate::tasks::{self, TaskKey};
+use crate::tasks::{self};
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for triage runs.
@@ -311,58 +310,38 @@ pub struct TriageCheckpoint {
 
 /// The triage loop: one report issue per project in, the same report issue
 /// (rewritten) out.
-pub struct TriageLoop;
-
-#[async_trait]
-impl super::Loop for TriageLoop {
-    fn kind(&self) -> &'static str {
-        KIND
+/// Whether a scan is due this resync (the old discover's read-only
+/// body, ADR 0012 S4 決定3): `Some(report_issue_or_0)` = the Repo Kind
+/// reconciler enqueues the triage arm keyed to it; `None` = not due.
+pub async fn observe_scan_due(deps: &Deps) -> Result<Option<i64>> {
+    if deps.forge.is_none() {
+        return Ok(None); // forge-driven loop; inert in local mode
     }
-
-    /// One target at most: the project's report issue (or `0` when it does not
-    /// exist yet — settle creates it; discovery itself stays read-only).
-    /// Gated on `[triage] mode` being `report` or `advise`: the loop is
-    /// opt-in, so it is a no-op until a human turns it on (`auto`, v2 #88,
-    /// still parses but stays idle here too).
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // forge-driven loop; inert in local mode
-        }
-        if !matches!(
-            deps.config.triage_for(&deps.project).mode,
-            TriageMode::Report | TriageMode::Advise | TriageMode::Auto
-        ) {
-            return Ok(Vec::new());
-        }
-        let issues = deps
-            .forge()
-            .list_issues_with_label(forge::LABEL_TRIAGE_REPORT)
-            .await?;
-        // More than one report issue (races, manual creation): the smallest
-        // number wins, the rest are ignored.
-        let report = issues.into_iter().min_by_key(|i| i.number);
-        if let Some(issue) = &report
-            && issue.has_label(forge::LABEL_HOLD)
-        {
-            return Ok(Vec::new());
-        }
-        let head =
-            gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
-        let max_open = max_open_issue(deps).await?;
-        let marker = report.as_ref().and_then(|i| parse_triage_marker(&i.body));
-        if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
-            return Ok(Vec::new());
-        }
-        Ok(vec![Target {
-            key: TaskKey::Issue(report.map(|i| i.number).unwrap_or(0)),
-            title: REPORT_TITLE.to_string(),
-            cadence_label: None,
-        }])
+    if !matches!(
+        deps.config.triage_for(&deps.project).mode,
+        TriageMode::Report | TriageMode::Advise | TriageMode::Auto
+    ) {
+        return Ok(None);
     }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_triage(deps, run_id).await
+    let issues = deps
+        .forge()
+        .list_issues_with_label(forge::LABEL_TRIAGE_REPORT)
+        .await?;
+    // More than one report issue (races, manual creation): the smallest
+    // number wins, the rest are ignored.
+    let report = issues.into_iter().min_by_key(|i| i.number);
+    if let Some(issue) = &report
+        && issue.has_label(forge::LABEL_HOLD)
+    {
+        return Ok(None);
     }
+    let head = gitops::default_branch_head(&deps.repo_path(), &deps.project.default_branch).await?;
+    let max_open = max_open_issue(deps).await?;
+    let marker = report.as_ref().and_then(|i| parse_triage_marker(&i.body));
+    if !scan_due(deps, marker.as_ref(), &head, max_open).await? {
+        return Ok(None);
+    }
+    Ok(Some(report.map(|i| i.number).unwrap_or(0)))
 }
 
 /// Largest open issue number on the forge, excluding the persistent report
@@ -950,6 +929,12 @@ async fn execute(
             TurnOutcome::Stopped => return Ok(ExecuteFlow::Stopped),
             TurnOutcome::PaneDied => {
                 return Ok(ExecuteFlow::Interrupted("pane died during triage".into()));
+            }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(ExecuteFlow::Interrupted(
+                    "agent went quiet during triage".into(),
+                ));
             }
         };
 

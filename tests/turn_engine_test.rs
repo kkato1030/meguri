@@ -241,43 +241,84 @@ async fn blocked_escalates_to_awaiting_human_then_recovers() {
     assert!(s.mux.sent_lines(&s.pane).is_empty());
 }
 
+/// Issue #245: an agent that stays silent past its nudge budget is no longer
+/// parked on awaiting_human — the quiet is returned as `AgentQuiet` (with the
+/// pane tail for diagnosis) so the flow layer can rotate the session instead
+/// of resume-looping forever.
 #[tokio::test(start_paused = true)]
-async fn quiet_agent_gets_nudged_then_escalates() {
+async fn quiet_agent_gets_nudged_then_returns_agent_quiet() {
     let s = setup().await;
     let control = FakeControl::new();
     s.mux.set_state(&s.pane, AgentState::Idle);
-
-    let driver = {
-        let mux = s.mux.clone();
-        let pane = s.pane.clone();
-        let dir = s.dir.path().to_path_buf();
-        let turn_id = s.turn_id.clone();
-        tokio::spawn(async move {
-            // Stay silent long enough for 2 nudges + escalation, then a
-            // human rescues the turn.
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            write_result(&dir, &turn_id, "needs_human");
-            let _ = (mux, pane);
-        })
-    };
+    s.mux.set_tail(
+        &s.pane,
+        vec!["API Error: 400 input exceeds the context window".into()],
+    );
 
     let outcome = s
         .engine
         .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
         .await
         .unwrap();
-    driver.await.unwrap();
 
-    assert!(matches!(
-        outcome,
-        TurnOutcome::Completed(r) if r.status == TurnStatus::NeedsHuman
-    ));
+    let TurnOutcome::AgentQuiet { tail } = outcome else {
+        panic!("expected AgentQuiet, got {outcome:?}");
+    };
+    assert!(tail.iter().any(|l| l.contains("API Error: 400")));
     let sent = s.mux.sent_lines(&s.pane);
     assert_eq!(sent.len(), 2, "expected exactly 2 nudges, got {sent:?}");
     assert!(sent[0].contains("result.json"));
     let kinds = control.event_kinds();
     assert_eq!(kinds.iter().filter(|k| *k == "turn.nudged").count(), 2);
-    assert!(kinds.contains(&"turn.awaiting_human".to_string()));
+    assert!(
+        !kinds.contains(&"turn.awaiting_human".to_string()),
+        "quiet no longer parks on awaiting_human: {kinds:?}"
+    );
+}
+
+/// Issue #245 (acceptance 2): a pane whose agent exited to a bare shell must
+/// not receive a nudge — typing into a shell is the failure. The definite
+/// absent reads as an immediate pane death instead.
+#[tokio::test(start_paused = true)]
+async fn agent_absent_pane_is_never_nudged() {
+    let s = setup().await;
+    let control = FakeControl::new();
+    s.mux.set_state(&s.pane, AgentState::Idle);
+    s.mux.set_agent_present(&s.pane, Some(false));
+
+    let outcome = s
+        .engine
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, TurnOutcome::PaneDied));
+    assert!(
+        s.mux.sent_lines(&s.pane).is_empty(),
+        "no nudge may be typed into a bare shell"
+    );
+    let kinds = control.event_kinds();
+    assert!(!kinds.contains(&"turn.nudged".to_string()));
+    assert!(kinds.contains(&"turn.pane_died".to_string()));
+}
+
+/// Issue #245: `agent_present == None` (mux cannot tell) must keep the
+/// pre-existing nudge behavior — the gate only acts on a definite absent.
+#[tokio::test(start_paused = true)]
+async fn unknown_agent_presence_keeps_nudging() {
+    let s = setup().await;
+    let control = FakeControl::new();
+    s.mux.set_state(&s.pane, AgentState::Idle);
+    s.mux.set_agent_present(&s.pane, None);
+
+    let outcome = s
+        .engine
+        .await_completion(&s.pane, s.dir.path(), &s.turn_id, false, control.as_ref())
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, TurnOutcome::AgentQuiet { .. }));
+    assert_eq!(s.mux.sent_lines(&s.pane).len(), 2, "nudges still happen");
 }
 
 /// Issue #214: a stalled *isolated* (parallel round-1) reviewer in pane mode
@@ -294,7 +335,10 @@ async fn quiet_isolated_agent_is_nudged_to_its_per_turn_result() {
         let dir = s.dir.path().to_path_buf();
         let turn_id = s.turn_id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Past the first nudge (idle_grace 10s) but inside the nudge
+            // budget — a quiet that outlives it now returns AgentQuiet
+            // (issue #245) instead of waiting for this rescue.
+            tokio::time::sleep(Duration::from_secs(15)).await;
             // The isolated turn's completion authority is the per-turn file.
             std::fs::write(
                 dir.join(format!(".meguri/result-{turn_id}.json")),

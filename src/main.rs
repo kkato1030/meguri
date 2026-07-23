@@ -52,8 +52,24 @@ async fn main() -> Result<()> {
         Command::Run {
             project,
             issue,
+            pr,
+            run,
+            task,
             mux,
-        } => app::cmd_run(project.as_deref(), issue, mux.as_deref()).await,
+        } => {
+            let sel = app::selector(issue, pr, run, task)?;
+            app::cmd_run(project.as_deref(), sel, mux.as_deref()).await
+        }
+        Command::Why {
+            project,
+            issue,
+            pr,
+            run,
+            task,
+        } => {
+            let sel = app::selector(issue, pr, run, task)?;
+            app::cmd_why(project.as_deref(), sel).await
+        }
         Command::Add {
             text,
             project,
@@ -75,7 +91,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
-        Command::Schedules { project } => app::cmd_schedules(project.as_deref()),
+        Command::Schedules { project } => app::cmd_schedules(project.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
         Command::Stats { command } => match command {
             StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
@@ -89,7 +105,14 @@ async fn main() -> Result<()> {
             interval,
         } => app::cmd_top_status(mux.as_deref(), &dashboard, interval).await,
         Command::Logs { run } => app::cmd_logs(&run).await,
-        Command::Attach { run, review } => app::cmd_attach(&run, review),
+        Command::Attach {
+            run,
+            issue,
+            pr,
+            run_id,
+            task,
+            review,
+        } => app::cmd_attach(run.as_deref(), issue, pr, run_id.as_deref(), task, review).await,
         Command::Pause { run } => app::cmd_pause(&run),
         Command::Resume { run } => app::cmd_resume(&run),
         Command::Takeover { run } => app::cmd_takeover(&run),
@@ -275,6 +298,10 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // active drift the watch's sweep recorded. Read-only, all-project.
             if let Some(store) = &store {
                 doctor_drift(store);
+                // Sweep failures in the last hour (issue #251, design doc
+                // P6.5 item 3): the same events `sweep_health.rs` emits on
+                // every failure, read here purely for visibility.
+                doctor_sweep_health(store, cfg);
             }
             doctor_workspaces(cfg);
             // Managed clones (issue #195): show each project's clone state
@@ -320,7 +347,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 /// not enable auto-merge print nothing.
 async fn check_auto_merge(cfg: &Config) -> bool {
     use meguri::config::AutoMergeMode;
-    use meguri::engine::merge_tail::validate_policy;
+    use meguri::engine::issue_reconciler::validate_policy;
     use meguri::forge::Forge;
     use meguri::forge::gh::GhForge;
 
@@ -485,74 +512,116 @@ async fn doctor_clones(cfg: &Config) -> bool {
     ok
 }
 
-/// Doctor's schedules section (issue #146): the cron expression, name
-/// uniqueness, body exclusivity, and local-mode `plan` rejection are already
-/// enforced at config load (so a loaded `cfg` has passed them). What load does
-/// *not* check is that each `body_file` is a regular file on the default branch
-/// — do that here (ADR 0015), and print each schedule's next fire. Returns false
-/// if any `body_file` is missing/unreadable; projects without schedules print
-/// nothing.
+/// Doctor's schedules section (issue #146 / #222): print each project's
+/// *effective* schedule set — host `[[projects.schedules]]` ∪ the repo's own
+/// `meguri.toml` on the default branch — via the same resolver the sweep uses,
+/// so display and firing agree (ADR 0026). Per-schedule / collection / cron /
+/// local-mode-plan validity is enforced at config load for host schedules and
+/// by the resolver for repo schedules; here we additionally check each
+/// `body_file` is a regular file on the default branch (ADR 0015) and surface
+/// the resolver's diagnostics. Returns false on an invalid repo config or an
+/// unreadable `body_file`. Reads only — it never emits the diagnostics (f6).
 async fn doctor_schedules(cfg: &Config) -> bool {
-    use meguri::cron::Cron;
+    use meguri::engine::schedule::{Diagnostic, resolve_effective_schedules};
     use meguri::gitops::{self, DefaultBranchFile};
     use meguri::store::format_epoch;
 
-    let has_any = cfg.projects.iter().any(|p| !p.schedules.is_empty());
-    if !has_any {
-        return true;
-    }
-    let now = meguri::engine::scheduler_fire::epoch_now();
+    let now = meguri::engine::schedule::epoch_now();
     let mut ok = true;
-    println!("\nschedules:");
+    let mut printed_header = false;
     for project in &cfg.projects {
-        if project.schedules.is_empty() {
-            continue;
-        }
-        // A managed clone that isn't materialized yet can't be read from; that
-        // is normal (doctor_clones reports it), so skip the body_file check here
-        // rather than failing on a missing path.
         let repo_path = cfg.repo_path_for(project);
+        // A managed clone that isn't materialized yet can't be read/fetched from;
+        // that is normal (doctor_clones reports it), so skip the body_file check.
         let cloned = matches!(
             project_clone_state(cfg, project).await,
             ProjectCloneState::Present
         );
-        for s in &project.schedules {
-            let next = Cron::parse(&s.cron)
+        let resolved = resolve_effective_schedules(
+            &repo_path,
+            &project.default_branch,
+            project.mode,
+            &project.schedules,
+        )
+        .await;
+        if resolved.schedules.is_empty() && resolved.diagnostics.is_empty() {
+            continue; // nothing configured for this project
+        }
+        if !printed_header {
+            println!("\nschedules:");
+            printed_header = true;
+        }
+
+        for d in &resolved.diagnostics {
+            match d {
+                Diagnostic::Shadowed { name } => println!(
+                    "  ⚠️  {}/{name} — repo schedule shadowed by a host schedule (host wins)",
+                    project.id
+                ),
+                Diagnostic::RepoInvalid { detail } => {
+                    ok = false;
+                    println!(
+                        "  ❌ {} — repo meguri.toml schedules invalid: {detail}",
+                        project.id
+                    );
+                }
+                Diagnostic::RepoScheduleDropped { detail } => {
+                    ok = false;
+                    println!("  ❌ {} — repo schedule dropped: {detail}", project.id);
+                }
+                Diagnostic::RepoUnavailable { detail } => println!(
+                    "  ⚠️  {} — repo schedules unavailable this check (fetch): {detail}",
+                    project.id
+                ),
+            }
+        }
+
+        for s in &resolved.schedules {
+            let c = &s.config;
+            let next = meguri::cron::Cron::parse(&c.cron)
                 .ok()
-                .and_then(|c| c.next_after(now))
+                .and_then(|cr| cr.next_after(now))
                 .map(format_epoch)
                 .unwrap_or_else(|| "never".into());
-            // body_file must be a regular file on the default branch (ADR
-            // 0015); inline body is always fine.
-            let (line_ok, body_detail) = match &s.body_file {
+            // body_file must be a regular file on the pinned snapshot (repo) or
+            // the default branch (host on a fetch-failed tick); inline is fine.
+            let (line_ok, body_detail) = match &c.body_file {
                 _ if !cloned => (true, "body_file check skipped (clone pending)".to_string()),
-                Some(rel) => match gitops::read_file_at_default_branch(
-                    &repo_path,
-                    &project.default_branch,
-                    rel,
-                )
-                .await
-                {
-                    Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
-                    Ok(DefaultBranchFile::Absent) => {
-                        (false, format!("body_file {rel} not on default branch"))
+                Some(rel) => {
+                    let read = match &s.pin_sha {
+                        Some(sha) => gitops::read_file_at_ref(&repo_path, sha, rel).await,
+                        None => {
+                            gitops::read_file_at_default_branch(
+                                &repo_path,
+                                &project.default_branch,
+                                rel,
+                            )
+                            .await
+                        }
+                    };
+                    match read {
+                        Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
+                        Ok(DefaultBranchFile::Absent) => {
+                            (false, format!("body_file {rel} not on default branch"))
+                        }
+                        Ok(DefaultBranchFile::NotRegularFile) => (
+                            false,
+                            format!("body_file {rel} is not a regular file on default branch"),
+                        ),
+                        Err(e) => (false, format!("body_file {rel}: {e:#}")),
                     }
-                    Ok(DefaultBranchFile::NotRegularFile) => (
-                        false,
-                        format!("body_file {rel} is not a regular file on default branch"),
-                    ),
-                    Err(e) => (false, format!("body_file {rel}: {e:#}")),
-                },
+                }
                 None => (true, "inline body".to_string()),
             };
             ok &= line_ok;
             println!(
-                "  {} {}/{} ({} {}, next {next} UTC) — {body_detail}",
+                "  {} {}/{} [{}] ({} {}, next {next} UTC) — {body_detail}",
                 if line_ok { "✅" } else { "❌" },
                 project.id,
-                s.name,
-                s.kind.as_str(),
-                s.cron,
+                c.name,
+                s.source.as_str(),
+                c.kind.as_str(),
+                c.cron,
             );
         }
     }
@@ -599,7 +668,7 @@ fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
     if !has_any {
         return;
     }
-    let now = meguri::engine::scheduler_fire::epoch_now();
+    let now = meguri::engine::schedule::epoch_now();
     println!("\ncadence:");
     for project in &cfg.projects {
         for rule in &project.cadence {
@@ -1097,6 +1166,58 @@ fn doctor_drift(store: &Store) {
     }
 }
 
+/// Doctor's sweep-health section (issue #251, design doc P6.5 item 3): the
+/// per-(project, sweep) `sweep.failed` **rate** over the last hour, read
+/// straight from `events` — no dedicated state table, since `sweep_health.rs`
+/// already emits one event per failure. Read-only and never fails doctor;
+/// this is visibility into an ongoing outage, not a precondition check.
+///
+/// `events` alone has no denominator — sweeps that succeed leave no trace,
+/// on purpose (an event per success, every ~`poll_interval_secs`, for every
+/// sweep × project, would be pure event-log noise for a number doctor can
+/// derive instead). So the denominator is computed from config: one sweep
+/// attempt per project per tick, and `window_secs / poll_interval_secs` ticks
+/// fit in the window (issue #251 self-review f3 — a bare failure *count*
+/// means something different at a 30s poll interval than a 5-minute one, and
+/// says nothing about a sweep that has been failing every single tick versus
+/// one that fails only occasionally).
+fn doctor_sweep_health(store: &Store, cfg: &Config) {
+    const WINDOW_SECS: u64 = 3600;
+    let since = meguri::store::format_epoch(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(WINDOW_SECS),
+    );
+    let failures = match store.events_since("sweep.failed", &since) {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("sweep-health read failed: {e:#}");
+            return;
+        }
+    };
+    if failures.is_empty() {
+        return;
+    }
+    // Every ready project runs every sweep once per tick (`scheduler.rs`), so
+    // this is the same expected attempt count for every (project, sweep) pair
+    // — an approximation (a project not yet cloned, or a daemon restart mid-
+    // window, attempts fewer), always erring toward *understating* the rate.
+    let expected_attempts = (WINDOW_SECS / cfg.scheduler.poll_interval_secs.max(1)).max(1);
+    let mut counts: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for e in &failures {
+        let project = e.data["project"].as_str().unwrap_or("?").to_string();
+        let sweep = e.data["sweep"].as_str().unwrap_or("?").to_string();
+        *counts.entry((project, sweep)).or_default() += 1;
+    }
+    println!("\nsweep 失敗率 (直近1時間、想定 {expected_attempts} 回試行):");
+    for ((project, sweep), n) in counts {
+        let rate = n as f64 / expected_attempts as f64 * 100.0;
+        println!("  ⚠️  [{project}] {sweep}: {n}/{expected_attempts} 回 ({rate:.0}%)");
+    }
+}
+
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
     match std::process::Command::new(cmd).args(args).output() {
         Ok(out) if out.status.success() => {
@@ -1126,6 +1247,8 @@ mod tests {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: config::AgentProfile::default()
+                .resume_transcript_limit_bytes,
         }
     }
 

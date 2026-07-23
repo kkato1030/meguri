@@ -446,6 +446,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
         },
     );
     m.insert(
@@ -463,6 +464,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
         },
     );
     m.insert(
@@ -478,6 +480,7 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
         },
     );
     m
@@ -1176,6 +1179,7 @@ args = ["--foo"]
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: AgentProfile::default().resume_transcript_limit_bytes,
         };
         // Rule 3: unset + known CLI (default profile is `claude`) → its default.
         assert_eq!(

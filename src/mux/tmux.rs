@@ -177,6 +177,31 @@ impl Multiplexer for TmuxMux {
         Ok(all[skip..].to_vec())
     }
 
+    /// Best-effort agent presence via `#{pane_current_command}` (issue #245):
+    /// tmux tracks the pane's foreground command, so a live pane whose
+    /// command is a plain shell means the agent exited underneath it. A dead
+    /// or missing pane reads as `None` — `pane_alive` is the authority there.
+    async fn agent_present(&self, pane: &PaneId) -> MuxResult<Option<bool>> {
+        if !self.pane_alive(pane).await? {
+            return Ok(None);
+        }
+        match self
+            .tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane.0,
+                "#{pane_current_command}",
+            ])
+            .await
+        {
+            Ok(cmd) if !cmd.trim().is_empty() => {
+                Ok(super::classify_foreground_processes([cmd.trim()]))
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn agent_state(&self, pane: &PaneId) -> MuxResult<AgentState> {
         if !self.pane_alive(pane).await? {
             return Ok(AgentState::Unknown);

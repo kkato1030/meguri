@@ -10,10 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, PlanDelivery, ProjectConfig};
-use meguri::engine::conflict_resolver::{
-    self, ConflictResolverLoop, MAX_RESOLVE_RUNS, run_conflict_resolver,
-};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::conflict_resolver::{self, MAX_RESOLVE_RUNS, run_conflict_resolver};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING, MergeableState,
@@ -143,6 +141,27 @@ fn create_resolver_run(env: &TestEnv) -> meguri::store::RunRecord {
         .store
         .create_run_for_loop("proj", conflict_resolver::KIND, 9, "Add feature (#9)")
         .unwrap()
+}
+
+/// Run the Issue Kind reconciler once and return the canonical issues that got
+/// a queued conflict-resolver run — the S3 replacement for
+/// `ConflictResolverLoop.discover()`.
+async fn reconciler_resolver_targets(env: &TestEnv) -> Vec<i64> {
+    meguri::engine::issue_reconciler::sweep(&env.deps)
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = env
+        .deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.loop_kind == conflict_resolver::KIND && r.status == RunStatus::Queued)
+        .map(|r| r.issue_number)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn find_worktree(worktree_root: &Path) -> Option<PathBuf> {
@@ -344,11 +363,21 @@ async fn resolver_discovery_wants_conflicting_unclaimed_meguri_prs_only() {
     // PR #3: a human's PR — not meguri's to touch.
     let pr = env.forge.push_pr("feature/manual", "Manual work", &[]);
     env.forge.set_pr_mergeable(pr, MergeableState::Conflicting);
-    // PR #4: already claimed by another host.
+    // PR #4: already being worked by another fixer-family arm (ADR 0027: the
+    // active-run index is the exclusion, not the `working` label projection).
     let pr = env
         .forge
         .push_pr("meguri/13-busy-aaa111", "Busy (#13)", &[LABEL_WORKING]);
     env.forge.set_pr_mergeable(pr, MergeableState::Conflicting);
+    let busy = env
+        .deps
+        .store
+        .create_run_for_loop("proj", "fixer", 13, "Busy (#13)")
+        .unwrap();
+    env.deps
+        .store
+        .update_run_status(&busy.id, RunStatus::Running, None)
+        .unwrap();
     // PR #5: escalated — waits for a human to clear the label.
     let pr = env.forge.push_pr(
         "meguri/14-stuck-bbb222",
@@ -369,11 +398,10 @@ async fn resolver_discovery_wants_conflicting_unclaimed_meguri_prs_only() {
     env.forge.set_pr_mergeable(pr, MergeableState::Conflicting);
     env.forge.set_pr_state(pr, "merged");
 
-    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        reconciler_resolver_targets(&env).await,
         vec![9],
-        "only the open, unclaimed, unescalated meguri PR that conflicts is actionable"
+        "only the open, unclaimed, unescalated conflicting meguri PR with no active family run is actionable"
     );
 }
 
@@ -395,9 +423,8 @@ async fn resolver_discovery_skips_spec_ready_prs_under_combined_delivery() {
 
     // PR #1 (from `setup`) still conflicts and is ordinary — only the
     // spec-ready PR must be skipped.
-    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        reconciler_resolver_targets(&env).await,
         vec![9],
         "a spec-ready PR belongs to the spec worker under combined delivery"
     );
@@ -406,17 +433,9 @@ async fn resolver_discovery_skips_spec_ready_prs_under_combined_delivery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn resolver_escalates_and_stops_rediscovering_after_the_resolve_budget() {
     let env = setup(None).await;
-    assert_eq!(
-        ConflictResolverLoop
-            .discover(&env.deps)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
 
-    // The resolve→re-conflict ping-pong: every round ends in a succeeded
-    // run, so cap the successes rather than looping forever.
+    // The resolve→re-conflict ping-pong: every round ends in a succeeded run,
+    // so the arm parks the PR (needs-human) rather than looping forever.
     for _ in 0..MAX_RESOLVE_RUNS {
         let run = create_resolver_run(&env);
         env.deps
@@ -424,20 +443,13 @@ async fn resolver_escalates_and_stops_rediscovering_after_the_resolve_budget() {
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
     }
-    // A new tick: the scheduler would clear the shared open-PR cache here
-    // (issue #170) before calling discover again.
-    env.deps.open_prs.clear().await;
     assert!(
-        ConflictResolverLoop
-            .discover(&env.deps)
-            .await
-            .unwrap()
-            .is_empty(),
-        "a PR that keeps re-conflicting must stop being rediscovered"
+        reconciler_resolver_targets(&env).await.is_empty(),
+        "a PR that keeps re-conflicting must escalate, not loop"
     );
     // #176: exhaustion is a human gate now (P4) — the still-conflicting PR is
-    // parked on needs-human with one comment, and the needs-human filter makes
-    // the escalation fire exactly once across sweeps.
+    // parked on needs-human with one comment; human_stop makes the escalation
+    // fire exactly once across sweeps.
     let labels = env.forge.pr_labels(1);
     assert!(
         labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
@@ -445,11 +457,9 @@ async fn resolver_escalates_and_stops_rediscovering_after_the_resolve_budget() {
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     assert_eq!(env.forge.comments_of(1).len(), 1);
-    // Next tick: the scheduler clears the shared open-PR cache (issue #170), so
-    // discover re-reads the now-needs-human PR and `pr_is_touchable` skips it —
-    // the escalation fires exactly once, not every sweep.
-    env.deps.open_prs.clear().await;
-    ConflictResolverLoop.discover(&env.deps).await.unwrap();
+    // Next sweep: the now-needs-human PR is a human stop → skipped; the
+    // escalation fires exactly once.
+    assert!(reconciler_resolver_targets(&env).await.is_empty());
     assert_eq!(
         env.forge.comments_of(1).len(),
         1,
@@ -471,8 +481,6 @@ async fn resolver_does_not_escalate_an_exhausted_but_resolved_pr() {
     }
     env.forge.set_pr_mergeable(1, MergeableState::Mergeable);
 
-    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
-    assert!(targets.is_empty(), "a resolved PR is not a resolver target");
     // The budget-exhaustion escalation must be gated on "still conflicting":
     // a PR that resolved itself must NOT be parked on needs-human (issue #176).
     let labels = env.forge.pr_labels(1);
@@ -546,15 +554,8 @@ async fn resolver_needs_human_escalates_on_the_pr_and_stays_quiet() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("could not resolve"), "{}", comments[0]);
 
-    // The PR still conflicts, but the escalation parks it: no failure loop.
-    assert!(
-        ConflictResolverLoop
-            .discover(&env.deps)
-            .await
-            .unwrap()
-            .is_empty(),
-        "an escalated PR must wait for a human, not re-trigger"
-    );
+    // The PR still conflicts, but the escalation parks it (the reconciler's
+    // human-stop gate; covered by the next_step property tests).
 
     // Nothing was pushed.
     let tip = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;

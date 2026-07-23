@@ -307,6 +307,26 @@ pub fn worktree_path(worktrees_root: &Path, project_id: &str, branch: &str) -> P
 /// branch. Prefers `origin/<default>` when a remote exists. `extra_excludes`
 /// (a project's `worktree_setup.exclude`) is appended to `info/exclude`
 /// alongside the always-on `.meguri/`.
+/// Serialize repo-mutating worktree creation per repository path: concurrent
+/// `git worktree add -b` invocations against one clone race on the shared
+/// `.git/config` lock ("could not lock config file .git/config") when both
+/// write the new branch's upstream configuration. Two runs of one project can
+/// start in the same instant since the reconciler enqueues them in one pass,
+/// so the collision is a normal schedule, not a freak. Keyed by the repo path
+/// (different projects never contend).
+fn worktree_creation_lock(repo_path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<
+        Option<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::Mutex::new(None);
+    LOCKS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .entry(repo_path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 pub async fn create_worktree(
     repo_path: &Path,
     worktree: &Path,
@@ -323,6 +343,8 @@ pub async fn create_worktree(
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let lock = worktree_creation_lock(repo_path);
+    let _guard = lock.lock().await;
 
     // Best-effort freshness; offline or remote-less repos still work.
     let _ = run_git(repo_path, &["fetch", "origin", default_branch]).await;
@@ -384,6 +406,10 @@ pub async fn attach_worktree(
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Same serialization as `create_worktree`: attach also mutates the
+    // shared clone (branch reset + worktree registration).
+    let lock = worktree_creation_lock(repo_path);
+    let _guard = lock.lock().await;
 
     // Best-effort freshness; offline or remote-less repos still work.
     let _ = run_git(repo_path, &["fetch", "origin", branch]).await;
@@ -645,7 +671,15 @@ pub async fn read_file_at_default_branch(
     default_branch: &str,
     rel: &str,
 ) -> Result<DefaultBranchFile> {
-    let base = if run_git(
+    let base = default_branch_ref(repo_path, default_branch).await;
+    read_file_at_ref(repo_path, &base, rel).await
+}
+
+/// The readable ref for the default branch: `origin/<default_branch>` when that
+/// remote-tracking ref exists, else the local branch name — the same base
+/// resolution [`read_file_at_default_branch`] and [`fetch_base_tip`] use.
+async fn default_branch_ref(repo_path: &Path, default_branch: &str) -> String {
+    if run_git(
         repo_path,
         &["rev-parse", "--verify", &format!("origin/{default_branch}")],
     )
@@ -655,8 +689,33 @@ pub async fn read_file_at_default_branch(
         format!("origin/{default_branch}")
     } else {
         default_branch.to_string()
-    };
+    }
+}
 
+/// Resolve the default branch to a fixed commit SHA — `origin/<default_branch>`
+/// when that ref exists, else the local `<default_branch>`. The schedule
+/// resolver pins this once so a fire's `meguri.toml` and every `body_file` are
+/// read from one immutable snapshot even if a concurrent fetch moves the branch
+/// (issue #222 f5).
+pub async fn resolve_default_branch_sha(repo_path: &Path, default_branch: &str) -> Result<String> {
+    let base = default_branch_ref(repo_path, default_branch).await;
+    run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )
+    .await
+    .with_context(|| format!("resolving {base} to a commit"))
+}
+
+/// Read a repo-relative path's contents at a fixed ref (a branch, tag, or SHA),
+/// blob-direct (not the working tree). The ref-pinned core of
+/// [`read_file_at_default_branch`]; the schedule resolver calls it with a pinned
+/// SHA so config and body come from one snapshot (issue #222 f5).
+pub async fn read_file_at_ref(
+    repo_path: &Path,
+    base: &str,
+    rel: &str,
+) -> Result<DefaultBranchFile> {
     // One entry, exact-path match. `--full-tree` makes the pathspec
     // root-relative; `:(literal)` disables pathspec magic/globbing; the absence
     // of `-r` means a directory returns its own tree entry, not its children.
@@ -668,7 +727,7 @@ pub async fn read_file_at_default_branch(
             "--full-tree",
             "-z",
             "--format=%(objectmode) %(objecttype) %(objectname) %(path)",
-            &base,
+            base,
             "--",
             &literal,
         ],
@@ -833,6 +892,66 @@ pub async fn fetch_base_tip(repo_path: &Path, base_branch: &str) -> Result<Strin
     )
     .await
     .with_context(|| format!("base branch {base_branch} exists neither on origin nor locally"))
+}
+
+/// How long the schedule resolver's freshness fetch may run before it counts
+/// as a failure. `run_git` has no timeout, so a stuck credential helper / SSH
+/// would otherwise block the serial scheduler indefinitely (issue #222 f4).
+const SCHEDULE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Bounded refresh of `origin/<default_branch>` for the schedule resolver
+/// (issue #222 f1/f4). Unlike [`fetch_base_tip`] the outcome is reported so the
+/// caller can abstain (ADR 0026):
+/// - no `origin` remote → `Ok(())` (nothing to fetch; the local branch is the
+///   only authority — no staleness is possible).
+/// - fetch succeeded within [`SCHEDULE_FETCH_TIMEOUT`] → `Ok(())`.
+/// - fetch failed, or timed out → `Err` (the caller skips the repo-schedule
+///   layer this tick; host schedules are unaffected).
+///
+/// The child is killed on drop, so a timed-out fetch does not linger.
+pub async fn fetch_default_branch(repo_path: &Path, default_branch: &str) -> Result<()> {
+    fetch_default_branch_within(repo_path, default_branch, SCHEDULE_FETCH_TIMEOUT).await
+}
+
+/// The timeout-injectable core of [`fetch_default_branch`] (the public wrapper
+/// pins [`SCHEDULE_FETCH_TIMEOUT`]); tests drive it with a short bound to prove
+/// a hanging fetch times out rather than stalling.
+async fn fetch_default_branch_within(
+    repo_path: &Path,
+    default_branch: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    if run_git(repo_path, &["remote", "get-url", "origin"])
+        .await
+        .is_err()
+    {
+        return Ok(()); // no remote: local branch is authoritative
+    }
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .args(["fetch", "origin", default_branch])
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .with_context(|| {
+            format!(
+                "git fetch origin {default_branch} timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
+        .context("spawning git fetch")?;
+    if !out.status.success() {
+        bail!(
+            "git fetch origin {default_branch} (in {}) failed: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Fetch a PR head branch from origin and return its freshly-fetched tip sha
@@ -1424,6 +1543,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetch_base_tip(repo.path(), "main").await.unwrap(), pushed);
+    }
+
+    #[tokio::test]
+    async fn read_file_at_ref_pins_the_commit_even_after_the_branch_moves() {
+        // issue #222 f5: the schedule resolver reads meguri.toml and body_file at
+        // one pinned SHA so a concurrent fetch can't split them across commits.
+        // Commit A adds the file; commit B removes it and advances main.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("f.md"), "at commit A").unwrap();
+        run_git(repo.path(), &["add", "f.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "add f"])
+            .await
+            .unwrap();
+        let sha_a = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        run_git(repo.path(), &["rm", "f.md"]).await.unwrap();
+        run_git(repo.path(), &["commit", "-m", "remove f"])
+            .await
+            .unwrap();
+
+        // The pinned SHA still yields the content; the moved branch does not.
+        match read_file_at_ref(repo.path(), &sha_a, "f.md").await.unwrap() {
+            DefaultBranchFile::Content(c) => assert_eq!(c, "at commit A"),
+            other => panic!("expected content at the pinned sha, got {other:?}"),
+        }
+        assert!(matches!(
+            read_file_at_default_branch(repo.path(), "main", "f.md")
+                .await
+                .unwrap(),
+            DefaultBranchFile::Absent
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_default_branch_reports_failure_without_hanging() {
+        // issue #222 f1/f4: no-remote is a benign success; a broken remote is a
+        // reported failure (the caller then abstains) — never a hang.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        // No `origin` remote → nothing to fetch, treated as success.
+        assert!(fetch_default_branch(repo.path(), "main").await.is_ok());
+        // A broken origin → the fetch fails fast (bounded), surfaced as an error.
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "/nonexistent/definitely-not-a-repo.git",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(fetch_default_branch(repo.path(), "main").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_default_branch_times_out_instead_of_hanging() {
+        // issue #222 f4: a fetch that never returns (a stuck credential helper)
+        // must be bounded, not stall the serial scheduler. A `git` remote via the
+        // `ext::` transport running `sleep` hangs deterministically; the bounded
+        // fetch returns an error well before the sleep would end.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        run_git(repo.path(), &["config", "protocol.ext.allow", "always"])
+            .await
+            .unwrap();
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "ext::sh -c \"sleep 30\""],
+        )
+        .await
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let r =
+            fetch_default_branch_within(repo.path(), "main", std::time::Duration::from_millis(300))
+                .await;
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "a hanging fetch must fail, not hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "bounded by the 300ms timeout, not the 30s sleep (took {elapsed:?})"
+        );
     }
 
     #[tokio::test]

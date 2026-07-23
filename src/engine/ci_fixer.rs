@@ -30,10 +30,9 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable};
-use crate::forge::{self, CheckRollup, CheckState, PullRequest};
+use super::{Deps, is_combined, open_pr_for_issue, pr_is_touchable};
+use crate::forge::{self, CheckRollup, CheckState};
 use crate::store::RunRecord;
-use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for ci-fixer runs.
@@ -63,86 +62,8 @@ fn without_meguri_statuses(rollup: CheckRollup) -> CheckRollup {
     }
 }
 
-/// The ci-fixer as a schedulable loop: red meguri PRs in, fix pushes out.
-pub struct CiFixerLoop;
-
-#[async_trait]
-impl super::Loop for CiFixerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Open meguri PRs whose CI rollup is FAILURE. Pending rollups wait for
-    /// CI to settle (retried next poll), escalated PRs wait for a human, and
-    /// a PR whose fix budget is spent while CI is still red escalates right
-    /// here — its rounds all *succeeded* (fixes pushed), so the flow's
-    /// failure escalation never fired, yet a human must look. The
-    /// needs-human guard runs before the rollup poll, so the escalation
-    /// fires once and later sweeps skip the PR cheaply.
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let combined = is_combined(deps);
-        let mut targets = Vec::new();
-        for pr in deps.open_prs.get(deps).await? {
-            if pr_is_touchable(&pr, combined).is_some() {
-                continue;
-            }
-            let rollup = without_meguri_statuses(deps.forge().pr_check_rollup(pr.number).await?);
-            if rollup.state() != CheckState::Failure {
-                continue;
-            }
-            let issue = canonical_key(&pr);
-            if deps
-                .store
-                .succeeded_run_count(&deps.project.id, KIND, issue)?
-                >= MAX_CI_FIX_RUNS
-            {
-                escalate_budget_exhausted(deps, &pr).await;
-                continue;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(issue),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_ci_fixer(deps, run_id).await
-    }
-}
-
 pub async fn run_ci_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     flow::run_flow(deps, run_id, &CiFixerFlavor).await
-}
-
-/// The retry-limit escalation: every budgeted round pushed a fix, CI is
-/// still red — park the PR on `meguri:needs-human`. Best-effort like the
-/// other escalations; the label is what stops rediscovery.
-async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
-    let comment = super::escalation::pr_needs_human_comment(
-        &format!(
-            "pushed {MAX_CI_FIX_RUNS} CI fixes to this PR but its checks are still failing, \
-             and needs a human."
-        ),
-        &format!(
-            "Clear the `{}` label (and re-run with `meguri run --issue {}` if wanted) once the \
-             cause is understood.",
-            forge::LABEL_NEEDS_HUMAN,
-            pr.number
-        ),
-        crate::tasks::DEFAULT_ATTACH_HINT,
-    );
-    super::escalation::escalate_pr(deps, pr.number, &comment).await;
-    let _ = deps.store.emit(
-        None,
-        "ci_fixer.budget_exhausted",
-        json!({ "pr": pr.number, "budget": MAX_CI_FIX_RUNS }),
-    );
 }
 
 /// Markdown listing of the failing checks plus the failed job logs for the

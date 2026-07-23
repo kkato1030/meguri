@@ -58,10 +58,14 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Review threads per PR number.
     pub threads: Mutex<Vec<(i64, ReviewThread)>>,
-    /// PR conversation comments: (pr, body, createdAt). `comment_pr` stamps
-    /// `store::now()`; [`FakeForge::add_pr_comment_at`] seeds an explicit
-    /// (e.g. stale) timestamp for merge-watch arm-since tests.
-    pub pr_comments: Mutex<Vec<(i64, String, String)>>,
+    /// PR conversation comments as `(pr, PrComment)`. `comment_pr` stamps a
+    /// unique node `id`, `store::now()`, and `viewer_did_author = true` (meguri
+    /// is the fake's viewer — the claim-marker authenticity the reconciler
+    /// checks); [`FakeForge::add_pr_comment_at`] seeds a third-party comment
+    /// (`viewer_did_author = false`) with an explicit timestamp.
+    pub pr_comments: Mutex<Vec<(i64, PrComment)>>,
+    /// Monotonic source of fake comment node ids.
+    pub comment_seq: Mutex<u64>,
     pub pr_diffs: Mutex<HashMap<i64, String>>,
     /// `mergeStateStatus` per PR (merge-watch); unset reports `Unknown`.
     pub merge_status: Mutex<HashMap<i64, MergeStateStatus>>,
@@ -122,13 +126,23 @@ pub struct FakeForge {
     /// (issue #221). A call whose expected head matches advances the recorded
     /// head (base merged in); a stale expected head is rejected (HeadMoved).
     pub update_branch_calls: Mutex<Vec<(i64, String)>>,
-    /// PRs whose `observe_merge_tail` reports its label set as clipped
+    /// PRs whose `observe_open_prs` reports its label set as clipped
     /// (`labels_complete = false`) — exercises the engine's conservative
     /// safety-gate fallback for a real forge's bounded label window.
     pub incomplete_labels: Mutex<HashSet<i64>>,
-    /// PRs whose `observe_merge_tail` reports its thread set as clipped
+    /// PRs whose `observe_open_prs` reports its thread set as clipped
     /// (`review_threads_complete = false`).
     pub incomplete_threads: Mutex<HashSet<i64>>,
+    /// PRs whose `observe_open_prs` reports its conversation as truncated
+    /// (`comments_complete = false`) — exercises the engine's park-on-
+    /// truncation fallback for the real forge's comment page budget.
+    pub incomplete_comments: Mutex<HashSet<i64>>,
+    /// GitHub's cross-reference ("Development") linkage: issue → PR numbers
+    /// mentioning it, real or rail-external (issue #249). Seeded via
+    /// [`FakeForge::link_pr_to_issue`]; `linked_open_prs` looks the numbers
+    /// up in `prs` and reports only the still-open ones, like the real
+    /// forge's timeline query would.
+    pub linked_prs: Mutex<HashMap<i64, Vec<i64>>>,
 }
 
 impl FakeForge {
@@ -252,6 +266,19 @@ impl FakeForge {
         });
     }
 
+    /// Seed a GitHub-style cross-reference from `pr` to `issue` (issue #249
+    /// tests): a rail-external PR mentioning the issue, or one meguri itself
+    /// opened. `linked_open_prs(issue)` reports `pr` back while it stays
+    /// open in `self.prs`.
+    pub fn link_pr_to_issue(&self, issue: i64, pr: i64) {
+        self.linked_prs
+            .lock()
+            .unwrap()
+            .entry(issue)
+            .or_default()
+            .push(pr);
+    }
+
     pub fn set_pr_diff(&self, number: i64, diff: &str) {
         self.pr_diffs.lock().unwrap().insert(number, diff.into());
     }
@@ -361,18 +388,32 @@ impl FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _, _)| *n == number)
-            .map(|(_, body, _)| body.clone())
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.body.clone())
             .collect()
     }
 
-    /// Seed a PR comment with an explicit `createdAt` (merge-watch tests seed a
-    /// stale arm marker to drive arm-since past `STALE_AFTER`).
+    /// The next fake comment node id (monotonic).
+    fn next_comment_id(&self) -> String {
+        let mut seq = self.comment_seq.lock().unwrap();
+        *seq += 1;
+        format!("fc-{seq}")
+    }
+
+    /// Seed a *third-party* PR comment (`viewer_did_author = false`) with an
+    /// explicit `createdAt` (merge-watch tests seed a stale arm marker to drive
+    /// arm-since past `STALE_AFTER`; f3 tests seed a forged claim marker).
     pub fn add_pr_comment_at(&self, pr: i64, body: &str, created_at: &str) {
-        self.pr_comments
-            .lock()
-            .unwrap()
-            .push((pr, body.into(), created_at.into()));
+        let id = self.next_comment_id();
+        self.pr_comments.lock().unwrap().push((
+            pr,
+            PrComment {
+                body: body.into(),
+                created_at: created_at.into(),
+                id,
+                viewer_did_author: false,
+            },
+        ));
     }
 
     /// Simulate GitHub's `mergeStateStatus` for a PR (merge-watch tests).
@@ -534,6 +575,12 @@ impl FakeForge {
     /// Report a PR's observed review-thread set as clipped.
     pub fn mark_threads_incomplete(&self, pr: i64) {
         self.incomplete_threads.lock().unwrap().insert(pr);
+    }
+
+    /// Report a PR's observed conversation as truncated (the real forge's
+    /// comment page budget or a stalled cursor cut the pagination short).
+    pub fn mark_comments_incomplete(&self, pr: i64) {
+        self.incomplete_comments.lock().unwrap().insert(pr);
     }
 
     /// How many times `update_branch` was called for a PR (BEHIND fix tests).
@@ -848,6 +895,22 @@ impl Forge for FakeForge {
             .map(|p| Self::pr_to_public(p)))
     }
 
+    async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>> {
+        let numbers = self
+            .linked_prs
+            .lock()
+            .unwrap()
+            .get(&issue)
+            .cloned()
+            .unwrap_or_default();
+        let prs = self.prs.lock().unwrap();
+        Ok(prs
+            .iter()
+            .filter(|p| p.state == "open" && numbers.contains(&p.number))
+            .map(Self::pr_to_public)
+            .collect())
+    }
+
     async fn pr_mergeable(&self, number: i64) -> Result<MergeableState> {
         Ok(self
             .mergeable
@@ -943,20 +1006,37 @@ impl Forge for FakeForge {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(n, _, _)| *n == number)
-            .map(|(_, body, created_at)| PrComment {
-                body: body.clone(),
-                created_at: created_at.clone(),
-            })
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.clone())
             .collect())
     }
 
     async fn comment_pr(&self, pr: i64, body: &str) -> Result<()> {
-        self.pr_comments
-            .lock()
-            .unwrap()
-            .push((pr, body.into(), crate::store::now()));
+        let id = self.next_comment_id();
+        self.pr_comments.lock().unwrap().push((
+            pr,
+            PrComment {
+                body: body.into(),
+                created_at: crate::store::now(),
+                id,
+                viewer_did_author: true,
+            },
+        ));
         Ok(())
+    }
+
+    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()> {
+        if self.comment_errors.lock().unwrap().contains(&-1) {
+            bail!("simulated update_comment failure");
+        }
+        let mut comments = self.pr_comments.lock().unwrap();
+        match comments.iter_mut().find(|(_, c)| c.id == comment_id) {
+            Some((_, c)) => {
+                c.body = body.into();
+                Ok(())
+            }
+            None => bail!("no comment with id {comment_id}"),
+        }
     }
 
     async fn comment(&self, issue: i64, body: &str) -> Result<()> {
@@ -1091,7 +1171,7 @@ impl Forge for FakeForge {
         Ok(UpdateBranchOutcome::Updated)
     }
 
-    async fn observe_merge_tail(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
         let open: Vec<RecordedPr> = self
             .prs
             .lock()
@@ -1139,11 +1219,8 @@ impl Forge for FakeForge {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(n, _, _)| *n == number)
-                .map(|(_, body, created_at)| PrComment {
-                    body: body.clone(),
-                    created_at: created_at.clone(),
-                })
+                .filter(|(n, _)| *n == number)
+                .map(|(_, c)| c.clone())
                 .collect();
             let review_threads = self.threads_of(number);
             let rollup = CheckRollup {
@@ -1173,6 +1250,7 @@ impl Forge for FakeForge {
                 // conservative fallback.
                 labels_complete: !self.incomplete_labels.lock().unwrap().contains(&number),
                 review_threads_complete: !self.incomplete_threads.lock().unwrap().contains(&number),
+                comments_complete: !self.incomplete_comments.lock().unwrap().contains(&number),
             });
         }
         // One bulk read regardless of PR count (issue #221): the informer-cache

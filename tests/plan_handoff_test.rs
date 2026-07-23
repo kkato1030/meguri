@@ -1,11 +1,13 @@
-//! The separate-mode plan→impl handoff sweep (ADR 0008 §6, criterion 7): a
-//! merged spec/ADR PR flips its `speccing` issue to `ready` so the worker
-//! implements it in a fresh PR. Combined delivery does not use this path.
+//! The separate-mode plan→impl handoff (ADR 0008 §6, criterion 7): a merged
+//! spec/ADR PR flips its `speccing` issue to `ready` so the worker implements
+//! it in a fresh PR. Since ADR 0012 S4 (決定5) this is the `Op(Handoff)`
+//! branch of the Issue Kind decider, driven through
+//! `issue_reconciler::reconcile_issues`. Combined delivery does not use it.
 
 use std::sync::Arc;
 
 use meguri::config::{Config, PlanDelivery, ProjectConfig};
-use meguri::engine::plan_handoff;
+use meguri::engine::issue_reconciler;
 use meguri::engine::pr_reviewer;
 use meguri::engine::{Deps, planner};
 use meguri::forge::fake::FakeForge;
@@ -61,6 +63,9 @@ fn seed(forge: &FakeForge, deps: &Deps, issue: i64, branch: &str, pr_state: &str
     deps.store
         .update_run_worktree(&run.id, branch, "/wt/x")
         .unwrap();
+    deps.store
+        .update_run_status(&run.id, RunStatus::Succeeded, None)
+        .unwrap();
     let pr = forge.push_pr(branch, &format!("Spec: issue {issue}"), &[]);
     forge.set_pr_state(pr, pr_state);
     pr
@@ -72,7 +77,9 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     let deps = deps_with(forge.clone(), PlanDelivery::Separate);
     let pr = seed(&forge, &deps, 5, "meguri/5-thing-abc", "merged");
 
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
 
     let labels = forge.labels_of(5);
     assert!(labels.contains(&LABEL_READY.to_string()), "{labels:?}");
@@ -86,7 +93,9 @@ async fn merged_spec_pr_flips_speccing_to_ready() {
     );
 
     // Idempotent: a second sweep (issue no longer speccing) is a no-op.
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(forge.comments_of(5).len(), 1);
 }
 
@@ -125,7 +134,9 @@ async fn handoff_clears_the_parked_plan_review() {
     let parked = park_review(&deps, 5);
     assert_eq!(deps.store.list_parked_reviews().unwrap().len(), 1);
 
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
 
     // Handed off…
     assert!(forge.labels_of(5).contains(&LABEL_READY.to_string()));
@@ -150,7 +161,9 @@ async fn no_handoff_keeps_the_park() {
     seed(&forge, &deps, 5, "meguri/5-thing-abc", "open");
     park_review(&deps, 5);
 
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
 
     assert_eq!(deps.store.list_parked_reviews().unwrap().len(), 1);
 }
@@ -161,13 +174,17 @@ async fn an_open_or_unmerged_spec_pr_does_not_hand_off() {
     let deps = deps_with(forge.clone(), PlanDelivery::Separate);
     // Still open (under review / awaiting merge): no handoff.
     seed(&forge, &deps, 5, "meguri/5-thing-abc", "open");
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
     assert!(forge.labels_of(5).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(5).contains(&LABEL_READY.to_string()));
 
     // Closed unmerged (abandoned spec): also no handoff — a human re-triages.
     seed(&forge, &deps, 6, "meguri/6-thing-def", "closed");
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
     assert!(forge.labels_of(6).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(6).contains(&LABEL_READY.to_string()));
 }
@@ -178,7 +195,9 @@ async fn combined_delivery_never_hands_off() {
     let deps = deps_with(forge.clone(), PlanDelivery::Combined);
     seed(&forge, &deps, 5, "meguri/5-thing-abc", "merged");
 
-    plan_handoff::sweep(&deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&deps, &Default::default())
+        .await
+        .unwrap();
     // Combined delivery hands off via the spec worker, not this sweep.
     assert!(forge.labels_of(5).contains(&LABEL_SPECCING.to_string()));
     assert!(!forge.labels_of(5).contains(&LABEL_READY.to_string()));

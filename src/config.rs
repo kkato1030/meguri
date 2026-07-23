@@ -154,6 +154,7 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
+# sweep_degraded_threshold = 10        # この回数連続で失敗したら sweep.degraded を通知(issue #251)
 #
 # [limits]
 # idle_grace_secs = 120
@@ -165,7 +166,7 @@ pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目�
 # macos = true                       # awaiting_human を macOS 通知で知らせる
 # webhook_url = "https://hooks.slack.com/services/..."  # 省略で webhook 無効。${ENV} 展開可
 # kind = "slack"                     # 省略で URL から自動判別(slack/ntfy/json)
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped"]  # 既定は ["awaiting_human"]
+# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # 既定は ["awaiting_human"]
 # throttle_secs = 60                 # 同一通知キーの連続通知の最短間隔(秒)
 # [projects.notify]                  # per-project: 指定ラベルの issue 起票を通知(issue #205)
 # labels = ["human:todo"]
@@ -256,6 +257,8 @@ pub struct Config {
     pub decompose: DecomposeConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
+    #[serde(default)]
+    pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
     /// the shared `all` key) → repo-relative path to a file whose contents are
     /// injected into the turn prompt. Per-project `[projects.prompts]` overrides
@@ -448,6 +451,69 @@ fn default_reconcile_body_edits() -> bool {
 }
 fn default_reconcile_signal_comment() -> bool {
     true
+}
+
+/// Settings for the Issue Kind reconciler (`[reconciler]`, ADR 0012 slice 3):
+/// the step-policy allow-set (ADR 0026 — a disabled arm becomes
+/// `Wait(PolicyDisabled)`) and the claim instance id (ADR 0027).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReconcilerConfig {
+    /// Which fixer-family arms may launch. A disabled arm's `Agent` step is
+    /// filtered to `Wait(PolicyDisabled)` (the uniform replacement for the
+    /// scattered per-loop kill switches).
+    #[serde(default)]
+    pub policy: StepPolicyConfig,
+    /// This instance's claim-marker owner id (ADR 0027 / §7). `None` falls back
+    /// to `mux.session`, so a single-machine deploy needs no config.
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+/// The step-policy allow-set (ADR 0026). Every arm is enabled by default; set a
+/// field false to make that symptom `Wait(PolicyDisabled)` instead of launching.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StepPolicyConfig {
+    #[serde(default = "default_true")]
+    pub conflict_resolver: bool,
+    #[serde(default = "default_true")]
+    pub ci_fixer: bool,
+    #[serde(default = "default_true")]
+    pub fixer: bool,
+    // ADR 0012 S4 (決定10): the uniform kill switch extends to every
+    // reconciler arm. Config *semantics* (triage mode, guard toggles, …) stay
+    // on their own keys as snapshot trigger conditions — these bools only gate
+    // the Agent step (`Wait(PolicyDisabled)`), they do not replace them.
+    #[serde(default = "default_true")]
+    pub pr_reviewer: bool,
+    #[serde(default = "default_true")]
+    pub spec_fixer: bool,
+    #[serde(default = "default_true")]
+    pub spec_worker: bool,
+    #[serde(default = "default_true")]
+    pub planner: bool,
+    #[serde(default = "default_true")]
+    pub worker: bool,
+    #[serde(default = "default_true")]
+    pub cleaner: bool,
+    #[serde(default = "default_true")]
+    pub triage: bool,
+}
+
+impl Default for StepPolicyConfig {
+    fn default() -> Self {
+        Self {
+            conflict_resolver: true,
+            ci_fixer: true,
+            fixer: true,
+            pr_reviewer: true,
+            spec_fixer: true,
+            spec_worker: true,
+            planner: true,
+            worker: true,
+            cleaner: true,
+            triage: true,
+        }
+    }
 }
 
 /// Settings for the cleaner loop (read-only repository sweeps).
@@ -793,6 +859,15 @@ pub struct AgentProfile {
     /// skipped and the pane launches as before.
     #[serde(default)]
     pub preflight: Option<Vec<String>>,
+    /// Transcript size (bytes) beyond which a saved session is NOT resumed
+    /// (issue #245): an oversized transcript is the signature of a session at
+    /// (or past) its context limit, where `--resume` only produces API 400s.
+    /// The gate clears the session and falls back to a fresh spawn with full
+    /// re-injection — prompts are self-contained, so nothing is lost. Per
+    /// profile because context windows differ per model. `0` disables the
+    /// gate. Default 5 MiB.
+    #[serde(default = "default_resume_transcript_limit_bytes")]
+    pub resume_transcript_limit_bytes: u64,
 }
 
 impl Default for AgentProfile {
@@ -806,8 +881,13 @@ impl Default for AgentProfile {
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
+            resume_transcript_limit_bytes: default_resume_transcript_limit_bytes(),
         }
     }
+}
+
+fn default_resume_transcript_limit_bytes() -> u64 {
+    5 * 1024 * 1024
 }
 
 /// `[agents]`: the named-profile registry. Its own section so `[routing]` can
@@ -1041,6 +1121,17 @@ pub struct LimitsConfig {
     /// Max validate-fix turns before escalating.
     #[serde(default = "default_validate_turns")]
     pub validate_turns: u32,
+    /// Attach a sanitized pane tail to the agent_quiet needs-human escalation
+    /// (issue #245). The tail is diagnosis-only — never used to judge turn
+    /// success — and always passes `sanitize_pane_tail` (ANSI/control strip,
+    /// credential masking, fence-escape-proof code block) before leaving the
+    /// local trust boundary. `false` keeps the raw tail in local events only.
+    ///
+    /// Lives under `[limits]` rather than `[escalation]`: that section is the
+    /// profile-escalation chain table whose flattened role map would swallow
+    /// (and choke on) a boolean key.
+    #[serde(default = "default_escalation_pane_tail")]
+    pub escalation_pane_tail: bool,
 }
 
 impl Default for LimitsConfig {
@@ -1051,8 +1142,13 @@ impl Default for LimitsConfig {
             max_turn_runtime_secs: default_max_turn_runtime(),
             result_grace_secs: default_result_grace(),
             validate_turns: default_validate_turns(),
+            escalation_pane_tail: default_escalation_pane_tail(),
         }
     }
+}
+
+fn default_escalation_pane_tail() -> bool {
+    true
 }
 
 fn default_idle_grace() -> u64 {
@@ -1077,6 +1173,15 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_runs: u32,
+    /// Consecutive-failure threshold before a watch-loop sweep (merge-tail /
+    /// handoff / reaper / …) escalates from a `tracing::warn!` to a
+    /// `sweep.degraded` event + notification (issue #251, design doc P6.5).
+    /// #227's unbalanced-brace GraphQL bug killed the merge-tail sweep every
+    /// poll for hours with no trace beyond the log — this bounds how long a
+    /// silent sweep failure can go unnoticed to roughly
+    /// `threshold * poll_interval_secs`.
+    #[serde(default = "default_sweep_degraded_threshold")]
+    pub sweep_degraded_threshold: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -1084,6 +1189,7 @@ impl Default for SchedulerConfig {
         Self {
             poll_interval_secs: default_poll_interval(),
             max_concurrent_runs: default_max_concurrent(),
+            sweep_degraded_threshold: default_sweep_degraded_threshold(),
         }
     }
 }
@@ -1093,6 +1199,9 @@ fn default_poll_interval() -> u64 {
 }
 fn default_max_concurrent() -> u32 {
     2
+}
+fn default_sweep_degraded_threshold() -> u32 {
+    10
 }
 
 /// Restart policy for the OS-supervised watch (maps to launchd `KeepAlive`).
@@ -1161,9 +1270,9 @@ pub struct NotificationsConfig {
     #[serde(default)]
     pub kind: Option<WebhookKind>,
     /// Which event tokens are delivered (`awaiting_human` / `escalation` /
-    /// `schedule.failed` / `schedule.skipped`). Default `["awaiting_human"]`
-    /// preserves the pre-#205 behavior. Per-project label watching is
-    /// configured separately via `[projects.notify]`, not here.
+    /// `schedule.failed` / `schedule.skipped` / `infra` / `sweep.degraded`).
+    /// Default `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
+    /// watching is configured separately via `[projects.notify]`, not here.
     #[serde(default = "default_notifications_events")]
     pub events: Vec<String>,
     /// Minimum seconds between notifications for the same dedup key.
@@ -1551,20 +1660,153 @@ impl RepoConfig {
             .with_context(|| format!("invalid repo config at {}", path.display()))
     }
 
-    /// Parse repo config from raw TOML text — the shared core of
+    /// Parse the completion-contract pin from raw TOML text — the shared core of
     /// [`load_from_worktree`] and the default-branch read path (`meguri doctor`
     /// lints the on-default-branch bytes, which have no filesystem home).
+    ///
+    /// Parsing goes through [`RepoManifest`] (which knows the *full* repo-eligible
+    /// surface, including `schedules`) and then derives the pin. This keeps the
+    /// pin type byte-stable — `schedules` never enters it, so a saved
+    /// `Checkpoint.repo_config` stays decodable by an older binary — while a
+    /// malformed `[[schedules]]` entry cannot fail the parse and blank the
+    /// completion contract (issue #222 / ADR 0026).
     pub fn parse_str(raw: &str) -> Result<Self> {
-        toml::from_str(raw).context("invalid repo config")
+        Ok(RepoManifest::parse_str(raw)?.pinned())
     }
 
     /// Whether this repo config actually carries an override worth folding in
     /// (all `None` means the file was empty — nothing to layer over the host).
+    /// `schedules` are deliberately excluded: they are not a run-flow concern, so
+    /// a `meguri.toml` carrying only schedules folds nothing into the run.
     pub fn has_values(&self) -> bool {
         self.language.is_some()
             || self.check_command.is_some()
             || self.pr.as_ref().is_some_and(|p| p.draft.is_some())
     }
+}
+
+/// The full repo-eligible surface of `meguri.toml` (issue #222): the run-flow
+/// pin keys plus `schedules`. It is the single parse envelope for both the
+/// completion-contract pin ([`RepoConfig::parse_str`] derives from it) and the
+/// schedule resolver (`engine::schedule` reads `schedules` from it).
+///
+/// Two properties make this envelope the right shape (ADR 0026):
+/// - `deny_unknown_fields` over the *complete* key set detects a host-only key
+///   (`repo_slug`, `agent`, …) as a parse error, while still accepting the
+///   legitimate `check_command` / `language` / `pr`.
+/// - `schedules` is a fully shape-tolerant `Option<toml::Value>`: neither a
+///   malformed `[[schedules]]` entry NOR a wrong-shaped `schedules` field
+///   (`schedules = "x"`, `[schedules]`) fails the envelope parse, so nothing on
+///   the schedule layer can ever blank the completion-contract pin (issue #222
+///   f2). The typed interpretation happens later, in [`typed_schedules`] /
+///   the resolver: a wrong shape is a schedule-layer collection error and a bad
+///   entry drops just itself (issue #222 f1) — the pin survives both.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoManifest {
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub check_command: Option<String>,
+    #[serde(default)]
+    pub pr: Option<RepoPrConfig>,
+    /// The raw `schedules` value, if present, in any shape. Interpreted by
+    /// [`typed_schedules`], never by the pin.
+    #[serde(default)]
+    pub schedules: Option<toml::Value>,
+}
+
+impl RepoManifest {
+    /// Parse the envelope from raw TOML text.
+    pub fn parse_str(raw: &str) -> Result<Self> {
+        toml::from_str(raw).context("invalid repo config")
+    }
+
+    /// Derive the completion-contract pin (the run-flow keys only). `schedules`
+    /// is dropped here — the run never reads it, and (crucially) its shape can
+    /// never make this fail: the pin is immune to schedule-layer errors.
+    pub fn pinned(&self) -> RepoConfig {
+        RepoConfig {
+            language: self.language.clone(),
+            check_command: self.check_command.clone(),
+            pr: self.pr.clone(),
+        }
+    }
+
+    /// Interpret the raw `schedules` value into typed [`ScheduleConfig`]s.
+    /// - `Ok((entries, entry_errors))`: `schedules` is a well-formed array;
+    ///   `entries` parsed and `entry_errors` are the per-entry drops the resolver
+    ///   surfaces individually (a missing `title` etc., issue #222 f1).
+    /// - `Err(_)`: the `schedules` field has the wrong shape (not an array of
+    ///   tables) — a schedule-layer collection error. The pin is unaffected
+    ///   because it does not go through here (issue #222 f2).
+    pub fn typed_schedules(&self) -> Result<(Vec<ScheduleConfig>, Vec<anyhow::Error>)> {
+        let Some(value) = &self.schedules else {
+            return Ok((Vec::new(), Vec::new())); // absent = opt-out
+        };
+        let toml::Value::Array(items) = value else {
+            anyhow::bail!("`schedules` must be an array of tables (`[[schedules]]`)");
+        };
+        let mut ok = Vec::new();
+        let mut errs = Vec::new();
+        for (i, v) in items.iter().enumerate() {
+            match v.clone().try_into() {
+                Ok(s) => ok.push(s),
+                Err(e) => errs.push(anyhow::anyhow!("schedule entry #{i}: {e}")),
+            }
+        }
+        Ok((ok, errs))
+    }
+}
+
+/// Per-schedule validation (issue #222): a bad cron, both/neither of
+/// `body`/`body_file`, an unsafe `body_file` path, or a local-mode `plan`
+/// schedule. Shared by host config load, the repo-schedule resolver, and
+/// `doctor`. Deliberately does NOT check duplicate names — that is a collection
+/// property ([`validate_schedule_set_names`]), kept separate so a caller can
+/// classify the disposition (drop one malformed entry vs. drop the whole set).
+pub fn validate_schedule(mode: ProjectMode, s: &ScheduleConfig) -> Result<()> {
+    if let Err(e) = crate::cron::Cron::parse(&s.cron) {
+        anyhow::bail!("schedule {:?} has invalid cron {:?}: {e}", s.name, s.cron);
+    }
+    match (&s.body, &s.body_file) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "schedule {:?} sets both `body` and `body_file` (mutually exclusive)",
+            s.name
+        ),
+        (None, None) => anyhow::bail!(
+            "schedule {:?} sets neither `body` nor `body_file` (one is required)",
+            s.name
+        ),
+        // `body_file` is read from the default branch at fire time (ADR 0015);
+        // reject `..`/absolute/trailing-slash here so the read can trust the path
+        // is a repo-relative regular file.
+        (None, Some(rel)) => validate_repo_relative(rel)
+            .with_context(|| format!("schedule {:?} body_file", s.name))?,
+        (Some(_), None) => {}
+    }
+    if mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
+        anyhow::bail!(
+            "schedule {:?} has kind = \"plan\" but mode = \"local\" \
+             (local mode has no planner, so the task would never be consumed)",
+            s.name
+        );
+    }
+    Ok(())
+}
+
+/// Collection-level schedule check (issue #222): no two schedules share a
+/// `name` (the sqlite `schedule_state` key). Separate from [`validate_schedule`]
+/// so callers can drop the whole set on a name clash while dropping only the
+/// individual entries that fail per-schedule validation.
+pub fn validate_schedule_set_names(schedules: &[ScheduleConfig]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for s in schedules {
+        if !seen.insert(s.name.as_str()) {
+            anyhow::bail!("duplicate schedule name {:?}", s.name);
+        }
+    }
+    Ok(())
 }
 
 /// `[[workspaces]]` — a static grouping of related projects (issue #154).
@@ -1681,10 +1923,31 @@ impl Config {
                     p.id
                 );
             }
-            self.validate_schedules(p)?;
+            // Host schedules hard-fail at load (issue #222). The collection
+            // check and the per-schedule checks are separate calls so the repo
+            // resolver can classify their dispositions differently; here both
+            // are fatal. `{e:#}` folds the inner reason into one message so the
+            // project id and the specific error stay in `to_string()`.
+            validate_schedule_set_names(&p.schedules)
+                .map_err(|e| anyhow::anyhow!("project {:?}: {e:#}", p.id))?;
+            for s in &p.schedules {
+                validate_schedule(p.mode, s)
+                    .map_err(|e| anyhow::anyhow!("project {:?}: {e:#}", p.id))?;
+            }
             self.validate_cadence(p)?;
             self.validate_triage(p)?;
         }
+        // A threshold of 0 would escalate on the very first failure, i.e.
+        // exactly the per-tick spam the edge-triggered design (issue #251)
+        // exists to avoid — reject it rather than silently degrade the
+        // feature to "notify on every failure".
+        if self.scheduler.sweep_degraded_threshold == 0 {
+            anyhow::bail!("scheduler.sweep_degraded_threshold must be >= 1");
+        }
+        // Workspace invariants are global, not per-project — validate once here
+        // (issue #222 f4: this used to hang off `validate_schedules`, which the
+        // schedule-validator split removed).
+        self.validate_workspaces()?;
         // Reject unknown notify event tokens so a typo fails fast at load
         // instead of silently never delivering (issue #205). Global config, so
         // it runs regardless of whether any project is defined.
@@ -1763,60 +2026,6 @@ impl Config {
             }
         }
         self.validate_prompts()?;
-        Ok(())
-    }
-
-    /// Reject schedule definitions that would break `watch` startup / hot
-    /// reload or silently never fire: a bad cron expression, a duplicate
-    /// `name`, both/neither of `body`/`body_file`, or a local-mode `plan`
-    /// schedule (no local planner — the task would never be consumed).
-    fn validate_schedules(&self, p: &ProjectConfig) -> Result<()> {
-        let mut seen = std::collections::HashSet::new();
-        for s in &p.schedules {
-            if !seen.insert(s.name.as_str()) {
-                anyhow::bail!(
-                    "project {:?} has duplicate schedule name {:?}",
-                    p.id,
-                    s.name
-                );
-            }
-            if let Err(e) = crate::cron::Cron::parse(&s.cron) {
-                anyhow::bail!(
-                    "project {:?} schedule {:?} has invalid cron {:?}: {e}",
-                    p.id,
-                    s.name,
-                    s.cron
-                );
-            }
-            match (&s.body, &s.body_file) {
-                (Some(_), Some(_)) => anyhow::bail!(
-                    "project {:?} schedule {:?} sets both `body` and `body_file` (mutually exclusive)",
-                    p.id,
-                    s.name
-                ),
-                (None, None) => anyhow::bail!(
-                    "project {:?} schedule {:?} sets neither `body` nor `body_file` (one is required)",
-                    p.id,
-                    s.name
-                ),
-                // `body_file` is read from the default branch at fire time
-                // (ADR 0015); reject `..`/absolute/trailing-slash here so the
-                // read can trust the path is a repo-relative regular file.
-                (None, Some(rel)) => validate_repo_relative(rel).with_context(|| {
-                    format!("project {:?} schedule {:?} body_file", p.id, s.name)
-                })?,
-                (Some(_), None) => {}
-            }
-            if p.mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
-                anyhow::bail!(
-                    "project {:?} is mode = \"local\" but schedule {:?} has kind = \"plan\" \
-                     (local mode has no planner, so the task would never be consumed)",
-                    p.id,
-                    s.name
-                );
-            }
-        }
-        self.validate_workspaces()?;
         Ok(())
     }
 
@@ -3952,6 +4161,117 @@ allow_overlap = true
         )
         .unwrap();
         assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn malformed_schedule_entry_does_not_blank_the_pin() {
+        // issue #222 f1: a `[[schedules]]` entry missing `title` is a *schedule*
+        // error, not a pin error — the completion-contract keys survive.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meguri.toml"),
+            "check_command = \"cargo test\"\nlanguage = \"日本語\"\n\
+             [[schedules]]\nname = \"broken\"\ncron = \"0 9 * * *\"\n",
+        )
+        .unwrap();
+        let repo = RepoConfig::load_from_worktree(dir.path())
+            .expect("pin parse must not fail on a schedule error")
+            .expect("present");
+        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
+        assert_eq!(repo.language.as_deref(), Some("日本語"));
+    }
+
+    #[test]
+    fn manifest_detects_host_only_key_even_with_schedules() {
+        // issue #222 f2: the envelope knows the full repo-eligible surface, so a
+        // host-only key is rejected while legitimate keys + schedules are fine.
+        let raw = "check_command = \"x\"\nrepo_slug = \"me/x\"\n\
+                   [[schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
+        assert!(RepoManifest::parse_str(raw).is_err());
+    }
+
+    #[test]
+    fn manifest_typed_schedules_drops_only_the_bad_entry() {
+        // A valid entry and a malformed one (missing title): the good one types,
+        // the bad one is reported — the resolver drops just it (issue #222 D6/f1).
+        let raw = "[[schedules]]\nname = \"ok\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
+                   [[schedules]]\nname = \"bad\"\ncron = \"0 9 * * *\"\n";
+        let manifest = RepoManifest::parse_str(raw).unwrap();
+        let (ok, errs) = manifest.typed_schedules().expect("array shape is fine");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "ok");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn wrong_shaped_schedules_field_does_not_blank_the_pin() {
+        // issue #222 f2: a `schedules` field of the wrong shape (a string, or a
+        // single `[schedules]` table instead of `[[schedules]]`) is a
+        // schedule-layer error, NOT a pin error — `check_command` survives, and
+        // `typed_schedules` reports the shape problem for the resolver to drop.
+        for bad in [
+            "check_command = \"cargo test\"\nschedules = \"not-an-array\"\n",
+            "check_command = \"cargo test\"\n[schedules]\nname = \"x\"\n",
+        ] {
+            let manifest = RepoManifest::parse_str(bad).expect("pin parse must not fail");
+            assert_eq!(
+                manifest.pinned().check_command.as_deref(),
+                Some("cargo test"),
+                "the completion contract survives a schedule-shape error"
+            );
+            // And the shape error is reported (collection-level), not a panic.
+            assert!(manifest.typed_schedules().is_err(), "{bad}");
+            // The pin path used by the run flow also succeeds.
+            assert_eq!(
+                RepoConfig::parse_str(bad).unwrap().check_command.as_deref(),
+                Some("cargo test")
+            );
+        }
+    }
+
+    #[test]
+    fn pin_type_stays_schedule_free_for_checkpoint_compat() {
+        // issue #222 f1: the pinned `RepoConfig` (serialized into `Checkpoint`)
+        // must NOT gain a `schedules` field, so an older binary can still decode
+        // a newer checkpoint. Its JSON carries only the pin keys.
+        let repo = RepoConfig {
+            check_command: Some("cargo test".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&repo).unwrap();
+        assert!(!json.contains("schedules"), "{json}");
+        // And it round-trips through its own (deny_unknown_fields) decoder.
+        let back: RepoConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.check_command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn validate_schedule_and_set_names_are_independent() {
+        // issue #222 f5: the two validators are separate so a caller can classify
+        // a collection error (dup name) apart from a per-schedule error.
+        let good = ScheduleConfig {
+            name: "a".into(),
+            cron: "0 9 * * *".into(),
+            kind: ScheduleKind::Ready,
+            title: "t".into(),
+            body_file: None,
+            body: Some("b".into()),
+            allow_overlap: false,
+        };
+        let bad_cron = ScheduleConfig {
+            cron: "nope".into(),
+            ..good.clone()
+        };
+        assert!(validate_schedule(ProjectMode::Github, &good).is_ok());
+        assert!(validate_schedule(ProjectMode::Github, &bad_cron).is_err());
+        // Dup name is a collection error, invisible to per-schedule validation.
+        let dup = vec![good.clone(), good.clone()];
+        assert!(
+            dup.iter()
+                .all(|s| validate_schedule(ProjectMode::Github, s).is_ok())
+        );
+        assert!(validate_schedule_set_names(&dup).is_err());
+        assert!(validate_schedule_set_names(&[good]).is_ok());
     }
 
     #[test]

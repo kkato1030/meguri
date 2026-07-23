@@ -15,44 +15,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, NeedsHuman};
-use super::{Deps, Target};
 use crate::config::Deliver;
 use crate::forge;
 use crate::store::RunRecord;
-use crate::tasks::{TaskKey, TaskKind};
+use crate::tasks::TaskKey;
 
 /// `runs.loop_kind` value for worker runs (the schema default).
 pub const KIND: &str = "worker";
-
-/// The worker as a schedulable loop: `meguri:ready` issues in, PRs out.
-pub struct WorkerLoop;
-
-#[async_trait]
-impl super::Loop for WorkerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        Ok(deps
-            .task_source
-            .discover(TaskKind::Work)
-            .await?
-            .into_iter()
-            .map(|t| Target {
-                key: t.key,
-                title: t.title,
-                cadence_label: t.cadence_label,
-            })
-            .collect())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_worker(deps, run_id).await
-    }
-}
 
 pub async fn run_worker(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
     let flavor = WorkerFlavor {

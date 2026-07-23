@@ -35,6 +35,8 @@ pub const NOTIFY_EVENT_TOKENS: &[&str] = &[
     "escalation",
     "schedule.failed",
     "schedule.skipped",
+    "infra",
+    "sweep.degraded",
 ];
 
 /// One notification ready for delivery. Sources build these through the
@@ -138,6 +140,22 @@ impl Notification {
         }
     }
 
+    /// A forge/mux command fault (issue #250) — deliberately NOT an
+    /// `escalation`: it says the dependency is unreachable, not that the
+    /// issue needs a human. `dedup_key` is `reason` alone (no issue/run id),
+    /// so every issue tripping the same fault collapses into one page inside
+    /// the throttle window instead of paging once per issue.
+    pub fn infra(reason: &str, detail: &str) -> Self {
+        Self {
+            event: "infra".into(),
+            dedup_key: format!("infra:{reason}"),
+            title: "meguri infra 故障".into(),
+            body: format!("forge/mux コマンドが失敗しています({reason}): {detail}"),
+            url: None,
+            fields: json!({ "reason": reason, "detail": detail }),
+        }
+    }
+
     /// A schedule that failed to fire (the `sweep` Err arm, issue #205).
     pub fn schedule_failed(project: &str, schedule: &str, error: &str) -> Self {
         Self {
@@ -150,7 +168,34 @@ impl Notification {
         }
     }
 
-    /// A schedule occurrence skipped by the overlap guard (`scheduler_fire.rs`).
+    /// A scheduler sweep whose consecutive-failure streak crossed the
+    /// configured threshold (`sweep_health.rs`, issue #251) — the escalation
+    /// that would have caught #227's silent merge-tail outage. Fires once per
+    /// outage (edge-triggered on the streak, not throttled per-failure).
+    pub fn sweep_degraded(
+        project: &str,
+        sweep: &str,
+        consecutive_failures: u32,
+        error: &str,
+    ) -> Self {
+        Self {
+            event: "sweep.degraded".into(),
+            dedup_key: format!("sweep:{project}:{sweep}"),
+            title: format!("meguri sweep {sweep} degraded"),
+            body: format!(
+                "sweep \"{sweep}\" ({project}) が {consecutive_failures} 回連続で失敗しています: {error}"
+            ),
+            url: None,
+            fields: json!({
+                "project": project,
+                "sweep": sweep,
+                "consecutive_failures": consecutive_failures,
+                "error": error,
+            }),
+        }
+    }
+
+    /// A schedule occurrence skipped by the overlap guard (`schedule.rs`).
     pub fn schedule_skipped(project: &str, schedule: &str, open_key: i64) -> Self {
         Self {
             event: "schedule.skipped".into(),
@@ -566,6 +611,17 @@ mod tests {
     }
 
     #[test]
+    fn infra_dedup_key_is_reason_only_not_per_issue() {
+        // Two different issues hitting the same fault must share a dedup
+        // key, so the notifier's throttle collapses them into one page
+        // (issue #250) — an infra fault says nothing about which issue.
+        let a = Notification::infra("mux_connection_refused", "issue 7 detail");
+        let b = Notification::infra("mux_connection_refused", "issue 8 detail");
+        assert_eq!(a.dedup_key, b.dedup_key);
+        assert_eq!(a.event, "infra");
+    }
+
+    #[test]
     fn json_payload_carries_event_title_text_and_fields() {
         let n = Notification::schedule_failed("proj", "nightly", "boom");
         let req = webhook_request(WebhookKind::Json, &n);
@@ -576,6 +632,18 @@ mod tests {
         // Structured fields are merged in for JSON consumers.
         assert_eq!(v["project"], "proj");
         assert_eq!(v["schedule"], "nightly");
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn json_payload_carries_sweep_degraded_fields() {
+        let n = Notification::sweep_degraded("proj", "merge-tail", 10, "boom");
+        let req = webhook_request(WebhookKind::Json, &n);
+        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+        assert_eq!(v["event"], "sweep.degraded");
+        assert_eq!(v["project"], "proj");
+        assert_eq!(v["sweep"], "merge-tail");
+        assert_eq!(v["consecutive_failures"], 10);
         assert_eq!(v["error"], "boom");
     }
 

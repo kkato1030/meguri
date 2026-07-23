@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use meguri::config::{AutoMergeMode, Autonomy, Config, ProjectConfig};
 use meguri::engine::Deps;
-use meguri::engine::merge_tail::sweep;
+use meguri::engine::issue_reconciler::sweep;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_AUTOMERGE, MergeStateStatus, MergeStrategy, MergeableState};
 
@@ -209,6 +209,25 @@ async fn clipped_label_window_is_treated_as_a_human_stop() {
 }
 
 #[tokio::test]
+async fn truncated_comment_pagination_is_treated_as_a_human_stop() {
+    // pr-review finding (#231 guard): the comment overflow pagination is
+    // budgeted, so a pathologically chatty PR cannot spend unbounded API cost
+    // per resync. A truncated conversation could hide an arm/claim marker, so
+    // the engine must park the PR (no writes) instead of acting on it.
+    let forge = Arc::new(FakeForge::default());
+    seed_armable(&forge, 1, "sha1");
+    forge.mark_comments_incomplete(1);
+    let deps = deps_with(forge.clone(), AutoMergeMode::Native);
+
+    sweep(&deps).await.unwrap();
+    assert_eq!(
+        forge.armed_of(1),
+        None,
+        "a truncated comment observation must not arm (a hidden marker is assumed)"
+    );
+}
+
+#[tokio::test]
 async fn clipped_thread_window_is_treated_as_unresolved() {
     // pr-review finding: a bounded review-thread window could hide an unresolved
     // thread, letting an arm slip the review gate. An incomplete thread set must
@@ -235,7 +254,7 @@ async fn observe_cost_is_constant_and_recorded() {
         seed_armable(&forge, n, "sha");
     }
     let one = forge
-        .observe_merge_tail(meguri::engine::pr_reviewer::PR_REVIEW_STATUS)
+        .observe_open_prs(meguri::engine::pr_reviewer::PR_REVIEW_STATUS)
         .await
         .unwrap();
     assert_eq!(one.prs.len(), 3);
@@ -244,7 +263,7 @@ async fn observe_cost_is_constant_and_recorded() {
     let deps = deps_with(forge.clone(), AutoMergeMode::Native);
     sweep(&deps).await.unwrap();
     assert_eq!(
-        deps.store.count_events("merge_tail.observe_cost").unwrap(),
+        deps.store.count_events("reconciler.observe_cost").unwrap(),
         1,
         "each sweep records the observe cost"
     );

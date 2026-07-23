@@ -169,28 +169,23 @@ cleaner (standalone) ── パイプラインの外を独立に回る
   帯びたままなので、上の pr_reviewer(kind=Impl)の対象条件から自然に除外される — 二重レビューは
   起きない。
 
-## 2. ディスパッチ優先度
+## 2. ディスパッチ優先度と enqueue の所有
 
-現行の `default_loops()`(`src/engine/mod.rs`)の**登録順そのものが優先度**である。プリエンプションは無く、`Loop` trait に `priority()` のような機構も無い — 並び順そのものが仕様([ADR 0001-scheduler-priority-wip-first](../adr/0001-scheduler-priority-wip-first.md))。
+ADR 0012 スライス4([0012-loops-are-emergent-level-triggered-reconciler](../adr/0012-loops-are-emergent-level-triggered-reconciler.md))で旧 `Loop` trait と `default_loops()` は撤去された。loop はコード上の構造物ではなく、reconciler が生む実行時の軌道である。
+
+- **enqueue は reconciler が所有する**。毎 poll、observe → 純関数 decide → act(run の enqueue、または agent を起こさない軽量 `Op`):
+  - **Issue Kind**(`issue_reconciler.rs`): PR 側 `next_step`(fixer 家族 + spec 段階 arm + merge tail + `Op(Finalize)` などの毎 resync act)、issue 側 `next_step_issue`(planner / worker / `Op(Handoff)`)、local 側 `next_step_local`(worker)。
+  - **Repo Kind**(`repo_reconciler.rs`): `Op(EnsureClone)`(tick 先頭の readiness 契約)> cleaner > triage、毎 resync の routing-drift 再計算。
+  - **Schedule Kind**(`schedule.rs`): cron スケジュールの評価と起票。
+- **dispatch は recipe テーブル**(決定8): `runs.loop_kind` → `run_recipe` の純 match。workqueue の順序は `dispatch_rank`(merge に近い側から先取り):
 
 ```
-conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → pr_reviewer → worker → planner → cleaner
+conflict_resolver → ci_fixer → fixer → spec_fixer → spec_worker → pr_reviewer → worker → planner → cleaner → triage
 ```
 
-これは**パイプラインの逆順**(merge に近い側から先取り)であり、背後の原則は一つだけ:**新規着手より仕掛かりの完了を優先する(WIP を減らす)**。`spec_fixer`(issue #188)は plan 側の fixer 系 — plan レビュー(pr_reviewer)の findings で parked した spec PR を進める仕掛かり完了ループなので、他の fixer 系と同じく新規着手ループ(spec_worker 以降)より上に置かれる。同一ループ内は issue/PR 番号の昇順(FIFO) — 古い仕掛かり品ほどコンフリクトのリスクが溜まるため、先に生まれたものを先に完了させる。複数プロジェクト構成ではループ→プロジェクトの順で走査するため、優先度がプロジェクト順より強く効く。
+同一 kind 内は issue/PR 番号の昇順(FIFO)。背後の原則は不変で一つだけ: **新規着手より仕掛かりの完了を優先する(WIP を減らす)**([ADR 0001-scheduler-priority-wip-first](../adr/0001-scheduler-priority-wip-first.md))。
 
-### 帯域外(out-of-band)sweep
-
-`default_loops()` の**外**で、`scheduler.rs` の poll tick から直接呼ばれる軽量 API 掃引がある。いずれも `Loop` trait を実装せず、run レコードも pane も持たないため、上のディスパッチ優先度リストには現れない:
-
-| sweep | 役割 | ADR |
-|---|---|---|
-| `scheduler_fire::sweep` | cron スケジュール(`[[projects.schedules]]`)を評価し、due なら issue/task を1件起票する(起票のみ、消化は既存ループ) | [0009-schedules-enqueue-only-not-a-cron-replacement](../adr/0009-schedules-enqueue-only-not-a-cron-replacement.md) |
-| `reaper::sweep` | close された issue の pane・worktree・マージ済みローカルブランチを回収 | [0004-issue-lane-pane-session-lifetime](../adr/0004-issue-lane-pane-session-lifetime.md) |
-| `merge_tail::sweep` | 一括 observe(informer cache)→ 純関数 `next_step` → act で PR ごとに 1 つの `Op` を実行する level-triggered な合流点(旧 `auto_merger` / `merge_watch` を畳んだもの)。`native` は arm(ADR 0003)、`orchestrator` は直接 merge(ADR 0009)、BEHIND(arm 済み × base 進行)は `Op(UpdateBranch)` + 再 arm で閉じる、conflict/red CI は fixer 系に委譲(no-op)、拾われない stall だけ escalate | [0012-loops-are-emergent-level-triggered-reconciler](../adr/0012-loops-are-emergent-level-triggered-reconciler.md) |
-| `plan_handoff::sweep` | `plan_delivery = separate` 限定。spec PR が merge 済みの `speccing` issue を検知し `speccing`→`ready` に切替える(combined では no-op) | [0008-symmetric-plan-impl-review-loop](../adr/0008-symmetric-plan-impl-review-loop.md) |
-
-上表4つの実行順は固定(scheduler_fire → reaper → merge_tail → plan_handoff)。`scheduler_fire` が起票した issue/task はその tick の discovery を既に過ぎているため次 tick で拾われる(poll_interval 粒度なので実害なし)。`merge_tail` は arm と drift 監視を 1 パスに畳んだので(旧 auto_merger → merge_watch の 2 sweep 順は不要になった)、arm・BEHIND 修正・stall escalate が同じ observe から一貫して決まる。`scheduler_fire` の状態(最終発火時刻)は forge ではなく sqlite の `schedule_state` に置く — 定義は config 側(hot reload 対象)にあり、Authority 原則の「forge が唯一の永続状態」の例外として、これは純粋にローカルなスケジューラの進行管理だから(cleaner の interval と同種)。`plan_handoff` の後には `routing_drift` / `reconcile` という discovery 系の sweep がさらに続くが、いずれも loop パイプラインではなく discovery の鮮度・再着手検知が役割のため本 doc のスコープ外(表に含めない)。
+旧「帯域外 sweep」はすべて reconciler の act / arm に畳まれた: reaper は Issue Kind の `Op(Finalize)`(open な meguri PR を持つ identity の資源は PR 側が保持)、plan_handoff は issue 側の `Op(Handoff)`、decompose materialize と body-edit signal は毎 resync の act、routing_drift は Repo Kind の毎 resync 再計算。scheduler tick に残る独立呼び出しは Schedule Kind(`schedule::sweep`)のみ。operator は identity への 3 動詞 `run` / `why` / `attach` で介入する([ADR 0016](../adr/0016-operator-surface-run-why-attach.md))。
 
 ## 3. loop 別ライフサイクル
 
@@ -211,8 +206,8 @@ README の「ループ別の寿命の一覧」を、設計視点([ADR 0004-issue
 補足:
 
 - **author lane** は同じ branch を編集する loop 全員(planner → spec_fixer → worker/spec_worker → fixer/ci_fixer/conflict_resolver)が同一 pane・同一 claude session を共有し、文脈を継ぐ。spec_fixer は run を PR の canonical issue で鍵るため、spec を書いた planner と同じ author pane・同一 session で修正が走り、planning の文脈を保つ(issue #92 の lane モデルどおり)。**self-review lane** は self-review が必須の3 loop(planner / worker / spec_worker、表の「+ self-review」)だけが使う、同じ issue に紐づく別の実行体(プロファイル `self-reviewer`)——author が積んだ diff を独立した目でレビューし、fix 指示を author lane へ戻す内部往復専用([ADR 0006](../adr/0006-ai-implementation-review-is-an-internal-loop.md) / [ADR 0008](../adr/0008-symmetric-plan-impl-review-loop.md) / [ADR 0011](../adr/0011-combined-impl-diff-self-review.md))。lane = pane とは限らない — launch mode は role 単位で pane/direct を選べ、self-reviewer の既定は `direct`(pane を張らない、[ADR 0012](../adr/0012-launch-mode-role-pane-or-direct-keep-pane-subordinate.md))。**pr-review lane** は pr_reviewer 専用の独立 pane(別 session)。**standalone** は cleaner のみで lane モデルの対象外。
-- pane・worktree はいずれも issue が寿命の単位で、issue が close されると `reaper::sweep` が回収する(watch 実行中はポーリングのたびに、一発実行では `meguri prune`)。
-- 表に無い `merge_tail.sweep` / `plan_handoff.sweep` は `Loop` trait を実装しない軽量 API 掃引のため、pane も worktree も持たない(§2 参照)。
+- pane・worktree はいずれも issue が寿命の単位で、issue が terminal に達すると Issue Kind の `Op(Finalize)` が回収する(watch 実行中は resync のたびに、一発実行では `meguri prune`)。open な meguri PR が残る identity の資源は PR 側が保持する(finding 4b)。
+- merge tail / handoff は Issue Kind reconciler の `Op` のため、pane も worktree も持たない(§2 参照)。
 
 ## 4. 横断原則
 

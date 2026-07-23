@@ -29,10 +29,9 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, Target, canonical_key, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, is_combined, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, ReviewThread};
 use crate::store::RunRecord;
-use crate::tasks::TaskKey;
 use serde_json::json;
 
 /// `runs.loop_kind` value for fixer runs.
@@ -50,50 +49,6 @@ pub fn thread_awaits_fixer(thread: &ReviewThread) -> bool {
             .comments
             .last()
             .is_some_and(|c| !c.body.starts_with(FIXER_REPLY_MARKER))
-}
-
-/// The fixer as a schedulable loop: reviewed meguri PRs in, fix pushes out.
-pub struct FixerLoop;
-
-#[async_trait]
-impl super::Loop for FixerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    /// Unlike the label-triggered loops, a PR stays discoverable across
-    /// multiple succeeded fixer runs — every reviewer round is a new run.
-    /// The active-run unique index still dedups concurrent rounds, and the
-    /// thread reply marker keeps a pushed-but-not-re-reviewed PR quiet.
-    /// Targets are keyed by the PR's canonical issue (the head branch always
-    /// encodes it — meguri branches only).
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let combined = is_combined(deps);
-        let mut targets = Vec::new();
-        for pr in deps.open_prs.get(deps).await? {
-            if pr_is_touchable(&pr, combined).is_some() {
-                continue;
-            }
-            let threads = deps.forge().list_review_threads(pr.number).await?;
-            if threads.iter().any(thread_awaits_fixer) {
-                targets.push(Target {
-                    // The fixer targets the PR's canonical issue (issue #92),
-                    // carried as an Issue key through the coordination layer.
-                    key: TaskKey::Issue(canonical_key(&pr)),
-                    title: pr.title,
-                    cadence_label: None,
-                });
-            }
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_fixer(deps, run_id).await
-    }
 }
 
 pub async fn run_fixer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
