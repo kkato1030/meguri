@@ -740,6 +740,15 @@ pub struct AgentProfile {
     /// resumable session id before closing a pane.
     #[serde(default)]
     pub session_dir: Option<PathBuf>,
+    /// Transcript size (bytes) beyond which a saved session is NOT resumed
+    /// (issue #245): an oversized transcript is the signature of a session at
+    /// (or past) its context limit, where `--resume` only produces API 400s.
+    /// The gate clears the session and falls back to a fresh spawn with full
+    /// re-injection — prompts are self-contained, so nothing is lost. Per
+    /// profile because context windows differ per model. `0` disables the
+    /// gate. Default 5 MiB.
+    #[serde(default = "default_resume_transcript_limit_bytes")]
+    pub resume_transcript_limit_bytes: u64,
 }
 
 impl Default for AgentProfile {
@@ -752,8 +761,13 @@ impl Default for AgentProfile {
             direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
+            resume_transcript_limit_bytes: default_resume_transcript_limit_bytes(),
         }
     }
+}
+
+fn default_resume_transcript_limit_bytes() -> u64 {
+    5 * 1024 * 1024
 }
 
 /// `[agents]`: the named-profile registry. Its own section so `[routing]` can
@@ -987,6 +1001,17 @@ pub struct LimitsConfig {
     /// Max validate-fix turns before escalating.
     #[serde(default = "default_validate_turns")]
     pub validate_turns: u32,
+    /// Attach a sanitized pane tail to the agent_quiet needs-human escalation
+    /// (issue #245). The tail is diagnosis-only — never used to judge turn
+    /// success — and always passes `sanitize_pane_tail` (ANSI/control strip,
+    /// credential masking, fence-escape-proof code block) before leaving the
+    /// local trust boundary. `false` keeps the raw tail in local events only.
+    ///
+    /// Lives under `[limits]` rather than `[escalation]`: that section is the
+    /// profile-escalation chain table whose flattened role map would swallow
+    /// (and choke on) a boolean key.
+    #[serde(default = "default_escalation_pane_tail")]
+    pub escalation_pane_tail: bool,
 }
 
 impl Default for LimitsConfig {
@@ -997,8 +1022,13 @@ impl Default for LimitsConfig {
             max_turn_runtime_secs: default_max_turn_runtime(),
             result_grace_secs: default_result_grace(),
             validate_turns: default_validate_turns(),
+            escalation_pane_tail: default_escalation_pane_tail(),
         }
     }
+}
+
+fn default_escalation_pane_tail() -> bool {
+    true
 }
 
 fn default_idle_grace() -> u64 {

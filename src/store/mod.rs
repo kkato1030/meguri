@@ -97,6 +97,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0016_reconciler_backoff",
         include_str!("migrations/0016_reconciler_backoff.sql"),
     ),
+    // Issue #245: per-lane agent_quiet strike counter for session-health
+    // rotation (2 strikes clear the session, 3 hand it to a human).
+    (
+        "0017_pane_quiet_strikes",
+        include_str!("migrations/0017_pane_quiet_strikes.sql"),
+    ),
 ];
 
 /// Thin handle over a single SQLite connection (WAL, busy-timeout).

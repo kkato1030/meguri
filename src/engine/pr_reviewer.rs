@@ -676,6 +676,12 @@ async fn execute(
                     "pane died during pr review".into(),
                 ));
             }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(flow::StepFlow::Interrupted(
+                    "agent went quiet during pr review".into(),
+                ));
+            }
         };
 
         match result.status {

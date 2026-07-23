@@ -160,6 +160,17 @@ pub trait Multiplexer: Send + Sync {
         Ok(None)
     }
 
+    /// Whether an agent process is (still) running in the pane (issue #245).
+    /// `Some(true)` = an agent is running; `Some(false)` = the pane has
+    /// fallen back to a bare shell (the agent process exited); `None` = the
+    /// mux cannot tell. Callers must only act on `Some(false)` — typing into
+    /// a bare shell is the failure this prevents — and treat `None` like
+    /// `Some(true)` (fail open, the result-file contract still decides).
+    async fn agent_present(&self, pane: &PaneId) -> MuxResult<Option<bool>> {
+        let _ = pane;
+        Ok(None)
+    }
+
     /// Wait until state ∈ `targets`, polling or via native events.
     /// Returns the matched state, or `WaitTimeout`.
     async fn wait_state(
@@ -310,9 +321,48 @@ pub(crate) fn tail_looks_blocked(tail: &[String]) -> bool {
         .any(|line| BLOCKED_PATTERNS.iter().any(|p| line.contains(p)))
 }
 
+/// Whether a foreground process name is a plain shell — the signature of an
+/// agent pane whose agent exited (issue #245). Matches the bare name, a login
+/// shell's leading dash (`-zsh`), and full paths (`/bin/zsh`).
+pub(crate) fn process_is_shell(name: &str) -> bool {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"];
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.strip_prefix('-').unwrap_or(base);
+    SHELLS.contains(&base)
+}
+
+/// Classify a pane's foreground process names into an `agent_present` answer:
+/// every process a shell → the agent is gone (`Some(false)`); any non-shell →
+/// something is running (`Some(true)`); nothing observed → cannot tell.
+pub(crate) fn classify_foreground_processes<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<bool> {
+    let mut saw_any = false;
+    for name in names {
+        saw_any = true;
+        if !process_is_shell(name) {
+            return Some(true);
+        }
+    }
+    if saw_any { Some(false) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_classification_reads_shell_only_as_agent_absent() {
+        // Bare shells in every spelling → the agent exited.
+        assert_eq!(classify_foreground_processes(["zsh"]), Some(false));
+        assert_eq!(classify_foreground_processes(["-zsh"]), Some(false));
+        assert_eq!(classify_foreground_processes(["/bin/bash"]), Some(false));
+        // Any non-shell process → something (agent, its MCP children) runs.
+        assert_eq!(classify_foreground_processes(["zsh", "claude"]), Some(true));
+        assert_eq!(classify_foreground_processes(["node"]), Some(true));
+        // No observation → cannot tell.
+        assert_eq!(classify_foreground_processes([]), None);
+    }
 
     #[test]
     fn workspace_labels_scope_by_project() {
