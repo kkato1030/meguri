@@ -403,6 +403,24 @@ pub struct StepPolicyConfig {
     pub ci_fixer: bool,
     #[serde(default = "default_true")]
     pub fixer: bool,
+    // ADR 0012 S4 (決定10): the uniform kill switch extends to every
+    // reconciler arm. Config *semantics* (triage mode, guard toggles, …) stay
+    // on their own keys as snapshot trigger conditions — these bools only gate
+    // the Agent step (`Wait(PolicyDisabled)`), they do not replace them.
+    #[serde(default = "default_true")]
+    pub pr_reviewer: bool,
+    #[serde(default = "default_true")]
+    pub spec_fixer: bool,
+    #[serde(default = "default_true")]
+    pub spec_worker: bool,
+    #[serde(default = "default_true")]
+    pub planner: bool,
+    #[serde(default = "default_true")]
+    pub worker: bool,
+    #[serde(default = "default_true")]
+    pub cleaner: bool,
+    #[serde(default = "default_true")]
+    pub triage: bool,
 }
 
 impl Default for StepPolicyConfig {
@@ -411,6 +429,13 @@ impl Default for StepPolicyConfig {
             conflict_resolver: true,
             ci_fixer: true,
             fixer: true,
+            pr_reviewer: true,
+            spec_fixer: true,
+            spec_worker: true,
+            planner: true,
+            worker: true,
+            cleaner: true,
+            triage: true,
         }
     }
 }

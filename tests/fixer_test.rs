@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::fixer::{self, FIXER_REPLY_MARKER, FixerLoop, run_fixer};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::fixer::{self, FIXER_REPLY_MARKER, run_fixer};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
@@ -559,11 +559,6 @@ async fn fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     assert_eq!(threads[0].comments.len(), 1);
 
     // The unresolved, unparked thread would otherwise re-trigger the fixer
-    // forever (issue #170: the fixer used to have no needs-human gate at
-    // all, unlike ci-fixer and the conflict resolver); the escalation must
-    // still park discovery.
-    assert!(
-        FixerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "an escalated PR must wait for a human, not re-trigger"
-    );
+    // forever — the reconciler's human-stop gate parks it (covered by the
+    // next_step property tests; the old Loop::discover is gone, ADR 0012 決定7).
 }

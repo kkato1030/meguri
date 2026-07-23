@@ -10,7 +10,8 @@ pub mod plan_handoff;
 pub mod planner;
 pub mod pr_reviewer;
 pub mod reaper;
-pub mod reconcile;
+pub mod reconcile_body_edits;
+pub mod repo_reconciler;
 pub mod routing_drift;
 pub mod schedule;
 pub mod scheduler;
@@ -25,7 +26,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::config::{Config, PlanDelivery, ProjectConfig};
 use crate::forge::{self, Forge, PullRequest};
@@ -33,7 +33,7 @@ use crate::gitops;
 use crate::mux::Multiplexer;
 use crate::notify::{Notification, Notifier};
 use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, LANE_PR_REVIEW, Store};
-use crate::tasks::{TaskKey, TaskSource};
+use crate::tasks::TaskSource;
 use crate::turn::TurnControl;
 
 /// Everything a loop needs to drive runs for one project.
@@ -60,11 +60,6 @@ pub struct Deps {
     pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
-    /// Per-tick cache of `list_open_prs`, shared by the fixer-family loops
-    /// (fixer / ci_fixer / conflict_resolver) so their discovery costs the
-    /// forge one call per project per tick instead of three (issue #170).
-    /// `Scheduler` clears it at the top of every tick; see [`OpenPrCache`].
-    pub open_prs: OpenPrCache,
 }
 
 impl Deps {
@@ -98,7 +93,6 @@ impl Deps {
             forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
-            open_prs: OpenPrCache::default(),
         }
     }
 
@@ -237,34 +231,6 @@ pub async fn ensure_project_clone(deps: &Deps) -> Result<()> {
     }
 }
 
-/// Per-tick cache of `list_open_prs` (issue #170): lazily filled by whichever
-/// fixer-family loop's `discover` runs first for a project this tick, reused
-/// by the other two, and reset by `Scheduler::discover` at the top of the
-/// next tick. Mirrors `reaper::IssueStates`, adapted to `Deps`'s shape — one
-/// `Deps` per project rather than a map keyed by id, so a bare `Mutex<Option<_>>`
-/// behind a cheap-to-clone `Arc` is enough.
-#[derive(Clone, Default)]
-pub struct OpenPrCache(Arc<Mutex<Option<Vec<PullRequest>>>>);
-
-impl OpenPrCache {
-    /// The project's open PRs: the cached list if this tick already fetched
-    /// one, otherwise one `list_open_prs` call that fills the cache.
-    pub async fn get(&self, deps: &Deps) -> Result<Vec<PullRequest>> {
-        let mut cached = self.0.lock().await;
-        if let Some(prs) = cached.as_ref() {
-            return Ok(prs.clone());
-        }
-        let prs = deps.forge().list_open_prs().await?;
-        *cached = Some(prs.clone());
-        Ok(prs)
-    }
-
-    /// Drop the cached list so the next tick's first caller re-fetches.
-    pub async fn clear(&self) {
-        *self.0.lock().await = None;
-    }
-}
-
 /// Head-branch prefix identifying meguri's own PRs — the fixer-family loops
 /// (fixer / ci_fixer / conflict_resolver) only ever touch work meguri opened.
 pub(crate) const MEGURI_BRANCH_PREFIX: &str = "meguri/";
@@ -328,22 +294,6 @@ pub fn pr_is_touchable(pr: &PullRequest, skip_spec_ready: bool) -> Option<String
     None
 }
 
-/// A unit of work a loop wants a run for: the task to drive. The `key` is the
-/// coordination-layer identity — a github issue number or a local task row
-/// (issue #54). PR-targeted loops resolve the canonical issue via
-/// [`canonical_key`] and carry the PR number in their checkpoint.
-#[derive(Debug, Clone)]
-pub struct Target {
-    /// The coordination-layer identity of the task (github issue or local
-    /// task row). Also the run-creation and dispatch-sort key.
-    pub key: TaskKey,
-    pub title: String,
-    /// The cadence bucket (issue #148) discovery matched, if any. The scheduler
-    /// stamps it onto the created run so consumption can be counted. `None`
-    /// outside any cadence rule and for all non-task-source loops.
-    pub cadence_label: Option<String>,
-}
-
 /// The GitHub issue a PR belongs to: the branch encoding first
 /// (`meguri/<issue>-…`, always present on meguri's own PRs), then a closing
 /// keyword (`Closes #N`) in the PR body — the fallback for human-made heads.
@@ -388,6 +338,17 @@ fn closes_issue(body: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// The open PR with this number, or `None` (the operator surface's PR
+/// lookup, ADR 0016).
+pub async fn open_pr_by_number(deps: &Deps, number: i64) -> Result<Option<PullRequest>> {
+    Ok(deps
+        .forge()
+        .list_open_prs()
+        .await?
+        .into_iter()
+        .find(|pr| pr.number == number))
 }
 
 /// The single open PR whose [`canonical_key`] is `issue`, re-resolved at
@@ -443,30 +404,12 @@ pub enum WorkerOutcome {
     Decomposed(String),
 }
 
-/// A schedulable loop: discovers actionable targets for a project and drives
-/// runs to a terminal outcome. `kind()` is persisted in `runs.loop_kind` so
-/// the scheduler can route a run back to its loop after a restart.
-#[async_trait]
-pub trait Loop: Send + Sync {
-    /// Stable identifier stored in `runs.loop_kind`.
-    fn kind(&self) -> &'static str;
-
-    /// Find targets that need a run for this project. Discovery must be
-    /// idempotent: targets already covered by an active run are filtered by
-    /// the scheduler via the unique (project, loop, issue) run index.
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>>;
-
-    /// Drive one run to a terminal outcome, resuming from its checkpoint.
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome>;
-}
-
 /// The dispatch priority of a `runs.loop_kind` (ADR 0001 → ADR 0012 §5): the
-/// smaller the rank, the closer to merge, the earlier it dispatches. This is
-/// the explicit form of the old "registration order is priority" — the value is
-/// the loop's index in [`default_loops`], now needed because the reconciler
-/// (issue #223) enqueues fixer-family runs *outside* the discovery loop, so the
-/// scheduler sorts every `queued` run by this key rather than by creation order.
-/// An unknown loop_kind sorts last (kept stable, never panics).
+/// smaller the rank, the closer to merge, the earlier it dispatches. The
+/// explicit form of the old "registration order is priority": every run is
+/// enqueued by a reconciler and the
+/// scheduler sorts the whole workqueue by this key rather than by creation
+/// order. An unknown loop_kind sorts last (kept stable, never panics).
 pub fn dispatch_rank(loop_kind: &str) -> u8 {
     match loop_kind {
         conflict_resolver::KIND => 0,
@@ -483,25 +426,49 @@ pub fn dispatch_rank(loop_kind: &str) -> u8 {
     }
 }
 
-/// The loops meguri ships today, in dispatch-priority order (the pipeline
-/// reversed = closest to merge first). The scheduler hands out slots from
-/// the head of this list, so ordering alone is the priority mechanism.
-pub fn default_loops() -> Vec<Arc<dyn Loop>> {
-    vec![
-        Arc::new(conflict_resolver::ConflictResolverLoop),
-        Arc::new(ci_fixer::CiFixerLoop),
-        Arc::new(fixer::FixerLoop),
-        // Plan-side fixer family (issue #188): unparks spec PRs the plan
-        // review flagged, so it sits with the other fixers, above new-work
-        // loops.
-        Arc::new(spec_fixer::SpecFixerLoop),
-        Arc::new(spec_worker::SpecWorkerLoop),
-        Arc::new(pr_reviewer::PrReviewerLoop),
-        Arc::new(worker::WorkerLoop),
-        Arc::new(planner::PlannerLoop),
-        Arc::new(cleaner::CleanerLoop),
-        Arc::new(triage::TriageLoop),
-    ]
+/// The scheduler's recipe dispatcher (ADR 0012 slice 4, 決定8): maps a queued
+/// run's `(deps, run_id, loop_kind)` to its recipe outcome. Production uses
+/// [`default_recipe`] (→ [`run_recipe`]); tests inject recording recipes, so
+/// dispatch stays a pure kind→recipe map with one seam.
+pub type RecipeFn = Arc<
+    dyn Fn(
+            Deps,
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerOutcome>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The production recipe dispatcher: route each run to its `run_*` entry point
+/// by `loop_kind` via [`run_recipe`].
+pub fn default_recipe() -> RecipeFn {
+    Arc::new(|deps, run_id, loop_kind| {
+        Box::pin(async move { run_recipe(&deps, &run_id, &loop_kind).await })
+    })
+}
+
+/// Dispatch a queued/interrupted run to its recipe by `loop_kind` (ADR 0012
+/// slice 4, 決定8). The level-triggered replacement for resolving a `dyn Loop`
+/// and calling its `drive`: enqueue is owned by the reconcilers, and the
+/// scheduler only routes a run back to the right `run_*` entry point.
+/// `dispatch_rank` still orders the workqueue. An unknown kind is a bug (no
+/// reconciler enqueues it) — surfaced as an error the scheduler logs.
+pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<WorkerOutcome> {
+    match loop_kind {
+        worker::KIND => worker::run_worker(deps, run_id).await,
+        planner::KIND => planner::run_planner(deps, run_id).await,
+        spec_worker::KIND => spec_worker::run_spec_worker(deps, run_id).await,
+        spec_fixer::KIND => spec_fixer::run_spec_fixer(deps, run_id).await,
+        pr_reviewer::KIND => pr_reviewer::run_pr_reviewer(deps, run_id).await,
+        conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
+        ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
+        fixer::KIND => fixer::run_fixer(deps, run_id).await,
+        cleaner::KIND => cleaner::run_cleaner(deps, run_id).await,
+        triage::KIND => triage::run_triage(deps, run_id).await,
+        other => anyhow::bail!("run {run_id}: unknown loop kind {other:?}"),
+    }
 }
 
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
@@ -617,15 +584,14 @@ mod tests {
 
     #[test]
     fn spec_fixer_sits_in_the_fixer_family_above_new_work() {
-        // Registration order is priority (issue #188): the spec-fixer must
-        // unpark a spec PR before the worker/planner start new work, and it
-        // belongs after the fixer, with the guard/worker/planner behind it.
-        let kinds: Vec<&str> = default_loops().iter().map(|l| l.kind()).collect();
-        let pos = |k: &str| kinds.iter().position(|x| *x == k).expect(k);
-        assert!(pos("fixer") < pos("spec-fixer"));
-        assert!(pos("spec-fixer") < pos("spec-worker"));
-        assert!(pos("spec-fixer") < pos("worker"));
-        assert!(pos("spec-fixer") < pos("planner"));
+        // dispatch_rank is priority (issue #188 → ADR 0012 決定7): the
+        // spec-fixer must unpark a spec PR before the worker/planner start
+        // new work, and it belongs after the fixer.
+        assert!(dispatch_rank("fixer") < dispatch_rank("spec-fixer"));
+        assert!(dispatch_rank("spec-fixer") < dispatch_rank("spec-worker"));
+        assert!(dispatch_rank("spec-fixer") < dispatch_rank("worker"));
+        assert!(dispatch_rank("spec-fixer") < dispatch_rank("planner"));
+        assert_eq!(dispatch_rank("nonsense"), u8::MAX);
     }
 
     #[test]
@@ -693,12 +659,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn open_pr_cache_fetches_once_per_project_per_tick() {
+    fn minimal_deps() -> Deps {
         use crate::mux::fake::FakeMux;
-
-        let forge = Arc::new(crate::forge::fake::FakeForge::default());
-        forge.push_pr("meguri/9-add-feature-abc123", "Add feature (#9)", &[]);
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
             repo_path: Some("/tmp/unused".into()),
@@ -721,25 +683,29 @@ mod tests {
             prompts: Default::default(),
             notify: None,
         };
-        let deps = Deps::with_label_source(
+        Deps::with_label_source(
             Store::open_in_memory().unwrap(),
             Arc::new(FakeMux::new(false)),
-            forge.clone(),
+            Arc::new(crate::forge::fake::FakeForge::default()),
             Config::default(),
             project,
-        );
+        )
+    }
 
-        let first = deps.open_prs.get(&deps).await.unwrap();
-        assert_eq!(first.len(), 1);
-        // A second PR appears on the forge mid-tick: the cache must not see
-        // it until cleared, proving the three fixer-family loops would share
-        // one fetch this tick.
-        forge.push_pr("meguri/10-other-def456", "Other (#10)", &[]);
-        let second = deps.open_prs.get(&deps).await.unwrap();
-        assert_eq!(second.len(), 1, "cached list reused within the tick");
-
-        deps.open_prs.clear().await;
-        let third = deps.open_prs.get(&deps).await.unwrap();
-        assert_eq!(third.len(), 2, "next tick re-fetches");
+    #[tokio::test]
+    async fn run_recipe_rejects_an_unknown_kind() {
+        // The kind→recipe map (決定8) surfaces an unknown loop_kind as an error
+        // (a bug — no reconciler enqueues one), the same signal the scheduler
+        // logs. Real kinds route to their `run_*` recipes, exercised end-to-end
+        // by the scheduler / worker integration tests.
+        let deps = minimal_deps();
+        let err = run_recipe(&deps, "run-x", "bogus-kind").await.unwrap_err();
+        assert!(err.to_string().contains("bogus-kind"), "{err}");
+        // default_recipe wraps the same map; its closure bails identically.
+        let recipe = default_recipe();
+        let err = recipe(deps, "run-x".into(), "bogus-kind".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bogus-kind"), "{err}");
     }
 }

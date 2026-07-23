@@ -36,17 +36,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Kind, NeedsHuman, STEP_EXECUTE, STEP_PREPARE_WORK, STEP_PREPARE_WORKTREE};
-use super::{Deps, Target, canonical_issue, canonical_key};
+use super::{Deps, canonical_key};
 use crate::forge::{self, CheckState, CommitStatusState, PullRequest};
 use crate::gitops;
 use crate::store::{LANE_PR_REVIEW, RunRecord, RunStatus};
-use crate::tasks::TaskKey;
 use crate::turn::{TurnOutcome, TurnStatus};
 
 /// `runs.loop_kind` value for pr-reviewer runs.
@@ -172,102 +170,57 @@ fn kind_of(pr: &PullRequest) -> Kind {
     }
 }
 
-/// The pr-reviewer as a schedulable loop: reviewable meguri PRs (spec or
-/// impl) in, a `meguri/pr-review` status + folded body summary out.
-pub struct PrReviewerLoop;
-
-#[async_trait]
-impl super::Loop for PrReviewerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
+/// The kind this PR is a pr-review candidate for, or `None` if it is not
+/// actionable (review disabled for its kind, held/claimed, already reviewed
+/// at this head, or — for impl — CI not green). The reconciler's PrReviewer
+/// arm mirrors these gates on its Snapshot; this remains the claim-time
+/// re-verification.
+async fn candidate_kind(deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
+    let review = deps.config.review_for(&deps.project);
+    // needs-human is a human stop signal on both sides: once the
+    // pr-reviewer (or anything else) escalated a PR, do not re-review it
+    // until a human clears the label (issue #176 — plan was previously
+    // reviewed unconditionally, so a findings escalation would re-fire
+    // forever; now symmetric with impl).
+    if pr.state != "open"
+        || pr.has_label(forge::LABEL_HOLD)
+        || pr.has_label(forge::LABEL_WORKING)
+        || pr.has_label(forge::LABEL_NEEDS_HUMAN)
+    {
+        return Ok(None);
     }
-
-    /// Candidate PRs whose *current head* has no pr-review status yet, keyed
-    /// by their canonical issue. Plan candidates are `spec-reviewing` PRs
-    /// (when the plan review is on); impl candidates are green,
-    /// unlabeled-by-spec meguri PRs (when the impl review is on).
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        if deps.forge.is_none() {
-            return Ok(Vec::new()); // PR loops are inert in local mode
-        }
-        let mut targets = Vec::new();
-        for pr in deps.forge().list_open_prs().await? {
-            if self.candidate_kind(deps, &pr).await?.is_none() {
-                continue;
+    let kind = kind_of(pr);
+    if !kind.guard_enabled(review) {
+        return Ok(None);
+    }
+    match kind {
+        Kind::Plan => {} // spec-reviewing PRs are always reviewable
+        Kind::Impl => {
+            // Same ownership guard as the fixer: meguri branch only, and no
+            // spec-phase label (spec-ready is the combined spec worker's
+            // territory). needs-human is handled in common above.
+            if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
+                || pr.has_label(forge::LABEL_SPEC_READY)
+            {
+                return Ok(None);
             }
-            // Degraded mode: unresolved canonical issue is observable, not fatal.
-            if canonical_issue(&pr).is_none() {
-                deps.store.emit(
-                    None,
-                    "canonical_issue.unresolved",
-                    json!({ "pr": pr.number, "head_branch": pr.head_branch }),
-                )?;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(canonical_key(&pr)),
-                title: pr.title,
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_pr_reviewer(deps, run_id).await
-    }
-}
-
-impl PrReviewerLoop {
-    /// The kind this PR is a pr-review candidate for, or `None` if it is not
-    /// actionable (review disabled for its kind, held/claimed, already
-    /// reviewed at this head, or — for impl — CI not green).
-    async fn candidate_kind(&self, deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
-        let review = deps.config.review_for(&deps.project);
-        // needs-human is a human stop signal on both sides: once the
-        // pr-reviewer (or anything else) escalated a PR, do not re-review it
-        // until a human clears the label (issue #176 — plan was previously
-        // reviewed unconditionally, so a findings escalation would re-fire
-        // forever; now symmetric with impl).
-        if pr.state != "open"
-            || pr.has_label(forge::LABEL_HOLD)
-            || pr.has_label(forge::LABEL_WORKING)
-            || pr.has_label(forge::LABEL_NEEDS_HUMAN)
-        {
-            return Ok(None);
-        }
-        let kind = kind_of(pr);
-        if !kind.guard_enabled(review) {
-            return Ok(None);
-        }
-        match kind {
-            Kind::Plan => {} // spec-reviewing PRs are always reviewable
-            Kind::Impl => {
-                // Same ownership guard as the fixer: meguri branch only, and no
-                // spec-phase label (spec-ready is the combined spec worker's
-                // territory). needs-human is handled in common above.
-                if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
-                    || pr.has_label(forge::LABEL_SPEC_READY)
-                {
-                    return Ok(None);
-                }
-                // Only review a settled-green head: Failure is the ci-fixer's,
-                // Pending may still change under us.
-                if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Success {
-                    return Ok(None);
-                }
+            // Only review a settled-green head: Failure is the ci-fixer's,
+            // Pending may still change under us.
+            if deps.forge().pr_check_rollup(pr.number).await?.state() != CheckState::Success {
+                return Ok(None);
             }
         }
-        // Head already reviewed (the status is the dedup key).
-        if deps
-            .forge()
-            .commit_status(&pr.head_sha, PR_REVIEW_STATUS)
-            .await?
-            .is_some()
-        {
-            return Ok(None);
-        }
-        Ok(Some(kind))
     }
+    // Head already reviewed (the status is the dedup key).
+    if deps
+        .forge()
+        .commit_status(&pr.head_sha, PR_REVIEW_STATUS)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(kind))
 }
 
 pub async fn run_pr_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
@@ -469,7 +422,7 @@ async fn prepare_work(deps: &Deps, run: &RunRecord) -> Result<Prepared> {
             )));
         }
     };
-    if PrReviewerLoop.candidate_kind(deps, &pr).await?.is_none() {
+    if candidate_kind(deps, &pr).await?.is_none() {
         return Ok(Prepared::Skip(format!(
             "PR #{} is no longer a pr-review candidate (claimed, held, reviewed, or CI moved)",
             pr.number

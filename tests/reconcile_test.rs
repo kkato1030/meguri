@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use meguri::config::{Config, ProjectConfig, ReconcileConfig};
-use meguri::engine::{Deps, reconcile, worker};
+use meguri::engine::{Deps, reconcile_body_edits, worker};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_IMPLEMENTING, LABEL_READY};
 use meguri::mux::fake::FakeMux;
@@ -194,7 +194,7 @@ async fn sweep_signals_a_changed_body_once_and_only_via_the_gate() {
     let deps = deps_with(forge.clone(), store.clone(), ReconcileConfig::default());
 
     // Unchanged body: the sweep is silent.
-    reconcile::sweep(&deps).await.unwrap();
+    reconcile_body_edits::sweep(&deps).await.unwrap();
     assert!(forge.comments_of(7).is_empty());
     assert!(body_changed_events(&store).is_empty());
 
@@ -203,14 +203,14 @@ async fn sweep_signals_a_changed_body_once_and_only_via_the_gate() {
         .update_issue_body(7, "edited by a human")
         .await
         .unwrap();
-    reconcile::sweep(&deps).await.unwrap();
+    reconcile_body_edits::sweep(&deps).await.unwrap();
     assert_eq!(body_changed_events(&store).len(), 1);
     let comments = forge.comments_of(7);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("meguri:ready"), "{}", comments[0]);
 
     // Re-sweep with the same body: deduped, still one comment and one event.
-    reconcile::sweep(&deps).await.unwrap();
+    reconcile_body_edits::sweep(&deps).await.unwrap();
     assert_eq!(forge.comments_of(7).len(), 1);
     assert_eq!(body_changed_events(&store).len(), 1);
 }
@@ -224,7 +224,7 @@ async fn sweep_only_touches_shipped_issues() {
     let deps = deps_with(forge.clone(), store.clone(), ReconcileConfig::default());
 
     forge.update_issue_body(9, "changed").await.unwrap();
-    reconcile::sweep(&deps).await.unwrap();
+    reconcile_body_edits::sweep(&deps).await.unwrap();
     assert!(forge.comments_of(9).is_empty());
     assert!(body_changed_events(&store).is_empty());
 }
@@ -246,7 +246,7 @@ async fn sweep_signal_comment_toggle_and_kill_switch() {
     };
     let deps = deps_with(forge.clone(), store.clone(), no_comment);
     forge.update_issue_body(7, "changed").await.unwrap();
-    reconcile::sweep(&deps).await.unwrap();
+    reconcile_body_edits::sweep(&deps).await.unwrap();
     assert_eq!(body_changed_events(&store).len(), 1, "event still emitted");
     assert!(forge.comments_of(7).is_empty(), "no comment when disabled");
 
@@ -265,7 +265,7 @@ async fn sweep_signal_comment_toggle_and_kill_switch() {
     };
     let deps2 = deps_with(forge2.clone(), store2.clone(), off);
     forge2.update_issue_body(8, "changed").await.unwrap();
-    reconcile::sweep(&deps2).await.unwrap();
+    reconcile_body_edits::sweep(&deps2).await.unwrap();
     assert!(forge2.comments_of(8).is_empty());
     assert!(body_changed_events(&store2).is_empty());
 }

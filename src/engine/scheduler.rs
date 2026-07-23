@@ -1,19 +1,18 @@
-//! The watch loop: startup recovery, per-loop discovery, slot-limited
-//! dispatch. Loops discover targets (e.g. labeled GitHub issues); sqlite
-//! only tracks runs, and `runs.loop_kind` routes each run to its loop.
+//! The watch loop: startup recovery, level-triggered reconcile passes, and
+//! slot-limited dispatch (ADR 0012). Enqueue is owned entirely by the
+//! reconcilers (issue / repo / schedule Kind); sqlite tracks runs, and
+//! `runs.loop_kind` routes each queued run to its recipe (決定8).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::{Deps, Loop};
+use super::Deps;
 use crate::mux::PaneId;
 use crate::store::{RunRecord, RunStatus, Store};
-use crate::tasks::TaskKey;
 
 /// The slot budget is spent by *weight*, not run count (issue #111, #214). Two
 /// phases spawn extra concurrent agents:
@@ -58,8 +57,10 @@ pub struct Reload {
 pub struct Scheduler {
     /// One Deps per configured project (mux/store shared via clones).
     pub projects: Vec<Deps>,
-    /// The loops to run; dispatch resolves a run's loop via `runs.loop_kind`.
-    pub loops: Vec<Arc<dyn Loop>>,
+    /// The recipe dispatcher (ADR 0012 §決定8): routes each run to its
+    /// `run_*` entry by `loop_kind`. Production is `default_recipe()`; tests
+    /// inject recording recipes.
+    pub recipe: super::RecipeFn,
     pub poll_interval: Duration,
     pub max_concurrent: usize,
     /// Config hot reload (issue #73), polled once per tick before discovery:
@@ -138,14 +139,6 @@ impl Scheduler {
                 tracing::warn!("redispatch failed: {e:#}");
             }
 
-            if active_weight(&active_run_ids) < self.max_concurrent
-                && let Err(e) = self
-                    .discover(&ready, &mut running, &mut active_run_ids)
-                    .await
-            {
-                tracing::warn!("discovery failed: {e:#}");
-            }
-
             // Ride the poll: fire due cron schedules (issue #146). An
             // out-of-band enqueue like the sweeps below — it creates an
             // issue/task that the loops above discover next tick. `now` is
@@ -177,48 +170,32 @@ impl Scheduler {
                         super::schedule::sweep(deps, now, &mut schedule_diag).await,
                     )
                     .await;
-                sweep_health
-                    .record(deps, "worktree", super::reaper::sweep(deps).await)
-                    .await;
                 // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
                 // informer-cache observe drives arm (ADR 0003) / orchestrator
                 // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the
                 // Stuck backstop in a single level-triggered pass — folding the
                 // former auto_merger + merge_watch sweeps. A light API sweep,
                 // no run record, no pane.
+                // The Issue Kind reconcile pass (ADR 0012 S4): the merge tail
+                // plus every folded act/arm — body-edit re-attention,
+                // separate-delivery handoff, decompose materialize,
+                // Op(Finalize), and the issue-/local-side deciders' enqueue —
+                // one level-triggered pass per project.
                 sweep_health
                     .record(
                         deps,
-                        "merge-tail",
+                        "issue-reconcile",
                         super::issue_reconciler::sweep(deps).await,
                     )
                     .await;
-                // Separate-mode plan→impl handoff (ADR 0008): a merged spec PR
-                // flips its issue speccing → ready so the worker implements it.
-                sweep_health
-                    .record(deps, "handoff", super::plan_handoff::sweep(deps).await)
-                    .await;
-                // Materialize approved decomposition proposals into child issues
-                // + dependencies (issue #134). Forge-only, like handoff — the
-                // adjacent spec-flow sweep that consumes spec-ready proposal PRs.
+                // Repo Kind per-resync pass (ADR 0012 §決定3): routing-drift
+                // recompute + the cleaner/triage scan arms.
                 sweep_health
                     .record(
                         deps,
-                        "decompose-materializer",
-                        super::decompose_materializer::sweep(deps).await,
+                        "repo-reconcile",
+                        super::repo_reconciler::reconcile_repo(deps).await,
                     )
-                    .await;
-                // Ride the poll: recompute routing outcome drift from run
-                // history and record any threshold crossing (routing 2/3,
-                // #65). Pure sqlite, no pane, no API.
-                sweep_health
-                    .record(deps, "routing-drift", super::routing_drift::sweep(deps))
-                    .await;
-                // Notice body edits on already-shipped issues the label-filtered
-                // discovery can no longer see (issue #142, half B) and leave a
-                // re-attention signal. Light API sweep, no run record.
-                sweep_health
-                    .record(deps, "reconcile", super::reconcile::sweep(deps).await)
                     .await;
             }
 
@@ -233,104 +210,24 @@ impl Scheduler {
         }
     }
 
-    /// Ask every loop for actionable targets in every project and enqueue
-    /// them, respecting the slot budget. Loops are visited in priority order
-    /// (loop before project, so priority beats project order); within a loop,
-    /// targets go oldest-first (FIFO by issue/PR number).
-    async fn discover(
-        &self,
-        ready: &HashSet<String>,
-        running: &mut JoinSet<String>,
-        active: &mut HashMap<String, usize>,
-    ) -> Result<()> {
-        // Fresh per-tick cache: the fixer-family loops (fixer / ci_fixer /
-        // conflict_resolver) below share one `list_open_prs` call per
-        // project this tick instead of one each (issue #170).
-        for deps in &self.projects {
-            deps.open_prs.clear().await;
-        }
-        for lp in &self.loops {
-            for deps in &self.projects {
-                if active_weight(active) >= self.max_concurrent {
-                    return Ok(());
-                }
-                // Skip a project whose managed clone isn't ready this tick
-                // (`lp.discover` touches `repo_path`); it retries next tick.
-                if !ready.contains(&deps.project.id) {
-                    continue;
-                }
-                let mut targets = lp.discover(deps).await?;
-                // Sort by the coordination key: issue_number is no longer the
-                // only identity (local tasks have none), so the key gives a
-                // stable order across Issue/Local targets.
-                targets.sort_by_key(|t| t.key);
-                for target in targets {
-                    if active_weight(active) >= self.max_concurrent {
-                        return Ok(());
-                    }
-                    // Unique active run per (project, loop, target) — enforced
-                    // by the partial DB indexes; a violation just means
-                    // someone raced us. Run creation branches on the key so
-                    // the target travels from discovery through claim.
-                    let created = match target.key {
-                        TaskKey::Issue(n) => deps.store.create_run_for_loop_cadence(
-                            &deps.project.id,
-                            lp.kind(),
-                            n,
-                            &target.title,
-                            target.cadence_label.as_deref(),
-                        ),
-                        TaskKey::Local(id) => deps.store.create_run_for_task(
-                            &deps.project.id,
-                            lp.kind(),
-                            id,
-                            &target.title,
-                        ),
-                    };
-                    let run = match created {
-                        Ok(run) => run,
-                        Err(_) => continue,
-                    };
-                    deps.store.emit(
-                        Some(&run.id),
-                        "run.discovered",
-                        json!({ "key": format!("{:?}", target.key), "title": target.title,
-                                "loop": lp.kind() }),
-                    )?;
-                    // Admit by weight (issue #111): a collab-advisor run books 2
-                    // slots, so start it only if it fits the budget. A run that
-                    // doesn't fit stays `queued` for a later tick — head-of-line,
-                    // so a heavy run isn't starved by lighter ones behind it.
-                    if !self.admits(active, self.run_weight_for(&run)) {
-                        return Ok(());
-                    }
-                    self.dispatch(&run, running, active);
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Redispatch runs left `interrupted` (pane died mid-execute) or
     /// `queued` (never got a slot), respecting the slot budget. `active`
     /// also guards against double-dispatching a run this loop already
     /// spawned earlier in the same tick, or in a still-running previous
     /// tick, whose store status hasn't caught up to `running` yet.
     /// Materialize declared-but-missing managed clones and return the set of
-    /// project ids ready to process this tick. A project whose clone can't be
-    /// materialized is excluded (a `tracing::warn!` per failing tick, matching
-    /// the sweep-failure idiom; the event is emitted inside
-    /// [`super::ensure_project_clone`]) and retried next tick.
+    /// project ids ready to process this tick, via the Repo Kind reconcile's
+    /// first Op (ADR 0012 §決定6): `repo_reconciler::reconcile_ready` observes
+    /// the clone health, runs `Op(EnsureClone)` when needed, and reports
+    /// readiness. A project whose clone can't be materialized is excluded (the
+    /// `repo.clone.failed` event / warn are emitted inside `reconcile_ready`)
+    /// and retried next tick. This replaces the old scheduler-specific bootstrap
+    /// gate with the same readiness contract every Kind consumes.
     async fn ensure_projects_ready(&self) -> HashSet<String> {
         let mut ready = HashSet::with_capacity(self.projects.len());
         for deps in &self.projects {
-            match super::ensure_project_clone(deps).await {
-                Ok(()) => {
-                    ready.insert(deps.project.id.clone());
-                }
-                Err(e) => {
-                    tracing::warn!("clone prep failed for {}: {e:#}", deps.project.id);
-                }
+            if super::repo_reconciler::reconcile_ready(deps).await {
+                ready.insert(deps.project.id.clone());
             }
         }
         ready
@@ -415,19 +312,14 @@ impl Scheduler {
             return;
         };
         let weight = run_weight(&deps, run);
-        let Some(lp) = self
-            .loops
-            .iter()
-            .find(|l| l.kind() == run.loop_kind)
-            .cloned()
-        else {
-            tracing::warn!("run {} references unknown loop {}", run.id, run.loop_kind);
-            return;
-        };
         let run_id = run.id.clone();
+        let loop_kind = run.loop_kind.clone();
+
+        // ADR 0012 §決定8: dispatch is a pure kind→recipe map.
+        let recipe = self.recipe.clone();
         active.insert(run_id.clone(), weight);
         running.spawn(async move {
-            if let Err(e) = lp.drive(&deps, &run_id).await {
+            if let Err(e) = recipe(deps, run_id.clone(), loop_kind).await {
                 tracing::warn!("run {run_id} failed: {e:#}");
             }
             run_id
@@ -476,6 +368,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
     use crate::forge::fake::FakeForge;
@@ -617,7 +511,7 @@ mod tests {
     fn empty_scheduler(max: usize) -> Scheduler {
         Scheduler {
             projects: vec![],
-            loops: vec![],
+            recipe: super::super::default_recipe(),
             poll_interval: Duration::from_secs(1),
             max_concurrent: max,
             reload: None,

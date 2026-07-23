@@ -331,7 +331,10 @@ async fn squash_merged_branch_is_deleted_via_forge_pr_state() {
 }
 
 #[tokio::test]
-async fn open_pr_branch_is_kept_without_force() {
+async fn open_pr_keeps_worktree_and_branch_without_force() {
+    // finding 4b tightened this: a closed issue whose meguri PR is still open
+    // used to have its worktree reclaimed (branch kept); now the PR side owns
+    // the whole resource set, so neither goes until the PR is terminal.
     let root = tempfile::tempdir().unwrap();
     let forge = Arc::new(FakeForge::with_issue(12, "Still open PR", "", &[]));
     let deps = setup(root.path(), forge.clone()).await;
@@ -341,16 +344,16 @@ async fn open_pr_branch_is_kept_without_force() {
     forge.close_issue(12); // issue closed, but the PR never merged
 
     let candidates = reaper::plan(&deps).await.unwrap();
+    assert_eq!(verdict_of(&candidates, 12).verdict, Verdict::OpenPr);
     let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
-    assert_eq!(reclaimed.len(), 1);
-    assert!(!wt.exists());
-    assert!(!reclaimed[0].branch_deleted);
+    assert!(reclaimed.is_empty());
+    assert!(wt.exists(), "the open PR keeps its worktree context");
     run_git(
         deps.project.repo_path.as_ref().unwrap(),
         &["rev-parse", "--verify", &branch],
     )
     .await
-    .expect("branch with an open PR survives without --force");
+    .expect("branch with an open PR survives");
 }
 
 #[tokio::test]
@@ -499,11 +502,13 @@ async fn sweep_reclaims_pane_then_worktree_of_closed_issue() {
     forge.close_issue(11);
     // The plan carries the real reclamation reason into the emitted event.
     let mut states = reaper::IssueStates::default();
-    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    let candidates = reaper::plan_panes(&deps, &mut states, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].verdict, Verdict::Reclaim);
     assert_eq!(candidates[0].reason, reaper::REASON_ISSUE_CLOSED);
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
 
     // Pane killed and detached; the session id survived the kill.
     assert!(!deps.mux.pane_alive(&pane).await.unwrap());
@@ -548,7 +553,9 @@ async fn sweep_keeps_pane_of_open_issue_and_active_run() {
     forge.close_issue(13);
 
     let mut states = reaper::IssueStates::default();
-    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    let candidates = reaper::plan_panes(&deps, &mut states, &Default::default())
+        .await
+        .unwrap();
     let verdict = |issue: i64| {
         candidates
             .iter()
@@ -559,7 +566,7 @@ async fn sweep_keeps_pane_of_open_issue_and_active_run() {
     assert_eq!(verdict(12), Verdict::Open);
     assert_eq!(verdict(13), Verdict::ActiveRun);
 
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
     assert!(deps.mux.pane_alive(&open_pane).await.unwrap());
     assert!(deps.mux.pane_alive(&active_pane).await.unwrap());
     assert!(open_wt.exists());
@@ -578,11 +585,13 @@ async fn sweep_clears_stale_mapping_of_dead_pane() {
 
     // A dead mapping is reclaimed for what it is — not "issue closed".
     let mut states = reaper::IssueStates::default();
-    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    let candidates = reaper::plan_panes(&deps, &mut states, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].verdict, Verdict::Reclaim);
     assert_eq!(candidates[0].reason, reaper::REASON_PANE_DEAD);
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
     let record = deps
         .store
         .get_pane("proj", 14, LANE_AUTHOR)
@@ -641,12 +650,14 @@ async fn advisor_pane_is_reclaimed_on_open_issue_without_saving_a_session_id() {
 
     // Reclaimed even on an open issue with no active run — the ephemeral rule.
     let mut states = reaper::IssueStates::default();
-    let candidates = reaper::plan_panes(&deps, &mut states).await.unwrap();
+    let candidates = reaper::plan_panes(&deps, &mut states, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].verdict, Verdict::Reclaim);
     assert_eq!(candidates[0].reason, reaper::REASON_ADVISOR_ORPHAN);
 
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
 
     // Pane gone, and — despite the transcript — no session id was saved.
     assert!(!deps.mux.pane_alive(&pane).await.unwrap());
@@ -693,7 +704,7 @@ async fn open_pr_review_worktree_is_skipped() {
     let candidates = reaper::plan(&deps).await.unwrap();
     assert_eq!(verdict_of(&candidates, 33).verdict, Verdict::Open);
 
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
     assert!(wt.exists(), "open PR's review worktree untouched");
 }
 
@@ -713,7 +724,49 @@ async fn sweep_reclaims_only_closed_clean_worktrees() {
     let (_, open_wt) = add_worktree(&deps, 10, "Open").await;
     forge.close_issue(9);
 
-    reaper::sweep(&deps).await.unwrap();
+    reaper::finalize(&deps, &Default::default()).await.unwrap();
     assert!(!closed_wt.exists(), "closed issue's worktree reclaimed");
     assert!(open_wt.exists(), "open issue's worktree untouched");
+}
+
+/// finding 4b (受け入れ9b): a closed issue whose canonical identity still has
+/// an *open* meguri PR is the PR side's — neither its worktree nor its pane is
+/// reclaimed while the PR is open; once the PR is terminal both are.
+#[tokio::test]
+async fn closed_issue_with_open_meguri_pr_keeps_its_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let forge = Arc::new(FakeForge::with_issue(9, "Closed but PR open", "", &[]));
+    let deps = setup(root.path(), forge.clone()).await;
+
+    let (branch, wt) = add_worktree(&deps, 9, "Closed but PR open").await;
+    forge.close_issue(9);
+    // An open meguri PR still references issue #9 (its head branch encodes it).
+    forge.add_pr(90, "impl", "Closes #9.\n\nbody", &[], &branch, "sha-9");
+
+    // A live pane on the issue's author lane, kept by the same boundary.
+    register_pane(&deps, 9, &wt).await;
+
+    // The automatic pass: exclusion computed from the open-PR list.
+    let open_prs = reaper::open_meguri_pr_issues(&deps).await;
+    assert!(open_prs.contains(&9), "{open_prs:?}");
+    let mut states = reaper::IssueStates::default();
+    let panes = reaper::plan_panes(&deps, &mut states, &open_prs)
+        .await
+        .unwrap();
+    assert_eq!(panes[0].verdict, Verdict::OpenPr, "{panes:?}");
+    let candidates = reaper::plan_with(&deps, &mut states, &open_prs)
+        .await
+        .unwrap();
+    assert_eq!(verdict_of(&candidates, 9).verdict, Verdict::OpenPr);
+    let reclaimed = reaper::reclaim(&deps, &candidates, false).await.unwrap();
+    assert!(reclaimed.is_empty());
+    assert!(wt.exists(), "the PR side keeps its worktree context");
+
+    // The PR merges → the identity is terminal on both sides → the full
+    // finalize pass (panes first, then worktrees) reclaims everything.
+    forge.prs.lock().unwrap()[0].state = "merged".into();
+    let open_prs = reaper::open_meguri_pr_issues(&deps).await;
+    assert!(!open_prs.contains(&9));
+    reaper::finalize(&deps, &open_prs).await.unwrap();
+    assert!(!wt.exists(), "terminal on both sides — reclaimed");
 }

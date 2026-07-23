@@ -7,13 +7,12 @@ use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
 use meguri::engine::scheduler::{Reload, Scheduler};
-use meguri::engine::{Deps, Loop, Target, WorkerOutcome, default_loops};
+use meguri::engine::{Deps, RecipeFn, WorkerOutcome, default_recipe};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{Forge, LABEL_IMPLEMENTING, LABEL_READY, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
-use meguri::tasks::TaskKey;
 
 async fn init_origin_and_clone(root: &Path) -> PathBuf {
     let origin = root.join("origin.git");
@@ -161,10 +160,10 @@ async fn watch_discovers_and_completes_labeled_issue() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -221,10 +220,10 @@ async fn watch_skips_working_and_hold_issues() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -253,10 +252,10 @@ async fn watch_gates_on_open_blocker_until_closed_as_completed() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -317,10 +316,10 @@ async fn watch_keeps_skipping_when_blocker_closed_as_not_planned() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -358,10 +357,10 @@ async fn watch_does_not_refile_issue_with_succeeded_run() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -412,10 +411,10 @@ async fn recovery_resumes_interrupted_run_to_success() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -464,10 +463,10 @@ async fn watch_dispatches_multiple_ready_issues_concurrently() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -513,10 +512,10 @@ async fn watch_reclaims_worktree_after_issue_closes() {
     let agent = spawn_scripted_agent(root.path().join("worktrees"));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(300),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -543,7 +542,15 @@ async fn watch_reclaims_worktree_after_issue_closes() {
         "worktree survives while the issue is open"
     );
 
-    // Closing the issue (PR merged) lets the watch sweep reclaim it.
+    // Closing the issue (PR merged) lets the watch sweep reclaim it. The PR
+    // must actually be terminal too: an *open* meguri PR keeps the identity's
+    // resources on the PR side (finding 4b), so mark it merged first.
+    forge
+        .prs
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .for_each(|p| p.state = "merged".into());
     forge.close_issue(31);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while worktree.exists() {
@@ -556,88 +563,38 @@ async fn watch_reclaims_worktree_after_issue_closes() {
     agent.abort();
 }
 
-/// A minimal non-worker loop: discovers one fixed target and drives its run
-/// straight to success.
-struct FixedLoop;
-
-#[async_trait::async_trait]
-impl Loop for FixedLoop {
-    fn kind(&self) -> &'static str {
-        "fixed"
-    }
-
-    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        if deps
-            .store
-            .issue_has_succeeded_run(&deps.project.id, "fixed", 99)?
-        {
-            return Ok(vec![]);
-        }
-        Ok(vec![Target {
-            key: TaskKey::Issue(99),
-            title: "Fixed target".into(),
-            cadence_label: None,
-        }])
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
-        deps.store
-            .update_run_status(run_id, RunStatus::Succeeded, None)?;
-        Ok(WorkerOutcome::Succeeded {
-            pr_url: "fixed://pr".into(),
-        })
-    }
-}
-
 /// Shared dispatch log: (loop kind, project id, issue number).
 type DispatchLog = Arc<std::sync::Mutex<Vec<(String, String, i64)>>>;
 
-/// A parameterized fake loop for the priority tests: fixed (project, issue)
-/// targets, each run driven straight to success while the dispatch order is
-/// recorded in a shared log.
-struct StubLoop {
-    kind: &'static str,
-    /// (project id, issue number) pairs this loop discovers.
-    targets: Vec<(&'static str, i64)>,
-    order: DispatchLog,
+/// A recording recipe (the test seam of ADR 0012 決定8): logs each dispatch
+/// and drives the run straight to success. Enqueue is the reconcilers' job
+/// now, so ordering tests seed `queued` runs directly and observe the
+/// workqueue's dispatch order.
+fn recording_recipe(order: DispatchLog) -> RecipeFn {
+    Arc::new(move |deps, run_id, _kind| {
+        let order = order.clone();
+        Box::pin(async move {
+            let run = deps.store.get_run(&run_id)?.expect("run exists");
+            order.lock().unwrap().push((
+                run.loop_kind.clone(),
+                run.project_id.clone(),
+                run.issue_number,
+            ));
+            deps.store
+                .update_run_status(&run_id, RunStatus::Succeeded, None)?;
+            Ok(WorkerOutcome::Succeeded {
+                pr_url: "stub://pr".into(),
+            })
+        })
+    })
 }
 
-#[async_trait::async_trait]
-impl Loop for StubLoop {
-    fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        let mut targets = Vec::new();
-        for (project, n) in &self.targets {
-            if *project == deps.project.id
-                && !deps
-                    .store
-                    .issue_has_succeeded_run(&deps.project.id, self.kind, *n)?
-            {
-                targets.push(Target {
-                    key: TaskKey::Issue(*n),
-                    title: format!("stub {n}"),
-                    cadence_label: None,
-                });
-            }
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
-        let run = deps.store.get_run(run_id)?.expect("run exists");
-        self.order
-            .lock()
-            .unwrap()
-            .push((run.loop_kind, run.project_id, run.issue_number));
-        deps.store
-            .update_run_status(run_id, RunStatus::Succeeded, None)?;
-        Ok(WorkerOutcome::Succeeded {
-            pr_url: "stub://pr".into(),
-        })
-    }
+/// Seed a queued run of `kind` for (project, issue) — what a reconciler's
+/// enqueue leaves for the workqueue.
+fn seed_queued_run(store: &Store, project: &str, kind: &str, issue: i64) {
+    store
+        .create_run_for_loop(project, kind, issue, &format!("target {issue}"))
+        .unwrap();
 }
 
 /// Wait until `order` has `expected` entries, then return them.
@@ -661,55 +618,47 @@ async fn wait_for_dispatches(order: &DispatchLog, expected: usize) -> Vec<(Strin
 /// Loop-list order is dispatch priority: with one slot, the first loop's
 /// target wins even though the other loop's issue number is smaller.
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_prioritizes_loops_in_list_order() {
+async fn watch_prioritizes_runs_by_dispatch_rank() {
     let root = tempfile::tempdir().unwrap();
     let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order: DispatchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // The worker run has the smaller issue number; only dispatch_rank
+    // (fixer = closer to merge) can put the fixer run ahead of it.
+    seed_queued_run(&deps.store, "proj", "fixer", 200);
+    seed_queued_run(&deps.store, "proj", "worker", 100);
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![
-            Arc::new(StubLoop {
-                kind: "stub-fixer",
-                targets: vec![("proj", 200)],
-                order: order.clone(),
-            }),
-            Arc::new(StubLoop {
-                kind: "stub-worker",
-                targets: vec![("proj", 100)],
-                order: order.clone(),
-            }),
-        ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: recording_recipe(order.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
     watch.abort();
 
-    assert_eq!(log[0], ("stub-fixer".into(), "proj".into(), 200));
-    assert_eq!(log[1], ("stub-worker".into(), "proj".into(), 100));
+    assert_eq!(log[0], ("fixer".into(), "proj".into(), 200));
+    assert_eq!(log[1], ("worker".into(), "proj".into(), 100));
 }
 
-/// Within one loop, targets dispatch oldest-first (FIFO by number) no matter
-/// what order discover returns them in.
+/// Within one kind, runs dispatch oldest-first (FIFO by issue number) no
+/// matter what order they were enqueued in.
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
+async fn watch_dispatches_runs_of_one_kind_in_fifo_order() {
     let root = tempfile::tempdir().unwrap();
     let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order: DispatchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    for issue in [33, 11, 22] {
+        seed_queued_run(&deps.store, "proj", "fixer", issue);
+    }
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![Arc::new(StubLoop {
-            kind: "stub",
-            targets: vec![("proj", 33), ("proj", 11), ("proj", 22)],
-            order: order.clone(),
-        })],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: recording_recipe(order.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 3).await;
@@ -719,40 +668,31 @@ async fn watch_dispatches_targets_of_one_loop_in_fifo_order() {
     assert_eq!(issues, vec![11, 22, 33]);
 }
 
-/// Loop priority beats project order: project B's high-priority loop takes
-/// the slot before project A's low-priority loop (nest inversion).
+/// dispatch_rank beats project order: project B's fixer run takes the slot
+/// before project A's planner run (nest inversion).
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_prioritizes_loop_order_over_project_order() {
+async fn watch_prioritizes_dispatch_rank_over_project_order() {
     let root = tempfile::tempdir().unwrap();
     let deps_a = setup(root.path(), Arc::new(FakeForge::default())).await;
     let mut deps_b = deps_a.clone();
     deps_b.project.id = "proj-b".into();
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order: DispatchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    seed_queued_run(&deps_a.store, "proj", "planner", 1);
+    seed_queued_run(&deps_a.store, "proj-b", "fixer", 300);
     let scheduler = Scheduler {
         projects: vec![deps_a, deps_b],
-        loops: vec![
-            Arc::new(StubLoop {
-                kind: "stub-fixer",
-                targets: vec![("proj-b", 300)],
-                order: order.clone(),
-            }),
-            Arc::new(StubLoop {
-                kind: "stub-planner",
-                targets: vec![("proj", 1)],
-                order: order.clone(),
-            }),
-        ],
         poll_interval: Duration::from_millis(100),
         max_concurrent: 1,
         reload: None,
+        recipe: recording_recipe(order.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
     let log = wait_for_dispatches(&order, 2).await;
     watch.abort();
 
-    assert_eq!(log[0], ("stub-fixer".into(), "proj-b".into(), 300));
-    assert_eq!(log[1], ("stub-planner".into(), "proj".into(), 1));
+    assert_eq!(log[0], ("fixer".into(), "proj-b".into(), 300));
+    assert_eq!(log[1], ("planner".into(), "proj".into(), 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -765,10 +705,10 @@ async fn watch_ticks_write_a_heartbeat() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: default_loops(),
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: default_recipe(),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -785,110 +725,42 @@ async fn watch_ticks_write_a_heartbeat() {
     watch.abort();
 }
 
-/// A scripted loop for dispatch-priority tests: discovers fixed
-/// (project, issue) targets and records drive order in a shared log.
-struct RecordingLoop {
-    kind: &'static str,
-    /// (project_id, issue_number) pairs this loop discovers.
-    targets: Vec<(&'static str, i64)>,
-    /// (loop kind, project_id, issue_number) in drive order.
-    log: Arc<Mutex<Vec<(String, String, i64)>>>,
-}
-
-#[async_trait::async_trait]
-impl Loop for RecordingLoop {
-    fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        let mut targets = Vec::new();
-        for (project, issue) in &self.targets {
-            if *project != deps.project.id
-                || deps
-                    .store
-                    .issue_has_succeeded_run(&deps.project.id, self.kind, *issue)?
-            {
-                continue;
-            }
-            targets.push(Target {
-                key: TaskKey::Issue(*issue),
-                title: format!("target {issue}"),
-                cadence_label: None,
-            });
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
-        let run = deps.store.get_run(run_id)?.expect("run exists");
-        self.log
-            .lock()
-            .unwrap()
-            .push((self.kind.into(), run.project_id, run.issue_number));
-        deps.store
-            .update_run_status(run_id, RunStatus::Succeeded, None)?;
-        Ok(WorkerOutcome::Succeeded {
-            pr_url: "fake://pr".into(),
-        })
-    }
-}
-
-/// Run a single-slot scheduler with `loops` over `projects` until `expected`
-/// drives are logged, then return the log in drive order.
+/// Run a single-slot scheduler over `projects` with the seeded queued runs
+/// until `expected` dispatches are logged, then return them in order.
 async fn drive_order(
     projects: Vec<Deps>,
-    loops: Vec<Arc<dyn Loop>>,
-    log: Arc<Mutex<Vec<(String, String, i64)>>>,
+    runs: Vec<(&'static str, &'static str, i64)>,
     expected: usize,
 ) -> Vec<(String, String, i64)> {
+    let log: DispatchLog = Arc::new(Mutex::new(Vec::new()));
+    let store = projects[0].store.clone();
+    for (project, kind, issue) in runs {
+        seed_queued_run(&store, project, kind, issue);
+    }
     let scheduler = Scheduler {
         projects,
-        loops,
         poll_interval: Duration::from_millis(100),
         // One slot at a time so drive order mirrors dispatch priority.
         max_concurrent: 1,
         reload: None,
+        recipe: recording_recipe(log.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if log.lock().unwrap().len() >= expected {
-            break;
-        }
-        if tokio::time::Instant::now() > deadline {
-            panic!("only {:?} of {expected} drives ran", log.lock().unwrap());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let order = wait_for_dispatches(&log, expected).await;
     watch.abort();
-    log.lock().unwrap().clone()
+    order
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn discovery_dispatches_loops_in_priority_order() {
     let root = tempfile::tempdir().unwrap();
     let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let log = Arc::new(Mutex::new(Vec::new()));
 
-    // The worker target has the smaller issue number; only loop priority
-    // (fixer listed first) can put the fixer target ahead of it.
+    // The worker run has the smaller issue number; only dispatch_rank can
+    // put the fixer run ahead of it.
     let order = drive_order(
         vec![deps],
-        vec![
-            Arc::new(RecordingLoop {
-                kind: "fixer",
-                targets: vec![("proj", 201)],
-                log: log.clone(),
-            }),
-            Arc::new(RecordingLoop {
-                kind: "worker",
-                targets: vec![("proj", 101)],
-                log: log.clone(),
-            }),
-        ],
-        log,
+        vec![("proj", "fixer", 201), ("proj", "worker", 101)],
         2,
     )
     .await;
@@ -906,18 +778,15 @@ async fn discovery_dispatches_loops_in_priority_order() {
 async fn discovery_orders_targets_within_a_loop_by_issue_number() {
     let root = tempfile::tempdir().unwrap();
     let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let log = Arc::new(Mutex::new(Vec::new()));
 
-    // discover() returns the targets unsorted; the scheduler normalizes
-    // to oldest-first (FIFO).
+    // Runs are seeded unsorted; the workqueue normalizes to oldest-first.
     let order = drive_order(
         vec![deps],
-        vec![Arc::new(RecordingLoop {
-            kind: "fixer",
-            targets: vec![("proj", 305), ("proj", 301), ("proj", 303)],
-            log: log.clone(),
-        })],
-        log,
+        vec![
+            ("proj", "fixer", 305),
+            ("proj", "fixer", 301),
+            ("proj", "fixer", 303),
+        ],
         3,
     )
     .await;
@@ -936,25 +805,12 @@ async fn discovery_prefers_loop_priority_over_project_order() {
     let mut deps_b = setup(&root.path().join("beta"), forge).await;
     deps_b.store = deps_a.store.clone();
     deps_b.project.id = "beta".into();
-    let log = Arc::new(Mutex::new(Vec::new()));
 
     // Project beta only has fixer work, project alpha only planner work;
-    // the fixer loop must win even though alpha comes first.
+    // the fixer rank must win even though alpha comes first.
     let order = drive_order(
         vec![deps_a, deps_b],
-        vec![
-            Arc::new(RecordingLoop {
-                kind: "fixer",
-                targets: vec![("beta", 501)],
-                log: log.clone(),
-            }),
-            Arc::new(RecordingLoop {
-                kind: "planner",
-                targets: vec![("alpha", 401)],
-                log: log.clone(),
-            }),
-        ],
-        log,
+        vec![("beta", "fixer", 501), ("alpha", "planner", 401)],
         2,
     )
     .await;
@@ -970,12 +826,16 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
     let deps = setup(root.path(), forge).await;
     let store = deps.store.clone();
 
+    // A queued run of an arbitrary kind (what a reconciler's enqueue leaves)
+    // dispatches through the recipe seam by its `loop_kind`.
+    seed_queued_run(&store, "proj", "fixed", 99);
+    let order: DispatchLog = Arc::new(Mutex::new(Vec::new()));
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![Arc::new(FixedLoop)],
         poll_interval: Duration::from_millis(200),
         max_concurrent: 2,
         reload: None,
+        recipe: recording_recipe(order.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -983,7 +843,7 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
     loop {
         if tokio::time::Instant::now() > deadline {
             panic!(
-                "fixed-loop run never succeeded; runs: {:?}",
+                "fixed-kind run never succeeded; runs: {:?}",
                 store.list_runs(false).unwrap()
             );
         }
@@ -999,47 +859,24 @@ async fn watch_dispatches_any_registered_loop_by_kind() {
     watch.abort();
 
     let runs = store.list_runs(false).unwrap();
-    assert_eq!(runs.len(), 1, "one run per discovered target: {runs:?}");
+    assert_eq!(runs.len(), 1, "exactly the seeded run: {runs:?}");
     assert_eq!(runs[0].loop_kind, "fixed");
 }
 
-/// A loop that records the `config.language` each of its drives sees:
-/// issues 71 and 72, driven straight to success.
-struct LanguageRecordingLoop {
-    log: Arc<Mutex<Vec<Option<String>>>>,
-}
-
-#[async_trait::async_trait]
-impl Loop for LanguageRecordingLoop {
-    fn kind(&self) -> &'static str {
-        "lang"
-    }
-
-    async fn discover(&self, deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        let mut targets = Vec::new();
-        for n in [71, 72] {
-            if !deps
-                .store
-                .issue_has_succeeded_run(&deps.project.id, self.kind(), n)?
-            {
-                targets.push(Target {
-                    key: TaskKey::Issue(n),
-                    title: format!("lang {n}"),
-                    cadence_label: None,
-                });
-            }
-        }
-        Ok(targets)
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
-        self.log.lock().unwrap().push(deps.config.language.clone());
-        deps.store
-            .update_run_status(run_id, RunStatus::Succeeded, None)?;
-        Ok(WorkerOutcome::Succeeded {
-            pr_url: "lang://pr".into(),
+/// A recipe that records the `config.language` each dispatch's Deps carries,
+/// then drives the run straight to success.
+fn language_recording_recipe(log: Arc<Mutex<Vec<Option<String>>>>) -> RecipeFn {
+    Arc::new(move |deps, run_id, _kind| {
+        let log = log.clone();
+        Box::pin(async move {
+            log.lock().unwrap().push(deps.config.language.clone());
+            deps.store
+                .update_run_status(&run_id, RunStatus::Succeeded, None)?;
+            Ok(WorkerOutcome::Succeeded {
+                pr_url: "lang://pr".into(),
+            })
         })
-    }
+    })
 }
 
 /// Config hot reload (issue #73): a swap delivered by the reload hook reaches
@@ -1064,13 +901,15 @@ async fn watch_applies_reloaded_config_to_new_runs() {
         })
     });
 
+    seed_queued_run(&deps.store, "proj", "lang", 71);
+    seed_queued_run(&deps.store, "proj", "lang", 72);
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![Arc::new(LanguageRecordingLoop { log: log.clone() })],
         poll_interval: Duration::from_millis(100),
         // One slot: issue 71 drives before the "edit", issue 72 after it.
         max_concurrent: 1,
         reload: Some(reload),
+        recipe: language_recording_recipe(log.clone()),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -1095,36 +934,24 @@ async fn watch_applies_reloaded_config_to_new_runs() {
     );
 }
 
-/// A loop with no discoverable targets, so the only way its `drive` fires is
-/// via the scheduler's per-tick interrupted/queued redispatch.
-struct NoDiscoveryLoop {
-    kind: &'static str,
-    dispatched: Arc<Mutex<Vec<String>>>,
-    /// How long `drive` sits before flipping the run's status away from
-    /// `interrupted`, simulating the async gap between `dispatch` spawning
-    /// the driver and the driver actually recording `running`.
-    delay: Duration,
-}
-
-#[async_trait::async_trait]
-impl Loop for NoDiscoveryLoop {
-    fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    async fn discover(&self, _deps: &Deps) -> anyhow::Result<Vec<Target>> {
-        Ok(vec![])
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> anyhow::Result<WorkerOutcome> {
-        self.dispatched.lock().unwrap().push(run_id.to_string());
-        tokio::time::sleep(self.delay).await;
-        deps.store
-            .update_run_status(run_id, RunStatus::Succeeded, None)?;
-        Ok(WorkerOutcome::Succeeded {
-            pr_url: "no-discovery://pr".into(),
+/// A recipe that records each dispatched run id, sits for `delay` (simulating
+/// the async gap between `dispatch` spawning the driver and the driver
+/// recording `running`), then succeeds. Nothing enqueues these runs — the
+/// tests seed them `interrupted`, so the only dispatch path is the per-tick
+/// redispatch.
+fn delayed_recording_recipe(dispatched: Arc<Mutex<Vec<String>>>, delay: Duration) -> RecipeFn {
+    Arc::new(move |deps, run_id, _kind| {
+        let dispatched = dispatched.clone();
+        Box::pin(async move {
+            dispatched.lock().unwrap().push(run_id.clone());
+            tokio::time::sleep(delay).await;
+            deps.store
+                .update_run_status(&run_id, RunStatus::Succeeded, None)?;
+            Ok(WorkerOutcome::Succeeded {
+                pr_url: "no-discovery://pr".into(),
+            })
         })
-    }
+    })
 }
 
 /// #183 regression: a run that goes `interrupted` (pane died mid-execute)
@@ -1141,14 +968,10 @@ async fn watch_redispatches_a_run_interrupted_after_watch_is_already_running() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![Arc::new(NoDiscoveryLoop {
-            kind: "no-discovery",
-            dispatched: dispatched.clone(),
-            delay: Duration::from_millis(10),
-        })],
         poll_interval: Duration::from_millis(80),
         max_concurrent: 2,
         reload: None,
+        recipe: delayed_recording_recipe(dispatched.clone(), Duration::from_millis(10)),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 
@@ -1225,16 +1048,12 @@ async fn watch_redispatch_respects_slots_and_avoids_double_dispatch() {
 
     let scheduler = Scheduler {
         projects: vec![deps],
-        loops: vec![Arc::new(NoDiscoveryLoop {
-            kind: "no-discovery",
-            dispatched: dispatched.clone(),
-            // Long enough that several ticks land while each run is mid-flight
-            // and its store status still reads `interrupted`.
-            delay: Duration::from_millis(400),
-        })],
         poll_interval: Duration::from_millis(80),
         max_concurrent: 1,
         reload: None,
+        // Long enough that several ticks land while each run is mid-flight
+        // and its store status still reads `interrupted`.
+        recipe: delayed_recording_recipe(dispatched.clone(), Duration::from_millis(400)),
     };
     let watch = tokio::spawn(async move { scheduler.watch().await });
 

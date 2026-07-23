@@ -36,12 +36,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
+use super::Deps;
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
-use super::{Deps, Target};
 use crate::forge::{self, Forge};
 use crate::store::RunRecord;
-use crate::tasks::TaskKind;
+
 use crate::turn::{ChildIssue, TurnResultFile};
 
 /// `runs.loop_kind` value for planner runs.
@@ -99,40 +99,6 @@ pub const CHILDREN_FENCE_INFO: &str = "json meguri-children";
 /// slug-qualified parent (`owner/repo#N`) so the key is unique across repos.
 pub fn decompose_child_key(parent_ref: &str, idx: usize) -> String {
     format!("<!-- meguri:decompose-child parent={parent_ref} idx={idx} -->")
-}
-
-/// The planner as a schedulable loop: `meguri:plan` issues in, spec PRs out.
-pub struct PlannerLoop;
-
-#[async_trait]
-impl super::Loop for PlannerLoop {
-    fn kind(&self) -> &'static str {
-        KIND
-    }
-
-    async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // The planner ships a spec *PR*, so it needs a forge. Local mode has
-        // no planner yet (issue #54 Phase 3): a local `plan` task stays
-        // queued and dormant rather than being driven into a forge call.
-        if deps.forge.is_none() {
-            return Ok(Vec::new());
-        }
-        Ok(deps
-            .task_source
-            .discover(TaskKind::Plan)
-            .await?
-            .into_iter()
-            .map(|t| Target {
-                key: t.key,
-                title: t.title,
-                cadence_label: t.cadence_label,
-            })
-            .collect())
-    }
-
-    async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {
-        run_planner(deps, run_id).await
-    }
 }
 
 pub async fn run_planner(deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

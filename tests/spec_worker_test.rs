@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, LaunchMode, ProjectConfig};
-use meguri::engine::spec_worker::{self, SpecWorkerLoop, run_spec_worker};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::issue_reconciler;
+use meguri::engine::spec_worker::{self, run_spec_worker};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_SPECCING,
@@ -303,17 +304,36 @@ async fn commit_implementation(wt: &Path) {
     .unwrap();
 }
 
+/// The takeover candidates one PR-side reconcile pass enqueues (the discovery
+/// path since ADR 0012 S4 決定2): issue numbers of queued spec-worker runs.
+/// Queued runs are retired (Skipped) after reading so the next pass is not
+/// blocked by the issue-wide reservation.
+async fn reconciled_takeovers(env: &TestEnv) -> Vec<i64> {
+    issue_reconciler::sweep(&env.deps).await.unwrap();
+    let runs: Vec<_> = env
+        .deps
+        .store
+        .list_runs(true)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.loop_kind == spec_worker::KIND && r.status == RunStatus::Queued)
+        .collect();
+    for r in &runs {
+        env.deps
+            .store
+            .update_run_status(&r.id, RunStatus::Skipped, None)
+            .unwrap();
+    }
+    runs.into_iter().map(|r| r.issue_number).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     // The check command also proves the spec was pruned from the branch.
     let env = setup(Some("test -f cache.txt && test ! -f docs/specs/issue-5.md")).await;
 
     // Discovery keys the run to the issue the branch encodes, not the PR.
-    let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![5]
-    );
+    assert_eq!(reconciled_takeovers(&env).await, vec![5]);
 
     let run = create_spec_worker_run(&env);
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
@@ -444,7 +464,7 @@ async fn spec_worker_happy_path_spec_ready_pr_to_implementation_commits() {
     // Success dedups discovery even while the fake label state lingers
     // elsewhere: a second takeover of the same issue is never queued.
     env.forge.add_pr_label(1, LABEL_SPEC_READY).await.unwrap();
-    assert!(SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(reconciled_takeovers(&env).await.is_empty());
 }
 
 /// ADR 0011: the combined-delivery takeover runs the internal self-review
@@ -602,7 +622,7 @@ async fn spec_worker_needs_human_escalates_like_the_worker() {
         "the escalation must park the PR itself: {pr_labels:?}"
     );
     assert!(
-        SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        reconciled_takeovers(&env).await.is_empty(),
         "an escalated spec-ready PR must not be rediscovered until a human clears it"
     );
     // A human clearing the PR label re-arms the takeover (the failed run never
@@ -611,11 +631,7 @@ async fn spec_worker_needs_human_escalates_like_the_worker() {
         .remove_pr_label(1, LABEL_NEEDS_HUMAN)
         .await
         .unwrap();
-    let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![5]
-    );
+    assert_eq!(reconciled_takeovers(&env).await, vec![5]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -690,11 +706,7 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
         env.forge.set_pr_state(number, state);
     }
 
-    let targets = SpecWorkerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![5]
-    );
+    assert_eq!(reconciled_takeovers(&env).await, vec![5]);
 
     // A *worker* success on the issue must not block the takeover...
     let done = env
@@ -706,7 +718,7 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
         .store
         .update_run_status(&done.id, RunStatus::Succeeded, None)
         .unwrap();
-    assert_eq!(SpecWorkerLoop.discover(&env.deps).await.unwrap().len(), 1);
+    assert_eq!(reconciled_takeovers(&env).await.len(), 1);
 
     // ...but a spec-worker success does (the spec-ready label lingered).
     let shipped = create_spec_worker_run(&env);
@@ -714,7 +726,7 @@ async fn spec_worker_discovery_filters_hold_working_foreign_and_shipped() {
         .store
         .update_run_status(&shipped.id, RunStatus::Succeeded, None)
         .unwrap();
-    assert!(SpecWorkerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(reconciled_takeovers(&env).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

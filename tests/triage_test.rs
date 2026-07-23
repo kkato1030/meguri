@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use meguri::config::{Config, LaunchMode, ProjectConfig, TriageAction, TriageConfig, TriageMode};
 use meguri::engine::triage::{
-    self, MARKER_HEAD_NONE, REPORT_FILE, TriageLoop, parse_triage_marker, run_triage, triage_marker,
+    self, MARKER_HEAD_NONE, REPORT_FILE, parse_triage_marker, run_triage, triage_marker,
 };
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     Forge, Issue, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY, LABEL_TRIAGE_PLAN,
@@ -260,7 +260,12 @@ async fn off_mode_discovers_nothing() {
     // The opt-in default: triage stays fully quiet until turned on.
     let env = setup_with_triage(TriageConfig::default()).await;
     assert_eq!(env.deps.config.triage.mode, TriageMode::Off);
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -268,11 +273,10 @@ async fn first_sweep_creates_report_issue_and_touches_nothing_else() {
     let env = setup().await;
 
     // Discovery: no report issue yet → the synthetic target 0.
-    let targets = TriageLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![0]
-    );
+    let due = meguri::engine::triage::observe_scan_due(&env.deps)
+        .await
+        .unwrap();
+    assert_eq!(due, Some(0));
 
     let origin_refs_before = run_git(&env.origin, &["for-each-ref"]).await.unwrap();
     let run = create_triage_run(&env, 0);
@@ -348,7 +352,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .unwrap();
 
     // Same head, no new issue: nothing to do.
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Head moves, but within the interval: still nothing.
     run_git(&env.clone, &["commit", "--allow-empty", "-m", "advance"])
@@ -358,7 +367,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .await
         .unwrap();
     let new_head = run_git(&env.clone, &["rev-parse", "HEAD"]).await.unwrap();
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Interval elapsed (seed an old `scanned`): the report issue is due.
     let stale_scanned = epoch_now() - 7 * 3600;
@@ -372,11 +386,10 @@ async fn rediscovery_respects_head_marker_and_interval() {
         )
         .await
         .unwrap();
-    let targets = TriageLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![report]
-    );
+    let due = meguri::engine::triage::observe_scan_due(&env.deps)
+        .await
+        .unwrap();
+    assert_eq!(due, Some(report));
 
     // The sweep rewrites the body: new recommendation in, previous line gone.
     let run = create_triage_run(&env, report);
@@ -400,7 +413,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
     assert!(updated.body.contains("⚠️ 要確認: which backend?"));
 
     // And the new head is now settled: no further target.
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -422,11 +440,21 @@ async fn new_issue_triggers_rescan_even_with_a_still_head() {
     // Head is still and no issue is above max_issue → no rescan, however old.
     // (The report issue itself carries a `meguri:` label, so it is not a
     // candidate and does not count as a new untriaged issue.)
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // A brand-new unlabeled issue appears above max_issue → rescan, head still.
     env.forge.add_issue(70, "new bug", "just filed", &[]);
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -444,7 +472,12 @@ async fn hold_on_the_report_issue_stops_the_loop() {
         .unwrap();
     env.forge.add_label(report, LABEL_HOLD).await.unwrap();
 
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -482,7 +515,10 @@ async fn failing_agent_skips_quietly_and_paces_retries() {
     assert_eq!(marker.max_issue, 0);
     assert!(marker.scanned > 0);
     assert!(
-        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "retry must wait for the interval"
     );
 
@@ -795,7 +831,12 @@ async fn advise_mode_content_edit_alone_triggers_rediscovery() {
     );
 
     // Head still, no new issue, content unchanged: quiet, as usual.
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // The candidate's title/body changes — no push, no new issue — and
     // discovery alone must still notice: `report`/`advise`'s README/ADR
@@ -805,7 +846,12 @@ async fn advise_mode_content_edit_alone_triggers_rediscovery() {
         .update_issue_body(CANDIDATE, "totally different ask now")
         .await
         .unwrap();
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -858,7 +904,12 @@ async fn advise_mode_budget_backlog_alone_triggers_rediscovery() {
     // sweep is still due — otherwise the un-proposed leftover would be
     // stranded until some unrelated trigger happened to fire (README/ADR's
     // "the rest carry over to the next sweep" promise).
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -889,7 +940,12 @@ async fn advise_mode_rejected_then_edited_issue_alone_triggers_rediscovery() {
         .remove_label(CANDIDATE, LABEL_TRIAGE_READY)
         .await
         .unwrap();
-    assert!(TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // The rejected issue's content changes — no new issue, no push, and no
     // proposal label anymore either. Discovery must still notice: the
@@ -899,7 +955,12 @@ async fn advise_mode_rejected_then_edited_issue_alone_triggers_rediscovery() {
         .update_issue_body(CANDIDATE, "totally different ask now")
         .await
         .unwrap();
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ---- v2 auto (issue #88) ---------------------------------------------------
@@ -1170,7 +1231,12 @@ async fn auto_mode_escalates_pending_proposal_and_respects_rejection() {
     // due (the advise→auto migration signal); without the level-aware check it
     // would stay quiet and #60 would never reach promotion.
     env.deps.config.triage.mode = TriageMode::Auto;
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Sweep 2 (auto): #60 (pending proposal) is a candidate; the rejected #61
     // is not — a report covering only #60 satisfies exact coverage.
@@ -1259,7 +1325,10 @@ async fn auto_mode_does_not_rescan_a_pending_proposal_kind_outside_apply() {
     // unchanged, head still, no new issue).
     env.deps.config.triage.mode = TriageMode::Auto;
     assert!(
-        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "a pending proposal whose kind is outside `apply` must not re-trigger the sweep"
     );
 
@@ -1267,7 +1336,10 @@ async fn auto_mode_does_not_rescan_a_pending_proposal_kind_outside_apply() {
     // so discovery fires.
     env.deps.config.triage.apply = vec![TriageAction::Ready, TriageAction::Plan];
     assert!(
-        !TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "once `plan` is in `apply`, the pending plan proposal must re-trigger the sweep"
     );
 }
@@ -1310,7 +1382,12 @@ async fn drive_auto_decline(auto_confidence: f64, ignore: Vec<String>) -> TestEn
     // due for one sweep.
     env.deps.config.triage.mode = TriageMode::Auto;
     env.deps.config.triage.ignore = ignore;
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Sweep 2 (auto): the agent returns `ready` at `auto_confidence`.
     let run2 = create_triage_run(&env, report.number);
@@ -1354,7 +1431,10 @@ async fn auto_mode_records_decline_for_below_threshold_pending_proposal() {
 
     // The loop is closed: discovery is now quiet.
     assert!(
-        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "a declined (below-threshold) pending proposal must not keep re-triggering the sweep"
     );
 }
@@ -1381,7 +1461,10 @@ async fn auto_mode_records_decline_for_ignored_pending_proposal() {
 
     // The loop is closed even though the confidence cleared the bar.
     assert!(
-        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "a declined (ignored) pending proposal must not keep re-triggering the sweep"
     );
 }
@@ -1428,7 +1511,12 @@ async fn auto_mode_records_decline_when_edited_proposal_stays_non_promotable() {
         .update_issue_body(CANDIDATE, "reworded but still a big spec-first ask")
         .await
         .unwrap();
-    assert!(!TriageLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        !meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Sweep 2 (auto): the agent still returns `plan` (not in apply) → no-op, but
     // the decline is recorded at the new content.
@@ -1465,7 +1553,10 @@ async fn auto_mode_records_decline_when_edited_proposal_stays_non_promotable() {
 
     // The drift signal is closed.
     assert!(
-        TriageLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::triage::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "an edited-but-still-non-promotable proposal must not keep re-triggering the sweep"
     );
 }

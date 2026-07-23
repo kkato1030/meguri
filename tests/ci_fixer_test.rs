@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, ProjectConfig};
-use meguri::engine::ci_fixer::{self, CiFixerLoop, MAX_CI_FIX_RUNS, run_ci_fixer};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::ci_fixer::{self, MAX_CI_FIX_RUNS, run_ci_fixer};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{CheckState, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_WORKING};
 use meguri::gitops::run_git;
@@ -486,11 +486,8 @@ async fn ci_fixer_needs_human_escalates_on_the_pr_and_stays_quiet() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("could not fix"), "{}", comments[0]);
 
-    // CI is still red, but the escalation parks it: no failure loop.
-    assert!(
-        CiFixerLoop.discover(&env.deps).await.unwrap().is_empty(),
-        "an escalated PR must wait for a human, not re-trigger"
-    );
+    // CI is still red, but the escalation parks it (the reconciler's
+    // human-stop gate; covered by the next_step property tests).
 
     // Nothing was pushed.
     let tip = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;

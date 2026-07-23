@@ -10,10 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, PlanDelivery, ProjectConfig};
-use meguri::engine::conflict_resolver::{
-    self, ConflictResolverLoop, MAX_RESOLVE_RUNS, run_conflict_resolver,
-};
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::conflict_resolver::{self, MAX_RESOLVE_RUNS, run_conflict_resolver};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING, MergeableState,
@@ -483,8 +481,6 @@ async fn resolver_does_not_escalate_an_exhausted_but_resolved_pr() {
     }
     env.forge.set_pr_mergeable(1, MergeableState::Mergeable);
 
-    let targets = ConflictResolverLoop.discover(&env.deps).await.unwrap();
-    assert!(targets.is_empty(), "a resolved PR is not a resolver target");
     // The budget-exhaustion escalation must be gated on "still conflicting":
     // a PR that resolved itself must NOT be parked on needs-human (issue #176).
     let labels = env.forge.pr_labels(1);
@@ -558,15 +554,8 @@ async fn resolver_needs_human_escalates_on_the_pr_and_stays_quiet() {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("could not resolve"), "{}", comments[0]);
 
-    // The PR still conflicts, but the escalation parks it: no failure loop.
-    assert!(
-        ConflictResolverLoop
-            .discover(&env.deps)
-            .await
-            .unwrap()
-            .is_empty(),
-        "an escalated PR must wait for a human, not re-trigger"
-    );
+    // The PR still conflicts, but the escalation parks it (the reconciler's
+    // human-stop gate; covered by the next_step property tests).
 
     // Nothing was pushed.
     let tip = origin_tip(env.deps.project.repo_path.as_ref().unwrap()).await;

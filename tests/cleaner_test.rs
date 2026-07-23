@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use meguri::config::{CleanConfig, Config, LaunchMode, ProjectConfig};
 use meguri::engine::cleaner::{
-    self, CleanerLoop, MARKER_HEAD_NONE, REPORT_FILE, clean_marker, parse_clean_marker, run_cleaner,
+    self, MARKER_HEAD_NONE, REPORT_FILE, clean_marker, parse_clean_marker, run_cleaner,
 };
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     Forge, LABEL_CLEAN_REPORT, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_READY,
@@ -267,11 +267,10 @@ async fn first_sweep_creates_report_issue_and_touches_nothing_else() {
     let env = setup().await;
 
     // Discovery: no report issue yet → the synthetic target 0.
-    let targets = CleanerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![0]
-    );
+    let due = meguri::engine::cleaner::observe_scan_due(&env.deps)
+        .await
+        .unwrap();
+    assert_eq!(due, Some(0));
 
     let origin_refs_before = run_git(&env.origin, &["for-each-ref"]).await.unwrap();
     let run = create_cleaner_run(&env, 0);
@@ -337,7 +336,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .unwrap();
 
     // Same head: nothing to do.
-    assert!(CleanerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::cleaner::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Head moves, but within the interval: still nothing.
     run_git(&env.clone, &["commit", "--allow-empty", "-m", "advance"])
@@ -347,7 +351,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
         .await
         .unwrap();
     let new_head = run_git(&env.clone, &["rev-parse", "HEAD"]).await.unwrap();
-    assert!(CleanerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::cleaner::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Interval elapsed (seed an old `scanned`): the report issue is due.
     let stale_scanned = epoch_now() - 25 * 3600;
@@ -361,11 +370,10 @@ async fn rediscovery_respects_head_marker_and_interval() {
         )
         .await
         .unwrap();
-    let targets = CleanerLoop.discover(&env.deps).await.unwrap();
-    assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
-        vec![report]
-    );
+    let due = meguri::engine::cleaner::observe_scan_due(&env.deps)
+        .await
+        .unwrap();
+    assert_eq!(due, Some(report));
 
     // The sweep rewrites the body: new findings in, previous items gone.
     let run = create_cleaner_run(&env, report);
@@ -392,7 +400,12 @@ async fn rediscovery_respects_head_marker_and_interval() {
     );
 
     // And the new head is now settled: no further target.
-    assert!(CleanerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::cleaner::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -410,7 +423,12 @@ async fn hold_on_the_report_issue_stops_the_loop() {
         .unwrap();
     env.forge.add_label(report, LABEL_HOLD).await.unwrap();
 
-    assert!(CleanerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(
+        meguri::engine::cleaner::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -445,7 +463,10 @@ async fn failing_agent_skips_quietly_and_paces_retries() {
     assert_eq!(marker.head, MARKER_HEAD_NONE);
     assert!(marker.scanned > 0);
     assert!(
-        CleanerLoop.discover(&env.deps).await.unwrap().is_empty(),
+        meguri::engine::cleaner::observe_scan_due(&env.deps)
+            .await
+            .unwrap()
+            .is_none(),
         "retry must wait for the interval"
     );
 

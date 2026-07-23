@@ -307,6 +307,26 @@ pub fn worktree_path(worktrees_root: &Path, project_id: &str, branch: &str) -> P
 /// branch. Prefers `origin/<default>` when a remote exists. `extra_excludes`
 /// (a project's `worktree_setup.exclude`) is appended to `info/exclude`
 /// alongside the always-on `.meguri/`.
+/// Serialize repo-mutating worktree creation per repository path: concurrent
+/// `git worktree add -b` invocations against one clone race on the shared
+/// `.git/config` lock ("could not lock config file .git/config") when both
+/// write the new branch's upstream configuration. Two runs of one project can
+/// start in the same instant since the reconciler enqueues them in one pass,
+/// so the collision is a normal schedule, not a freak. Keyed by the repo path
+/// (different projects never contend).
+fn worktree_creation_lock(repo_path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<
+        Option<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::Mutex::new(None);
+    LOCKS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .entry(repo_path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 pub async fn create_worktree(
     repo_path: &Path,
     worktree: &Path,
@@ -323,6 +343,8 @@ pub async fn create_worktree(
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let lock = worktree_creation_lock(repo_path);
+    let _guard = lock.lock().await;
 
     // Best-effort freshness; offline or remote-less repos still work.
     let _ = run_git(repo_path, &["fetch", "origin", default_branch]).await;
@@ -384,6 +406,10 @@ pub async fn attach_worktree(
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Same serialization as `create_worktree`: attach also mutates the
+    // shared clone (branch reset + worktree registration).
+    let lock = worktree_creation_lock(repo_path);
+    let _guard = lock.lock().await;
 
     // Best-effort freshness; offline or remote-less repos still work.
     let _ = run_git(repo_path, &["fetch", "origin", branch]).await;

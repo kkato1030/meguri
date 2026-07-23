@@ -4,7 +4,7 @@
 //! sweep. Reclamation is reversible: the agent's native session id is saved
 //! before a pane is killed, so `claude --resume <id>` restores the context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,6 +45,10 @@ pub enum Verdict {
     Orphan,
     /// The forge could not tell us the issue state — assume nothing.
     StateUnknown,
+    /// Issue closed but an open meguri PR still references it (finding 4b):
+    /// the PR side owns the resources (a fixer needs the worktree's context),
+    /// so Finalize keeps its hands off until the PR is terminal too.
+    OpenPr,
 }
 
 impl Verdict {
@@ -57,6 +61,7 @@ impl Verdict {
             Self::Dirty => "dirty",
             Self::Orphan => "orphan",
             Self::StateUnknown => "state unknown",
+            Self::OpenPr => "open PR",
         }
     }
 
@@ -134,11 +139,44 @@ fn project_worktree_root(deps: &Deps) -> PathBuf {
 /// Enumerate this project's meguri worktrees and classify each one.
 /// Prunes stale worktree registrations first so the listing is honest.
 pub async fn plan(deps: &Deps) -> Result<Vec<Candidate>> {
-    plan_with(deps, &mut IssueStates::default()).await
+    let open_prs = open_meguri_pr_issues(deps).await;
+    plan_with(deps, &mut IssueStates::default(), &open_prs).await
+}
+
+/// The canonical issues currently owned by an *open* meguri PR (finding 4b):
+/// their local resources are the PR side's, so the Finalize pass keeps them.
+/// Best-effort: an unreadable PR list degrades to no exclusion (the historical
+/// behavior) rather than blocking the sweep.
+pub async fn open_meguri_pr_issues(deps: &Deps) -> HashSet<i64> {
+    let Some(_) = deps.forge.as_ref() else {
+        return HashSet::new();
+    };
+    match deps.forge().list_open_prs().await {
+        Ok(prs) => prs
+            .iter()
+            .filter(|pr| {
+                pr.state == "open"
+                    && pr
+                        .head_branch
+                        .starts_with(super::issue_reconciler::MEGURI_BRANCH_PREFIX)
+            })
+            .map(super::canonical_key)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("cannot list open PRs for the finalize exclusion: {e:#}");
+            HashSet::new()
+        }
+    }
 }
 
 /// [`plan`] sharing an issue-state cache with a pane sweep of the same tick.
-pub async fn plan_with(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Candidate>> {
+/// `open_pr_issues` are the identities an open meguri PR owns (finding 4b) —
+/// their worktrees are never candidates even when the issue is closed.
+pub async fn plan_with(
+    deps: &Deps,
+    states: &mut IssueStates,
+    open_pr_issues: &HashSet<i64>,
+) -> Result<Vec<Candidate>> {
     gitops::prune_worktrees(&deps.repo_path()).await.ok();
     let root = project_worktree_root(deps);
     let mut candidates = Vec::new();
@@ -147,7 +185,7 @@ pub async fn plan_with(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Cand
         if !path.starts_with(&root) {
             continue; // not managed by meguri (e.g. the primary checkout)
         }
-        candidates.push(classify(deps, states, path, wt.branch).await?);
+        candidates.push(classify(deps, states, open_pr_issues, path, wt.branch).await?);
     }
     Ok(candidates)
 }
@@ -155,6 +193,7 @@ pub async fn plan_with(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Cand
 async fn classify(
     deps: &Deps,
     states: &mut IssueStates,
+    open_pr_issues: &HashSet<i64>,
     path: PathBuf,
     branch: Option<String>,
 ) -> Result<Candidate> {
@@ -196,6 +235,13 @@ async fn classify(
         Some(IssueState::Open) => return Ok(candidate(Verdict::Open)),
         Some(IssueState::Closed) => {}
         None => return Ok(candidate(Verdict::StateUnknown)),
+    }
+    // Closed issue, but an open meguri PR still references it (finding 4b):
+    // the ownership boundary hands the identity — and its local resources —
+    // to the PR side while any open PR exists. Never race a fixer for its
+    // worktree context.
+    if open_pr_issues.contains(&issue_number) {
+        return Ok(candidate(Verdict::OpenPr));
     }
     // Closed, but a live pane in the worktree means an agent (or a human
     // investigating) still stands there. The pane sweep of the same tick
@@ -386,7 +432,11 @@ pub struct ReclaimedPane {
 /// Classify every lane↔pane mapping of the project: reclaim when the issue
 /// closed (and no run is active), or when the pane already died and only the
 /// stale mapping is left.
-pub async fn plan_panes(deps: &Deps, states: &mut IssueStates) -> Result<Vec<PaneCandidate>> {
+pub async fn plan_panes(
+    deps: &Deps,
+    states: &mut IssueStates,
+    open_pr_issues: &HashSet<i64>,
+) -> Result<Vec<PaneCandidate>> {
     let mut candidates = Vec::new();
     for record in deps.store.list_panes(&deps.project.id)? {
         let Some(id) = record.mux_pane_id.clone() else {
@@ -422,6 +472,11 @@ pub async fn plan_panes(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Pan
         }
         candidates.push(match states.get(deps, record.issue_number).await {
             Some(IssueState::Open) => candidate(Verdict::Open, ""),
+            // Closed issue owned by an open meguri PR (finding 4b): the PR
+            // side keeps its pane/session alive for the fixer family.
+            Some(IssueState::Closed) if open_pr_issues.contains(&record.issue_number) => {
+                candidate(Verdict::OpenPr, "")
+            }
             Some(IssueState::Closed) => candidate(Verdict::Reclaim, REASON_ISSUE_CLOSED),
             None => candidate(Verdict::StateUnknown, ""),
         });
@@ -541,9 +596,9 @@ async fn release_pane_record(
 /// Watch-poll sweep: reclaim panes and worktrees of closed issues, never
 /// forcing. Panes go first so their worktrees become reclaimable in the same
 /// tick; dirty worktrees are left for `meguri prune --force`.
-pub async fn sweep(deps: &Deps) -> Result<()> {
+pub async fn finalize(deps: &Deps, open_pr_issues: &HashSet<i64>) -> Result<()> {
     let mut states = IssueStates::default();
-    for p in reclaim_panes(deps, &plan_panes(deps, &mut states).await?).await? {
+    for p in reclaim_panes(deps, &plan_panes(deps, &mut states, open_pr_issues).await?).await? {
         tracing::info!(
             "reclaimed {} pane {} (issue #{}{})",
             p.lane,
@@ -555,7 +610,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
             },
         );
     }
-    let candidates = plan_with(deps, &mut states).await?;
+    let candidates = plan_with(deps, &mut states, open_pr_issues).await?;
     for c in candidates.iter().filter(|c| c.verdict == Verdict::Dirty) {
         tracing::warn!(
             "worktree {} has uncommitted changes for closed issue #{} — \

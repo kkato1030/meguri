@@ -1120,6 +1120,22 @@ async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result
         .claim(&key, tasks::LOCAL_HOST, run.cadence_label.as_deref())
         .await?
     {
+        // Arm-tagged re-verification (ADR 0012 S4 決定1): the claim must still
+        // match the arm this run was enqueued as. A phase label that moved
+        // between the reconcile and the claim (plan added over ready, or plan
+        // dropped) re-routes ownership to the other arm — this run then steps
+        // aside as a benign race and the next resync enqueues the right one.
+        Some(task)
+            if (run.loop_kind == super::worker::KIND && task.kind == tasks::TaskKind::Plan)
+                || (run.loop_kind == super::planner::KIND
+                    && task.kind == tasks::TaskKind::Work) =>
+        {
+            let _ = deps.task_source.release(&key).await;
+            Ok(PreparedWork::Skip(format!(
+                "phase moved to {:?} after this {} run was enqueued (benign race)",
+                task.kind, run.loop_kind
+            )))
+        }
         Some(task) => {
             // Carry the auto-merge opt-in from the issue to the PR (auto-merge
             // 1/3, #41): recorded now, applied in open-pr (non-draft + label
@@ -3808,7 +3824,6 @@ mod tests {
             forge_factory: std::sync::Arc::new(crate::forge::gh::GhForgeFactory),
             config: crate::config::Config::default(),
             project,
-            open_prs: Default::default(),
         };
 
         // Must not panic.

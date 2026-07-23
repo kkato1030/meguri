@@ -1,6 +1,11 @@
-//! The reconcile sweep (issue #142, half B): a light poll-riding pass — like
-//! the reaper and auto-merger — that notices when a *once-shipped* issue's body
-//! was edited and leaves a re-attention signal.
+//! The body-edit reconcile sweep (issue #142, half B): a light poll-riding pass
+//! — like the reaper — that notices when a *once-shipped* issue's body was
+//! edited and leaves a re-attention signal.
+//!
+//! Renamed from `reconcile` to `reconcile_body_edits` (ADR 0012 slice 4): the
+//! bare name `reconcile` now belongs to the level-triggered `reconcile(id)`
+//! contract (ADR 0012 §決定2), so this pre-existing body-edit sweep moves aside
+//! to avoid the collision. The behaviour is unchanged.
 //!
 //! Why a sweep and not the label discovery: after a worker success the issue's
 //! phase label swaps `ready` → `implementing` (ADR 0005), so it drops out of
