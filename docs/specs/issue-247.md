@@ -38,6 +38,9 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
 9. `anchor_verified=Some(false)` の entry は publish 時(clean / cap→final-fix いずれでも)PR `<details>` に表示。
 10. `anchor_verified=Some(false)` の entry は `status=Waived` なので、**#247 以降・以前を問わず ledger-aware な
     binary は fixer に渡さない**(rollback しても ping-pong を再発しない)。
+11. system-waive(`anchor_verified=Some(false)`)は author-waive と区別され、`waive_rate` 等「作者が拒否」を
+    意味する consumer から除外される(ADR 0028 が 0022/0026 を精緻化)。
+12. 「初回 stale → 差し戻し後 clean」でも stale 率が 0% にならない(全 attempt 通算で stale を1回計上)。
 
 ## 触るファイル
 
@@ -110,6 +113,11 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
    **open/fixed/waived の遷移は `status`、`anchor_verified` は「その waive が anchor 失敗由来か」の由来 + 表示/統計**。
    これで f14 の二枚舌を解き、actionability を status に集約して rollback 安全も同時に満たす。fix file 検証や
    pending mirror の特別扱いは不要(Waived が既に非 Open)。stale 率は台帳ではなくイベントから導出(§observability)。
+   **`Waived` は今後 author-waive(ADR 0022、`anchor_verified=None`)と system-waive(anchor 失敗、
+   `anchor_verified=Some(false)`)の2種を含む(f-259b-1)。ADR 0028 が 0022/0026 の `waived` 意味論を精緻化する。
+   「作者が拒否した」を意味する全 consumer は `anchor_verified=Some(false)` を除外**すること。ADR 0026 の
+   `waive_rate`(本 issue では未実装・将来 phase)は author-waive のみを数える。system-waive は `Fixed` に
+   しないので ADR 0026 の捕捉(numerator=fixed)は汚さない。詳細は ADR 0028 §2/§4。
 6. **fresh session の対象**: reviewer ロール = `self-reviewer`(self-review / self-review#N / self-review-anchor
    lane)と `pr-reviewer`(pr-review lane)。author lane(worker/planner/spec-worker + 相乗りする
    fixer/spec-fixer/ci-fixer)は resume 継続。判定は `Lane.reuse_session` に集約し、ロープ名の直 match を避ける。
@@ -132,6 +140,10 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   `mirror_open_to_pending` は `status==Open` だけ写すので Waived は元から入らない。以前の設計は entry を Open のまま
   残し pending 除外だけで守ろうとしたが、それでは (1) の ledger-aware binary を守れない(pr-review 指摘)ため、
   status を Waived に落とす方式へ変更した。
+- **rollback 時の統計劣化は許容(f-259b-1)**: 旧 binary が `status` だけを見ると system-waive を author-waive と
+  数え得る(`anchor_verified` を読めない)。だがこれは実行時契約(ping-pong 再発なし・tree 検証)には触れず、
+  `waive_rate` 等の統計が run 完了までわずかに過大になるだけの一時的劣化。numerator=fixed(ADR 0026)は
+  system-waive を含まないので捕捉数は汚れない。新 binary は `anchor_verified` で正しく除外する。
 - **byte-for-byte 不変の範囲**: 常時 serialize される裸の `bool` だと単一 reviewer 経路の checkpoint が
   変わってしまう。`Option` + `skip_serializing_if` にすることで、`anchor_verification = false`(照合を
   走らせない)なら両フィールドは None のまま **serialize されず byte-for-byte 不変**。照合が走る経路では
@@ -144,10 +156,14 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
 ## observability
 
 - **単一イベント `self_review.anchor_checked`**(f6/f8 の決定): 照合を走らせた reviewer ターンにつき
-  **1回だけ** emit(差し戻し中間状態では出さない → 二重計上しない)。**発火単位を照合単位に一致**させ、
-  parallel は各 `self-review#N` が merge 前に照合するので reviewer ごと・`reviewer_index` 付き、sequential は
-  round ごと。payload = `{ round, reviewer_index, findings_total, stale_count }`。`stale_count` は照合失敗数
-  (新規棄却ぶん + 再リスト Waived 化ぶんの両方)。
+  **1回だけ** emit(イベントは二重に出さない)。**発火単位を照合単位に一致**させ、parallel は各 `self-review#N`
+  が merge 前に照合するので reviewer ごと・`reviewer_index` 付き、sequential は round ごと。
+  payload = `{ round, reviewer_index, findings_total, stale_count }`。
+- **カウントはそのターンの全 attempt を通算する(f-259b-2)**: `findings_total` は照合した `defect` finding の
+  延べ数(初回 + anchor 差し戻し後の再試行を合算)、`stale_count` は失敗の延べ数(新規棄却 + 再リスト Waived 化)。
+  こうしないと「初回 stale → 再試行 clean」が最終試行だけ数えられ `stale_count=0`(0%)になり、stale 出力が
+  定義から漏れる。通算なら findings_total=2, stale_count=1(= stale を1回計上)。各 attempt の stale ⊆ findings
+  なので `stale_count ≤ findings_total`、率は [0,1]。差し戻しの無い parallel/anchor_confirm は attempt 1回分。
 - **stale 率 = Σ`stale_count` / Σ`findings_total`**。**集計は `anchor_checked` イベントのみを母集団にし、
   terminal event に依存しない(f-259-2)。** 既存 `review_stats` は terminal event だけを読み phases=0 の
   グループを落とすため、anchor 照合後に pane 停止などで terminal が出なかった run の `anchor_checked` が
@@ -174,9 +190,13 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
   merge 前に棄却され union に残らないこと、anchor index で `anchor_checked` が出ること。
   (m) **rollback 安全(f-259-1)** — Waived 化した stale 再リストが `fix_turn` の `status==Open` 抽出に入らないこと、
   かつ `mirror_open_to_pending`(Open のみ)にも入らないこと。
+  (q) **system-waive の由来区別(f-259b-1)** — system-waive(`anchor_verified=Some(false)`)と author-waive
+  (`anchor_verified=None`)がともに `status=Waived` でも、由来で分けられること(将来 `waive_rate` が前者を除外できる形)。
 - **unit(stats.rs)**: (h) Σ`findings_total`>0 で率が出る。(i) **Σ`findings_total`=0 → ゼロ除算せず N/A**。
   (o) **terminal event なしでも計上(f-259-2)** — `anchor_checked` は出たが terminal event が無い run でも、
   独立ロールアップの CHECKS/FINDINGS/STALE に反映される(既存 `review_stats` の phases=0 drop に飲まれない)。
+  (r) **初回 stale → 再試行 clean(f-259b-2)** — 全 attempt 通算で `anchor_checked` が `findings_total=2,
+  stale_count=1` になり、stale 率が 0% にならないこと。
 - **unit(app.rs)**: (p) `cmd_stats_review` の anchor セクションが CHECKS/FINDINGS/STALE/STALE% を出し、M=0 で `N/A`。
 - **unit(flow.rs)**: (j) `Lane.reuse_session` が role で正しく分岐。(k) reviewer lane は spawn 前に生存 pane を
   release し、resume 引数なしで spawn する(pane・direct 両モードで、前ターン session に接続しないこと)。
