@@ -237,6 +237,75 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
         .await;
 }
 
+/// Max lines a sanitized pane tail keeps.
+const PANE_TAIL_MAX_LINES: usize = 30;
+/// Max bytes a sanitized pane tail keeps (after masking, before fencing).
+const PANE_TAIL_MAX_BYTES: usize = 4000;
+
+/// Make a pane tail safe to post on a forge (issue #245, spec f5): the raw
+/// screen of a wedged agent can carry ANSI noise, credentials, `@mention`s
+/// and markdown that would break out of a code fence. Diagnosis-only — never
+/// parsed for success. Layers:
+/// 1. ANSI escape sequences and control characters are stripped.
+/// 2. Token-shaped credentials are masked to `‹redacted›` (best-effort: the
+///    shapes that leak into terminal tails, not a DLP guarantee).
+/// 3. Truncated to [`PANE_TAIL_MAX_LINES`] / [`PANE_TAIL_MAX_BYTES`].
+/// 4. Wrapped in a code fence one backtick longer than any run inside, so
+///    the content cannot close the fence; GitHub does not linkify `@`/`#`
+///    inside code blocks.
+pub fn sanitize_pane_tail(lines: &[String]) -> String {
+    use std::sync::OnceLock;
+    static ANSI: OnceLock<regex::Regex> = OnceLock::new();
+    static SECRETS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let ansi = ANSI.get_or_init(|| {
+        // CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL/ST`), and two-byte
+        // escapes; anything the terminal would interpret rather than print.
+        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[@-_]")
+            .expect("static regex")
+    });
+    let secrets = SECRETS.get_or_init(|| {
+        [
+            r"gh[pousr]_[A-Za-z0-9]{20,}",   // GitHub tokens
+            r"sk-[A-Za-z0-9_-]{20,}",        // OpenAI-style keys
+            r"AKIA[0-9A-Z]{16}",             // AWS access key ids
+            r"xox[baprs]-[A-Za-z0-9-]{10,}", // Slack tokens
+            r"(?i)(authorization|bearer|api[-_]?key|token|secret|password)\s*[:=]\s*\S+",
+            r"[A-Fa-f0-9]{40,}",    // long hex runs (keys, sigs)
+            r"[A-Za-z0-9+/=]{60,}", // long base64 runs
+        ]
+        .iter()
+        .map(|p| regex::Regex::new(p).expect("static regex"))
+        .collect()
+    });
+
+    let mut text = lines
+        .iter()
+        .rev()
+        .take(PANE_TAIL_MAX_LINES)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    text = ansi.replace_all(&text, "").into_owned();
+    text.retain(|c| c == '\n' || c == '\t' || !c.is_control());
+    for re in secrets {
+        text = re.replace_all(&text, "‹redacted›").into_owned();
+    }
+    if text.len() > PANE_TAIL_MAX_BYTES {
+        let mut cut = PANE_TAIL_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("…(truncated)");
+    }
+
+    // A fence longer than any backtick run inside cannot be closed early.
+    let longest_backtick_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest_backtick_run + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
 /// The standard needs-human PR comment. `lead` is the site-specific clause
 /// (e.g. "could not resolve the merge conflicts on this PR and needs a human."),
 /// `reason` the underlying detail (quoted below it), and `hint` the closing
@@ -317,6 +386,58 @@ mod tests {
         escalate_issue(&deps, 7, "ci red").await;
 
         assert!(gw.delivered().is_empty());
+    }
+
+    #[test]
+    fn sanitize_pane_tail_masks_credentials_and_strips_ansi() {
+        let lines = vec![
+            "\u{1b}[31mAPI Error:\u{1b}[0m 400 input exceeds the context window".to_string(),
+            "export GITHUB_TOKEN=ghp_0123456789abcdefghijklmnop".to_string(),
+            "authorization: Bearer abc.def.ghi".to_string(),
+            "sk-proj-0123456789abcdefghij more".to_string(),
+            "AKIAABCDEFGHIJKLMNOP used".to_string(),
+        ];
+        let out = sanitize_pane_tail(&lines);
+        assert!(out.contains("API Error:"), "printable text survives: {out}");
+        assert!(!out.contains('\u{1b}'), "ANSI stripped: {out}");
+        assert!(
+            !out.contains("ghp_0123456789"),
+            "github token masked: {out}"
+        );
+        assert!(!out.contains("Bearer abc"), "bearer masked: {out}");
+        assert!(!out.contains("sk-proj-0123456789abcdefghij"), "sk masked");
+        assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "aws key masked");
+        assert!(out.contains("‹redacted›"));
+    }
+
+    #[test]
+    fn sanitize_pane_tail_cannot_be_fence_escaped_and_truncates() {
+        let lines = vec![
+            "before".to_string(),
+            "````".to_string(),
+            "@here #123 <script>".to_string(),
+            // Spaces keep this from reading as one maskable base64/hex run.
+            "lorem ipsum ".repeat(1000),
+        ];
+        let out = sanitize_pane_tail(&lines);
+        // The wrapping fence must be longer than the longest run inside.
+        let fence_len = out.chars().take_while(|c| *c == '`').count();
+        assert!(
+            fence_len >= 5,
+            "fence outruns the embedded ````: {fence_len}"
+        );
+        assert!(out.ends_with(&"`".repeat(fence_len)));
+        assert!(out.contains("…(truncated)"));
+        assert!(out.len() < 6000, "byte cap applies: {}", out.len());
+    }
+
+    #[test]
+    fn sanitize_pane_tail_keeps_only_the_last_30_lines() {
+        let lines: Vec<String> = (0..50).map(|i| format!("line-{i}")).collect();
+        let out = sanitize_pane_tail(&lines);
+        assert!(!out.contains("line-19\n"), "old lines dropped");
+        assert!(out.contains("line-20"), "tail window kept");
+        assert!(out.contains("line-49"));
     }
 
     #[test]

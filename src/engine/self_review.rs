@@ -844,6 +844,12 @@ async fn review_turn(
                     "pane died during self-review".into(),
                 ));
             }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(ReviewTurn::Interrupted(
+                    "agent went quiet during self-review".into(),
+                ));
+            }
         };
 
         match result.status {
@@ -1152,6 +1158,10 @@ fn classify_reviewer_outcome(
         Ok((TurnOutcome::PaneDied, _)) => {
             ReviewerTaskOutcome::Dropped("pane died during review".into())
         }
+        // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+        Ok((TurnOutcome::AgentQuiet { .. }, _)) => {
+            ReviewerTaskOutcome::Dropped("agent went quiet during review".into())
+        }
         Err(e) => ReviewerTaskOutcome::Dropped(format!("review turn errored: {e}")),
     }
 }
@@ -1193,6 +1203,12 @@ async fn anchor_confirm(
         TurnOutcome::PaneDied => {
             return Ok(AnchorOutcome::Interrupted(
                 "pane died during anchor confirmation".into(),
+            ));
+        }
+        // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+        TurnOutcome::AgentQuiet { .. } => {
+            return Ok(AnchorOutcome::Interrupted(
+                "agent went quiet during anchor confirmation".into(),
             ));
         }
     };
@@ -1321,6 +1337,12 @@ async fn fix_turn(
             TurnOutcome::PaneDied => {
                 return Ok(flow::StepFlow::Interrupted(
                     "pane died during self-review fix".into(),
+                ));
+            }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(flow::StepFlow::Interrupted(
+                    "agent went quiet during self-review fix".into(),
                 ));
             }
         };

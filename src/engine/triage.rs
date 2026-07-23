@@ -951,6 +951,12 @@ async fn execute(
             TurnOutcome::PaneDied => {
                 return Ok(ExecuteFlow::Interrupted("pane died during triage".into()));
             }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(ExecuteFlow::Interrupted(
+                    "agent went quiet during triage".into(),
+                ));
+            }
         };
 
         match result.status {

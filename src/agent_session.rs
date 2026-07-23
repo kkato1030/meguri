@@ -31,6 +31,24 @@ fn project_dir_name(worktree: &Path) -> String {
         .collect()
 }
 
+/// Where a specific session's transcript lives for `worktree`.
+pub fn transcript_path(session_root: &Path, worktree: &Path, session_id: &str) -> PathBuf {
+    session_root
+        .join("projects")
+        .join(project_dir_name(worktree))
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// Size in bytes of the session's transcript, or None when it cannot be
+/// found (custom CLI layout, moved config dir, …). Callers treat None as
+/// "cannot judge" and fail open (issue #245): the resume gate lets the
+/// resume proceed rather than guessing.
+pub fn transcript_len(session_root: &Path, worktree: &Path, session_id: &str) -> Option<u64> {
+    std::fs::metadata(transcript_path(session_root, worktree, session_id))
+        .ok()
+        .map(|m| m.len())
+}
+
 /// The newest session id recorded for `worktree`, or None when the agent
 /// never ran there (best-effort: reclamation proceeds either way).
 pub fn latest_session_id(session_root: &Path, worktree: &Path) -> Option<String> {
@@ -89,6 +107,19 @@ mod tests {
             latest_session_id(root.path(), worktree).as_deref(),
             Some("session-new")
         );
+    }
+
+    #[test]
+    fn transcript_len_reads_the_session_file_or_none() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = Path::new("/wt/demo/branch");
+        assert_eq!(transcript_len(root.path(), worktree, "sess-a"), None);
+
+        let dir = root.path().join("projects").join("-wt-demo-branch");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sess-a.jsonl"), "0123456789").unwrap();
+        assert_eq!(transcript_len(root.path(), worktree, "sess-a"), Some(10));
+        assert_eq!(transcript_len(root.path(), worktree, "sess-b"), None);
     }
 
     #[test]

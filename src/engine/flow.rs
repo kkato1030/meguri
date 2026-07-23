@@ -1357,7 +1357,20 @@ async fn ensure_pane(
         if record.mux_kind.as_deref() == Some(deps.mux.kind().as_str())
             && deps.mux.pane_alive(&pane).await.unwrap_or(false)
         {
-            if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
+            // Adopt gate (issue #245): "pane alive" is not "agent alive". A
+            // pane whose agent exited to a bare shell would swallow the
+            // trigger line as a shell command, so a definite absent retires
+            // the pane (kill + reclaim) and falls through to resume/fresh.
+            // None (mux can't tell) adopts as before — fail open.
+            if matches!(deps.mux.agent_present(&pane).await, Ok(Some(false))) {
+                deps.store.emit(
+                    Some(&run.id),
+                    "pane.agent_absent",
+                    json!({ "pane": pane.0, "lane": lane_name }),
+                )?;
+                super::reaper::release_pane(deps, run.issue_number, lane_name, "agent absent")
+                    .await;
+            } else if record.worktree_path.as_deref() == Some(worktree_str.as_ref()) {
                 // Adopt the lane's live pane for this run.
                 deps.store.update_run_mux(
                     &run.id,
@@ -1370,12 +1383,14 @@ async fn ensure_pane(
                     freshly_spawned: false,
                     resumed: false,
                 });
+            } else {
+                // The lane moved to another worktree (e.g. a fresh branch):
+                // the old pane can't see it. Retire it — session id saved —
+                // and respawn below (the saved id makes the respawn a resume,
+                // so the context follows the lane into the new worktree).
+                super::reaper::release_pane(deps, run.issue_number, lane_name, "worktree moved")
+                    .await;
             }
-            // The lane moved to another worktree (e.g. a fresh branch): the
-            // old pane can't see it. Retire it — session id saved — and
-            // respawn below (the saved id makes the respawn a resume, so the
-            // context follows the lane into the new worktree).
-            super::reaper::release_pane(deps, run.issue_number, lane_name, "worktree moved").await;
         }
     }
 
@@ -1383,11 +1398,10 @@ async fn ensure_pane(
 
     // The lane's resumable context lives on the pane row (issue lifetime),
     // not the ephemeral run: written after every completed turn and before
-    // every reclamation.
-    let session_id = deps
-        .store
-        .get_pane(&deps.project.id, run.issue_number, lane_name)?
-        .and_then(|p| p.agent_session_id);
+    // every reclamation. Resuming it is conditional on the session still
+    // being conversable (issue #245) — the transcript-size gate clears a
+    // session that would only produce context-window 400s.
+    let session_id = gated_resume_session(deps, run, worktree, lane).await?;
     if let Some(session_id) = session_id {
         let resumed = match spawn_agent_pane(
             deps,
@@ -1434,6 +1448,81 @@ async fn ensure_pane(
         freshly_spawned: true,
         resumed: false,
     })
+}
+
+/// The lane's saved session id, after the resume-health gate (issue #245):
+/// resume must mean "the conversation is still alive", not just "an id is on
+/// record". A transcript past the profile's size limit is the signature of a
+/// session at its context limit — resuming it yields nothing but API 400s —
+/// so the gate retires the pane, clears the id, and lets the caller fall back
+/// to a fresh spawn with full re-injection (prompts are self-contained).
+///
+/// The gate is the single size authority and resolves the transcript root
+/// from the lane's pinned profile (spec f4) — id *acquisition* elsewhere
+/// (reaper rescans with the default root) stays best-effort precisely because
+/// any stale/mis-rooted id saved there is re-measured here before a resume.
+/// An unlocatable transcript fails open (`pane.resume_gate_skipped`): the
+/// quiet-strike ladder is the backstop for dead sessions it lets through.
+async fn gated_resume_session(
+    deps: &Deps,
+    run: &RunRecord,
+    worktree: &Path,
+    lane: &Lane,
+) -> Result<Option<String>> {
+    let lane_name = lane.lane.as_str();
+    let Some(record) = deps
+        .store
+        .get_pane(&deps.project.id, run.issue_number, lane_name)?
+    else {
+        return Ok(None);
+    };
+    let Some(session_id) = record.agent_session_id else {
+        return Ok(None);
+    };
+    let limit = lane.profile.resume_transcript_limit_bytes;
+    if limit == 0 {
+        return Ok(Some(session_id));
+    }
+    // The transcript lives under the cwd the session actually ran in: the
+    // pane row's worktree when recorded (the lane may have moved since),
+    // else the current worktree.
+    let session_worktree = record
+        .worktree_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| worktree.to_path_buf());
+    let root = agent_session::session_root(&lane.profile);
+    match agent_session::transcript_len(&root, &session_worktree, &session_id) {
+        None => {
+            deps.store.emit(
+                Some(&run.id),
+                "pane.resume_gate_skipped",
+                json!({ "reason": "transcript_not_found",
+                        "lane": lane_name, "agent_session_id": session_id }),
+            )?;
+            Ok(Some(session_id))
+        }
+        Some(bytes) if bytes > limit => {
+            // Kill + reclaim BEFORE clearing the id: `release_pane` re-saves
+            // the freshest transcript id as its reversibility net, so the
+            // clear must come after to win. A pane-less lane makes the
+            // release a no-op and the clear still lands.
+            super::reaper::release_pane(deps, run.issue_number, lane_name, "transcript oversize")
+                .await;
+            deps.store
+                .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
+            deps.store.update_run_agent_session(&run.id, None)?;
+            deps.store.emit(
+                Some(&run.id),
+                "agent_session.cleared",
+                json!({ "reason": "transcript_oversize", "lane": lane_name,
+                        "bytes": bytes, "limit": limit,
+                        "agent_session_id": session_id }),
+            )?;
+            Ok(None)
+        }
+        Some(_) => Ok(Some(session_id)),
+    }
 }
 
 /// Spawn the agent pane (optionally resuming a native session) and persist
@@ -1962,16 +2051,7 @@ async fn run_turn_in(
         }
     };
 
-    record_agent_session(
-        deps,
-        run,
-        worktree,
-        lane.lane.as_str(),
-        pane.as_ref(),
-        resumed,
-        &outcome,
-    )
-    .await?;
+    record_agent_session(deps, run, worktree, lane, pane.as_ref(), resumed, &outcome).await?;
 
     let (outcome_str, result_json) = match &outcome {
         TurnOutcome::Completed(r) => (
@@ -1982,10 +2062,94 @@ async fn run_turn_in(
         ),
         TurnOutcome::Stopped => ("stopped".to_string(), None),
         TurnOutcome::PaneDied => ("pane_died".to_string(), None),
+        TurnOutcome::AgentQuiet { .. } => ("agent_quiet".to_string(), None),
     };
     deps.store
         .finish_turn(&prepared.turn_id, &outcome_str, result_json.as_deref())?;
+
+    // Normalize AgentQuiet here, at the single flow choke point (issue #245):
+    // callers keep seeing only Completed/Stopped/PaneDied. The strike ladder
+    // decides between "retry" (PaneDied → the usual Interrupted redispatch)
+    // and "hand to a human" (Err(NeedsHuman) → the flavor's escalate path).
+    if let TurnOutcome::AgentQuiet { tail } = outcome {
+        let outcome = handle_agent_quiet(deps, run, lane, &prepared.turn_id, tail).await?;
+        return Ok((outcome, prepared.turn_id));
+    }
     Ok((outcome, prepared.turn_id))
+}
+
+/// Strikes of consecutive agent_quiet before the session is rotated: the
+/// first quiet gets one more resume (a one-off hiccup deserves grace), the
+/// second proves the session dead.
+const QUIET_STRIKE_CLEAR: i64 = 2;
+/// Strikes before a human takes over: quiet even after a fresh session means
+/// the environment (profile, CLI, credentials), not the session, is broken —
+/// more rotations would loop forever.
+const QUIET_STRIKE_HUMAN: i64 = 3;
+
+/// The quiet-strike ladder (issue #245): count consecutive quiet turns per
+/// lane, rotate the session at [`QUIET_STRIKE_CLEAR`], escalate at
+/// [`QUIET_STRIKE_HUMAN`]. Owns all session/pane state for the quiet path —
+/// `record_agent_session` never sees an `AgentQuiet` (it no-ops on it), so
+/// the two can't double-clear. The counter is reset only by a completed turn;
+/// deliberately NOT by the rotation itself, which would reset the ladder and
+/// make the human rung unreachable.
+async fn handle_agent_quiet(
+    deps: &Deps,
+    run: &RunRecord,
+    lane: &Lane,
+    turn_id: &str,
+    tail: Vec<String>,
+) -> Result<TurnOutcome> {
+    let lane_name = lane.lane.as_str();
+    let strikes =
+        deps.store
+            .bump_pane_quiet_strikes(&deps.project.id, run.issue_number, lane_name)?;
+    // Raw tail stays inside the local trust boundary (the events table);
+    // anything leaving for the forge below goes through sanitize_pane_tail.
+    deps.store.emit(
+        Some(&run.id),
+        "turn.agent_quiet",
+        json!({ "turn_id": turn_id, "lane": lane_name, "strikes": strikes, "tail": tail }),
+    )?;
+
+    if strikes >= QUIET_STRIKE_HUMAN {
+        let diagnosis = if deps.config.limits.escalation_pane_tail {
+            format!(
+                "\n\npane tail (diagnosis only — success is still judged by the \
+                 result-file contract):\n{}",
+                super::escalation::sanitize_pane_tail(&tail)
+            )
+        } else {
+            String::new()
+        };
+        return Err(NeedsHuman(format!(
+            "agent went quiet {strikes} turns in a row on issue #{} ({lane_name} lane) — \
+             nudges and a fresh session did not revive it, so the profile/environment \
+             looks broken{diagnosis}",
+            run.issue_number
+        ))
+        .into());
+    }
+    if strikes >= QUIET_STRIKE_CLEAR {
+        // Kill + reclaim first, clear the id second (`release_pane` re-saves
+        // the freshest transcript id, so the clear must come after): the next
+        // dispatch then has nothing to adopt and nothing to resume — a
+        // guaranteed fresh spawn with full re-injection.
+        super::reaper::release_pane(deps, run.issue_number, lane_name, "quiet loop").await;
+        deps.store
+            .save_pane_session(&deps.project.id, run.issue_number, lane_name, None)?;
+        deps.store.update_run_agent_session(&run.id, None)?;
+        deps.store.emit(
+            Some(&run.id),
+            "agent_session.cleared",
+            json!({ "reason": "quiet_loop", "lane": lane_name, "strikes": strikes }),
+        )?;
+    }
+    // Strike 1 keeps pane and session: the next dispatch adopts/resumes and
+    // may simply recover. Either way the run takes the usual Interrupted
+    // redispatch path.
+    Ok(TurnOutcome::PaneDied)
 }
 
 /// Spawn one direct-mode turn (issue #169): `{command} {args} {direct_args}
@@ -2007,10 +2171,9 @@ async fn spawn_direct_process(
     let lane_name = lane.lane.as_str();
     let profile = &lane.profile;
 
-    let session_id = deps
-        .store
-        .get_pane(&deps.project.id, run.issue_number, lane_name)?
-        .and_then(|p| p.agent_session_id);
+    // Same resume-health gate as the pane path (issue #245): an oversized
+    // transcript is cleared instead of resumed.
+    let session_id = gated_resume_session(deps, run, worktree, lane).await?;
 
     let mut args = profile.args.clone();
     args.extend(profile.direct_args.iter().cloned());
@@ -2064,18 +2227,28 @@ async fn spawn_direct_process(
 /// `runs.agent_session_id` is still written for observability. A resumed
 /// executor dying without a result means the stored id no longer restores a
 /// working session, so drop it rather than resume-loop on it forever.
+///
+/// The transcript root comes from the lane's pinned profile (issue #245,
+/// spec f4) — a named profile with its own `session_dir` would otherwise
+/// have its sessions recorded from (and misjudged against) the default
+/// agent's directory. An `AgentQuiet` outcome is deliberately a no-op here:
+/// [`handle_agent_quiet`] owns that path's session state.
 async fn record_agent_session(
     deps: &Deps,
     run: &RunRecord,
     worktree: &Path,
-    lane_name: &str,
+    lane: &Lane,
     pane: Option<&PaneId>,
     resumed: bool,
     outcome: &TurnOutcome,
 ) -> Result<()> {
+    let lane_name = lane.lane.as_str();
     match outcome {
         TurnOutcome::Completed(r) => {
-            let session_root = agent_session::session_root(&deps.config.agent);
+            // The session answered — the lane's quiet-strike ladder resets.
+            deps.store
+                .reset_pane_quiet_strikes(&deps.project.id, run.issue_number, lane_name)?;
+            let session_root = agent_session::session_root(&lane.profile);
             let session_id = match agent_session::latest_session_id(&session_root, worktree) {
                 Some(id) => Some(id),
                 None => match &r.agent_session_id {
@@ -2153,6 +2326,12 @@ async fn execute(
             TurnOutcome::Stopped => return Ok(StepFlow::Stopped),
             TurnOutcome::PaneDied => {
                 return Ok(StepFlow::Interrupted("pane died during execute".into()));
+            }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(StepFlow::Interrupted(
+                    "agent went quiet during execute".into(),
+                ));
             }
         };
 
@@ -2351,6 +2530,12 @@ pub(crate) async fn validate(
             TurnOutcome::Stopped => return Ok(StepFlow::Stopped),
             TurnOutcome::PaneDied => {
                 return Ok(StepFlow::Interrupted("pane died during validate".into()));
+            }
+            // Normalized inside run_turn_in (issue #245); kept for exhaustiveness.
+            TurnOutcome::AgentQuiet { .. } => {
+                return Ok(StepFlow::Interrupted(
+                    "agent went quiet during validate".into(),
+                ));
             }
         }
     }

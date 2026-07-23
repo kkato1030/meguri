@@ -69,6 +69,15 @@ pub enum TurnOutcome {
     /// (direct launch mode, issue #169). Both map to the same Interrupted
     /// handling upstream — callers never need to know which executor ran.
     PaneDied,
+    /// The agent exhausted its nudges without producing a result (issue
+    /// #245): the pane is alive but the session may be unrecoverable
+    /// (context-limit 400 loop, wedged CLI). `tail` is the pane's last
+    /// screen lines for diagnosis only — never for judging success.
+    ///
+    /// Normalized inside `flow::run_turn_in` (strike counting → session
+    /// rotation → needs-human); it never reaches the loop flavors, which
+    /// keep matching only the three variants above.
+    AgentQuiet { tail: Vec<String> },
 }
 
 /// A prepared-but-not-yet-injected turn.
@@ -132,8 +141,10 @@ impl TurnEngine {
     /// Wait for the turn identified by `turn_id` to complete in `pane`.
     ///
     /// Never fails the turn because of silence or human activity: quiet
-    /// agents get nudged then escalated to a human; the only exits are a
-    /// matching result file, an explicit stop, or the pane dying.
+    /// agents get nudged, and when the nudges run out the quiet is returned
+    /// as [`TurnOutcome::AgentQuiet`] for the flow layer to judge (issue
+    /// #245) — the exits are a matching result file, an explicit stop, the
+    /// pane dying, or the agent staying quiet past its nudge budget.
     ///
     /// `isolated` (issue #214) must match the flag the turn was prepared with:
     /// it selects which result file the stagnation nudge names, so a nudged
@@ -289,8 +300,23 @@ impl TurnEngine {
                 }
             }
 
-            // 5. Stagnation: nudge, then hand to a human. Never auto-fail.
+            // 5. Stagnation: nudge, then return the quiet to the flow layer
+            // (issue #245) — parking here would let an unrecoverable session
+            // resume-loop forever with a human as the only way out.
             if state != AgentState::Blocked && !escalated && activity_clock >= self.cfg.idle_grace {
+                // A quiet pane may have lost its agent entirely (bare shell
+                // after a crash): typing a nudge into a shell is useless and
+                // noisy, so ask the mux first. Only a definite "absent" acts;
+                // None keeps the normal nudge path (fail open).
+                if let Ok(Some(false)) = self.mux.agent_present(pane).await {
+                    control
+                        .event(
+                            "turn.pane_died",
+                            json!({ "turn_id": turn_id, "reason": "agent_absent" }),
+                        )
+                        .await;
+                    return Ok(TurnOutcome::PaneDied);
+                }
                 if nudges_sent < self.cfg.nudge_limit {
                     // Only type into the pane when the agent is not mid-output
                     // and no human question is pending (checked above).
@@ -306,19 +332,8 @@ impl TurnEngine {
                         )
                         .await;
                 } else {
-                    escalated = true;
-                    interaction = InteractionState::AwaitingHuman;
-                    control.set_interaction(interaction).await;
-                    control
-                        .event(
-                            "turn.awaiting_human",
-                            json!({
-                                "turn_id": turn_id,
-                                "reason": "agent_quiet",
-                                "attach": self.mux.attach_command(pane),
-                            }),
-                        )
-                        .await;
+                    let tail = self.mux.read_tail(pane, 30).await.unwrap_or_default();
+                    return Ok(TurnOutcome::AgentQuiet { tail });
                 }
             }
 
