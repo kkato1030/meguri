@@ -1,6 +1,6 @@
 # spec: issue #247 — blocking finding の anchor 機械照合と reviewer turn の fresh session 既定化
 
-> 使い捨ての足場(ADR 0001)。恒久的な設計判断は **ADR 0028** に、実装完了時にこの spec は消す。
+> 使い捨ての足場(ADR 0001)。恒久的な設計判断は **ADR 0031** に、実装完了時にこの spec は消す。
 
 ## なぜこの深さ(design tier)か
 
@@ -39,7 +39,7 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
 10. `anchor_verified=Some(false)` の entry は `status=Waived` なので、**#247 以降・以前を問わず ledger-aware な
     binary は fixer に渡さない**(rollback しても ping-pong を再発しない)。
 11. system-waive(`anchor_verified=Some(false)`)は author-waive と区別され、`waive_rate` 等「作者が拒否」を
-    意味する consumer から除外される(ADR 0028 が 0022/0026 を精緻化)。
+    意味する consumer から除外される(ADR 0031 が 0022/0026 を精緻化)。
 12. 「初回 stale → 差し戻し後 clean」でも stale 率が 0% にならない(全 attempt 通算で stale を1回計上)。
 
 ## 触るファイル
@@ -114,15 +114,15 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
    これで f14 の二枚舌を解き、actionability を status に集約して rollback 安全も同時に満たす。fix file 検証や
    pending mirror の特別扱いは不要(Waived が既に非 Open)。stale 率は台帳ではなくイベントから導出(§observability)。
    **`Waived` は今後 author-waive(ADR 0022、`anchor_verified=None`)と system-waive(anchor 失敗、
-   `anchor_verified=Some(false)`)の2種を含む(f-259b-1)。ADR 0028 が 0022/0026 の `waived` 意味論を精緻化する。
+   `anchor_verified=Some(false)`)の2種を含む(f-259b-1)。ADR 0031 が 0022/0026 の `waived` 意味論を精緻化する。
    「作者が拒否した」を意味する全 consumer は `anchor_verified=Some(false)` を除外**すること。ADR 0026 の
    `waive_rate`(本 issue では未実装・将来 phase)は author-waive のみを数える。system-waive は `Fixed` に
-   しないので ADR 0026 の捕捉(numerator=fixed)は汚さない。詳細は ADR 0028 §2/§4。
+   しないので ADR 0026 の捕捉(numerator=fixed)は汚さない。詳細は ADR 0031 §2/§4。
 6. **fresh session の対象**: reviewer ロール = `self-reviewer`(self-review / self-review#N / self-review-anchor
    lane)と `pr-reviewer`(pr-review lane)。author lane(worker/planner/spec-worker + 相乗りする
    fixer/spec-fixer/ci-fixer)は resume 継続。判定は `Lane.reuse_session` に集約し、ロープ名の直 match を避ける。
    **session id を読まないだけでなく、spawn 前に生存 pane を畳む**(§触るファイル `flow.rs`)。
-7. **pr-reviewer は anchor 照合をやらない**(ADR 0028 スコープ)。pr-reviewer は prose findings 契約のままで、
+7. **pr-reviewer は anchor 照合をやらない**(ADR 0031 スコープ)。pr-reviewer は prose findings 契約のままで、
    #247 では **fresh session だけ**効かせる。構造 anchor は将来の follow-up。#231 の実インシデント(pr-reviewer
    resume で stale 再主張)は **B の fresh session** が直接閉じる。
 8. **config トグル**: `[review].anchor_verification`(既定 true)。false で A を無効化(rollback)。
@@ -211,5 +211,5 @@ A と B は関連するが独立にレビュー/rollback 可能。ただし #247
 
 ## 実装しないこと
 
-- pr-reviewer の finding 構造化・anchor 照合(将来 follow-up、ADR 0028 スコープ外)。
+- pr-reviewer の finding 構造化・anchor 照合(将来 follow-up、ADR 0031 スコープ外)。
 - P1/P2/P4/P5/P6 系(設計書 #241 の別 issue)。

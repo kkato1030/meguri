@@ -1,4 +1,4 @@
-# ADR 0028: blocking finding は現物引用で機械照合し、reviewer ターンは fresh session を既定にする
+# ADR 0031: blocking finding は現物引用で機械照合し、reviewer ターンは fresh session を既定にする
 
 - Status: proposed
 - Date: 2026-07-22
