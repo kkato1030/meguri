@@ -41,7 +41,7 @@ use super::flow::{self, Checkpoint, Flavor, Kind, NeedsHuman};
 use super::{Deps, Target};
 use crate::forge::{self, Forge};
 use crate::store::RunRecord;
-use crate::tasks::TaskKind;
+
 use crate::turn::{ChildIssue, TurnResultFile};
 
 /// `runs.loop_kind` value for planner runs.
@@ -111,23 +111,12 @@ impl super::Loop for PlannerLoop {
     }
 
     async fn discover(&self, deps: &Deps) -> Result<Vec<Target>> {
-        // The planner ships a spec *PR*, so it needs a forge. Local mode has
-        // no planner yet (issue #54 Phase 3): a local `plan` task stays
-        // queued and dormant rather than being driven into a forge call.
-        if deps.forge.is_none() {
-            return Ok(Vec::new());
-        }
-        Ok(deps
-            .task_source
-            .discover(TaskKind::Plan)
-            .await?
-            .into_iter()
-            .map(|t| Target {
-                key: t.key,
-                title: t.title,
-                cadence_label: t.cadence_label,
-            })
-            .collect())
+        // Discovery moved to the Issue Kind reconciler (ADR 0012 S4 決定1):
+        // `issue_reconciler::reconcile_issues` observes every open issue once
+        // and enqueues the planner arm itself. This stub keeps the transitional
+        // `Loop` registration dispatchable until 決定7 removes the trait.
+        let _ = deps;
+        Ok(Vec::new())
     }
 
     async fn drive(&self, deps: &Deps, run_id: &str) -> Result<WorkerOutcome> {

@@ -21,24 +21,17 @@ use super::planner;
 use crate::config::PlanDelivery;
 use crate::forge;
 
-/// Flip every `speccing` issue whose spec PR merged to `ready` (separate mode).
-pub async fn sweep(deps: &Deps) -> Result<()> {
-    if deps.forge.is_none() {
-        return Ok(()); // local mode has no planner / PRs
-    }
-    if deps.project.plan_delivery != PlanDelivery::Separate {
+/// One issue through the handoff — the `Op(Handoff)` act of the Issue Kind
+/// decider (ADR 0012 §決定5; the old standalone sweep's per-issue body). The
+/// caller (`issue_reconciler::process_issue_identity`) picked the branch; this
+/// act re-verifies everything (delivery mode, merged spec PR, not a decompose
+/// proposal, no human stop) before flipping `speccing → ready`, so a drifted
+/// observation degrades to a no-op.
+pub async fn handoff_issue(deps: &Deps, issue: i64, labels: &[String]) -> Result<()> {
+    if deps.forge.is_none() || deps.project.plan_delivery != PlanDelivery::Separate {
         return Ok(()); // combined delivery hands off via the spec worker
     }
-    for issue in deps
-        .forge()
-        .list_issues_with_label(forge::LABEL_SPECCING)
-        .await?
-    {
-        if let Err(e) = process_issue(deps, issue.number, &issue.labels).await {
-            tracing::warn!("handoff sweep failed for issue #{}: {e:#}", issue.number);
-        }
-    }
-    Ok(())
+    process_issue(deps, issue, labels).await
 }
 
 /// One issue through the handoff. A held / claimed / escalated issue is left

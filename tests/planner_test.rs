@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meguri::config::{Config, LaunchMode, ProjectConfig, WorkspaceConfig};
+use meguri::engine::issue_reconciler;
 use meguri::engine::planner::{
-    self, DECOMPOSED_MARKER, PlannerLoop, decompose_child_footer, run_planner, spec_rel_path,
+    self, DECOMPOSED_MARKER, decompose_child_footer, run_planner, spec_rel_path,
 };
 use meguri::engine::worker;
-use meguri::engine::{Deps, Loop, WorkerOutcome};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
     Forge, ForgeFactory, Issue, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_PLAN, LABEL_READY,
@@ -922,11 +923,29 @@ async fn planner_discovery_filters_hold_working_and_shipped() {
         });
     }
 
-    let targets = PlannerLoop.discover(&env.deps).await.unwrap();
+    // Discovery is the Issue Kind reconciler now (ADR 0012 S4 決定1): one
+    // pass enqueues a planner run for the actionable issue only.
+    async fn enqueued(deps: &Deps) -> Vec<meguri::store::RunRecord> {
+        issue_reconciler::reconcile_issues(deps, &Default::default())
+            .await
+            .unwrap();
+        deps.store
+            .list_runs(true)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.loop_kind == planner::KIND && r.status == RunStatus::Queued)
+            .collect()
+    }
+    let runs = enqueued(&env.deps).await;
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
         vec![5]
     );
+    // Retire it so later passes are not blocked by the issue-wide reservation.
+    env.deps
+        .store
+        .update_run_status(&runs[0].id, RunStatus::Skipped, None)
+        .unwrap();
 
     // A *worker* success on the issue must not block the planner...
     let done = env
@@ -938,7 +957,12 @@ async fn planner_discovery_filters_hold_working_and_shipped() {
         .store
         .update_run_status(&done.id, RunStatus::Succeeded, None)
         .unwrap();
-    assert_eq!(PlannerLoop.discover(&env.deps).await.unwrap().len(), 1);
+    let runs = enqueued(&env.deps).await;
+    assert_eq!(runs.len(), 1);
+    env.deps
+        .store
+        .update_run_status(&runs[0].id, RunStatus::Skipped, None)
+        .unwrap();
 
     // ...but a planner success does (the plan label lingered).
     let shipped = create_planner_run(&env);
@@ -946,32 +970,57 @@ async fn planner_discovery_filters_hold_working_and_shipped() {
         .store
         .update_run_status(&shipped.id, RunStatus::Succeeded, None)
         .unwrap();
-    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+    assert!(enqueued(&env.deps).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn planner_discovery_gates_on_unresolved_blockers() {
     let env = setup(None).await;
 
-    // Open blocker: skipped.
+    let queued_planner_runs = |deps: &Deps| {
+        deps.store
+            .list_runs(true)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.loop_kind == planner::KIND && r.status == RunStatus::Queued)
+            .collect::<Vec<_>>()
+    };
+
+    // Open blocker: skipped (no run enqueued).
     env.forge.block_issue(5, 4);
-    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+    issue_reconciler::reconcile_issues(&env.deps, &Default::default())
+        .await
+        .unwrap();
+    assert!(queued_planner_runs(&env.deps).is_empty());
 
     // duplicate does not resolve the dependency either (same as not_planned).
     env.forge.close_issue_as(4, "duplicate");
-    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+    issue_reconciler::reconcile_issues(&env.deps, &Default::default())
+        .await
+        .unwrap();
+    assert!(queued_planner_runs(&env.deps).is_empty());
 
     // Only closed-as-completed lets the issue through.
     env.forge.close_issue(4);
-    let targets = PlannerLoop.discover(&env.deps).await.unwrap();
+    issue_reconciler::reconcile_issues(&env.deps, &Default::default())
+        .await
+        .unwrap();
+    let runs = queued_planner_runs(&env.deps);
     assert_eq!(
-        targets.iter().map(|t| t.key.number()).collect::<Vec<_>>(),
+        runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
         vec![5]
     );
+    env.deps
+        .store
+        .update_run_status(&runs[0].id, RunStatus::Skipped, None)
+        .unwrap();
 
     // Unreadable blockers count as unresolved, never as resolved.
     env.forge.fail_blocked_by(5);
-    assert!(PlannerLoop.discover(&env.deps).await.unwrap().is_empty());
+    issue_reconciler::reconcile_issues(&env.deps, &Default::default())
+        .await
+        .unwrap();
+    assert!(queued_planner_runs(&env.deps).is_empty());
 
     // Every skip above was silent: no comment, no extra label.
     assert!(env.forge.comments_of(5).is_empty());

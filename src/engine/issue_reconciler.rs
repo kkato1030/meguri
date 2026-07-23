@@ -589,6 +589,14 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
         if let Err(e) = super::reaper::finalize(deps, &std::collections::HashSet::new()).await {
             tracing::warn!("finalize failed for {}: {e:#}", deps.project.id);
         }
+        // The third decider (決定1 / f1): local `TaskKey::Local` identities.
+        // The local task source's discover is the bulk observation (it already
+        // applies the local not-before gate and returns queued/needs_human
+        // rows); `next_step_local` owns the decision, and the unique
+        // (project, loop, task) run index is the enqueue dedup.
+        if let Err(e) = reconcile_local(deps).await {
+            tracing::warn!("local reconcile failed for {}: {e:#}", deps.project.id);
+        }
         return Ok(());
     }
     // The sweep runs whenever there is a forge: the fixer family (conflict / CI
@@ -646,12 +654,12 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
         tracing::warn!("body-edit reconcile failed for {}: {e:#}", deps.project.id);
     }
-    // Separate-delivery plan→impl handoff (ADR 0012 §決定5): a merged spec PR
-    // advances its `speccing` issue to `ready`. Folded out of the tick's
-    // standalone sweep into the Issue Kind pass (the full `Op(Handoff)` branch of
-    // `next_step_issue` folds in with the issue-side observe).
-    if let Err(e) = super::plan_handoff::sweep(deps).await {
-        tracing::warn!("handoff reconcile failed for {}: {e:#}", deps.project.id);
+    // Issue-side reconcile (ADR 0012 §決定1): one bulk observe of every open
+    // issue, the pure `next_step_issue` per identity, then enqueue the chosen
+    // planner/worker arm or run the `Op(Handoff)` act (決定5 — the old
+    // plan_handoff sweep, now the merged-spec branch of the decider).
+    if let Err(e) = reconcile_issues(deps, &open_pr_issues).await {
+        tracing::warn!("issue-side reconcile failed for {}: {e:#}", deps.project.id);
     }
     // Approved decomposition proposals → child issues + dependencies (ADR 0012
     // §決定4, decompose_materializer → PR-side act). Forge-only, like the merge
@@ -2172,6 +2180,215 @@ mod tests {
             }
         }
     }
+}
+
+// ===========================================================================
+// Issue-side observe → decide → enqueue wiring (ADR 0012 slice 4, 決定1).
+// ===========================================================================
+
+/// Issue-side reconcile: one bulk observe of every open issue, the pure
+/// [`next_step_issue`] per identity, then act. Per-issue failures warn and
+/// retry next resync; they never abort the pass. The per-pass cadence
+/// allowance (`remaining`) is shared across issues so one pass never
+/// over-reserves a bucket (finding 3).
+pub async fn reconcile_issues(
+    deps: &Deps,
+    open_pr_issues: &std::collections::HashSet<i64>,
+) -> Result<()> {
+    let issues = deps.forge().list_open_issues().await?;
+    let mut remaining: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for issue in issues {
+        if let Err(e) = process_issue_identity(deps, &issue, open_pr_issues, &mut remaining).await {
+            tracing::warn!("issue reconcile failed for #{}: {e:#}", issue.number);
+        }
+    }
+    Ok(())
+}
+
+/// One issue identity through observe-reduce → `next_step_issue` → act.
+async fn process_issue_identity(
+    deps: &Deps,
+    issue: &forge::Issue,
+    open_pr_issues: &std::collections::HashSet<i64>,
+    remaining: &mut std::collections::HashMap<String, i64>,
+) -> Result<()> {
+    let has = |l: &str| issue.has_label(l);
+    let mut snap = IssueSnapshot {
+        human_stop: has(forge::LABEL_HOLD) || has(forge::LABEL_NEEDS_HUMAN),
+        has_open_meguri_pr: open_pr_issues.contains(&issue.number),
+        // `working` label OR run liveness (finding 3: the label skip is
+        // doubled with `issue_busy` so a stale label from a crashed run
+        // cannot deadlock, and a live run without its label cannot double).
+        issue_busy: has(forge::LABEL_WORKING)
+            || deps
+                .store
+                .issue_has_active_author_run(&deps.project.id, issue.number)?,
+        has_plan: has(forge::LABEL_PLAN),
+        has_ready: has(forge::LABEL_READY),
+        has_speccing: has(forge::LABEL_SPECCING),
+        has_implementing: has(forge::LABEL_IMPLEMENTING),
+        spec_pr_state: None,
+        already_shipped: false,
+        not_before_wait: false,
+        deps_unmet: false,
+        cadence_full: false,
+    };
+    // The discovery gates cost API calls (dependencies) and reserve cadence,
+    // so they are only evaluated when the decider would otherwise reach a
+    // new-work arm — the same laziness the old per-label discover had.
+    let reaches_new_work = !snap.human_stop
+        && !snap.has_open_meguri_pr
+        && !snap.issue_busy
+        && (snap.has_plan || snap.has_ready);
+    let mut cadence_label: Option<String> = None;
+    if reaches_new_work {
+        let loop_kind = if snap.has_plan {
+            super::planner::KIND
+        } else {
+            super::worker::KIND
+        };
+        match deps
+            .task_source
+            .evaluate_issue(loop_kind, issue, remaining)
+            .await?
+        {
+            crate::tasks::GateVerdict::Pass { cadence_label: c } => cadence_label = c,
+            crate::tasks::GateVerdict::Shipped => snap.already_shipped = true,
+            crate::tasks::GateVerdict::Hold(d) => match d {
+                crate::cadence::Disposition::WaitingNotBefore { .. }
+                | crate::cadence::Disposition::UnparsableNotBefore { .. } => {
+                    snap.not_before_wait = true;
+                }
+                crate::cadence::Disposition::Blocked => snap.deps_unmet = true,
+                crate::cadence::Disposition::WaitingCadence { .. }
+                | crate::cadence::Disposition::ConflictingCadenceLabels { .. } => {
+                    snap.cadence_full = true;
+                }
+                crate::cadence::Disposition::Ready => {}
+            },
+        }
+    }
+    // A `speccing` issue with no open PR needs its spec PR's terminal state
+    // for the handoff branch (決定5 / f3): a targeted per-issue read, like the
+    // old plan_handoff sweep. Separate delivery only — combined hands off via
+    // the spec worker on the PR side.
+    if snap.has_speccing
+        && !snap.human_stop
+        && !snap.has_open_meguri_pr
+        && !snap.issue_busy
+        && !snap.has_plan
+        && !snap.has_ready
+        && deps.project.plan_delivery == crate::config::PlanDelivery::Separate
+    {
+        snap.spec_pr_state = observe_spec_pr_state(deps, issue.number).await?;
+    }
+
+    match next_step_issue(&snap, Mode::Reconcile) {
+        IssueStep::Agent(arm) => {
+            // The issue-wide reservation was read into `issue_busy`; the
+            // per-loop unique run index is the atomic backstop — a create
+            // failure is a benign race, retried next resync.
+            if let Ok(run) = deps.store.create_run_for_loop_cadence(
+                &deps.project.id,
+                arm.loop_kind(),
+                issue.number,
+                &issue.title,
+                cadence_label.as_deref(),
+            ) {
+                deps.store.emit(
+                    Some(&run.id),
+                    "run.discovered",
+                    json!({ "key": format!("Issue({})", issue.number),
+                            "title": issue.title, "loop": arm.loop_kind() }),
+                )?;
+                deps.store.emit(
+                    Some(&run.id),
+                    "reconciler.enqueued",
+                    json!({ "arm": arm.loop_kind(), "issue": issue.number }),
+                )?;
+            }
+        }
+        IssueStep::Op(IssueOp::Handoff) => {
+            // The act re-verifies (merged spec PR, not a decompose proposal)
+            // before flipping speccing → ready — defense in depth against a
+            // drifted observation.
+            super::plan_handoff::handoff_issue(deps, issue.number, &issue.labels).await?;
+        }
+        IssueStep::Wait(reason) | IssueStep::Skip(reason) => {
+            tracing::debug!("issue #{}: reconciler — {reason}", issue.number);
+        }
+    }
+    Ok(())
+}
+
+/// The terminal state of a `speccing` issue's recorded spec PR (決定5 / f3):
+/// the branch the planner recorded, resolved to its PR's state. `None` when no
+/// spec PR was recorded or it cannot be read (waits for the next resync), and
+/// for a decompose proposal (the materializer owns it, never the handoff).
+async fn observe_spec_pr_state(deps: &Deps, issue: i64) -> Result<Option<SpecPrState>> {
+    let Some(branch) =
+        deps.store
+            .branch_for_issue(&deps.project.id, super::planner::KIND, issue)?
+    else {
+        return Ok(None);
+    };
+    let Some(pr) = deps.forge().pr_for_branch(&branch).await? else {
+        return Ok(None);
+    };
+    if super::planner::is_decompose_proposal(&pr.body) {
+        return Ok(None);
+    }
+    Ok(Some(match pr.state.as_str() {
+        "open" => SpecPrState::Open,
+        "merged" => SpecPrState::Merged,
+        _ => SpecPrState::ClosedUnmerged,
+    }))
+}
+
+/// The local-mode reconcile (決定1 / f1, third decider): the local task
+/// source's discover is the bulk observation, `next_step_local` decides, the
+/// unique (project, loop, task) run index dedups the enqueue.
+async fn reconcile_local(deps: &Deps) -> Result<()> {
+    for task in deps
+        .task_source
+        .discover(crate::tasks::TaskKind::Work)
+        .await?
+    {
+        let crate::tasks::TaskKey::Local(id) = task.key else {
+            continue;
+        };
+        // The source already applied the local gates (not-before, status);
+        // the snapshot reflects the observed post-gate state.
+        let snap = LocalSnapshot {
+            human_stop: false,
+            issue_busy: false,
+            already_shipped: false,
+            not_before_wait: false,
+            deps_unmet: false,
+            cadence_full: false,
+        };
+        if let LocalStep::Agent(LocalArm::Worker) = next_step_local(&snap, Mode::Reconcile)
+            && let Ok(run) = deps.store.create_run_for_task(
+                &deps.project.id,
+                super::worker::KIND,
+                id,
+                &task.title,
+            )
+        {
+            deps.store.emit(
+                Some(&run.id),
+                "run.discovered",
+                json!({ "key": format!("Local({id})"), "title": task.title,
+                        "loop": super::worker::KIND }),
+            )?;
+            deps.store.emit(
+                Some(&run.id),
+                "reconciler.enqueued",
+                json!({ "arm": super::worker::KIND, "task": id }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================

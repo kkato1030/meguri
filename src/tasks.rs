@@ -137,12 +137,44 @@ pub struct Task {
 
 /// The task coordination layer: discover / claim / release / escalate /
 /// complete. `claim` is a single atomic operation (see the module docs).
+/// The discovery-gate verdict for one issue candidate (ADR 0012 S4 決定1):
+/// the same predicates `discover` applies — already-shipped suppression,
+/// not-before, dependencies, the cadence window — exposed per issue so the
+/// Issue Kind reconciler can consult them on a single snapshot instead of
+/// running per-label discovers (finding 2).
+#[derive(Debug, Clone)]
+pub enum GateVerdict {
+    /// Every gate passes; an enqueue may proceed with this cadence stamp.
+    Pass { cadence_label: Option<String> },
+    /// A succeeded run already covers this issue at its current body.
+    Shipped,
+    /// Held by a gate; the disposition names which (same vocabulary as
+    /// `meguri tasks`).
+    Hold(cadence::Disposition),
+}
+
 #[async_trait]
 pub trait TaskSource: Send + Sync {
     /// Actionable tasks of `kind` (queued *or* needs_human, so a re-claim can
     /// clear an escalation — the label version does the same by leaving the
     /// trigger label on an escalated issue). Idempotent.
     async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>>;
+
+    /// Evaluate the discovery gates for one issue candidate of `loop_kind`
+    /// (ADR 0012 S4 決定1). `remaining` is the caller's per-pass cadence
+    /// allowance, shared across candidates so one reconcile pass never
+    /// over-reserves a bucket. Sources without issue gates (local) pass.
+    async fn evaluate_issue(
+        &self,
+        loop_kind: &str,
+        issue: &forge::Issue,
+        remaining: &mut HashMap<String, i64>,
+    ) -> Result<GateVerdict> {
+        let _ = (loop_kind, issue, remaining);
+        Ok(GateVerdict::Pass {
+            cadence_label: None,
+        })
+    }
 
     /// Claim a task as one atomic operation. `None` is a benign race (someone
     /// else took it, or it is no longer actionable) and ends the run Skipped.
@@ -407,6 +439,23 @@ enum Evaluation {
 
 #[async_trait]
 impl TaskSource for LabelTaskSource {
+    async fn evaluate_issue(
+        &self,
+        loop_kind: &str,
+        issue: &forge::Issue,
+        remaining: &mut HashMap<String, i64>,
+    ) -> Result<GateVerdict> {
+        if self.already_shipped(loop_kind, issue)? {
+            return Ok(GateVerdict::Shipped);
+        }
+        Ok(
+            match self.evaluate(issue, (self.clock)(), remaining).await? {
+                Evaluation::Emit { cadence_label } => GateVerdict::Pass { cadence_label },
+                Evaluation::Hold(d) => GateVerdict::Hold(d),
+            },
+        )
+    }
+
     async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>> {
         let (label, loop_kind) = kind.label_and_loop();
         let issues = self.forge.list_issues_with_label(label).await?;
