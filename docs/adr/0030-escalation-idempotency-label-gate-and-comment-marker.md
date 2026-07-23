@@ -1,4 +1,4 @@
-# ADR 0028: エスカレーションの冪等性 — label 書き込みゲート + head×reason コメントマーカー
+# ADR 0030: エスカレーションの冪等性 — label 書き込みゲート + head×reason コメントマーカー
 
 - Status: accepted
 - Date: 2026-07-22
