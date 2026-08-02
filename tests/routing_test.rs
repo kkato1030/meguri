@@ -206,16 +206,11 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         pr: None,
         mode: Default::default(),
         deliver: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
     let deps = Deps::with_label_source(
         Store::open_in_memory().unwrap(),
@@ -468,16 +463,11 @@ async fn drive_worker_scenario(
         pr: None,
         mode: Default::default(),
         deliver: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
     let store = Store::open_in_memory().unwrap();
     let deps = Deps::with_label_source(store.clone(), mux.clone(), forge, config, project);
@@ -617,13 +607,6 @@ async fn explore_diverts_to_the_alternative_and_marks_the_arm() {
     assert!(
         events.iter().any(|e| e.kind == "run.explore_assigned"),
         "run.explore_assigned is on the event log"
-    );
-    let rows = store.routing_stats(Some("proj"), 20).unwrap();
-    assert!(
-        rows.iter().any(|r| r.loop_kind == "worker"
-            && r.agent_profile == "default"
-            && r.routing_arm == "explore"),
-        "explore run gets its own arm row in stats: {rows:?}"
     );
 }
 

@@ -5,17 +5,14 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
-mod reconcile;
 mod reconciler;
 mod runs;
 mod schedules;
-mod stats;
 mod tasks;
 pub use panes::*;
 pub use reconciler::*;
 pub use runs::*;
 pub use schedules::*;
-pub use stats::*;
 pub use tasks::*;
 // `reconcile` only adds inherent `impl Store` methods (no exported types).
 

@@ -1,5 +1,4 @@
 pub mod ci_fixer;
-pub mod cleaner;
 pub mod conflict_resolver;
 pub mod decompose_materializer;
 pub mod escalation;
@@ -10,16 +9,11 @@ pub mod plan_handoff;
 pub mod planner;
 pub mod pr_reviewer;
 pub mod reaper;
-pub mod reconcile_body_edits;
 pub mod repo_reconciler;
-pub mod routing_drift;
-pub mod schedule;
 pub mod scheduler;
 pub mod self_review;
 pub mod spec_fixer;
 pub mod spec_worker;
-pub mod sweep_health;
-pub mod triage;
 pub mod worker;
 
 use std::sync::Arc;
@@ -31,7 +25,6 @@ use crate::config::{Config, PlanDelivery, ProjectConfig};
 use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
-use crate::notify::{Notification, Notifier};
 use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, LANE_PR_REVIEW, Store};
 use crate::tasks::TaskSource;
 use crate::turn::TurnControl;
@@ -50,9 +43,6 @@ pub struct Deps {
     /// complete) — `LabelTaskSource` in github mode, `LocalTaskSource` in
     /// local mode.
     pub task_source: Arc<dyn TaskSource>,
-    /// Shared across every run of the project so the per-run notification
-    /// throttle survives turn boundaries.
-    pub notifier: Arc<Notifier>,
     /// Builds a forge for a repo slug — how cross-repo decomposition reaches a
     /// workspace sibling's repository (issue #154). Production is
     /// `GhForgeFactory`; tests inject fakes. Only ever consulted for siblings;
@@ -74,7 +64,6 @@ impl Deps {
     /// it. This is the shape `app::build_coordination` produces for github
     /// projects; tests use it so their FakeForge flows through the same
     /// `TaskSource` seam production does (issue #54 acceptance criterion 6).
-    /// The notifier is built from the config's `[notifications]` section.
     pub fn with_label_source(
         store: Store,
         mux: Arc<dyn Multiplexer>,
@@ -86,16 +75,12 @@ impl Deps {
             forge.clone(),
             store.clone(),
             project.id.clone(),
-            config.reconcile,
-            project.cadence.clone(),
         ));
-        let notifier = Arc::new(Notifier::from_config(&config.notifications));
         Self {
             store,
             mux,
             forge: Some(forge),
             task_source,
-            notifier,
             forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
@@ -159,24 +144,6 @@ impl Deps {
         self.forge
             .as_ref()
             .expect("forge is required for this loop (github mode)")
-    }
-
-    /// Push a notification for each watched label an issue meguri just created
-    /// in *this project's* repo (per-project `[projects.notify]`, issue #205).
-    /// The shared hook every own-repo `create_issue` site calls right after
-    /// creation — scheduler fire, cleaner/triage reports, planner children.
-    /// Cross-repo sibling children are excluded: this project's watch does not
-    /// govern another repo's issues. Best-effort.
-    pub async fn notify_created_issue(&self, number: i64, title: &str, labels: &[&str]) {
-        let watched = self
-            .project
-            .notify
-            .as_ref()
-            .map(|n| n.labels.as_slice())
-            .unwrap_or(&[]);
-        self.notifier
-            .notify_labels(number, title, watched, labels)
-            .await;
     }
 }
 
@@ -428,8 +395,6 @@ pub fn dispatch_rank(loop_kind: &str) -> u8 {
         pr_reviewer::KIND => 5,
         worker::KIND => 6,
         planner::KIND => 7,
-        cleaner::KIND => 8,
-        triage::KIND => 9,
         _ => u8::MAX,
     }
 }
@@ -473,19 +438,15 @@ pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<Wo
         conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
         ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
         fixer::KIND => fixer::run_fixer(deps, run_id).await,
-        cleaner::KIND => cleaner::run_cleaner(deps, run_id).await,
-        triage::KIND => triage::run_triage(deps, run_id).await,
         other => anyhow::bail!("run {run_id}: unknown loop kind {other:?}"),
     }
 }
 
 /// TurnControl over the sqlite store: the CLI writes `desired_state`,
-/// live turns converge to it and report state/events back. Additionally
-/// pages a human (via the throttled notifier) on `turn.awaiting_human`.
+/// live turns converge to it and report state/events back.
 pub struct StoreControl {
     pub store: Store,
     pub run_id: String,
-    pub notifier: Arc<Notifier>,
 }
 
 #[async_trait]
@@ -501,22 +462,7 @@ impl TurnControl for StoreControl {
     }
 
     async fn event(&self, kind: &str, data: serde_json::Value) {
-        let awaiting = (kind == "turn.awaiting_human").then(|| {
-            let run = self.store.get_run(&self.run_id).ok().flatten();
-            Notification::awaiting_human(
-                self.run_id.clone(),
-                run.as_ref().map_or(0, |r| r.issue_number),
-                run.and_then(|r| r.issue_title),
-                data["reason"].as_str().unwrap_or("unknown"),
-                // Turn-scoped escalations point at the live pane, never a URL.
-                Some(data["attach"].as_str().unwrap_or_default().to_string()),
-                None,
-            )
-        });
         let _ = self.store.emit(Some(&self.run_id), kind, data);
-        if let Some(n) = awaiting {
-            self.notifier.notify(&n).await;
-        }
     }
 }
 
@@ -583,8 +529,6 @@ mod tests {
             "fixer",
             "ci-fixer",
             "conflict-resolver",
-            "cleaner",
-            "triage",
         ] {
             assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
@@ -680,16 +624,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),

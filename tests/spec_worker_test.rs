@@ -133,18 +133,13 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        clean: None,
-        triage: None,
         // The spec worker (branch-takeover morph) is the combined delivery
         // (ADR 0008); in separate delivery it is inert.
         plan_delivery: meguri::config::PlanDelivery::Combined,
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
 
     let deps = Deps::with_label_source(

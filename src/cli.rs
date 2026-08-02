@@ -42,17 +42,10 @@ pub enum Command {
         /// github mode: also queue it for the worker loop (`meguri:ready`)
         #[arg(long)]
         ready: bool,
-        /// github mode: skip refine entirely, capture the raw memo (no LLM call)
-        #[arg(long)]
-        raw: bool,
         /// local mode: read the task from a markdown file (first heading →
         /// title, body → body)
         #[arg(long)]
         file: Option<String>,
-        /// local mode: hold the task until this instant (YYYY-MM-DD or RFC3339
-        /// UTC); discovered only once the time passes (issue #148)
-        #[arg(long)]
-        not_before: Option<String>,
     },
     /// Add a project to config.toml in one command: append a [[projects]]
     /// entry (and materialize its managed clone). github mode takes an
@@ -83,11 +76,6 @@ pub enum Command {
     },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
-    /// Manage the resident watch: detach, OS supervision, status, logs
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
     /// Run one identity now: the owning reconciler decides the role
     /// (ADR 0016). Exactly one of --issue / --pr / --run / --task.
     Run {
@@ -110,25 +98,6 @@ pub enum Command {
         #[arg(long)]
         mux: Option<String>,
     },
-    /// Explain what the owning reconciler would do next for one identity —
-    /// read-only (ADR 0016). Exactly one of --issue / --pr / --run / --task.
-    Why {
-        /// Project id from config.toml (defaults to the sole configured project)
-        #[arg(long)]
-        project: Option<String>,
-        /// Issue number (issue identity)
-        #[arg(long)]
-        issue: Option<i64>,
-        /// PR number (PR identity)
-        #[arg(long)]
-        pr: Option<i64>,
-        /// Run id
-        #[arg(long)]
-        run: Option<String>,
-        /// Local task id
-        #[arg(long)]
-        task: Option<i64>,
-    },
     /// List local tasks (needs_human is highlighted)
     Tasks {
         /// Project id from config.toml (defaults to the sole configured project)
@@ -138,46 +107,11 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// List cron schedules (definition, last fire, next fire)
-    Schedules {
-        /// Project id from config.toml (defaults to the sole configured project)
-        #[arg(long)]
-        project: Option<String>,
-    },
     /// List runs and their interaction state
     Ps {
         /// Include finished runs
         #[arg(long)]
         all: bool,
-    },
-    /// Show aggregate stats read straight from sqlite (works with watch stopped)
-    Stats {
-        #[command(subcommand)]
-        command: StatsCommand,
-    },
-    /// Build a dedicated dashboard workspace of tiled live agent panes and
-    /// attach to it — a terminal dashboard
-    Top {
-        /// Multiplexer override: herdr | tmux
-        #[arg(long)]
-        mux: Option<String>,
-        /// Status refresh interval in seconds
-        #[arg(long, default_value_t = 2)]
-        interval: u64,
-    },
-    /// (internal) status-render loop for `meguri top`, run inside its status
-    /// pane. Not for direct use.
-    #[command(hide = true)]
-    TopStatus {
-        /// Multiplexer override: herdr | tmux
-        #[arg(long)]
-        mux: Option<String>,
-        /// Dashboard tiling container id the outer `top` created
-        #[arg(long)]
-        dashboard: String,
-        /// Status refresh interval in seconds
-        #[arg(long, default_value_t = 2)]
-        interval: u64,
     },
     /// Show events (and recent pane output) for a run
     Logs { run: String },
@@ -225,103 +159,6 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Distribute the embedded meguri skill/rule fragment to agent CLIs, so
-    /// an agent working nearby can learn about and propose meguri on its own
-    AgentSkills {
-        #[command(subcommand)]
-        command: AgentSkillsCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AgentSkillsCommand {
-    /// Install the user-level skill (default), or the project-level rule
-    /// fragment with `--project`
-    Install {
-        /// Agent CLI to target (currently only "claude")
-        #[arg(long, default_value = "claude")]
-        target: String,
-        /// Install the repo-level rule fragment (`.claude/rules/meguri.md`
-        /// for the claude target) instead of the user-level skill
-        /// (`~/.claude/skills/meguri/`)
-        #[arg(long)]
-        project: bool,
-        /// Repo root for --project (defaults to the Git toplevel of the
-        /// current directory; errors outside a Git repository)
-        #[arg(long)]
-        repo: Option<String>,
-        /// Overwrite files that differ from the embedded source (without
-        /// this, a diff is shown and differing files are left untouched)
-        #[arg(long)]
-        force: bool,
-    },
-    /// Show whether the skill/rule fragment is installed and matches this
-    /// binary's embedded version
-    Status {
-        /// Agent CLI to target (currently only "claude")
-        #[arg(long, default_value = "claude")]
-        target: String,
-        /// Check the project-level rule fragment instead of the user-level
-        /// skill
-        #[arg(long)]
-        project: bool,
-        /// Repo root for --project (defaults to the Git toplevel of the
-        /// current directory; errors outside a Git repository)
-        #[arg(long)]
-        repo: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum StatsCommand {
-    /// Success rate / mean turns / mean duration per (role, profile), plus any
-    /// active routing drift
-    Routing {
-        /// Restrict to one project id (default: all projects, project column)
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Compare collab planes (off vs advisor) per (role, profile, arm) — the
-    /// effect of the collab layer on durable orchestration-plane signals (#121)
-    Collab {
-        /// Restrict to one project id (default: all projects, project column)
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Self-review cap-escalation / needs-human / correction rates and the
-    /// round-to-clean distribution per (role, profile), from self_review.*
-    /// events (#213)
-    Review {
-        /// Restrict to one project id (default: all projects, project column)
-        #[arg(long)]
-        project: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DaemonCommand {
-    /// Start `meguri watch` detached from this terminal
-    Start,
-    /// Stop the watch (launchd mode: bootout, so it stays down)
-    Stop,
-    /// Restart the watch, keeping its supervision mode
-    Restart,
-    /// Show PID / mode / liveness / log location
-    Status,
-    /// Tail the daemon log
-    Logs {
-        /// Keep following the log (tail -f)
-        #[arg(short, long)]
-        follow: bool,
-    },
-    /// Install OS supervision (generate + bootstrap a LaunchAgent)
-    Install {
-        /// Supervision mode: launchd (macOS only)
-        #[arg(long)]
-        mode: String,
-    },
-    /// Remove OS supervision (bootout + delete the LaunchAgent)
-    Uninstall,
 }
 
 #[cfg(test)]
@@ -354,58 +191,6 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("prune"));
         assert!(!help.contains("clean"));
-    }
-
-    #[test]
-    fn agent_skills_install_defaults_to_user_level_claude_target() {
-        let cli = Cli::try_parse_from(["meguri", "agent-skills", "install"]).unwrap();
-        match cli.command {
-            Command::AgentSkills {
-                command:
-                    AgentSkillsCommand::Install {
-                        target,
-                        project,
-                        repo,
-                        force,
-                    },
-            } => {
-                assert_eq!(target, "claude");
-                assert!(!project);
-                assert_eq!(repo, None);
-                assert!(!force);
-            }
-            other => panic!("expected AgentSkills(Install), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_skills_install_parses_project_flags() {
-        let cli = Cli::try_parse_from([
-            "meguri",
-            "agent-skills",
-            "install",
-            "--project",
-            "--repo",
-            "/tmp/some-repo",
-            "--force",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::AgentSkills {
-                command:
-                    AgentSkillsCommand::Install {
-                        project,
-                        repo,
-                        force,
-                        ..
-                    },
-            } => {
-                assert!(project);
-                assert_eq!(repo.as_deref(), Some("/tmp/some-repo"));
-                assert!(force);
-            }
-            other => panic!("expected AgentSkills(Install), got {other:?}"),
-        }
     }
 
     #[test]
@@ -474,22 +259,5 @@ mod tests {
             ])
             .is_ok()
         );
-    }
-
-    #[test]
-    fn agent_skills_status_parses() {
-        let cli = Cli::try_parse_from(["meguri", "agent-skills", "status", "--project"]).unwrap();
-        match cli.command {
-            Command::AgentSkills {
-                command:
-                    AgentSkillsCommand::Status {
-                        target, project, ..
-                    },
-            } => {
-                assert_eq!(target, "claude");
-                assert!(project);
-            }
-            other => panic!("expected AgentSkills(Status), got {other:?}"),
-        }
     }
 }

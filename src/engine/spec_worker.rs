@@ -222,12 +222,11 @@ impl Flavor for SpecWorkerFlavor {
                exists and meguri pushes to it.\n\
              - Do NOT switch branches, do NOT rebase, and do NOT touch other \
                worktrees.\n\n\
-             {consult_section}{pr_section}{lang_section}",
+             {pr_section}{lang_section}",
             number = run.issue_number,
             branch = run.branch.as_deref().unwrap_or("?"),
             title = cp.issue_title,
             body = cp.issue_body,
-            consult_section = flow::advisor_consult_section(deps, run),
             pr_section = flow::pr_body_instruction(worktree),
             lang_section = flow::language_instruction(deps.config.language_for(&deps.project)),
         )
@@ -526,16 +525,11 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

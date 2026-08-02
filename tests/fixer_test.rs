@@ -93,8 +93,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
-        clean: None,
-        triage: None,
         // These tests assert the combined-delivery invariant that a
         // spec-ready PR belongs to the spec worker, so the fixer keeps off
         // it (ADR 0008). Separate-mode fixing of spec-ready PRs is covered
@@ -102,11 +100,8 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         plan_delivery: meguri::config::PlanDelivery::Combined,
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
 
     let deps = Deps::with_label_source(
