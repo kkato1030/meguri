@@ -46,13 +46,14 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     config.limits.result_grace_secs = 1;
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: Some(clone),
+        repo_path: clone,
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
+        profile: None,
         worktree_root: Some(root.join("worktrees")),
         pr: None,
         worktree_setup: Default::default(),

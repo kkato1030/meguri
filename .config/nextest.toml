@@ -4,14 +4,3 @@
 # 統合テストは実時間 sleep / tmux IO バウンドで CPU をほぼ使わないため、
 # CI ランナー(ubuntu-latest = 4 vCPU)のコア数より広い並列度で回す。
 test-threads = 16
-
-[[profile.ci.overrides]]
-# routing_test の escalation_climbs_a_multi_step_chain_without_skipping は
-# 3段エスカレーション連鎖 × never-passing check で全 rung を消化する、
-# スイート最重量のシナリオ。run_worker がハードコードされた 90秒のタイムアウト
-# (drive_worker_scenario)でくくられている。単独では ~16秒で通るが、
-# 16並列 / 4 vCPU の過剰並列下で他の tmux 実プロセステストにスケジューリングを
-# 圧迫されると 90秒を超えることがある(実際に CI で発生: 90.121s で timeout)。
-# cleaner_test と同種の環境要因フレークなので、同じくリトライで吸収する。
-filter = 'binary(routing_test)'
-retries = 2

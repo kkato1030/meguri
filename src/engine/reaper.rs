@@ -16,7 +16,7 @@ use crate::agent_session;
 use crate::forge::IssueState;
 use crate::gitops;
 use crate::mux::{Multiplexer, PaneId};
-use crate::store::{LANE_AUTHOR, LANE_PR_REVIEW, LANE_SELF_REVIEW, PaneRecord};
+use crate::store::{LANE_AUTHOR, PaneRecord};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
@@ -206,14 +206,13 @@ async fn classify(
     // Closed, but a live pane in the worktree means an agent (or a human
     // investigating) still stands there. The pane sweep of the same tick
     // runs first, so this only trips when the kill failed (or was skipped);
-    // the worktree then waits for the next sweep. Both lanes of the issue
-    // are checked — either one alive keeps the worktree.
-    for lane in [LANE_AUTHOR, LANE_PR_REVIEW, LANE_SELF_REVIEW] {
-        if let Some(pane) = deps.store.get_pane(&deps.project.id, issue_number, lane)?
-            && record_pane_alive(deps, &pane).await
-        {
-            return Ok(candidate(Verdict::PaneAlive));
-        }
+    // the worktree then waits for the next sweep.
+    if let Some(pane) = deps
+        .store
+        .get_pane(&deps.project.id, issue_number, LANE_AUTHOR)?
+        && record_pane_alive(deps, &pane).await
+    {
+        return Ok(candidate(Verdict::PaneAlive));
     }
     for run in &runs {
         if pane_alive(deps, run).await {

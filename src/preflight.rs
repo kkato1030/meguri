@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{self, AgentProfile};
-use crate::routing;
+use crate::profile as routing;
 
 /// How long to wait for a killed prime child to be reapable before giving up
 /// and leaking it as a zombie — an unbounded `wait()` would hang the launch.

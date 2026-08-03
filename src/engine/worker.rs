@@ -37,13 +37,6 @@ impl Flavor for WorkerFlavor {
         forge::LABEL_READY
     }
 
-    /// The worker self-reviews its own diff before opening the PR (ADR 0006):
-    /// the internal review→fix loop runs in the run's worktree with no forge
-    /// calls, so the human sees an already-self-reviewed PR.
-    fn self_reviews(&self) -> bool {
-        true
-    }
-
     fn execute_prompt(
         &self,
         deps: &Deps,
@@ -185,13 +178,14 @@ mod tests {
         run.branch = Some("meguri/test".into());
         let project = ProjectConfig {
             id: "proj".into(),
-            repo_path: Some("/tmp/unused".into()),
+            repo_path: "/tmp/unused".into(),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,
             default_branch: "main".into(),
             language: None,
             check_command: None,
+            profile: None,
             worktree_root: None,
             pr: None,
             worktree_setup: Default::default(),

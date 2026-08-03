@@ -16,14 +16,7 @@ pub enum Command {
     /// Create ~/.meguri (config.toml + sqlite db)
     Init,
     /// Check environment: gh auth, mux availability, git
-    Doctor {
-        /// Also fire a one-shot live probe per agent profile to verify each
-        /// model alias still resolves (spends a few hundred tokens of quota),
-        /// and a short interactive PTY probe per pane-launched profile to
-        /// check the bypass-permissions gate is already accepted
-        #[arg(long)]
-        probe: bool,
-    },
+    Doctor,
     /// Capture work with one line: a GitHub issue (github mode — created
     /// immediately, then refined by an agent best-effort) or a local task
     /// (local mode — queued for the watch)
@@ -42,33 +35,6 @@ pub enum Command {
         /// title, body → body)
         #[arg(long)]
         file: Option<String>,
-    },
-    /// Add a project to config.toml in one command: append a [[projects]]
-    /// entry (and materialize its managed clone). github mode takes an
-    /// owner/repo; local mode takes --local <path>.
-    AddProject {
-        /// owner/repo on GitHub (github mode). Required unless --local.
-        #[arg(
-            value_name = "owner/repo",
-            required_unless_present = "local",
-            conflicts_with = "local"
-        )]
-        slug: Option<String>,
-        /// Create the repo from scratch first (`gh repo create`, initial commit
-        /// included). Irreversible — meguri never deletes a repo it created.
-        #[arg(long, conflicts_with = "local")]
-        create: bool,
-        /// Visibility for --create (default: private). Requires --create.
-        #[arg(long, requires = "create", conflicts_with = "local")]
-        public: bool,
-        /// Override the derived project id (default: the repo name, or the
-        /// --local path's basename)
-        #[arg(long)]
-        id: Option<String>,
-        /// Add a local-mode project rooted at this absolute path (no GitHub;
-        /// repo_slug not required)
-        #[arg(long, value_name = "path")]
-        local: Option<String>,
     },
     /// Run the foreground orchestrator (poll GitHub, drive runs)
     Watch,
@@ -184,73 +150,5 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("prune"));
         assert!(!help.contains("clean"));
-    }
-
-    #[test]
-    fn add_project_github_form_parses() {
-        let cli = Cli::try_parse_from(["meguri", "add-project", "owner/repo"]).unwrap();
-        match cli.command {
-            Command::AddProject {
-                slug,
-                create,
-                public,
-                id,
-                local,
-            } => {
-                assert_eq!(slug.as_deref(), Some("owner/repo"));
-                assert!(!create && !public);
-                assert_eq!(id, None);
-                assert_eq!(local, None);
-            }
-            other => panic!("expected AddProject, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn add_project_local_form_parses_without_positional() {
-        let cli = Cli::try_parse_from(["meguri", "add-project", "--local", "/abs/path"]).unwrap();
-        match cli.command {
-            Command::AddProject { slug, local, .. } => {
-                assert_eq!(slug, None);
-                assert_eq!(local.as_deref(), Some("/abs/path"));
-            }
-            other => panic!("expected AddProject, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn add_project_requires_slug_or_local() {
-        // Neither positional nor --local → clap rejects (required_unless_present).
-        assert!(Cli::try_parse_from(["meguri", "add-project"]).is_err());
-    }
-
-    #[test]
-    fn add_project_slug_and_local_conflict() {
-        assert!(
-            Cli::try_parse_from(["meguri", "add-project", "owner/repo", "--local", "/p"]).is_err()
-        );
-    }
-
-    #[test]
-    fn add_project_create_conflicts_with_local() {
-        assert!(
-            Cli::try_parse_from(["meguri", "add-project", "--local", "/p", "--create"]).is_err()
-        );
-    }
-
-    #[test]
-    fn add_project_public_requires_create() {
-        assert!(Cli::try_parse_from(["meguri", "add-project", "owner/repo", "--public"]).is_err());
-        // With --create it is accepted.
-        assert!(
-            Cli::try_parse_from([
-                "meguri",
-                "add-project",
-                "owner/repo",
-                "--create",
-                "--public"
-            ])
-            .is_ok()
-        );
     }
 }

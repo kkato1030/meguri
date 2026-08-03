@@ -78,13 +78,14 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> TestEnv {
     tune(&mut config);
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: Some(clone),
+        repo_path: clone,
         repo_slug: Some("me/proj".into()),
         mode: Default::default(),
         deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: None,
+        profile: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         worktree_setup: Default::default(),
@@ -361,29 +362,18 @@ async fn named_profile_session_dir_drives_the_gate() {
     let profile_root = tempfile::tempdir().unwrap();
     let profile_root_path = profile_root.path().to_path_buf();
     let env = setup_with(move |c| {
+        // The default profile carries its own session_dir + transcript limit
+        // (per-profile session gating, issue #245).
         let toml = r#"
-[agents.profiles.p-worker]
+[agent]
 command = "worker-cli"
 args = ["--go"]
 resume_args = ["resume", "--continue-session"]
 resume_transcript_limit_bytes = 1024
-
-[routing]
-mode = "manual"
-
-[routing.roles]
-worker = "p-worker"
 "#;
         let overlay: Config = toml::from_str(toml).unwrap();
-        c.agents = overlay.agents;
-        c.routing = overlay.routing;
-        c.agents
-            .as_mut()
-            .unwrap()
-            .profiles
-            .get_mut("p-worker")
-            .unwrap()
-            .session_dir = Some(profile_root_path.clone());
+        c.agent = overlay.agent;
+        c.agent.session_dir = Some(profile_root_path.clone());
     })
     .await;
     seed_pane_session(&env, "sess-big", "/wt/old");

@@ -160,22 +160,12 @@ impl Scheduler {
     /// also guards against double-dispatching a run this loop already
     /// spawned earlier in the same tick, or in a still-running previous
     /// tick, whose store status hasn't caught up to `running` yet.
-    /// Materialize declared-but-missing managed clones and return the set of
-    /// project ids ready to process this tick, via the Repo Kind reconcile's
-    /// first Op (ADR 0012 §決定6): `repo_reconciler::reconcile_ready` observes
-    /// the clone health, runs `Op(EnsureClone)` when needed, and reports
-    /// readiness. A project whose clone can't be materialized is excluded (the
-    /// `repo.clone.failed` event / warn are emitted inside `reconcile_ready`)
-    /// and retried next tick. This replaces the old scheduler-specific bootstrap
-    /// gate with the same readiness contract every Kind consumes.
+    /// The set of project ids to process this tick — every configured
+    /// project (`repo_path` is required and points at an existing clone).
     async fn ensure_projects_ready(&self) -> HashSet<String> {
-        let mut ready = HashSet::with_capacity(self.projects.len());
-        for deps in &self.projects {
-            if super::repo_reconciler::reconcile_ready(deps).await {
-                ready.insert(deps.project.id.clone());
-            }
-        }
-        ready
+        // Every project pins an explicit `repo_path` (managed clones are
+        // dormant, docs/adr/STATUS.md), so all projects are always ready.
+        self.projects.iter().map(|d| d.project.id.clone()).collect()
     }
 
     fn redispatch_interrupted(
