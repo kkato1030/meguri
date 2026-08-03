@@ -2,7 +2,7 @@
 
 **AI コーディングエージェントを terminal multiplexer の生きた pane で回すオーケストレーター。**
 
-このブランチは meguri のフルスクラッチ書き直し(v2)です。v1(〜15k 行の核)は main / git 履歴にあり、その運用で確定した概念だけを、**全行を通読・理解できるサイズを保ちながら**積み直します。書き直しの主目的は理解の再取得 — 1 増分 = 1 PR = 人間が全行読めるサイズ、を規律とします。
+このブランチは meguri のフルスクラッチ書き直し(v2)です。v1(〜15k 行の核)は main / git 履歴にあり、その運用で確定した概念だけを積み直します。書き直しの主目的は理解の再取得 — **「現時点のアーキテクチャと機能」を常に正確に映す [docs/architecture.md](docs/architecture.md) を増分ごとに更新し続ける**ことを規律とします(1 増分 = 1 PR)。
 
 ## v1 から持ち越す不変条件
 
@@ -33,13 +33,11 @@ meguri run "READMEのtypoを直す"
 
 途中で介入したければ `tmux attach -t meguri-myproj`。失敗・needs_human・検証落ちのときも pane は残るので、attach して続きを人間が引き取れる。
 
-### コードの読み順(全 5 ファイル)
+### アーキテクチャ
 
-1. `src/main.rs` — 1 run の一生が上から下へ並ぶ
-2. `src/config.rs` — 最小 config(書いた項目だけ上書き)
-3. `src/turn.rs` — 完了コントラクト
-4. `src/mux.rs` — tmux に求める 3 操作(spawn / send / alive)
-5. `src/gitops.rs` — worktree と trust-but-verify
+現時点の正確な地図(コンポーネント・1 run の流れ・契約・割り切り)は
+[docs/architecture.md](docs/architecture.md)。コードはその地図と 1:1 の 5 ファイル
+(main / config / turn / mux / gitops、約 800 行)。
 
 ## ロードマップ
 

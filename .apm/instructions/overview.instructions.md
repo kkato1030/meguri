@@ -2,9 +2,11 @@
 description: meguri v2 の全体像・完了コントラクト・書き直しの規律
 ---
 
-- meguri v2 はフルスクラッチ書き直し中である。目的は理解の再取得: **1 増分 =
-  1 PR = 人間が全行読めるサイズ**を守り、増分は直列に積む。順序と各増分が参照
-  する失敗カタログは `docs/design/v2-roadmap.md` が正。
+- meguri v2 はフルスクラッチ書き直し中である。目的は理解の再取得:
+  **「現時点のアーキテクチャと機能」は `docs/architecture.md` が正であり、
+  機能を変える PR は必ず同時にこれを更新する**(未来の計画は書かない —
+  それは roadmap の仕事)。増分は直列に積み、順序と参照する失敗カタログは
+  `docs/design/v2-roadmap.md` が正。
 - 中核概念(v1 から持ち越した不変条件): 完了コントラクト(worktree の
   `.meguri/prompt-<turn_id>.md` → エージェントが `.meguri/result.json` を書く。
   画面は読まない)、trust-but-verify(clean tree / base より ahead /
