@@ -298,12 +298,13 @@ mod tests {
     fn deps_with(forge: Arc<FakeForge>) -> Deps {
         let project = ProjectConfig {
             id: "proj".into(),
-            repo_path: Some("/tmp/unused".into()),
+            repo_path: "/tmp/unused".into(),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,
             default_branch: "main".into(),
             check_command: None,
+            profile: None,
             worktree_root: None,
             language: None,
             pr: None,

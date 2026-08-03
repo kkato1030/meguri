@@ -53,13 +53,14 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
 
     let project = ProjectConfig {
         id: "proj".into(),
-        repo_path: Some(clone),
+        repo_path: clone,
         repo_slug: None,
         mode: ProjectMode::Local,
         deliver: None, // local default is `branch`
         default_branch: "main".into(),
         language: None,
         check_command: check_command.map(str::to_string),
+        profile: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         worktree_setup: Default::default(),
@@ -74,7 +75,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         mux: Arc::new(FakeMux::new(false)),
         forge: None,
         task_source,
-        forge_factory: Arc::new(meguri::forge::gh::GhForgeFactory),
         config,
         project,
         preflight_enabled: false,
@@ -226,7 +226,7 @@ async fn local_task_to_verified_branch() {
     // The run landed on the local branch; nothing was pushed (no remote at all).
     let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
     assert_eq!(record.status, RunStatus::Succeeded);
-    let clone = env.deps.project.repo_path.as_ref().unwrap();
+    let clone = env.deps.project.repo_path.as_path();
     let branches = run_git(clone, &["branch", "--list"]).await.unwrap();
     assert!(
         branches.contains(&format!("meguri/t{}-", task.id)),

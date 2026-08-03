@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use meguri::app;
 use meguri::cli::{Cli, Command};
-use meguri::config::{self, Config, ProjectConfig};
+use meguri::config::{self, Config};
 use meguri::store::Store;
 
 #[tokio::main]
@@ -18,23 +18,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => cmd_init(),
-        Command::Doctor { probe } => cmd_doctor(probe).await,
-        Command::AddProject {
-            slug,
-            create,
-            public,
-            id,
-            local,
-        } => {
-            app::cmd_add_project(
-                slug.as_deref(),
-                create,
-                public,
-                id.as_deref(),
-                local.as_deref(),
-            )
-            .await
-        }
+        Command::Doctor => cmd_doctor().await,
         Command::Watch => app::cmd_watch().await,
         Command::Run {
             project,
@@ -92,14 +76,13 @@ fn cmd_init() -> Result<()> {
     println!("db ready: {}", db.display());
     std::fs::create_dir_all(config::worktrees_root())?;
     println!(
-        "\nNext: `meguri add-project owner/repo` to add your first project \
-         (or `--local <path>` for a local-mode project). It appends to {}.",
+        "\nNext: edit {} to add your first [[projects]] entry.",
         cfg_path.display()
     );
     Ok(())
 }
 
-async fn cmd_doctor(probe: bool) -> Result<()> {
+async fn cmd_doctor() -> Result<()> {
     let mut ok = true;
 
     let check = |name: &str, pass: bool, detail: String| {
@@ -177,7 +160,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 
     match &cfg {
         Ok(cfg) => {
-            ok &= doctor_agents(cfg, probe);
+            ok &= doctor_agents(cfg);
             let n = cfg.projects.len();
             println!(
                 "{} projects: {n} configured{}",
@@ -188,19 +171,8 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
-            doctor_workspaces(cfg);
-            // Managed clones (issue #195): show each project's clone state
-            // (present / not cloned yet / broken) and whether the gh token can
-            // push. "Not cloned" is a normal, self-healing state, not a failure.
-            ok &= doctor_clones(cfg).await;
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
-            // Repo config (issue #165): lint each project's `meguri.toml` on the
-            // default branch, failing on a host-only key or TOML error.
-            ok &= doctor_repo_configs(cfg).await;
-            // Role preambles (issue #149): each configured path must resolve to
-            // a regular file on the default branch (ADR 0015).
-            ok &= doctor_prompts(cfg).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -215,259 +187,13 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
     }
 }
 
-/// Whether a project's effective clone is usable for the git-backed doctor
-/// reads (schedules / repo config / preambles). For a managed clone (derived
-/// `repo_path`), "not cloned yet" is a normal state that must not fail those
-/// sections; a broken remnant is a real problem.
-enum ProjectCloneState {
-    /// A usable git repo at the effective path (proceed with git reads).
-    Present,
-    /// A managed clone that hasn't been materialized yet — normal, self-healing.
-    NotCloned,
-    /// A managed clone directory that exists but is broken (reason).
-    Broken(String),
-}
+/// Doctor's profile section: list every defined profile (default + builtin +
+/// user) with its CLI detection, validate the per-project overrides, and show
+/// each project's resolved profile.
+fn doctor_agents(cfg: &Config) -> bool {
+    use meguri::profile;
 
-/// Classify a project's effective clone for doctor. An explicit `repo_path` is
-/// always treated as `Present` (a missing path surfaces through the git reads
-/// exactly as before); a managed clone is probed with [`gitops::clone_health`].
-async fn project_clone_state(cfg: &Config, project: &ProjectConfig) -> ProjectCloneState {
-    use meguri::gitops::{self, CloneHealth};
-    if !cfg.is_managed_clone(project) {
-        return ProjectCloneState::Present;
-    }
-    // A managed clone is always github mode, so a slug is present (validate
-    // guarantees it); default to "" so a somehow-missing slug reads as broken.
-    let slug = project.repo_slug.as_deref().unwrap_or_default();
-    match gitops::clone_health(&cfg.repo_path_for(project), slug).await {
-        CloneHealth::Healthy => ProjectCloneState::Present,
-        CloneHealth::Absent => ProjectCloneState::NotCloned,
-        CloneHealth::Broken(why) => ProjectCloneState::Broken(why),
-    }
-}
-
-/// Doctor's managed-clone section (issue #195): per github project, show the
-/// clone state and whether the gh token can push. "Not cloned" is ✅ (it will be
-/// materialized on the next watch tick); a broken clone fails; a read-only token
-/// fails (it would only surface at `push_branch`/`create_pr` otherwise). A gh
-/// call that can't reach the API is a warning, never a doctor failure.
-async fn doctor_clones(cfg: &Config) -> bool {
-    let github: Vec<&ProjectConfig> = cfg
-        .projects
-        .iter()
-        .filter(|p| p.mode != meguri::config::ProjectMode::Local)
-        .collect();
-    if github.is_empty() {
-        return true;
-    }
-    let mut ok = true;
-    println!("\nmanaged clones:");
-    for project in github {
-        let managed = cfg.is_managed_clone(project);
-        let dest = cfg.repo_path_for(project);
-        let kind = if managed { "managed" } else { "explicit" };
-        match project_clone_state(cfg, project).await {
-            ProjectCloneState::Present => {
-                println!(
-                    "  ✅ {} ({kind}) — clone present at {}",
-                    project.id,
-                    dest.display()
-                );
-            }
-            ProjectCloneState::NotCloned => {
-                println!(
-                    "  ✅ {} ({kind}) — not cloned yet (will materialize at {} on next tick)",
-                    project.id,
-                    dest.display()
-                );
-            }
-            ProjectCloneState::Broken(why) => {
-                println!(
-                    "  ❌ {} ({kind}) — clone at {} is broken ({why}); remove it and re-run",
-                    project.id,
-                    dest.display()
-                );
-                ok = false;
-            }
-        }
-        // gh push permission — the write-scope check (a read-only token passes
-        // discovery but fails at push/PR, so surface it here).
-        if let Some(slug) = project.repo_slug.as_deref() {
-            match app::gh_viewer_permission(slug).await {
-                Ok(perm) if app::can_push(&perm) => {
-                    println!("     ✅ gh token can push ({perm})");
-                }
-                Ok(perm) => {
-                    println!(
-                        "     ❌ gh token cannot push (permission {perm}) — need write access"
-                    );
-                    ok = false;
-                }
-                Err(e) => {
-                    println!("     ⚠️  gh push-permission check inconclusive: {e:#}");
-                }
-            }
-        }
-    }
-    ok
-}
-
-/// Doctor's repo-config section (issue #165): lint each project's repo root
-/// `meguri.toml`. Doctor holds no run, so it reads the default branch's
-/// `meguri.toml` (ADR 0015), not the working tree — advisory, not the run's
-/// pinned value. A host-only key or malformed TOML fails (deny_unknown_fields);
-/// an absent file is the silent, valid opt-out. Follows routing/schedules' "never silently
-/// fall back" principle so a boundary violation surfaces here, not as a no-op.
-async fn doctor_repo_configs(cfg: &Config) -> bool {
-    use meguri::config::RepoConfig;
-    use meguri::gitops::{self, DefaultBranchFile};
-
-    let mut printed_header = false;
-    let mut ok = true;
-    let mut header = || {
-        if !printed_header {
-            println!("\nrepo config:");
-            printed_header = true;
-        }
-    };
-    for project in &cfg.projects {
-        // A managed clone not materialized yet can't be read; that's normal
-        // (doctor_clones reports it), so skip rather than fail on a missing path.
-        if !matches!(
-            project_clone_state(cfg, project).await,
-            ProjectCloneState::Present
-        ) {
-            continue;
-        }
-        // Lint the default branch's `meguri.toml` (ADR 0015), not the working
-        // tree. An absent file is the silent, valid opt-out.
-        let read = gitops::read_file_at_default_branch(
-            &cfg.repo_path_for(project),
-            &project.default_branch,
-            "meguri.toml",
-        )
-        .await;
-        match read {
-            Ok(DefaultBranchFile::Absent) => {}
-            Ok(DefaultBranchFile::Content(raw)) => {
-                header();
-                match RepoConfig::parse_str(&raw) {
-                    Ok(_) => println!("  ✅ {}: meguri.toml OK", project.id),
-                    Err(e) => {
-                        println!("  ❌ {}: {e:#}", project.id);
-                        ok = false;
-                    }
-                }
-            }
-            Ok(DefaultBranchFile::NotRegularFile) => {
-                header();
-                println!(
-                    "  ❌ {}: meguri.toml is not a regular file on default branch",
-                    project.id
-                );
-                ok = false;
-            }
-            Err(e) => {
-                header();
-                println!("  ❌ {}: {e:#}", project.id);
-                ok = false;
-            }
-        }
-    }
-    ok
-}
-
-/// Doctor's preamble section (issue #149): for every project, every preamble
-/// path that could be injected for it — the top-level `[prompts]` overlaid by
-/// its own `[projects.prompts]` — must be a regular file on the default branch
-/// (ADR 0015). Missing paths and non-regular files (a symlink, which can't be
-/// followed in a blob read) are both reported as ❌ (config validate already
-/// rejects absolute / `..` / trailing-slash values, so those never reach here).
-/// Projects with no preambles configured print nothing.
-async fn doctor_prompts(cfg: &Config) -> bool {
-    use meguri::gitops::{self, DefaultBranchFile};
-
-    let has_any = !cfg.prompts.is_empty() || cfg.projects.iter().any(|p| !p.prompts.is_empty());
-    if !has_any {
-        return true;
-    }
-    let mut ok = true;
-    println!("\npreambles:");
-    for project in &cfg.projects {
-        if cfg.effective_prompts(project).is_empty() {
-            continue;
-        }
-        // A managed clone not materialized yet can't be read; that's normal
-        // (doctor_clones reports it), so skip rather than fail on a missing path.
-        if !matches!(
-            project_clone_state(cfg, project).await,
-            ProjectCloneState::Present
-        ) {
-            continue;
-        }
-        let repo_path = cfg.repo_path_for(project);
-        for (key, rel) in cfg.effective_prompts(project) {
-            // Verify against the default branch (ADR 0015), reading the blob
-            // directly. A symlink can't be followed here, so it is reported as
-            // unverifiable rather than silently passing (its target string
-            // would otherwise read as content).
-            let (mark, detail) = match gitops::read_file_at_default_branch(
-                &repo_path,
-                &project.default_branch,
-                &rel,
-            )
-            .await
-            {
-                Ok(DefaultBranchFile::Content(_)) => ("✅", rel.to_string()),
-                Ok(DefaultBranchFile::Absent) => {
-                    ok = false;
-                    ("❌", format!("{rel} not on default branch"))
-                }
-                Ok(DefaultBranchFile::NotRegularFile) => {
-                    ok = false;
-                    (
-                        "❌",
-                        format!("{rel} is not a regular file on default branch (symlink/dir)"),
-                    )
-                }
-                Err(e) => {
-                    ok = false;
-                    ("❌", format!("{rel}: {e:#}"))
-                }
-            };
-            println!("  {mark} {}/{key} — {detail}", project.id);
-        }
-    }
-    ok
-}
-
-/// Doctor's workspace section (issue #154): list each `[[workspaces]]` group
-/// and its member projects. Reaching here means the config already loaded, and
-/// loading hard-fails on an undefined project reference or a project in two
-/// workspaces — so a printed workspace is a validated one. An invalid
-/// workspace instead surfaces on doctor's `config` line (the load error).
-fn doctor_workspaces(cfg: &Config) {
-    if cfg.workspaces.is_empty() {
-        return;
-    }
-    println!("\nworkspaces:");
-    for ws in &cfg.workspaces {
-        println!("  ✅ {} → {}", ws.id, ws.projects.join(", "));
-    }
-}
-
-/// Doctor's routing section: list every defined profile (default + builtin +
-/// user) with its detection result and — with `--probe` — a live model-alias
-/// probe, record CLI major-version drift, warn on a stale recommendation
-/// table, and print the role→profile resolution. Returns whether the mandatory
-/// `default` profile CLI is present, explicit routing validates, and no probe
-/// found an invalid model.
-fn doctor_agents(cfg: &Config, probe: bool) -> bool {
-    use meguri::routing;
-
-    // Merged profile set: builtins first, user profiles override same names.
-    // `default` (the [agent] section) is listed separately and is mandatory.
-    let mut names: Vec<String> = routing::builtin_profiles().into_keys().collect();
+    let mut names: Vec<String> = profile::builtin_profiles().into_keys().collect();
     if let Some(agents) = &cfg.agents {
         for name in agents.profiles.keys() {
             if !names.contains(name) {
@@ -478,162 +204,43 @@ fn doctor_agents(cfg: &Config, probe: bool) -> bool {
     names.sort();
 
     println!("\nagent profiles:");
-    // The default profile is required: a missing CLI here breaks every legacy
-    // and fall-through run.
     let default_detail = run_capture(&cfg.agent.command, &["--version"])
         .map(|v| v.lines().next().unwrap_or_default().to_string());
     let default_ok = default_detail.is_ok();
     println!(
-        "  {} default ({}) [{}]: {}",
+        "  {} default ({}): {}",
         if default_ok { "✅" } else { "❌" },
         cfg.agent.command,
-        headless_note(&cfg.agent),
-        default_detail.clone().unwrap_or_else(|e| e),
+        default_detail.unwrap_or_else(|e| e),
     );
     let mut ok = default_ok;
-    if probe {
-        ok &= doctor_probe("default", &cfg.agent, &routing::probe_profile);
-    }
 
-    // Named profiles are optional — a missing CLI just prunes it from the auto
-    // chain; only report their detection, don't fail doctor.
     for name in &names {
-        let profile = routing::profile_by_name(cfg, name).expect("listed profile resolves");
+        let profile = profile::profile_by_name(cfg, name).expect("listed profile resolves");
         let detail = run_capture(&profile.command, &["--version"])
             .map(|v| v.lines().next().unwrap_or_default().to_string());
         println!(
-            "  {} {name} ({}) [{}]: {}",
+            "  {} {name} ({}): {}",
             if detail.is_ok() { "✅" } else { "⚠️ " },
             profile.command,
-            headless_note(&profile),
-            detail.clone().unwrap_or_else(|e| e),
+            detail.unwrap_or_else(|e| e),
         );
-        // Probe only profiles whose CLI was detected — a missing CLI is
-        // already reported above and can't be launched.
-        if probe && detail.is_ok() {
-            ok &= doctor_probe(name, &profile, &routing::probe_profile);
-        }
     }
 
-    // Recommendation-table freshness (routing 2/3, #65): warn when the baked-in
-    // snapshot has aged past the staleness window.
-    match routing::table_age_days() {
-        Some(days) if days > routing::TABLE_STALE_DAYS => {
-            let ym = routing::GENERATED_AT
-                .get(..7)
-                .unwrap_or(routing::GENERATED_AT);
-            println!(
-                "⚠️  routing 推奨は {ym} 版({days} 日前)。新モデルのリリースを確認してください"
-            );
-        }
-        _ => {}
-    }
-
-    match &cfg.routing {
-        None => {
-            println!("routing: legacy — every role runs `default` ([agent])");
-        }
-        Some(routing_cfg) => {
-            let mode = match routing_cfg.mode {
-                meguri::config::RoutingMode::Auto => "auto",
-                meguri::config::RoutingMode::Manual => "manual",
-            };
-            // Explicit routing errors are startup errors: surface them here.
-            if let Err(e) = routing::validate(cfg, &routing::detect_command) {
-                println!("  ❌ routing config: {e:#}");
-                ok = false;
-            }
-            println!("routing ({mode}, table {}):", routing::GENERATED_AT);
-            for role in routing::KNOWN_ROLES {
-                match routing::resolve(cfg, role, &routing::detect_command) {
-                    Ok(profile) => println!("  {role:<18} → {profile}"),
-                    Err(e) => {
-                        println!("  {role:<18} → ❌ {e:#}");
-                        ok = false;
-                    }
-                }
-            }
-        }
-    }
-
-    // `meguri add`'s refine runs headless: report whether the resolved refiner
-    // profile actually has a headless mode. A miss isn't a doctor failure —
-    // capture still works, refine just stays off — but a human should know.
-    if let Ok(name) = routing::resolve(cfg, "refiner", &routing::detect_command)
-        && let Ok(profile) = routing::profile_by_name(cfg, &name)
-    {
-        match routing::effective_headless_args(&profile) {
-            Some(_) => println!("refine (`meguri add`): ✅ via {name} ({})", profile.command),
-            None => println!(
-                "refine (`meguri add`): ⚠️  {name} ({}) has no headless mode — \
-                 `meguri add` will capture raw only; set `headless_args` for it",
-                profile.command,
-            ),
-        }
-    }
-
-    ok &= doctor_launch(cfg);
-    ok
-}
-
-/// One-word summary of a profile's headless (refine) resolution for doctor:
-/// explicit argv, inherited from a known CLI, opted out, or unsupported.
-fn headless_note(profile: &meguri::config::AgentProfile) -> &'static str {
-    use meguri::routing::effective_headless_args;
-    match &profile.headless_args {
-        Some(a) if !a.is_empty() => "headless: explicit",
-        Some(_) => "headless: off",
-        None if effective_headless_args(profile).is_some() => "headless: inherited",
-        None => "headless: none",
-    }
-}
-
-/// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
-/// resolved (no legacy/off state, unlike routing). Explicit launch config
-/// errors (an unknown role key) are startup errors, surfaced here like
-/// routing's.
-fn doctor_launch(cfg: &Config) -> bool {
-    use meguri::{launch, routing};
-    let mut ok = true;
-    if let Err(e) = launch::validate(cfg) {
-        println!("  ❌ launch config: {e:#}");
+    if let Err(e) = profile::validate(cfg) {
+        println!("  ❌ profile config: {e:#}");
         ok = false;
     }
-    println!("launch mode:");
-    for role in routing::KNOWN_ROLES {
-        println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
+    for p in &cfg.projects {
+        match profile::resolve(cfg, p) {
+            Ok(name) => println!("  project {:<12} → {name}", p.id),
+            Err(e) => {
+                println!("  project {:<12} → ❌ {e:#}", p.id);
+                ok = false;
+            }
+        }
     }
     ok
-}
-
-/// doctor's severity for one profile's live probe. `ModelInvalid` is fatal (the
-/// routing table points at a model that no longer resolves); `Unavailable`
-/// (network/auth/unknown CLI) is a non-fatal ⚠️ so a flaky link doesn't fail
-/// doctor. Returns whether doctor may still pass.
-fn doctor_probe(
-    label: &str,
-    profile: &config::AgentProfile,
-    probe: &dyn Fn(&config::AgentProfile) -> meguri::routing::ProbeOutcome,
-) -> bool {
-    use meguri::routing::ProbeOutcome;
-    let (symbol, detail, fatal) = match probe(profile) {
-        ProbeOutcome::Ok => ("✅", "model alias valid".to_string(), false),
-        ProbeOutcome::ModelInvalid => (
-            "❌",
-            format!(
-                "model alias rejected by `{}` — routing 表が古い可能性",
-                profile.command
-            ),
-            true,
-        ),
-        ProbeOutcome::Unavailable => (
-            "⚠️ ",
-            "probe inconclusive (network/auth/unknown CLI) — doctor は fail させない".to_string(),
-            false,
-        ),
-    };
-    println!("  {symbol} probe {label}: {detail}");
-    !fatal
 }
 
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
@@ -647,55 +254,5 @@ fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> 
             String::from_utf8_lossy(&out.stderr).trim()
         )),
         Err(e) => Err(format!("not found ({e})")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use meguri::routing::ProbeOutcome;
-
-    fn fake_profile() -> config::AgentProfile {
-        config::AgentProfile {
-            command: "fake-claude".into(),
-            args: vec![],
-            resume_args: vec![],
-            headless_args: None,
-            direct_args: vec![],
-            herdr_agent_hint: None,
-            session_dir: None,
-            preflight: None,
-            resume_transcript_limit_bytes: config::AgentProfile::default()
-                .resume_transcript_limit_bytes,
-        }
-    }
-
-    #[test]
-    fn probe_invalid_model_fails_doctor() {
-        // "fake agent" = injected probe closure: a rejected model is fatal (❌).
-        let p = fake_profile();
-        let bad = |_: &config::AgentProfile| ProbeOutcome::ModelInvalid;
-        assert!(!doctor_probe("default", &p, &bad));
-    }
-
-    #[test]
-    fn can_push_accepts_write_and_up_only() {
-        // The write-scope decision is pure and now shared with add-project
-        // (`meguri::app::can_push`), so doctor can test it without gh.
-        for perm in ["ADMIN", "MAINTAIN", "WRITE"] {
-            assert!(app::can_push(perm), "{perm} should be able to push");
-        }
-        for perm in ["READ", "TRIAGE", "NONE", ""] {
-            assert!(!app::can_push(perm), "{perm} must not be able to push");
-        }
-    }
-
-    #[test]
-    fn probe_network_failure_does_not_fail_doctor() {
-        let p = fake_profile();
-        let flaky = |_: &config::AgentProfile| ProbeOutcome::Unavailable;
-        assert!(doctor_probe("default", &p, &flaky));
-        let ok = |_: &config::AgentProfile| ProbeOutcome::Ok;
-        assert!(doctor_probe("default", &p, &ok));
     }
 }

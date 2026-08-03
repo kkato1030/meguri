@@ -102,89 +102,49 @@ fn normalize_config_dir(
         .join(".claude")
 }
 
-/// Root of meguri-managed bare clones: `~/.meguri/repos`. Each project whose
-/// `repo_path` is omitted gets `repos_root().join(<id>)` (a bare clone
-/// materialized from its `repo_slug`). Deliberately a sibling of
-/// [`worktrees_root`], NOT under it: the reaper's only guard against reaping the
-/// primary clone is a `worktrees_root` prefix comparison, so a managed clone
-/// placed under it would be mis-reaped.
-pub fn repos_root() -> PathBuf {
-    meguri_home().join("repos")
-}
-
 /// Minimal `config.toml` written by `meguri init`. Loading fills every
 /// omitted section/key from the serde defaults, so the template only carries
 /// the projects stub plus commented override examples.
 pub const INIT_TEMPLATE: &str = r#"# meguri config — override したい項目だけ書けば、残りは既定値が使われます。
 # 既定値一覧は README を参照。
 
-# プロジェクトは `meguri add-project owner/repo` で追加します(1 コマンドで下の
-# [[projects]] を追記し、clone まで実体化する)。手書きしたいときは下の例のコメントを
-# 外して編集してください。init 直後はプロジェクト 0 件です。
+# プロジェクトは下の例のコメントを外して手書きします。init 直後は 0 件です。
 # [[projects]]
 # id = "myproj"
-# repo_slug = "owner/repo"
-# repo_path = "/abs/path/to/clone"  # 省略すると ~/.meguri/repos/<id> に bare clone を自動実体化。
-#                                   # 手元の clone を使いたいときだけ絶対パスを明示(従来どおり)。
+# repo_path = "/abs/path/to/clone"  # meguri が worktree を切る元の clone(必須)
+# repo_slug = "owner/repo"          # github mode で必須
 # default_branch = "main"
-# check_command = "cargo test"
-# mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、repo_path は必須、
-#                     # 成果物はローカルブランチ)。`meguri add "タスク"` で投入。詳細は README を参照。
+# check_command = "cargo test"      # 設定すると success 申告時に独立検証で実行される
+# profile = "claude"                # [agents.profiles.*] の名前。省略で default([agent])
+# mode = "local"      # ラベル/GitHub を使わず手元で回す(repo_slug は不要、成果物は
+#                     # ローカルブランチ)。`meguri add "タスク"` で投入。
 
 # [projects.worktree_setup]                  # worktree 準備のたびに(再利用時も)実行する汎用フック
-# commands = ["apm install --frozen"]        # 例: agent 指示ファイルの再生成。apm 専用ではなく任意コマンド列
+# commands = ["apm install --frozen"]        # 任意コマンド列
 # exclude = [".claude/rules", "AGENTS.md"]   # 生成物を .git/info/exclude に追記(.meguri/ は常に追記される)
 # required = false                           # true にすると失敗時に run が失敗扱いになる(既定は warn で続行)
 # timeout_secs = 300
 
-# [[workspaces]]                       # 関連 project の静的グルーピング(cross-repo 分解のスコープ + 表示単位)
-# id = "shop"                          # decompose の起票範囲・cross-repo blocker の解決範囲・ps/top のまとめ方にだけ効く
-# projects = ["shop-api", "shop-web"]  # 実行系(worktree/pane/branch)には一切現れない。詳細は README / ADR 0009
-
-# プロジェクト内在の設定(check_command / language / pr.draft)は repo ルートの
-# meguri.toml にも書ける。値は run 開始時にそのブランチから読まれて run に固定され、
-# host [projects.*] があれば host が勝つ。詳細は README の Configuration / ADR 0011。
-
-# [prompts]                            # ロール別 preamble: turn プロンプト冒頭に埋め込む恒常規律(issue #149)
-# all = "ops/agents/guardrails.md"     # 全ロール共通。値は repo 相対パス(絶対パス/`..` は不可)
-# worker = "ops/agents/worker.md"      # キーは routing のロール名(worker/planner/fixer/self-reviewer/pr-reviewer/cleaner)
-# [projects.prompts]                   # per-project override(キー単位で [prompts] を上書き)。ADR 0012
-# planner = "ops/agents/planner.md"    # 常時読み込みで足りるなら CLAUDE.md を使い、これは使わない(過剰採用を避ける)
+# [prompts]                            # preamble: turn プロンプト冒頭に埋め込む恒常規律
+# all = "ops/agents/guardrails.md"     # 値は repo 相対パス(絶対パス/`..` は不可)
+# worker = "ops/agents/worker.md"
+# [projects.prompts]                   # per-project override(キー単位で [prompts] を上書き)
+# worker = "ops/agents/worker.md"      # 常時読み込みで足りるなら CLAUDE.md を使い、これは使わない
 
 # 既定を上書きしたい時だけ、必要なセクション/キーを書く:
 # [scheduler]
 # max_concurrent_runs = 3
-# sweep_degraded_threshold = 10        # この回数連続で失敗したら sweep.degraded を通知(issue #251)
+# intake_interval_secs = 120           # GitHub ラベル読み取り(intake)の周期。キューの権威は sqlite
 #
 # [limits]
 # idle_grace_secs = 120
 #
-# [agent]
+# [agent]                              # default profile
 # args = ["--permission-mode", "acceptEdits"]  # yolo をやめて確認ダイアログ運用にする例
 #
-# [notifications]
-# macos = true                       # awaiting_human を macOS 通知で知らせる
-# webhook_url = "https://hooks.slack.com/services/..."  # 省略で webhook 無効。${ENV} 展開可
-# kind = "slack"                     # 省略で URL から自動判別(slack/ntfy/json)
-# events = ["awaiting_human", "escalation", "schedule.failed", "schedule.skipped", "infra", "sweep.degraded"]  # 既定は ["awaiting_human"]
-# throttle_secs = 60                 # 同一通知キーの連続通知の最短間隔(秒)
-# [projects.notify]                  # per-project: 指定ラベルの issue 起票を通知(issue #205)
-# labels = ["human:todo"]
-#
-# [review]                           # 内部 self-review(ADR 0006/0008)。host 専用(信頼の宣言 = ADR 0011/0024)
-# [[review.reviewers]]               # round 1 の並列 finder(issue #214)。空なら現行どおり単一 reviewer で挙動不変
-# profile = "claude-opus"            # 省略で self-reviewer profile。異種モデルを並べて round 1 の recall を上げる
-# # lenses = ["security"]            # 省略で全 lens。単一モデルなら lens を割って attention の非相関を作る
-#
-# [decompose]
-# materialize_enabled = true         # false で承認済み分解提案を materialize せず spec-ready のまま保留(不可逆な子 issue 作成の停止レバー、ADR 0016)
-#
-# [triage]                           # 未トリアージ issue を巡回し扱い方を推薦するループ(既定 off、ADR 0006/0015/0017)
-# mode = "off"                       # off | report(レポートのみ) | advise(提案ラベル) | auto(本ラベル自動付与)
-# confidence_threshold = 0.7         # auto: この確信度以上だけ昇格(0.0..=1.0)
-# apply = ["ready"]                  # auto: 昇格する推薦種別。信頼が積めたら ["ready", "plan"] へ
-# max_actions_per_tick = 3           # 1 スイープの書き込み上限
-# ignore = []                        # 誤検知を黙らせる substring
+# [agents.profiles.claude-opus]        # 追加の名前付き profile(projects.profile で選択)
+# command = "claude"
+# args = ["--model", "opus", "--dangerously-skip-permissions"]
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -200,27 +160,16 @@ pub struct Config {
     /// elsewhere. Keeps the historical `[agent]` section shape and semantics.
     #[serde(default)]
     pub agent: AgentProfile,
-    /// Named launch profiles (`[agents.profiles.<name>]`). Inert until a
-    /// `[routing]` section references them — see [`crate::routing`].
+    /// Named launch profiles (`[agents.profiles.<name>]`), selectable per
+    /// project via `projects.profile` — see [`crate::profile`].
     #[serde(default)]
     pub agents: Option<AgentsConfig>,
-    /// Role→profile routing (`[routing]`). Absent = legacy behavior: every
-    /// loop runs the `default` profile, no detection.
-    #[serde(default)]
-    pub routing: Option<RoutingConfig>,
-    /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
-    /// (no legacy/off state) — a role with no entry here still resolves
-    /// through the built-in recommendation table.
-    #[serde(default)]
-    pub launch: LaunchConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub pr: PrConfig,
-    #[serde(default)]
-    pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
     /// the shared `all` key) → repo-relative path to a file whose contents are
     /// injected into the turn prompt. Per-project `[projects.prompts]` overrides
@@ -229,65 +178,6 @@ pub struct Config {
     pub prompts: HashMap<String, String>,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
-    /// Static groupings of related projects (issue #154). Purely declarative —
-    /// no runtime state, never touches run/turn — and used for exactly three
-    /// things: the decompose issue-filing scope, the cross-repo blocker
-    /// resolution scope, and `ps`/`top` display grouping. Opt-in: a config
-    /// without `[[workspaces]]` behaves exactly as before. See ADR 0009.
-    #[serde(default)]
-    pub workspaces: Vec<WorkspaceConfig>,
-}
-
-/// Settings for the Issue Kind reconciler (`[reconciler]`, ADR 0012 slice 3):
-/// the step-policy allow-set (ADR 0026 — a disabled arm becomes
-/// `Wait(PolicyDisabled)`) and the claim instance id (ADR 0027).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ReconcilerConfig {
-    /// Which fixer-family arms may launch. A disabled arm's `Agent` step is
-    /// filtered to `Wait(PolicyDisabled)` (the uniform replacement for the
-    /// scattered per-loop kill switches).
-    #[serde(default)]
-    pub policy: StepPolicyConfig,
-    /// This instance's claim-marker owner id (ADR 0027 / §7). `None` falls back
-    /// to `mux.session`, so a single-machine deploy needs no config.
-    #[serde(default)]
-    pub instance: Option<String>,
-}
-
-/// The step-policy allow-set (ADR 0026). Every arm is enabled by default; set a
-/// field false to make that symptom `Wait(PolicyDisabled)` instead of launching.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct StepPolicyConfig {
-    #[serde(default = "default_true")]
-    pub conflict_resolver: bool,
-    #[serde(default = "default_true")]
-    pub ci_fixer: bool,
-    #[serde(default = "default_true")]
-    pub fixer: bool,
-    // ADR 0012 S4 (決定10): the uniform kill switch extends to every
-    // reconciler arm. Config *semantics* (guard toggles, …) stay on their own
-    // keys as snapshot trigger conditions — these bools only gate the Agent
-    // step (`Wait(PolicyDisabled)`), they do not replace them.
-    #[serde(default = "default_true")]
-    pub pr_reviewer: bool,
-    #[serde(default = "default_true")]
-    pub worker: bool,
-}
-
-impl Default for StepPolicyConfig {
-    fn default() -> Self {
-        Self {
-            conflict_resolver: true,
-            ci_fixer: true,
-            fixer: true,
-            pr_reviewer: true,
-            worker: true,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// How far the triage loop is allowed to act (issue #85). The series stages
@@ -415,7 +305,7 @@ pub struct AgentProfile {
     /// `args`, yolo included, for full runs): refine must stay read-only, so
     /// it cannot reuse a yolo-carrying arg set.
     ///
-    /// Resolution (see [`crate::routing::effective_headless_args`]): a
+    /// Resolution (see [`crate::profile::effective_headless_args`]): a
     /// non-empty value is used as-is; an explicit empty `[]` declares "no
     /// headless mode" (opt-out, since TOML can't write `None`); absence falls
     /// back to a known-CLI default (`claude` → `["-p"]`) so a zero-config
@@ -444,14 +334,14 @@ pub struct AgentProfile {
     /// pane no longer stalls at the first-run trust prompt (meguri never reads
     /// the screen to answer it).
     ///
-    /// Resolution (see [`crate::routing::effective_preflight_args`]): a
+    /// Resolution (see [`crate::profile::effective_preflight_args`]): a
     /// non-empty value is used verbatim (a complete argv — a host opt-in that
     /// bypasses the safe default and is warned about if it carries yolo); an
     /// explicit empty `[]` disables the prime; absence falls back to a
     /// known-CLI default that keeps the pane's model but adds a meguri-owned
     /// all-tool deny (`--settings` + `--strict-mcp-config`) so the prime turn
     /// executes no tool even against a permissive inherited config. On a
-    /// `claude` older than [`crate::routing::PREFLIGHT_MIN_CLAUDE_VERSION`] (or
+    /// `claude` older than [`crate::profile::PREFLIGHT_MIN_CLAUDE_VERSION`] (or
     /// any non-`claude` command) the default resolves empty — the prime is
     /// skipped and the pane launches as before.
     #[serde(default)]
@@ -495,67 +385,6 @@ pub struct AgentsConfig {
     /// (`claude-opus` / `claude-sonnet` / `codex`) overrides that builtin.
     #[serde(default)]
     pub profiles: HashMap<String, AgentProfile>,
-}
-
-/// How `[routing]` steers a loop's role to a profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RoutingMode {
-    /// Roles absent from `[routing.roles]` resolve through the built-in
-    /// recommendation table, filtered by CLI detection.
-    #[default]
-    Auto,
-    /// Roles absent from `[routing.roles]` resolve to `default`; the
-    /// recommendation table is off.
-    Manual,
-}
-
-/// How a role's turns are launched (issue #169, ADR 0012): `pane` keeps the
-/// historical live mux pane (a human can attach; the turn engine nudges a
-/// quiet agent); `direct` spawns the agent CLI as a plain subprocess for one
-/// turn and reads its exit + the result file — no pane, no attach, no
-/// nudging. Orthogonal to `[routing]`'s profile axis: this only decides
-/// *how* the chosen profile is launched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LaunchMode {
-    Pane,
-    Direct,
-}
-
-impl LaunchMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pane => "pane",
-            Self::Direct => "direct",
-        }
-    }
-}
-
-/// `[launch]`: role→launch-mode resolution (issue #169). Unlike `[routing]`,
-/// there is no legacy/off state — a role with no explicit entry always
-/// resolves through the built-in recommendation table
-/// ([`crate::launch::recommended_mode`]); an explicit `[launch.roles]` entry
-/// always wins over it. See `crate::launch`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LaunchConfig {
-    #[serde(default)]
-    pub roles: HashMap<String, LaunchMode>,
-}
-
-/// `[routing]`: role→profile resolution. Present = routing is active (auto or
-/// manual); absent = legacy (every role runs `default`, no detection).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RoutingConfig {
-    #[serde(default)]
-    pub mode: RoutingMode,
-    /// Explicit per-role overrides. Keys are the 6 routing roles (`planner`,
-    /// `worker`, `fixer`, `self-reviewer`, `pr-reviewer`, `cleaner`) — a
-    /// "kind of work" grouping, independent from the finer-grained internal
-    /// loop kinds (`runs.loop_kind`); see `crate::routing::KNOWN_ROLES`.
-    /// Values are profile names. An explicit entry always beats auto.
-    #[serde(default)]
-    pub roles: HashMap<String, String>,
 }
 
 fn default_agent_command() -> String {
@@ -787,14 +616,8 @@ fn default_worktree_setup_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
-    /// Absolute path to the clone meguri operates on. Optional in github mode:
-    /// when omitted, it is derived to `~/.meguri/repos/<id>` (a meguri-managed
-    /// bare clone materialized from `repo_slug`) — see [`Config::repo_path_for`].
-    /// Local mode has no clone source, so it must be set explicitly there
-    /// (enforced by [`Config::validate`]). Never read this field directly for
-    /// the effective path; go through `repo_path_for` / `Deps::repo_path`.
-    #[serde(default)]
-    pub repo_path: Option<PathBuf>,
+    /// Absolute path to the clone meguri operates on.
+    pub repo_path: PathBuf,
     /// "owner/repo" on GitHub. Optional: required unless `mode = "local"`.
     #[serde(default)]
     pub repo_slug: Option<String>,
@@ -813,6 +636,11 @@ pub struct ProjectConfig {
     /// Command the orchestrator runs in the worktree to validate agent work.
     #[serde(default)]
     pub check_command: Option<String>,
+    /// The agent profile this project's runs launch under (a name from
+    /// `[agents.profiles]`, a builtin, or the reserved `default`). One level
+    /// of override — role routing is dormant.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// Override for the worktree parent directory (default: ~/.meguri/worktrees).
     #[serde(default)]
     pub worktree_root: Option<PathBuf>,
@@ -832,158 +660,6 @@ pub struct ProjectConfig {
 
 fn default_branch() -> String {
     "main".into()
-}
-
-/// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
-/// the "project-intrinsic facts" subset of [`ProjectConfig`] a repo may carry
-/// for itself. Read from the run's worktree once at claim time and pinned to
-/// the run (see [`crate::engine::flow`] and ADR 0011); host `config.toml`
-/// always wins last (see [`Deps::with_repo_config`]).
-///
-/// `#[serde(deny_unknown_fields)]` is the boundary's enforcement: a host-only
-/// key (`repo_slug`, `agent`, `[[workspaces]]`, …) in `meguri.toml` is a parse
-/// error, surfaced by `meguri doctor` rather than silently ignored.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepoConfig {
-    /// Deliverable language; folds under host `language` / project `language`.
-    #[serde(default)]
-    pub language: Option<String>,
-    /// Independent-verification command; folds under the project's
-    /// `check_command`. Pinned at claim time so a run cannot weaken its own
-    /// completion contract mid-run (ADR 0011 §security).
-    #[serde(default)]
-    pub check_command: Option<String>,
-    /// The repo-eligible slice of `[pr]` (only `draft`; `auto_merge` is
-    /// host-only and absent here, so writing it under `[pr]` is a parse error).
-    #[serde(default)]
-    pub pr: Option<RepoPrConfig>,
-}
-
-/// The repo-eligible subset of `[pr]`. Carries `draft` but not `auto_merge`:
-/// arming GitHub-native auto-merge uses the host's `gh` token, so it stays
-/// host-only. `deny_unknown_fields` makes `[pr] auto_merge = …` in a
-/// `meguri.toml` a parse error — the first key-level boundary inside one
-/// section (ADR 0011).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepoPrConfig {
-    #[serde(default)]
-    pub draft: Option<bool>,
-}
-
-impl RepoConfig {
-    /// Read `<worktree>/meguri.toml`.
-    /// - absent → `Ok(None)` (opt-in default: no repo config).
-    /// - present but invalid TOML / host-only key → `Err` (the caller warns,
-    ///   emits `repo_config.invalid`, and falls back to "as if absent").
-    ///
-    /// Reads the working-tree file directly (no git); the run scopes which
-    /// branch's `meguri.toml` this is by which branch the worktree checked out.
-    pub fn load_from_worktree(worktree: &Path) -> Result<Option<Self>> {
-        let path = worktree.join("meguri.toml");
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot read {}", path.display()));
-            }
-        };
-        Self::parse_str(&raw)
-            .map(Some)
-            .with_context(|| format!("invalid repo config at {}", path.display()))
-    }
-
-    /// Parse the completion-contract pin from raw TOML text — the shared core of
-    /// [`load_from_worktree`] and the default-branch read path (`meguri doctor`
-    /// lints the on-default-branch bytes, which have no filesystem home).
-    ///
-    /// Parsing goes through [`RepoManifest`] (which knows the *full* repo-eligible
-    /// surface, including `schedules`) and then derives the pin. This keeps the
-    /// pin type byte-stable — `schedules` never enters it, so a saved
-    /// `Checkpoint.repo_config` stays decodable by an older binary — while a
-    /// malformed `[[schedules]]` entry cannot fail the parse and blank the
-    /// completion contract (issue #222 / ADR 0026).
-    pub fn parse_str(raw: &str) -> Result<Self> {
-        Ok(RepoManifest::parse_str(raw)?.pinned())
-    }
-
-    /// Whether this repo config actually carries an override worth folding in
-    /// (all `None` means the file was empty — nothing to layer over the host).
-    /// `schedules` are deliberately excluded: they are not a run-flow concern, so
-    /// a `meguri.toml` carrying only schedules folds nothing into the run.
-    pub fn has_values(&self) -> bool {
-        self.language.is_some()
-            || self.check_command.is_some()
-            || self.pr.as_ref().is_some_and(|p| p.draft.is_some())
-    }
-}
-
-/// The full repo-eligible surface of `meguri.toml` (issue #222): the run-flow
-/// pin keys plus `schedules`. It is the single parse envelope for both the
-/// completion-contract pin ([`RepoConfig::parse_str`] derives from it) and the
-/// schedule resolver (`engine::schedule` reads `schedules` from it).
-///
-/// Two properties make this envelope the right shape (ADR 0026):
-/// - `deny_unknown_fields` over the *complete* key set detects a host-only key
-///   (`repo_slug`, `agent`, …) as a parse error, while still accepting the
-///   legitimate `check_command` / `language` / `pr`.
-/// - `schedules` is accepted shape-tolerantly and **ignored** (the schedule
-///   layer is dormant, docs/adr/STATUS.md): a repo `meguri.toml` still carrying
-///   `[[schedules]]` must not blank the completion-contract pin (issue #222 f2).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepoManifest {
-    #[serde(default)]
-    pub language: Option<String>,
-    #[serde(default)]
-    pub check_command: Option<String>,
-    #[serde(default)]
-    pub pr: Option<RepoPrConfig>,
-    /// Accepted and ignored (dormant schedule layer): tolerating any shape
-    /// here keeps a leftover `[[schedules]]` from failing the pin parse.
-    #[serde(default)]
-    pub schedules: Option<toml::Value>,
-}
-
-impl RepoManifest {
-    /// Parse the envelope from raw TOML text.
-    pub fn parse_str(raw: &str) -> Result<Self> {
-        toml::from_str(raw).context("invalid repo config")
-    }
-
-    /// Derive the completion-contract pin (the run-flow keys only). A leftover
-    /// `schedules` value is dropped here — the run never reads it.
-    pub fn pinned(&self) -> RepoConfig {
-        RepoConfig {
-            language: self.language.clone(),
-            check_command: self.check_command.clone(),
-            pr: self.pr.clone(),
-        }
-    }
-}
-
-/// `[[workspaces]]` — a static grouping of related projects (issue #154).
-///
-/// ```toml
-/// [[workspaces]]
-/// id = "shop"
-/// projects = ["shop-api", "shop-web", "shop-infra"]
-/// ```
-///
-/// A workspace never appears in the execution path (worktree / pane / branch /
-/// verification are unchanged) and carries no runtime state. It only bounds
-/// where a decomposition may file cross-repo child issues, which sibling repos
-/// discovery is willing to resolve blockers in, and how `ps` / `top` group
-/// their rows. See ADR 0009.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceConfig {
-    pub id: String,
-    /// Member project ids. Each must reference a defined `[[projects]]` entry,
-    /// and a project may belong to at most one workspace (both enforced by
-    /// [`Config::validate`]).
-    #[serde(default)]
-    pub projects: Vec<String>,
 }
 
 impl Config {
@@ -1022,26 +698,16 @@ impl Config {
             ),
         }
         for p in &self.projects {
-            // `id` becomes a filesystem path element (managed clone root
-            // `repos_root()/<id>`, and worktree paths), so it must be a single
-            // safe path component — reject empty, `/`, `\`, `.`, `..`, and any
-            // multi-component or absolute value before it can escape the tree.
+            // `id` becomes a filesystem path element (worktree paths), so it
+            // must be a single safe path component — reject empty, `/`, `\`,
+            // `.`, `..`, and any multi-component or absolute value before it
+            // can escape the tree.
             validate_project_id(&p.id)?;
             if p.mode != ProjectMode::Local && p.repo_slug.is_none() {
                 anyhow::bail!(
                     "project {:?} has mode = {:?} but no repo_slug (required unless mode = \"local\")",
                     p.id,
                     p.mode.as_str()
-                );
-            }
-            // Local mode has no remote to clone from, so `repo_path` cannot be
-            // derived — it must be set explicitly (github mode may omit it and
-            // let meguri materialize a managed bare clone from `repo_slug`).
-            if p.mode == ProjectMode::Local && p.repo_path.is_none() {
-                anyhow::bail!(
-                    "project {:?} is mode = \"local\" but has no repo_path \
-                     (required in local mode — there is no repo_slug to clone from)",
-                    p.id
                 );
             }
             if p.mode == ProjectMode::Local && p.deliver == Some(Deliver::Pr) {
@@ -1054,77 +720,12 @@ impl Config {
         // Workspace invariants are global, not per-project — validate once here
         // (issue #222 f4: this used to hang off `validate_schedules`, which the
         // schedule-validator split removed).
-        self.validate_workspaces()?;
         self.validate_prompts()?;
-        Ok(())
-    }
-
-    /// Workspace invariants (issue #154): every referenced project is defined,
-    /// no project belongs to two workspaces, and workspace ids are unique and
-    /// non-empty. Hard-fail like the other structural checks so a typo surfaces
-    /// at load time (and `meguri doctor`) rather than as a silent no-op scope.
-    fn validate_workspaces(&self) -> Result<()> {
-        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut owner: HashMap<&str, &str> = HashMap::new();
-        for ws in &self.workspaces {
-            if !seen_ids.insert(ws.id.as_str()) {
-                anyhow::bail!("workspace id {:?} is defined more than once", ws.id);
-            }
-            if ws.projects.is_empty() {
-                anyhow::bail!("workspace {:?} has no projects", ws.id);
-            }
-            for pid in &ws.projects {
-                if self.project(pid).is_none() {
-                    anyhow::bail!(
-                        "workspace {:?} references undefined project {:?}",
-                        ws.id,
-                        pid
-                    );
-                }
-                if let Some(other) = owner.insert(pid.as_str(), ws.id.as_str()) {
-                    anyhow::bail!(
-                        "project {:?} belongs to both workspace {:?} and {:?} \
-                         (a project may join at most one workspace)",
-                        pid,
-                        other,
-                        ws.id
-                    );
-                }
-            }
-        }
         Ok(())
     }
 
     pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
         self.projects.iter().find(|p| p.id == id)
-    }
-
-    /// The workspace with this id, if any.
-    pub fn workspace(&self, id: &str) -> Option<&WorkspaceConfig> {
-        self.workspaces.iter().find(|w| w.id == id)
-    }
-
-    /// The workspace a project belongs to, if any. `None` for a project that
-    /// joined no workspace (the opt-out default).
-    pub fn workspace_of(&self, project_id: &str) -> Option<&WorkspaceConfig> {
-        self.workspaces
-            .iter()
-            .find(|w| w.projects.iter().any(|p| p == project_id))
-    }
-
-    /// The other projects sharing `project_id`'s workspace (self excluded),
-    /// resolved to their [`ProjectConfig`]. Empty when the project joined no
-    /// workspace. Drives both the decompose issue-filing scope and the
-    /// cross-repo blocker resolution scope (issue #154).
-    pub fn workspace_siblings(&self, project_id: &str) -> Vec<&ProjectConfig> {
-        let Some(ws) = self.workspace_of(project_id) else {
-            return Vec::new();
-        };
-        ws.projects
-            .iter()
-            .filter(|p| p.as_str() != project_id)
-            .filter_map(|p| self.project(p))
-            .collect()
     }
 
     /// Effective PR settings for a project (project override wins).
@@ -1147,26 +748,6 @@ impl Config {
             ProjectMode::Local => Deliver::Branch,
             ProjectMode::Github => Deliver::Pr,
         })
-    }
-
-    /// The clone path meguri operates on for a project. An explicit `repo_path`
-    /// wins; when omitted (github mode only — [`Config::validate`] rejects the
-    /// omission in local mode), it is derived to `repos_root().join(<id>)`, a
-    /// meguri-managed bare clone materialized from `repo_slug`. The single place
-    /// the derivation lives; callers must go through here (or [`super::engine::
-    /// Deps::repo_path`]) rather than reading the raw field.
-    pub fn repo_path_for(&self, project: &ProjectConfig) -> PathBuf {
-        project
-            .repo_path
-            .clone()
-            .unwrap_or_else(|| repos_root().join(&project.id))
-    }
-
-    /// Whether a project's clone is meguri-managed (derived path), i.e. the
-    /// `repo_path` was omitted so meguri owns and materializes it. `false` for an
-    /// explicit `repo_path` (the host's own clone — meguri never clones over it).
-    pub fn is_managed_clone(&self, project: &ProjectConfig) -> bool {
-        project.repo_path.is_none()
     }
 
     /// The preamble paths to inject for a role, in injection order: the shared
@@ -1222,14 +803,11 @@ fn preamble_in_map(map: &HashMap<String, String>, want: &str) -> Option<String> 
         .map(|(_, v)| v.clone())
 }
 
-/// Canonicalize a preamble map key: `all` stays literal, everything else goes
-/// through the routing role aliases (`spec-reviewer` → `pr-reviewer`, …).
+/// Preamble map keys: the shared `all` plus the worker role.
+pub const KNOWN_PROMPT_KEYS: &[&str] = &["worker"];
+
 fn canonical_preamble_key(key: &str) -> &str {
-    if key == "all" {
-        "all"
-    } else {
-        crate::routing::canonical_role(key)
-    }
+    key
 }
 
 /// Validate one preamble map's keys and path values (see
@@ -1238,10 +816,10 @@ fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, rel) in map {
         let canon = canonical_preamble_key(key);
-        if canon != "all" && !crate::routing::KNOWN_ROLES.contains(&canon) {
+        if canon != "all" && !KNOWN_PROMPT_KEYS.contains(&canon) {
             anyhow::bail!(
                 "{label} has unknown role key {key:?} — valid keys: all, {}",
-                crate::routing::KNOWN_ROLES.join(", ")
+                KNOWN_PROMPT_KEYS.join(", ")
             );
         }
         if !seen.insert(canon.to_string()) {
@@ -1257,7 +835,7 @@ fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
 
 /// Reject a project `id` that is not a single safe path component. The `id`
 /// becomes a filesystem path element — the managed clone root
-/// (`repos_root()/<id>`) and the worktree paths — so `../x`, `a/b`, a leading
+/// (the worktree paths) — so `../x`, `a/b`, a leading
 /// `/`, `.`, `..`, or an empty string must fail loudly at load time rather than
 /// silently placing a clone outside `~/.meguri/repos`. Same "interpret as a
 /// path and reject dangerous components" stance as [`validate_repo_relative`].
@@ -1283,114 +861,6 @@ pub fn validate_project_id(id: &str) -> Result<()> {
              (no `/`, `\\`, `.`, `..`, or leading `/`)"
         ),
     }
-}
-
-/// Reject an `owner/repo` slug that is not a safe, GitHub-shaped identifier
-/// (issue #196). Two gates: a conservative character set (`[A-Za-z0-9._-]`,
-/// exactly one `/`, both halves non-empty) and an explicit per-component check
-/// that rejects `.`/`..` — which the character set alone would let through — so
-/// a slug can never carry path traversal or, once written into config.toml,
-/// inject beyond its own `key = "..."`.
-pub fn validate_repo_slug(slug: &str) -> Result<()> {
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
-        anyhow::bail!("repo slug {slug:?} must be exactly \"owner/repo\"");
-    };
-    for (label, part) in [("owner", owner), ("repo", repo)] {
-        if part.is_empty() {
-            anyhow::bail!("repo slug {slug:?} has an empty {label}");
-        }
-        if part == "." || part == ".." {
-            anyhow::bail!("repo slug {slug:?} {label} must not be `.` or `..`");
-        }
-        if !part
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        {
-            anyhow::bail!(
-                "repo slug {slug:?} {label} has an invalid character \
-                 (allowed: letters, digits, `.`, `_`, `-`)"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The default project id derived from an `owner/repo` slug: the repo half. The
-/// caller still runs it through [`validate_project_id`] (a repo name may hold
-/// characters an id may not) and asks for `--id` if it fails.
-pub fn default_id_from_slug(slug: &str) -> &str {
-    slug.rsplit('/').next().unwrap_or(slug)
-}
-
-/// The default project id derived from a local path: its final component.
-pub fn default_id_from_path(path: &Path) -> Option<&str> {
-    path.file_name().and_then(|s| s.to_str())
-}
-
-/// A new `[[projects]]` entry to append to config.toml (issue #196). Only the
-/// keys an add-project is allowed to set; every value is written through the
-/// TOML serializer (see [`render_project_block`]), so a string carrying quotes,
-/// newlines, or backslashes is escaped rather than injected.
-#[derive(Debug, Serialize)]
-pub struct ProjectDraft {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_slug: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_path: Option<String>,
-    /// Omitted for the default (github) mode; `Some("local")` for local mode.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ProjectsDoc<'a> {
-    projects: &'a [ProjectDraft],
-}
-
-/// Render a single `[[projects]]` block for `draft` via the TOML serializer —
-/// the escape boundary that makes the append injection-safe.
-pub fn render_project_block(draft: &ProjectDraft) -> Result<String> {
-    let doc = ProjectsDoc {
-        projects: std::slice::from_ref(draft),
-    };
-    toml::to_string(&doc).context("serializing the new [[projects]] block")
-}
-
-/// Append a `[[projects]]` block to the config file, preserving every existing
-/// byte — comments, key order, hand edits (issue #196, ADR 0019). TOML's
-/// array-of-tables can always be extended at EOF, so a plain text append is the
-/// whole mechanism (no re-serialization of the existing file). Atomic: the new
-/// content is written to a sibling temp file and renamed over the original.
-pub fn append_project(cfg_path: &Path, draft: &ProjectDraft) -> Result<()> {
-    let block = render_project_block(draft)?;
-    let existing = std::fs::read_to_string(cfg_path)
-        .with_context(|| format!("cannot read config at {}", cfg_path.display()))?;
-    let mut out = existing;
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push('\n');
-    out.push_str(&block);
-    write_atomic(cfg_path, &out)
-}
-
-/// Overwrite a file atomically (temp file in the same directory + rename). Used
-/// by [`append_project`] and by add-project's rollback path (restore the
-/// original bytes if the appended config fails to reparse).
-pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let base = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config.toml");
-    let tmp = dir.join(format!(".{base}.tmp-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("writing temp config {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
-    Ok(())
 }
 
 /// Reject a configured preamble path that could escape the repo lexically: an
@@ -1533,15 +1003,6 @@ impl ConfigReloader {
             );
             return None;
         }
-        // `[launch.roles]` typos are a loud startup error (`crate::launch::
-        // validate`, issue #169) — a hot reload must reject the same way
-        // instead of silently applying an ignored override.
-        if let Err(e) = crate::launch::validate(&next) {
-            self.last_seen = Some(raw);
-            tracing::warn!("config reload rejected: {e:#} — keeping the last good config");
-            return None;
-        }
-
         // Pin the process-bound settings so `current` always reflects what is
         // actually in effect.
         if next.mux.kind != self.current.mux.kind || next.mux.session != self.current.mux.session {
@@ -1779,9 +1240,8 @@ language = "English"
 
     #[test]
     fn init_template_is_minimal_and_loads_with_defaults() {
-        // No table is active — the projects stub is commented too (issue #196):
-        // a fresh `meguri init` config has zero live projects, so `add-project`
-        // appends the first one without leaving a dummy `owner/repo` behind.
+        // No table is active — the projects stub is commented too: a fresh
+        // `meguri init` config has zero live projects.
         let active_tables: Vec<&str> = INIT_TEMPLATE
             .lines()
             .filter(|l| l.trim_start().starts_with('['))
@@ -1946,69 +1406,6 @@ language = "English"
     }
 
     #[test]
-    fn agents_and_routing_default_to_none() {
-        // Back-compat: an empty config (and any config without the new
-        // sections) leaves both `agents` and `routing` absent — the legacy
-        // "everything runs [agent]" path.
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.agents.is_none());
-        assert!(cfg.routing.is_none());
-    }
-
-    #[test]
-    fn parses_profiles_and_routing() {
-        let raw = r#"
-[agents.profiles.claude-opus]
-command = "claude"
-args = ["--dangerously-skip-permissions", "--model", "opus"]
-resume_args = ["--resume"]
-
-[agents.profiles.codex]
-command = "codex"
-args = ["--yolo"]
-resume_args = ["resume"]
-
-[routing]
-mode = "auto"
-
-[routing.roles]
-reviewer = "codex"
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let profiles = &cfg.agents.as_ref().unwrap().profiles;
-        assert_eq!(profiles["claude-opus"].command, "claude");
-        assert_eq!(
-            profiles["claude-opus"].args,
-            vec!["--dangerously-skip-permissions", "--model", "opus"]
-        );
-        assert_eq!(profiles["codex"].resume_args, vec!["resume"]);
-        let routing = cfg.routing.as_ref().unwrap();
-        assert_eq!(routing.mode, RoutingMode::Auto);
-        assert_eq!(routing.roles["reviewer"], "codex");
-    }
-
-    #[test]
-    fn routing_mode_defaults_to_auto_when_section_present() {
-        let cfg: Config = toml::from_str("[routing]\n").unwrap();
-        assert_eq!(cfg.routing.as_ref().unwrap().mode, RoutingMode::Auto);
-        let cfg: Config = toml::from_str("[routing]\nmode = \"manual\"\n").unwrap();
-        assert_eq!(cfg.routing.as_ref().unwrap().mode, RoutingMode::Manual);
-    }
-
-    #[test]
-    fn profiles_without_routing_still_parse() {
-        // `[agents.profiles]` alone is legal; it stays inert (no routing).
-        let raw = r#"
-[agents.profiles.codex]
-command = "codex"
-args = ["--yolo"]
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(cfg.agents.is_some());
-        assert!(cfg.routing.is_none());
-    }
-
-    #[test]
     fn parses_project() {
         let raw = r#"
 [[projects]]
@@ -2067,53 +1464,19 @@ check_command = "cargo test"
     }
 
     #[test]
-    fn repo_path_for_derives_when_omitted_and_honors_explicit() {
-        // github mode without repo_path → derived under repos_root()/<id>.
-        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        cfg.validate().unwrap();
-        let p = cfg.project("g").unwrap();
-        assert!(cfg.is_managed_clone(p));
-        assert_eq!(cfg.repo_path_for(p), repos_root().join("g"));
-
-        // Explicit repo_path is returned verbatim and is not a managed clone.
-        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\nrepo_path = \"/tmp/g\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let p = cfg.project("g").unwrap();
-        assert!(!cfg.is_managed_clone(p));
-        assert_eq!(cfg.repo_path_for(p), PathBuf::from("/tmp/g"));
-    }
-
-    #[test]
-    fn github_project_may_omit_repo_path() {
-        // Acceptance criterion 1: id + repo_slug alone is a valid github project.
-        let raw = "[[projects]]\nid = \"g\"\nrepo_slug = \"me/g\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.project("g").unwrap().repo_path, None);
-    }
-
-    #[test]
-    fn local_without_repo_path_is_rejected() {
-        // Acceptance criterion 3: local mode has no slug to clone from, so
-        // repo_path is required.
-        let raw = "[[projects]]\nid = \"l\"\nmode = \"local\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("repo_path"), "{err}");
-    }
-
-    #[test]
     fn dangerous_project_ids_are_rejected() {
-        // Acceptance criterion 7: an id that isn't a single safe path component
-        // would let a managed clone escape ~/.meguri/repos.
+        // An id that isn't a single safe path component would let a worktree
+        // path escape the worktree root.
         for bad in ["../x", "a/b", "a\\b", "/x", ".", "..", "", "a/"] {
-            let raw = format!("[[projects]]\nid = {bad:?}\nrepo_slug = \"me/g\"\n");
+            let raw = format!(
+                "[[projects]]\nid = {bad:?}\nrepo_path = \"/tmp/g\"\nrepo_slug = \"me/g\"\n"
+            );
             let cfg: Config = toml::from_str(&raw).unwrap();
             assert!(cfg.validate().is_err(), "id {bad:?} should be rejected");
         }
         // A normal id passes.
-        let raw = "[[projects]]\nid = \"my-proj_1\"\nrepo_slug = \"me/g\"\n";
+        let raw =
+            "[[projects]]\nid = \"my-proj_1\"\nrepo_path = \"/tmp/g\"\nrepo_slug = \"me/g\"\n";
         let cfg: Config = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
     }
@@ -2171,118 +1534,15 @@ timeout_secs = 60
         assert_eq!(ws.timeout_secs, 60);
     }
 
-    /// Minimal valid config carrying the given projects plus the extra lines.
-    fn config_with_projects(ids: &[&str], extra: &str) -> String {
-        let mut raw = String::new();
-        for id in ids {
-            raw.push_str(&format!(
-                "[[projects]]\nid = \"{id}\"\nrepo_path = \"/tmp/{id}\"\nrepo_slug = \"me/{id}\"\n\n"
-            ));
-        }
-        raw.push_str(extra);
-        raw
-    }
-
-    #[test]
-    fn workspaces_default_to_empty() {
-        // Opt-in: a config without [[workspaces]] has none, and behavior is
-        // unchanged (acceptance criterion 5).
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.workspaces.is_empty());
-        assert!(cfg.workspace_of("anything").is_none());
-        assert!(cfg.workspace_siblings("anything").is_empty());
-    }
-
-    #[test]
-    fn parses_workspace_and_resolves_membership() {
-        let raw = config_with_projects(
-            &["shop-api", "shop-web", "shop-infra", "loner"],
-            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"shop-web\", \"shop-infra\"]\n",
-        );
-        let cfg: Config = toml::from_str(&raw).unwrap();
-        cfg.validate().unwrap();
-
-        assert_eq!(cfg.workspace("shop").unwrap().projects.len(), 3);
-        assert_eq!(
-            cfg.workspace_of("shop-web").map(|w| w.id.as_str()),
-            Some("shop")
-        );
-        assert!(cfg.workspace_of("loner").is_none());
-
-        let siblings: Vec<&str> = cfg
-            .workspace_siblings("shop-api")
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert_eq!(siblings, vec!["shop-web", "shop-infra"]);
-        assert!(cfg.workspace_siblings("loner").is_empty());
-    }
-
-    #[test]
-    fn workspace_referencing_undefined_project_is_rejected() {
-        let raw = config_with_projects(
-            &["shop-api"],
-            "[[workspaces]]\nid = \"shop\"\nprojects = [\"shop-api\", \"ghost\"]\n",
-        );
-        let cfg: Config = toml::from_str(&raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("undefined project") && err.contains("ghost"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn project_in_two_workspaces_is_rejected() {
-        let raw = config_with_projects(
-            &["a", "b"],
-            "[[workspaces]]\nid = \"w1\"\nprojects = [\"a\", \"b\"]\n\
-             [[workspaces]]\nid = \"w2\"\nprojects = [\"b\"]\n",
-        );
-        let cfg: Config = toml::from_str(&raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("at most one workspace"), "{err}");
-    }
-
-    #[test]
-    fn duplicate_workspace_id_and_empty_projects_are_rejected() {
-        let dup = config_with_projects(
-            &["a"],
-            "[[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n\
-             [[workspaces]]\nid = \"w\"\nprojects = [\"a\"]\n",
-        );
-        let cfg: Config = toml::from_str(&dup).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("more than once"), "{err}");
-
-        let empty = config_with_projects(&["a"], "[[workspaces]]\nid = \"w\"\nprojects = []\n");
-        let cfg: Config = toml::from_str(&empty).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("no projects"), "{err}");
-    }
-
     // ---- repo config (issue #165) ----
-
-    #[test]
-    fn repo_config_absent_is_ok_none() {
-        let dir = tempfile::tempdir().unwrap();
-        // No meguri.toml in the worktree → opt-out, not an error.
-        assert!(
-            RepoConfig::load_from_worktree(dir.path())
-                .unwrap()
-                .is_none()
-        );
-    }
 
     const A_PROJECT: &str =
         "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";
 
     #[test]
     fn prompts_parse_and_key_validation() {
-        // Known roles, deprecated aliases, and `all` all load and validate.
-        let raw = format!(
-            "[prompts]\nall = \"a.md\"\nworker = \"w.md\"\nci-fixer = \"f.md\"\n{A_PROJECT}"
-        );
+        // Known keys and `all` all load and validate.
+        let raw = format!("[prompts]\nall = \"a.md\"\nworker = \"w.md\"\n{A_PROJECT}");
         let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
         assert_eq!(cfg.prompts.get("all").map(String::as_str), Some("a.md"));
 
@@ -2290,13 +1550,6 @@ timeout_secs = 60
         let bad = format!("[prompts]\nnonsense = \"x.md\"\n{A_PROJECT}");
         let err = Config::parse(&bad, Path::new("t.toml")).unwrap_err();
         assert!(format!("{err:#}").contains("unknown role key"), "{err:#}");
-    }
-
-    #[test]
-    fn prompts_alias_and_canonical_collision_rejected() {
-        let bad = format!("[prompts]\nfixer = \"a.md\"\nci-fixer = \"b.md\"\n{A_PROJECT}");
-        let err = Config::parse(&bad, Path::new("t.toml")).unwrap_err();
-        assert!(format!("{err:#}").contains("more than once"), "{err:#}");
     }
 
     #[test]
@@ -2346,123 +1599,16 @@ timeout_secs = 60
     }
 
     #[test]
-    fn repo_config_parses_eligible_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("meguri.toml"),
-            "language = \"日本語\"\ncheck_command = \"cargo test\"\n\n[pr]\ndraft = false\n",
-        )
-        .unwrap();
-        let repo = RepoConfig::load_from_worktree(dir.path())
-            .unwrap()
-            .expect("meguri.toml present");
-        assert_eq!(repo.language.as_deref(), Some("日本語"));
-        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
-        assert_eq!(repo.pr.and_then(|p| p.draft), Some(false));
-    }
-
-    #[test]
-    fn repo_config_rejects_host_only_key() {
-        // A host-only key (the doctor's failure case) is a parse error, not a
-        // silent drop — `deny_unknown_fields`.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("meguri.toml"),
-            "check_command = \"cargo test\"\nrepo_slug = \"me/x\"\n",
-        )
-        .unwrap();
-        let err = RepoConfig::load_from_worktree(dir.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("repo_slug")
-                || format!("{err:#}").contains("unknown field"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn repo_config_rejects_auto_merge_under_pr() {
-        // The key-level boundary: `[pr] draft` is fine, `[pr] auto_merge` is
-        // host-only and must be rejected inside meguri.toml.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("meguri.toml"),
-            "[pr]\ndraft = false\n\n[pr.auto_merge]\nenabled = true\n",
-        )
-        .unwrap();
-        assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
-    }
-
-    #[test]
-    fn malformed_schedule_entry_does_not_blank_the_pin() {
-        // issue #222 f1: a `[[schedules]]` entry missing `title` is a *schedule*
-        // error, not a pin error — the completion-contract keys survive.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("meguri.toml"),
-            "check_command = \"cargo test\"\nlanguage = \"日本語\"\n\
-             [[schedules]]\nname = \"broken\"\ncron = \"0 9 * * *\"\n",
-        )
-        .unwrap();
-        let repo = RepoConfig::load_from_worktree(dir.path())
-            .expect("pin parse must not fail on a schedule error")
-            .expect("present");
-        assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
-        assert_eq!(repo.language.as_deref(), Some("日本語"));
-    }
-
-    #[test]
-    fn repo_config_has_values() {
-        assert!(!RepoConfig::default().has_values());
-        assert!(
-            RepoConfig {
-                check_command: Some("x".into()),
-                ..Default::default()
-            }
-            .has_values()
-        );
-        assert!(
-            RepoConfig {
-                pr: Some(RepoPrConfig { draft: Some(true) }),
-                ..Default::default()
-            }
-            .has_values()
-        );
-        // An empty [pr] table (draft = None) is not itself an override.
-        assert!(
-            !RepoConfig {
-                pr: Some(RepoPrConfig { draft: None }),
-                ..Default::default()
-            }
-            .has_values()
-        );
-    }
-
-    #[test]
-    fn preambles_for_resolves_aliases_and_top_project_override() {
-        // Old name at top-level, canonical name per-project: project wins, and
-        // the alias still resolves for the canonical role.
+    fn preambles_for_project_override_wins() {
         let raw = format!(
-            "[prompts]\nci-fixer = \"top-fix.md\"\n\
-             {A_PROJECT}[projects.prompts]\nfixer = \"proj-fix.md\"\n"
+            "[prompts]\nworker = \"top.md\"\n{A_PROJECT}[projects.prompts]\nworker = \"proj.md\"\n"
         );
         let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
         let p = cfg.project("p").unwrap();
         assert_eq!(
-            cfg.preambles_for(p, "fixer"),
-            vec![("fixer".to_string(), "proj-fix.md".to_string())]
+            cfg.preambles_for(p, "worker"),
+            vec![("worker".to_string(), "proj.md".to_string())]
         );
-
-        // Old name only, at top-level, resolves for the canonical role turn.
-        let raw2 = format!("[prompts]\nci-fixer = \"fix.md\"\n{A_PROJECT}");
-        let cfg2 = Config::parse(&raw2, Path::new("t.toml")).unwrap();
-        let p2 = cfg2.project("p").unwrap();
-        assert_eq!(
-            cfg2.preambles_for(p2, "fixer"),
-            vec![("fixer".to_string(), "fix.md".to_string())]
-        );
-
-        // A role with nothing configured returns nothing.
-        assert!(cfg2.preambles_for(p2, "worker").is_empty());
     }
 
     #[cfg(unix)]

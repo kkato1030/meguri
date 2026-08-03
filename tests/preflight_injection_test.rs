@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use meguri::config::AgentProfile;
 use meguri::preflight::{PreflightOutcome, ensure_preflight};
-use meguri::routing::{PREFLIGHT_MIN_CLAUDE_VERSION, parse_version_triple};
+use meguri::profile::{PREFLIGHT_MIN_CLAUDE_VERSION, parse_version_triple};
 
 fn enabled() -> bool {
     if std::env::var("MEGURI_TEST_CLAUDE").as_deref() != Ok("1") {

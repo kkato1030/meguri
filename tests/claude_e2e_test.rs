@@ -147,13 +147,14 @@ async fn real_claude_implements_issue_in_tmux() {
 
     let project = ProjectConfig {
         id: "sandbox".into(),
-        repo_path: Some(clone.clone()),
+        repo_path: clone.clone(),
         repo_slug: Some("local/sandbox".into()),
         mode: Default::default(),
         deliver: None,
         default_branch: "main".into(),
         language: None,
         check_command: Some("python3 -m unittest discover -q".into()),
+        profile: None,
         worktree_root: Some(root.path().join("worktrees")),
         pr: None,
         worktree_setup: Default::default(),

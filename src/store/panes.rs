@@ -15,13 +15,6 @@ use super::{Store, now};
 /// fixer, ci-fixer, conflict resolver — and the cleaner's standalone report
 /// pane, which no other loop ever touches).
 pub const LANE_AUTHOR: &str = "author";
-/// The pr-reviewer's independent lane: separate pane, separate session, but
-/// keyed by the same issue so it stays discoverable and resumable.
-pub const LANE_PR_REVIEW: &str = "pr-review";
-/// The worker's internal self-review lane (ADR 0006): the review turn of the
-/// pre-publish self-review runs here, under the `self-reviewer` profile, so
-/// it stays a separate session/model from the author lane doing the fixes.
-pub const LANE_SELF_REVIEW: &str = "self-review";
 /// The collab advisor lane (issue #111, ADR 0006 collab-advisor): the
 /// plan-author advisor pane a worker consults over agmsg. Ephemeral — spawned
 /// at worker execute, reaped at run end regardless of `keep_pane`, never
@@ -32,7 +25,7 @@ pub const LANE_ADVISOR: &str = "advisor";
 pub struct PaneRecord {
     pub project_id: String,
     pub issue_number: i64,
-    /// Lane within the issue: [`LANE_AUTHOR`] or [`LANE_PR_REVIEW`].
+    /// Lane within the issue (the kernel only uses [`LANE_AUTHOR`]).
     pub lane: String,
     pub mux_kind: Option<String>,
     pub mux_session: Option<String>,
@@ -401,21 +394,19 @@ mod tests {
             .upsert_pane("demo", 7, LANE_AUTHOR, "tmux", "meguri", "%1", "/wt/a")
             .unwrap();
         store
-            .upsert_pane("demo", 7, LANE_PR_REVIEW, "tmux", "meguri", "%2", "/wt/r")
+            .upsert_pane("demo", 7, "pr-review", "tmux", "meguri", "%2", "/wt/r")
             .unwrap();
         assert_eq!(store.list_panes("demo").unwrap().len(), 2);
 
         // Reclaiming one lane leaves the other standing.
         store
-            .save_pane_session("demo", 7, LANE_PR_REVIEW, Some("sess-rev"))
+            .save_pane_session("demo", 7, "pr-review", Some("sess-rev"))
             .unwrap();
-        store
-            .mark_pane_reclaimed("demo", 7, LANE_PR_REVIEW)
-            .unwrap();
+        store.mark_pane_reclaimed("demo", 7, "pr-review").unwrap();
         let author = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
         assert_eq!(author.mux_pane_id.as_deref(), Some("%1"));
         assert_eq!(author.agent_session_id, None);
-        let review = store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().unwrap();
+        let review = store.get_pane("demo", 7, "pr-review").unwrap().unwrap();
         assert_eq!(review.mux_pane_id, None);
         assert_eq!(review.agent_session_id.as_deref(), Some("sess-rev"));
     }
@@ -430,7 +421,7 @@ mod tests {
             .upsert_pane("b", 1, LANE_AUTHOR, "tmux", "meguri", "%2", "/wt/b/1")
             .unwrap();
         store
-            .upsert_pane("a", 1, LANE_PR_REVIEW, "tmux", "meguri", "%3", "/wt/a/r1")
+            .upsert_pane("a", 1, "pr-review", "tmux", "meguri", "%3", "/wt/a/r1")
             .unwrap();
         assert_eq!(store.list_panes("a").unwrap().len(), 2);
         assert_eq!(store.panes_for_issue(1).unwrap().len(), 3);
@@ -479,7 +470,7 @@ mod tests {
         // Lanes count independently.
         assert_eq!(
             store
-                .bump_pane_quiet_strikes("demo", 7, LANE_PR_REVIEW)
+                .bump_pane_quiet_strikes("demo", 7, "pr-review")
                 .unwrap(),
             1
         );
@@ -503,164 +494,5 @@ mod tests {
             .update_run_status(&run.id, crate::store::RunStatus::Succeeded, None)
             .unwrap();
         assert!(!store.issue_has_active_run("demo", 7).unwrap());
-    }
-
-    #[test]
-    fn migration_backfills_panes_from_latest_run() {
-        // Simulate a pre-0004 database: apply only 0001, record a run with a
-        // pane, then let Store::open run the 0004 backfill (and the 0005
-        // role rebuild, later renamed to lane by 0011, on top).
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("meguri.sqlite");
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
-                   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
-                 );",
-            )
-            .unwrap();
-            conn.execute_batch(include_str!("migrations/0001_init.sql"))
-                .unwrap();
-            conn.execute(
-                "INSERT INTO schema_migrations (name, applied_at) VALUES ('0001_init', ?1)",
-                [now()],
-            )
-            .unwrap();
-            for (id, pane, created) in [
-                ("run-old", "%1", "2026-01-01T00:00:00Z"),
-                ("run-new", "%2", "2026-01-02T00:00:00Z"),
-            ] {
-                conn.execute(
-                    "INSERT INTO runs (id, project_id, issue_number, status, mux_kind,
-                                       mux_session, mux_pane_id, worktree_path, created_at)
-                     VALUES (?1, 'demo', 7, 'succeeded', 'tmux', 'meguri', ?2,
-                             '/wt/demo/b', ?3)",
-                    params![id, pane, created],
-                )
-                .unwrap();
-            }
-        }
-
-        let store = Store::open(&db).unwrap();
-        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
-        assert_eq!(pane.mux_pane_id.as_deref(), Some("%2"), "newest run wins");
-        assert_eq!(pane.worktree_path.as_deref(), Some("/wt/demo/b"));
-        assert_eq!(pane.lane, LANE_AUTHOR);
-    }
-
-    #[test]
-    fn migration_carries_0004_panes_into_the_author_lane() {
-        // Simulate a 0004-era database: panes exist without a role column;
-        // 0005 must rebuild them as author rows, keeping the saved session.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("meguri.sqlite");
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
-                   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
-                 );",
-            )
-            .unwrap();
-            for (name, sql) in [
-                ("0001_init", include_str!("migrations/0001_init.sql")),
-                (
-                    "0002_heartbeats",
-                    include_str!("migrations/0002_heartbeats.sql"),
-                ),
-                (
-                    "0003_agent_session",
-                    include_str!("migrations/0003_agent_session.sql"),
-                ),
-                ("0004_panes", include_str!("migrations/0004_panes.sql")),
-            ] {
-                conn.execute_batch(sql).unwrap();
-                conn.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
-                    params![name, now()],
-                )
-                .unwrap();
-            }
-            conn.execute(
-                "INSERT INTO panes (project_id, issue_number, mux_kind, mux_session,
-                                    mux_pane_id, worktree_path, agent_session_id,
-                                    created_at, updated_at)
-                 VALUES ('demo', 7, 'tmux', 'meguri', '%5', '/wt/demo/b',
-                         'sess-old', ?1, ?1)",
-                [now()],
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&db).unwrap();
-        let pane = store.get_pane("demo", 7, LANE_AUTHOR).unwrap().unwrap();
-        assert_eq!(pane.lane, LANE_AUTHOR);
-        assert_eq!(pane.mux_pane_id.as_deref(), Some("%5"));
-        assert_eq!(pane.agent_session_id.as_deref(), Some("sess-old"));
-        assert!(store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().is_none());
-    }
-
-    #[test]
-    fn migration_renames_role_to_lane_and_remaps_old_values() {
-        // Simulate a pre-0011 database with the old `role` column and old
-        // lane values ('review', 'impl-review'); 0011 must rebuild the table
-        // as `lane` with the values remapped to 'pr-review'/'self-review'.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("meguri.sqlite");
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
-                   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
-                 );",
-            )
-            .unwrap();
-            for (name, sql) in [
-                ("0001_init", include_str!("migrations/0001_init.sql")),
-                (
-                    "0002_heartbeats",
-                    include_str!("migrations/0002_heartbeats.sql"),
-                ),
-                (
-                    "0003_agent_session",
-                    include_str!("migrations/0003_agent_session.sql"),
-                ),
-                ("0004_panes", include_str!("migrations/0004_panes.sql")),
-                (
-                    "0005_agent_profile",
-                    include_str!("migrations/0005_agent_profile.sql"),
-                ),
-                (
-                    "0006_pane_role",
-                    include_str!("migrations/0006_pane_role.sql"),
-                ),
-            ] {
-                conn.execute_batch(sql).unwrap();
-                conn.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
-                    params![name, now()],
-                )
-                .unwrap();
-            }
-            for (issue, role, pane) in [(7, "review", "%1"), (8, "impl-review", "%2")] {
-                conn.execute(
-                    "INSERT INTO panes (project_id, issue_number, role, mux_kind, mux_session,
-                                        mux_pane_id, worktree_path, created_at, updated_at)
-                     VALUES ('demo', ?1, ?2, 'tmux', 'meguri', ?3, '/wt/demo/b', ?4, ?4)",
-                    params![issue, role, pane, now()],
-                )
-                .unwrap();
-            }
-        }
-
-        let store = Store::open(&db).unwrap();
-        let review = store.get_pane("demo", 7, LANE_PR_REVIEW).unwrap().unwrap();
-        assert_eq!(review.mux_pane_id.as_deref(), Some("%1"));
-        let self_review = store
-            .get_pane("demo", 8, LANE_SELF_REVIEW)
-            .unwrap()
-            .unwrap();
-        assert_eq!(self_review.mux_pane_id.as_deref(), Some("%2"));
     }
 }

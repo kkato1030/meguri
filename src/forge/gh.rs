@@ -96,17 +96,6 @@ pub struct GhForge {
     repo: String,
 }
 
-/// Production [`ForgeFactory`](super::ForgeFactory): builds a [`GhForge`] per
-/// repo slug. Used by cross-repo decomposition to reach workspace siblings
-/// (issue #154).
-pub struct GhForgeFactory;
-
-impl super::ForgeFactory for GhForgeFactory {
-    fn for_slug(&self, slug: &str) -> std::sync::Arc<dyn Forge> {
-        std::sync::Arc::new(GhForge::new(slug))
-    }
-}
-
 impl GhForge {
     pub fn new(repo_slug: &str) -> Self {
         Self {

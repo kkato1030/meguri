@@ -2,7 +2,6 @@ pub mod escalation;
 pub mod flow;
 pub mod issue_reconciler;
 pub mod reaper;
-pub mod repo_reconciler;
 pub mod scheduler;
 pub mod worker;
 
@@ -33,11 +32,6 @@ pub struct Deps {
     /// complete) — `LabelTaskSource` in github mode, `LocalTaskSource` in
     /// local mode.
     pub task_source: Arc<dyn TaskSource>,
-    /// Builds a forge for a repo slug — how cross-repo decomposition reaches a
-    /// workspace sibling's repository (issue #154). Production is
-    /// `GhForgeFactory`; tests inject fakes. Only ever consulted for siblings;
-    /// the project's own repo uses [`Deps::forge`].
-    pub forge_factory: Arc<dyn crate::forge::ForgeFactory>,
     pub config: Config,
     pub project: ProjectConfig,
     /// Whether launch-time pre-flight priming is active (issue #235). Production
@@ -71,7 +65,6 @@ impl Deps {
             mux,
             forge: Some(forge),
             task_source,
-            forge_factory: Arc::new(crate::forge::gh::GhForgeFactory),
             config,
             project,
             // Test seam: never run a real prime subprocess in tests.
@@ -79,47 +72,9 @@ impl Deps {
         }
     }
 
-    /// Swap in a custom [`ForgeFactory`] (cross-repo decomposition tests inject
-    /// fakes for workspace siblings). Builder-style so the common
-    /// `with_github_source` path stays a single call.
-    pub fn with_forge_factory(mut self, factory: Arc<dyn crate::forge::ForgeFactory>) -> Self {
-        self.forge_factory = factory;
-        self
-    }
-
-    /// A run-scoped clone whose `project` folds in the run's pinned repo
-    /// `meguri.toml` (issue #165). The precedence is
-    /// `builtin < host global < repo < host [projects.*] override`: a field the
-    /// host project already set wins wholesale; otherwise the repo value fills
-    /// it in. Cheap — `Deps` shares its store/mux/forge via `Arc`.
-    ///
-    /// `[pr]` keeps a key-level boundary (ADR 0011): the host's
-    /// `[projects.pr]` wins wholesale; otherwise the repo's `draft` applies.
-    pub fn with_repo_config(&self, repo: &crate::config::RepoConfig) -> Self {
-        let mut project = self.project.clone();
-        if project.language.is_none() {
-            project.language = repo.language.clone();
-        }
-        if project.check_command.is_none() {
-            project.check_command = repo.check_command.clone();
-        }
-        if project.pr.is_none()
-            && let Some(draft) = repo.pr.as_ref().and_then(|p| p.draft)
-        {
-            project.pr = Some(crate::config::PrConfig { draft });
-        }
-        let mut deps = self.clone();
-        deps.project = project;
-        deps
-    }
-
-    /// The clone path this project's loops operate on. Resolves through
-    /// [`Config::repo_path_for`]: an explicit `repo_path`, or the derived
-    /// managed-clone path (`~/.meguri/repos/<id>`) when omitted. The single
-    /// accessor every loop uses instead of reading `project.repo_path` directly,
-    /// so the derivation lives in one place.
+    /// The clone path this project's loops operate on.
     pub fn repo_path(&self) -> std::path::PathBuf {
-        self.config.repo_path_for(&self.project)
+        self.project.repo_path.clone()
     }
 
     /// The forge for github-mode loops. Panics if absent — only the
@@ -129,65 +84,6 @@ impl Deps {
         self.forge
             .as_ref()
             .expect("forge is required for this loop (github mode)")
-    }
-}
-
-/// Materialize a project's managed bare clone if it is declared but missing —
-/// the level-triggered reconcile step for `repo_path` (ADR 0012 / 0018). Called
-/// at the very top of each scheduler tick, before anything (redispatch,
-/// discover, sweeps) touches `repo_path`, and before a one-shot `meguri run`
-/// prepares its worktree.
-///
-/// A no-op unless the project is github mode **and** its `repo_path` was omitted
-/// (a managed clone): an explicit `repo_path` is the host's own clone and meguri
-/// never clones over it; local mode has no remote to clone from.
-///
-/// On failure it emits `repo.clone.failed` and returns the error, so the caller
-/// can exclude the project from this tick and retry next tick. It does NOT raise
-/// `needs-human` or notify: at this point there is no run/issue/PR to key those
-/// to, and the failure is an operator config/auth/network problem that
-/// self-heals once fixed — `doctor` is the human-facing surface (ADR 0018).
-pub async fn ensure_project_clone(deps: &Deps) -> Result<()> {
-    if deps.project.mode != crate::config::ProjectMode::Github
-        || !deps.config.is_managed_clone(&deps.project)
-    {
-        return Ok(());
-    }
-    let Some(slug) = deps.project.repo_slug.clone() else {
-        return Ok(()); // validate guarantees a github slug; stay defensive
-    };
-    let dest = deps.repo_path();
-    // Emit `repo.cloned` only on the tick that actually materializes it, not on
-    // every healthy no-op tick.
-    let was_absent = matches!(
-        gitops::clone_health(&dest, &slug).await,
-        gitops::CloneHealth::Absent
-    );
-    match gitops::ensure_bare_clone(&dest, &slug).await {
-        Ok(()) => {
-            if was_absent {
-                let _ = deps.store.emit(
-                    None,
-                    "repo.cloned",
-                    serde_json::json!({ "slug": slug, "dest": dest.to_string_lossy() }),
-                );
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Level-triggered: emitted every failing tick (not deduped) — the
-            // observation point for "still not fixed".
-            let _ = deps.store.emit(
-                None,
-                "repo.clone.failed",
-                serde_json::json!({
-                    "slug": slug,
-                    "dest": dest.to_string_lossy(),
-                    "reason": format!("{e:#}"),
-                }),
-            );
-            Err(e)
-        }
     }
 }
 
@@ -518,12 +414,13 @@ mod tests {
         use crate::mux::fake::FakeMux;
         let project = crate::config::ProjectConfig {
             id: "proj".into(),
-            repo_path: Some("/tmp/unused".into()),
+            repo_path: "/tmp/unused".into(),
             repo_slug: Some("me/proj".into()),
             mode: Default::default(),
             deliver: None,
             default_branch: "main".into(),
             check_command: None,
+            profile: None,
             worktree_root: None,
             language: None,
             pr: None,

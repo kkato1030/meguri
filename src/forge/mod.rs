@@ -1,8 +1,7 @@
-//! Forge abstraction (GitHub for MVP). Follows looper's "Authority"
-//! principle: labels and comments on the forge are the durable source of
-//! truth for workflow state, never in-memory agent output.
-
-use std::sync::Arc;
+//! Forge abstraction (GitHub for MVP). Since the 権威反転 (kernel-pruning
+//! Phase 5), the sqlite `tasks` table is the workflow authority; the forge is
+//! read as a low-frequency edge signal and written as a best-effort
+//! projection.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -190,15 +189,6 @@ pub trait Forge: Send + Sync {
     async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
-}
-
-/// Builds a [`Forge`] for a given repo slug (`owner/repo`). Cross-repo
-/// decomposition needs a forge for a workspace sibling's repository, which the
-/// per-project `Deps::forge` cannot provide (issue #154). Production returns a
-/// `GhForge`; tests inject fakes so the sibling-repo path is exercised without
-/// hitting GitHub. See ADR 0009.
-pub trait ForgeFactory: Send + Sync {
-    fn for_slug(&self, slug: &str) -> Arc<dyn Forge>;
 }
 
 #[cfg(test)]
