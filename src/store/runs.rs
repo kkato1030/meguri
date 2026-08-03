@@ -317,6 +317,23 @@ impl Store {
         })
     }
 
+    /// Whether a live author-lane run (queued/running/interrupted) already
+    /// owns the issue — the run-liveness half of the `issue_busy` gate
+    /// (finding 3: a stale `working` label from a crashed run must not
+    /// deadlock recovery).
+    pub fn issue_has_active_author_run(&self, project_id: &str, issue_number: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let active: bool = c
+                .prepare(
+                    "SELECT 1 FROM runs
+                      WHERE project_id = ?1 AND issue_number = ?2
+                        AND status IN ('queued', 'running', 'interrupted')",
+                )?
+                .exists(params![project_id, issue_number])?;
+            Ok(active)
+        })
+    }
+
     /// Whether the issue has already been shipped by a succeeded run of the
     /// given loop — used by watch discovery to avoid re-filing (and duplicate
     /// PRs) after the success de-labeled the issue. Scoped by loop kind so

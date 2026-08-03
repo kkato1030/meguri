@@ -5,12 +5,10 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 mod panes;
-mod reconciler;
 mod runs;
 mod schedules;
 mod tasks;
 pub use panes::*;
-pub use reconciler::*;
 pub use runs::*;
 pub use schedules::*;
 pub use tasks::*;

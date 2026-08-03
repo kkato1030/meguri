@@ -82,7 +82,6 @@ async fn setup() -> TestEnv {
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
 

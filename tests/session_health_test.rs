@@ -88,7 +88,6 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
 

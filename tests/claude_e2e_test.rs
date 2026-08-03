@@ -157,7 +157,6 @@ async fn real_claude_implements_issue_in_tmux() {
         worktree_root: Some(root.path().join("worktrees")),
         pr: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
     let deps = Deps::with_label_source(

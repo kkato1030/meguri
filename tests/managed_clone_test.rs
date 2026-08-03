@@ -32,7 +32,6 @@ fn managed_project(id: &str, repo_path: Option<PathBuf>, mode: ProjectMode) -> P
         worktree_root: None,
         pr: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     }
 }

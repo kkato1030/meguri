@@ -91,10 +91,6 @@ pub struct Task {
     /// The GitHub issue a local task points at (`origin = github:<N>`), for
     /// silent mode. `None` for plain local tasks.
     pub issue: Option<i64>,
-    /// The task opted into auto-merge (auto-merge 1/3, #41): github mode reads
-    /// the `meguri:automerge` label; local mode is always `false`. Carried into
-    /// the checkpoint at claim time and applied when the PR opens.
-    pub automerge: bool,
 }
 
 /// The task coordination layer: discover / claim / release / escalate /
@@ -263,7 +259,6 @@ impl TaskSource for LabelTaskSource {
             tasks.push(Task {
                 key: TaskKey::Issue(issue.number),
                 kind,
-                automerge: issue.has_label(forge::LABEL_AUTOMERGE),
                 title: issue.title,
                 body: issue.body,
                 issue: Some(issue.number),
@@ -294,7 +289,6 @@ impl TaskSource for LabelTaskSource {
         Ok(Some(Task {
             key: *key,
             kind: TaskKind::Work,
-            automerge: issue.has_label(forge::LABEL_AUTOMERGE),
             title: issue.title,
             body: issue.body,
             issue: Some(n),
@@ -352,8 +346,6 @@ fn row_to_task(row: crate::store::TaskRow) -> Task {
     Task {
         key: TaskKey::Local(row.id),
         kind: TaskKind::parse(&row.kind).unwrap_or(TaskKind::Work),
-        // Local tasks never opt into auto-merge (it is a github-PR concern).
-        automerge: false,
         title: row.title,
         body: row.body,
         issue: origin_issue(&row.origin),

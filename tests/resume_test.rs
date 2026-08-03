@@ -83,7 +83,6 @@ async fn setup() -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         pr: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
 
