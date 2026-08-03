@@ -644,15 +644,12 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_runs: u32,
-    /// Consecutive-failure threshold before a watch-loop sweep (merge-tail /
-    /// handoff / reaper / …) escalates from a `tracing::warn!` to a
-    /// `sweep.degraded` event + notification (issue #251, design doc P6.5).
-    /// #227's unbalanced-brace GraphQL bug killed the merge-tail sweep every
-    /// poll for hours with no trace beyond the log — this bounds how long a
-    /// silent sweep failure can go unnoticed to roughly
-    /// `threshold * poll_interval_secs`.
-    #[serde(default = "default_sweep_degraded_threshold")]
-    pub sweep_degraded_threshold: u32,
+    /// How often the GitHub intake sweep runs (issue listings → task rows,
+    /// 権威反転). Deliberately slower than the poll: the queue authority is
+    /// sqlite, so the label read is a low-frequency edge signal — the human's
+    /// label edits reach meguri within this window.
+    #[serde(default = "default_intake_interval")]
+    pub intake_interval_secs: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -660,9 +657,13 @@ impl Default for SchedulerConfig {
         Self {
             poll_interval_secs: default_poll_interval(),
             max_concurrent_runs: default_max_concurrent(),
-            sweep_degraded_threshold: default_sweep_degraded_threshold(),
+            intake_interval_secs: default_intake_interval(),
         }
     }
+}
+
+fn default_intake_interval() -> u64 {
+    120
 }
 
 fn default_poll_interval() -> u64 {
@@ -671,10 +672,6 @@ fn default_poll_interval() -> u64 {
 fn default_max_concurrent() -> u32 {
     2
 }
-fn default_sweep_degraded_threshold() -> u32 {
-    10
-}
-
 /// Restart policy for the OS-supervised watch (maps to launchd `KeepAlive`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

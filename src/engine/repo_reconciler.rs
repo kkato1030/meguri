@@ -87,7 +87,7 @@ mod tests {
             worktree_setup: Default::default(),
             prompts: Default::default(),
         };
-        let deps = super::super::Deps::with_label_source(
+        let deps = super::super::Deps::with_github_source(
             Store::open_in_memory().unwrap(),
             Arc::new(crate::mux::fake::FakeMux::new(false)),
             Arc::new(crate::forge::fake::FakeForge::default()),

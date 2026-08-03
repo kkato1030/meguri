@@ -58,7 +58,7 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         worktree_setup: Default::default(),
         prompts: Default::default(),
     };
-    Deps::with_label_source(
+    Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         Arc::new(FakeMux::new(false)),
         forge,
@@ -175,20 +175,14 @@ async fn watch_discovers_and_completes_labeled_issue() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_skips_working_and_hold_issues() {
+async fn watch_skips_hold_issues() {
     let root = tempfile::tempdir().unwrap();
     let forge = Arc::new(FakeForge::with_issue(
-        12,
-        "Claimed elsewhere",
-        "Another host is on it.",
-        &[LABEL_READY, LABEL_WORKING],
+        13,
+        "Held",
+        "A human parked this.",
+        &[LABEL_READY, meguri::forge::LABEL_HOLD],
     ));
-    forge.issues.lock().unwrap().push(meguri::forge::Issue {
-        number: 13,
-        title: "Held".into(),
-        body: String::new(),
-        labels: vec![LABEL_READY.into(), meguri::forge::LABEL_HOLD.into()],
-    });
     let deps = setup(root.path(), forge.clone()).await;
     let store = deps.store.clone();
 
@@ -203,9 +197,13 @@ async fn watch_skips_working_and_hold_issues() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     watch.abort();
 
+    // The intake imported the row but the hold label held it (権威反転):
+    // nothing dispatches until the human removes the hold.
+    let row = store.task_by_origin("proj", "github:13").unwrap().unwrap();
+    assert_eq!(row.status, "held");
     assert!(
         store.list_runs(false).unwrap().is_empty(),
-        "no runs may be created for claimed/held issues"
+        "no runs may be created for held issues"
     );
 }
 

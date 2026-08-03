@@ -202,7 +202,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         worktree_setup: Default::default(),
         prompts: Default::default(),
     };
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
         forge,

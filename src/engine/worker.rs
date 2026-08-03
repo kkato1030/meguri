@@ -197,7 +197,7 @@ mod tests {
             worktree_setup: Default::default(),
             prompts: Default::default(),
         };
-        let deps = Deps::with_label_source(
+        let deps = Deps::with_github_source(
             store,
             Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge.clone(),

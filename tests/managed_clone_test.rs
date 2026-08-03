@@ -37,7 +37,7 @@ fn managed_project(id: &str, repo_path: Option<PathBuf>, mode: ProjectMode) -> P
 }
 
 fn deps_for(project: ProjectConfig) -> Deps {
-    Deps::with_label_source(
+    Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         Arc::new(FakeMux::new(false)),
         Arc::new(FakeForge::default()),

@@ -1,37 +1,32 @@
 //! The task coordination layer, split out of [`Forge`](crate::forge::Forge):
-//! discover / claim / release / escalate / complete. This is the seam that
-//! GitHub labels used to fill; swapping it is how meguri runs against a repo
-//! whose labels it cannot (or must not) touch, and — later — how a remote DB
-//! coordinates several hosts (see ADR 0003).
+//! claim / release / escalate / complete. **The sqlite `tasks` table is the
+//! authority for the task lifecycle in every mode** (kernel-pruning-plan
+//! Phase 5, 権威反転): GitHub is a projection — labels and comments are
+//! written best-effort for the human's benefit, and read only as low-frequency
+//! edge signals (the intake sweep, and the claim-time re-verification).
 //!
-//! Two implementations ship today:
-//! - [`LabelTaskSource`]: the current label-driven behavior, wrapping a
-//!   [`Forge`]. `meguri:ready`/`meguri:plan` are the queue, `meguri:working`
-//!   the claim, `meguri:needs-human` the escalation. task identity is the
-//!   issue number ([`TaskKey::Issue`]); no DB row mirrors the labels.
-//! - [`LocalTaskSource`]: a sqlite `tasks` table. task identity is the row id
-//!   ([`TaskKey::Local`]); state lives entirely in the local store.
-//!
-//! The `claim` contract is deliberately async + single-atomic-operation so
-//! the Phase 4 remote-DB implementation is one more `impl TaskSource` rather
-//! than a reshaped contract: `claim(key, host) -> Option<Task>`, where `None`
-//! is a benign race (someone else took it, or it is no longer actionable).
+//! Two implementations ship:
+//! - [`GithubTaskSource`]: sqlite authority + GitHub projection. Task rows are
+//!   imported from `meguri:ready` issues by the intake sweep (or lazily at
+//!   claim time), carry `origin = github:<N>`, and keep the issue number as
+//!   their engine-facing identity ([`TaskKey::Issue`]) so runs, panes,
+//!   worktrees, and PRs stay issue-keyed.
+//! - [`LocalTaskSource`]: pure sqlite, no forge. task identity is the row id
+//!   ([`TaskKey::Local`]).
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::engine::worker;
 use crate::forge::{self, Forge};
 use crate::store::Store;
 
 /// The claiming host id stored in `tasks.claimed_by`. Fixed on a single
-/// machine (Phase 1–3); Phase 4's remote DB gives each host its own.
+/// machine; a remote DB would give each host its own.
 pub const LOCAL_HOST: &str = "local";
 
-/// What a task is queued for. Maps to the worker (`work`) loop and to the
-/// `meguri:ready` label in [`LabelTaskSource`].
+/// What a task is queued for. Only worker work remains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Work,
@@ -50,20 +45,11 @@ impl TaskKind {
             _ => None,
         }
     }
-
-    /// The `(trigger label, loop kind)` this task kind maps to in label mode.
-    /// The loop kind scopes the succeeded-run discovery guard exactly as the
-    /// old `discover_by_label` call sites did.
-    fn label_and_loop(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Work => (forge::LABEL_READY, worker::KIND),
-        }
-    }
 }
 
-/// A task's identity across the coordination layer. github mode keeps the
-/// issue number as the key (labels remain the only source of truth — no
-/// mirror row); local/silent tasks use the `tasks` row id.
+/// A task's identity across the coordination layer. A github-origin task keeps
+/// its issue number as the key (runs/panes/worktrees/PRs stay issue-keyed);
+/// plain local tasks use the `tasks` row id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskKey {
     Issue(i64),
@@ -88,58 +74,30 @@ pub struct Task {
     pub kind: TaskKind,
     pub title: String,
     pub body: String,
-    /// The GitHub issue a local task points at (`origin = github:<N>`), for
-    /// silent mode. `None` for plain local tasks.
+    /// The GitHub issue this task points at (`origin = github:<N>`). `None`
+    /// for plain local tasks.
     pub issue: Option<i64>,
 }
 
-/// The task coordination layer: discover / claim / release / escalate /
-/// complete. `claim` is a single atomic operation (see the module docs).
-/// The discovery-gate verdict for one issue candidate (ADR 0012 S4 決定1):
-/// the same predicates `discover` applies — already-shipped suppression and
-/// the dependency gate — exposed per issue so the Issue Kind reconciler can
-/// consult them on a single snapshot instead of running per-label discovers.
-#[derive(Debug, Clone)]
-pub enum GateVerdict {
-    /// Every gate passes; an enqueue may proceed.
-    Pass,
-    /// A succeeded run already covers this issue.
-    Shipped,
-    /// Held by an unresolved `blocked_by` dependency.
-    Blocked,
-}
-
+/// The task coordination layer: claim / release / escalate / complete.
+/// `claim` is a single atomic operation (an UPDATE guarded on the claimable
+/// statuses); `None` is a benign race (someone else took it, or it is no
+/// longer actionable) and ends the run Skipped.
 #[async_trait]
 pub trait TaskSource: Send + Sync {
-    /// Actionable tasks of `kind` (queued *or* needs_human, so a re-claim can
-    /// clear an escalation — the label version does the same by leaving the
-    /// trigger label on an escalated issue). Idempotent.
-    async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>>;
-
-    /// Evaluate the discovery gates for one issue candidate of `loop_kind`
-    /// (ADR 0012 S4 決定1). Sources without issue gates (local) pass.
-    async fn evaluate_issue(&self, loop_kind: &str, issue: &forge::Issue) -> Result<GateVerdict> {
-        let _ = (loop_kind, issue);
-        Ok(GateVerdict::Pass)
-    }
-
-    /// Claim a task as one atomic operation. `None` is a benign race (someone
-    /// else took it, or it is no longer actionable) and ends the run Skipped.
     async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>>;
 
-    /// Release a claim (`meguri stop`, needs-plan demotion).
+    /// Release a claim (`meguri stop`).
     async fn release(&self, key: &TaskKey) -> Result<()>;
 
-    /// Hand the task to a human; `reason` is stored durably (label + comment
-    /// in github mode, `status='needs_human'` + `reason` in local mode).
-    /// `hint` is the launch-mode-aware "how to look at this" sentence (issue
-    /// #169) — pane attach, or a `claude --resume` hint for a direct-mode
-    /// role — folded into the github comment; local mode ignores it (nothing
-    /// renders markdown there).
+    /// Hand the task to a human; `reason` is stored durably
+    /// (`status='needs_human'` + `reason`, plus the label + comment
+    /// projection in github mode). `hint` is the launch-mode-aware "how to
+    /// look at this" sentence (issue #169) folded into the github comment.
     async fn escalate(&self, key: &TaskKey, reason: &str, hint: &str) -> Result<()>;
 
-    /// The task shipped a deliverable (github: drop the trigger/working
-    /// labels; local: `status='done'`).
+    /// The task shipped a deliverable (`status='done'`; github mode also
+    /// drops the trigger/working labels as projection).
     async fn complete(&self, key: &TaskKey) -> Result<()>;
 }
 
@@ -148,35 +106,41 @@ pub trait TaskSource: Send + Sync {
 pub const DEFAULT_ATTACH_HINT: &str = "The agent's pane (if still open) has the full context — \
      see `meguri ps` / `meguri attach` on the host running meguri.";
 
-/// The needs-human comment left on an escalated issue (shared by
-/// [`LabelTaskSource`] and [`crate::engine::flow::escalate_on_forge`]).
-/// `hint` is the closing "how to look at this" sentence — pane attach by
-/// default, or a mode-aware alternative the caller computed (issue #169).
+/// The needs-human comment left on an escalated issue.
 pub fn needs_human_comment(reason: &str, hint: &str) -> String {
     format!("🔁 **meguri** could not finish this issue and needs a human.\n\n> {reason}\n\n{hint}")
 }
 
+/// The `tasks.origin` value for a task imported from a GitHub issue.
+pub fn github_origin(issue: i64) -> String {
+    format!("github:{issue}")
+}
+
+/// The issue number a task points at, parsed from its `origin`
+/// (`github:<N>`; plain `local` otherwise).
+pub fn origin_issue(origin: &str) -> Option<i64> {
+    origin.strip_prefix("github:")?.parse().ok()
+}
+
 /// Dependency gate (looper ADR-0004): only a blocker closed as completed
 /// resolves; open blockers, not_planned/duplicate closes, and blockers we
-/// cannot read all keep the issue out of discovery.
-async fn has_unresolved_blockers(forge: &dyn Forge, issue: i64) -> bool {
+/// cannot read all keep the issue out of dispatch.
+pub async fn has_unresolved_blockers(forge: &dyn Forge, issue: i64) -> bool {
     match forge.blocked_by(issue).await {
         Ok(blockers) => blockers.iter().any(|b| !b.resolved()),
         Err(_) => true,
     }
 }
 
-/// The current label-driven coordination layer, wrapping a [`Forge`]. This is
-/// the verbatim behavior of the old `flow::discover_by_label` / `claim_issue`
-/// / `escalate_on_forge` / worker `settle_labels`, now behind the trait so a
-/// non-label implementation can stand in.
-pub struct LabelTaskSource {
+/// sqlite-authority coordination for a github project, with the forge as a
+/// best-effort projection (権威反転): the row decides, the labels display.
+pub struct GithubTaskSource {
     forge: Arc<dyn Forge>,
     store: Store,
     project_id: String,
 }
 
-impl LabelTaskSource {
+impl GithubTaskSource {
     pub fn new(forge: Arc<dyn Forge>, store: Store, project_id: String) -> Self {
         Self {
             forge,
@@ -185,106 +149,62 @@ impl LabelTaskSource {
         }
     }
 
-    /// Whether a succeeded run already covers this issue: permanent
-    /// suppression keyed on `(project, loop, issue)`.
-    fn already_shipped(&self, loop_kind: &str, issue: &forge::Issue) -> Result<bool> {
+    /// The task row an issue key resolves to, if any.
+    fn row_of(&self, issue: i64) -> Result<Option<crate::store::TaskRow>> {
         self.store
-            .issue_has_succeeded_run(&self.project_id, loop_kind, issue.number)
+            .task_by_origin(&self.project_id, &github_origin(issue))
     }
-
-    /// Every candidate issue for `kind` with the reason discovery would (or
-    /// would not) run it — the read-only view behind `meguri tasks`. Same gate
-    /// order as `discover`, so a `Ready` here is exactly what discover emits.
-    /// hold / working / already-shipped issues are dropped, as discover drops
-    /// them.
-    pub async fn dispositions(&self, kind: TaskKind) -> Result<Vec<(forge::Issue, Disposition)>> {
-        let (label, loop_kind) = kind.label_and_loop();
-        let issues = self.forge.list_issues_with_label(label).await?;
-        let mut out = Vec::new();
-        for issue in issues {
-            if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
-                continue;
-            }
-            if self.already_shipped(loop_kind, &issue)? {
-                continue;
-            }
-            let disp = if has_unresolved_blockers(&*self.forge, issue.number).await {
-                Disposition::Blocked
-            } else {
-                Disposition::Ready
-            };
-            out.push((issue, disp));
-        }
-        Ok(out)
-    }
-}
-
-/// Why discovery would (or would not) run a candidate — the `meguri tasks`
-/// vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Disposition {
-    Ready,
-    /// Held by an unresolved `blocked_by` dependency.
-    Blocked,
 }
 
 #[async_trait]
-impl TaskSource for LabelTaskSource {
-    async fn evaluate_issue(&self, loop_kind: &str, issue: &forge::Issue) -> Result<GateVerdict> {
-        if self.already_shipped(loop_kind, issue)? {
-            return Ok(GateVerdict::Shipped);
-        }
-        if has_unresolved_blockers(&*self.forge, issue.number).await {
-            return Ok(GateVerdict::Blocked);
-        }
-        Ok(GateVerdict::Pass)
-    }
-
-    async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>> {
-        let (label, loop_kind) = kind.label_and_loop();
-        let issues = self.forge.list_issues_with_label(label).await?;
-        let mut tasks = Vec::new();
-        for issue in issues {
-            if issue.has_label(forge::LABEL_HOLD) || issue.has_label(forge::LABEL_WORKING) {
-                continue;
-            }
-            if self.already_shipped(loop_kind, &issue)? {
-                continue;
-            }
-            // The dependency gate, shared with the `meguri tasks` view: a held
-            // candidate is silently dropped (no label, no comment).
-            if has_unresolved_blockers(&*self.forge, issue.number).await {
-                continue;
-            }
-            tasks.push(Task {
-                key: TaskKey::Issue(issue.number),
-                kind,
-                title: issue.title,
-                body: issue.body,
-                issue: Some(issue.number),
-            });
-        }
-        Ok(tasks)
-    }
-
-    async fn claim(&self, key: &TaskKey, _host: &str) -> Result<Option<Task>> {
+impl TaskSource for GithubTaskSource {
+    /// Claim = "import if absent + claim", idempotent. The forge read is a
+    /// re-verification edge signal (the issue may have been held or
+    /// de-labeled since import); the sqlite UPDATE is the atomic authority.
+    async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>> {
         let TaskKey::Issue(n) = *key else {
-            return Ok(None); // a local key can never belong to the label source
+            // A plain local row inside a github project (e.g. seeded by hand).
+            let TaskKey::Local(id) = *key else {
+                return Ok(None);
+            };
+            return Ok(self
+                .store
+                .claim_task(id, &self.project_id, host)?
+                .map(row_to_task));
         };
+        // Re-verify against the forge: hold or a missing trigger label is a
+        // benign race (the issue changed since import / discovery).
         let issue = self.forge.get_issue(n).await?;
-        // A hold or a missing trigger label is a benign race (the issue
-        // changed between discovery and claim — e.g. another run shipped it
-        // and removed the trigger label). Re-verify before taking the claim.
         if issue.has_label(forge::LABEL_HOLD) {
             return Ok(None);
         }
         if !issue.has_label(forge::LABEL_READY) {
             return Ok(None);
         }
-        self.forge.add_label(n, forge::LABEL_WORKING).await?;
-        // A fresh claim supersedes a previous run's escalation: the human is
-        // no longer needed while this run is in flight (a new failure re-adds
-        // the label). Best-effort, like the escalation side.
+        // Import lazily when no live row exists (manual `meguri run --issue`
+        // before the intake ever saw the issue; a done row means a re-run —
+        // a fresh row keeps history).
+        let row = match self.row_of(n)? {
+            Some(r) if r.status == "held" => return Ok(None),
+            Some(r) if matches!(r.status.as_str(), "queued" | "needs_human" | "claimed") => r,
+            _ => self.store.create_task(
+                &self.project_id,
+                TaskKind::Work.as_str(),
+                &issue.title,
+                &issue.body,
+                &github_origin(n),
+            )?,
+        };
+        if self
+            .store
+            .claim_task(row.id, &self.project_id, host)?
+            .is_none()
+        {
+            return Ok(None); // someone else holds the claim
+        }
+        // Projection: the working label for the human's dashboard, and a fresh
+        // claim supersedes a previous run's escalation. Best-effort.
+        let _ = self.forge.add_label(n, forge::LABEL_WORKING).await;
         let _ = self.forge.remove_label(n, forge::LABEL_NEEDS_HUMAN).await;
         Ok(Some(Task {
             key: *key,
@@ -296,28 +216,46 @@ impl TaskSource for LabelTaskSource {
     }
 
     async fn release(&self, key: &TaskKey) -> Result<()> {
-        if let TaskKey::Issue(n) = *key {
-            let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
+        match *key {
+            TaskKey::Issue(n) => {
+                if let Some(row) = self.row_of(n)? {
+                    self.store.release_task(row.id)?;
+                }
+                let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
+            }
+            TaskKey::Local(id) => self.store.release_task(id)?,
         }
         Ok(())
     }
 
     async fn escalate(&self, key: &TaskKey, reason: &str, hint: &str) -> Result<()> {
-        if let TaskKey::Issue(n) = *key {
-            let _ = self.forge.add_label(n, forge::LABEL_NEEDS_HUMAN).await;
-            let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
-            let _ = self
-                .forge
-                .comment(n, &needs_human_comment(reason, hint))
-                .await;
+        match *key {
+            TaskKey::Issue(n) => {
+                if let Some(row) = self.row_of(n)? {
+                    self.store.escalate_task(row.id, reason)?;
+                }
+                let _ = self.forge.add_label(n, forge::LABEL_NEEDS_HUMAN).await;
+                let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
+                let _ = self
+                    .forge
+                    .comment(n, &needs_human_comment(reason, hint))
+                    .await;
+            }
+            TaskKey::Local(id) => self.store.escalate_task(id, reason)?,
         }
         Ok(())
     }
 
     async fn complete(&self, key: &TaskKey) -> Result<()> {
-        if let TaskKey::Issue(n) = *key {
-            let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
-            let _ = self.forge.remove_label(n, forge::LABEL_READY).await;
+        match *key {
+            TaskKey::Issue(n) => {
+                if let Some(row) = self.row_of(n)? {
+                    self.store.complete_task(row.id)?;
+                }
+                let _ = self.forge.remove_label(n, forge::LABEL_WORKING).await;
+                let _ = self.forge.remove_label(n, forge::LABEL_READY).await;
+            }
+            TaskKey::Local(id) => self.store.complete_task(id)?,
         }
         Ok(())
     }
@@ -336,13 +274,7 @@ impl LocalTaskSource {
     }
 }
 
-/// The issue number a local task points at, parsed from its `origin`
-/// (`github:<N>` for silent-mode tasks; plain `local` otherwise).
-fn origin_issue(origin: &str) -> Option<i64> {
-    origin.strip_prefix("github:")?.parse().ok()
-}
-
-fn row_to_task(row: crate::store::TaskRow) -> Task {
+pub(crate) fn row_to_task(row: crate::store::TaskRow) -> Task {
     Task {
         key: TaskKey::Local(row.id),
         kind: TaskKind::parse(&row.kind).unwrap_or(TaskKind::Work),
@@ -354,25 +286,6 @@ fn row_to_task(row: crate::store::TaskRow) -> Task {
 
 #[async_trait]
 impl TaskSource for LocalTaskSource {
-    async fn discover(&self, kind: TaskKind) -> Result<Vec<Task>> {
-        // The not-before gate, kept as the durable local parking mechanism
-        // (infra capping parks a task at a far-future instant; issue #250 /
-        // ADR 0028). Both sides are UTC RFC3339, so a lexical compare works.
-        let now = crate::store::format_epoch(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
-        Ok(self
-            .store
-            .discover_tasks(&self.project_id, kind.as_str())?
-            .into_iter()
-            .filter(|row| row.not_before.as_deref().is_none_or(|nb| *nb <= *now))
-            .map(row_to_task)
-            .collect())
-    }
-
     async fn claim(&self, key: &TaskKey, host: &str) -> Result<Option<Task>> {
         let TaskKey::Local(id) = *key else {
             return Ok(None);
@@ -410,14 +323,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_kind_maps_to_the_matching_label_and_loop() {
-        assert_eq!(
-            TaskKind::Work.label_and_loop(),
-            (forge::LABEL_READY, worker::KIND)
-        );
-    }
-
-    #[test]
     fn task_key_orders_issue_before_local_then_by_id() {
         let mut keys = vec![
             TaskKey::Local(2),
@@ -444,48 +349,88 @@ mod tests {
         assert_eq!(origin_issue("github:x"), None);
     }
 
-    /// LabelTaskSource wraps a forge and maps the trait onto labels: discover
-    /// keys off the trigger label, claim adds `working` (and clears a stale
-    /// `needs-human`), escalate/complete drive the escalation/settle labels.
+    /// GithubTaskSource: the sqlite row is the authority, the labels are the
+    /// projection. Claim imports lazily, marks working; escalate/complete
+    /// settle both sides.
     #[tokio::test]
-    async fn label_source_maps_the_contract_onto_labels() {
+    async fn github_source_claims_via_row_and_projects_labels() {
         use crate::forge::fake::FakeForge;
         use crate::forge::{LABEL_NEEDS_HUMAN, LABEL_READY, LABEL_WORKING};
 
         let forge = Arc::new(FakeForge::with_issue(7, "T", "B", &[LABEL_READY]));
-        let src = LabelTaskSource::new(
-            forge.clone(),
-            Store::open_in_memory().unwrap(),
-            "proj".into(),
-        );
+        let store = Store::open_in_memory().unwrap();
+        let src = GithubTaskSource::new(forge.clone(), store.clone(), "proj".into());
         let key = TaskKey::Issue(7);
 
-        let tasks = src.discover(TaskKind::Work).await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].key, key);
-
+        // Claim imports the row lazily and claims it atomically.
         assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_some());
+        let row = store.task_by_origin("proj", "github:7").unwrap().unwrap();
+        assert_eq!(row.status, "claimed");
         assert!(forge.labels_of(7).contains(&LABEL_WORKING.to_string()));
+
+        // A second claim is a benign race.
+        assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_none());
 
         src.escalate(&key, "stuck", DEFAULT_ATTACH_HINT)
             .await
             .unwrap();
+        let row = store.task_by_origin("proj", "github:7").unwrap().unwrap();
+        assert_eq!(row.status, "needs_human");
         let labels = forge.labels_of(7);
         assert!(labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
         assert!(!labels.contains(&LABEL_WORKING.to_string()));
         assert_eq!(forge.comments_of(7).len(), 1);
 
+        // Re-claim un-escalates (needs_human is claimable).
+        assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_some());
         src.complete(&key).await.unwrap();
+        let row = store.task_by_origin("proj", "github:7").unwrap().unwrap();
+        assert_eq!(row.status, "done");
         let labels = forge.labels_of(7);
         assert!(!labels.contains(&LABEL_READY.to_string()));
         assert!(!labels.contains(&LABEL_WORKING.to_string()));
 
-        // A local key can never belong to the label source.
+        // Done row + ready label re-added = a fresh row on the next claim.
+        forge.add_label(7, LABEL_READY).await.unwrap();
+        assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_some());
+        let row = store.task_by_origin("proj", "github:7").unwrap().unwrap();
+        assert_eq!(row.status, "claimed");
+
+        // A held row refuses the claim.
+        src.release(&key).await.unwrap();
+        let row = store.task_by_origin("proj", "github:7").unwrap().unwrap();
+        store.hold_task(row.id).unwrap();
+        assert!(src.claim(&key, LOCAL_HOST).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn github_source_respects_hold_and_missing_trigger_labels() {
+        use crate::forge::fake::FakeForge;
+        use crate::forge::{LABEL_HOLD, LABEL_READY};
+
+        let forge = Arc::new(FakeForge::with_issue(
+            7,
+            "T",
+            "B",
+            &[LABEL_READY, LABEL_HOLD],
+        ));
+        let store = Store::open_in_memory().unwrap();
+        let src = GithubTaskSource::new(forge.clone(), store.clone(), "proj".into());
         assert!(
-            src.claim(&TaskKey::Local(1), LOCAL_HOST)
+            src.claim(&TaskKey::Issue(7), LOCAL_HOST)
                 .await
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "hold refuses the claim"
+        );
+        forge.remove_label(7, LABEL_HOLD).await.unwrap();
+        forge.remove_label(7, LABEL_READY).await.unwrap();
+        assert!(
+            src.claim(&TaskKey::Issue(7), LOCAL_HOST)
+                .await
+                .unwrap()
+                .is_none(),
+            "a de-labeled issue is a benign race"
         );
     }
 }

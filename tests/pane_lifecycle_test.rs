@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use meguri::config::{Config, ProjectConfig};
 use meguri::engine::flow::{self, Checkpoint, Flavor};
 use meguri::engine::{Deps, WorkerOutcome};
-use meguri::forge::LABEL_READY;
 use meguri::forge::fake::FakeForge;
+use meguri::forge::{Forge, LABEL_READY};
 use meguri::gitops::{self, run_git};
 use meguri::mux::PaneId;
 use meguri::mux::fake::FakeMux;
@@ -47,6 +47,7 @@ async fn init_origin_and_clone(root: &Path) -> PathBuf {
 struct TestEnv {
     deps: Deps,
     mux: Arc<FakeMux>,
+    forge: Arc<FakeForge>,
     #[allow(dead_code)]
     root: tempfile::TempDir,
     worktree_root: PathBuf,
@@ -86,16 +87,17 @@ async fn setup() -> TestEnv {
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
-        forge,
+        forge.clone(),
         config,
         project,
     );
     TestEnv {
         deps,
         mux,
+        forge,
         root,
         worktree_root,
         session_root,
@@ -162,11 +164,13 @@ impl Flavor for FixedBranchFlavor {
 
     async fn settle_labels(
         &self,
-        _deps: &Deps,
-        _run: &meguri::store::RunRecord,
+        deps: &Deps,
+        run: &meguri::store::RunRecord,
         _cp: &Checkpoint,
     ) -> Result<()> {
-        Ok(()) // keep the trigger label so a follow-up run can claim again
+        // Complete the row like the worker would; each test round re-adds the
+        // trigger label so the next claim imports a fresh row.
+        deps.task_source.complete(&run.task_key()).await
     }
 }
 
@@ -264,6 +268,9 @@ fn spawn_scripted_agent(worktree_root: PathBuf) -> tokio::task::JoinHandle<()> {
 }
 
 async fn drive_to_success(env: &TestEnv, flavor: &dyn Flavor) -> String {
+    // Each round starts from a fresh trigger label (a completed round's
+    // `complete` removed it as projection).
+    let _ = env.forge.add_label(7, meguri::forge::LABEL_READY).await;
     let run = env
         .deps
         .store
@@ -429,9 +436,9 @@ async fn fixer_family_run_adopts_the_workers_author_pane() {
         .unwrap();
     let pane_id = pane.mux_pane_id.expect("worker pane registered");
 
-    // Round 2: review feedback arrives — a fixer run on the same issue and
-    // branch (the flow under test is ensure_pane's lane key, so the
-    // worker-shaped flavor stands in for the fixer's).
+    // Round 2: a follow-up run on the same issue and branch (the flow under
+    // test is ensure_pane's lane key).
+    let _ = env.forge.add_label(7, meguri::forge::LABEL_READY).await;
     let run = env
         .deps
         .store

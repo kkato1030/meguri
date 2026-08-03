@@ -159,7 +159,7 @@ async fn real_claude_implements_issue_in_tmux() {
         worktree_setup: Default::default(),
         prompts: Default::default(),
     };
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
         forge.clone(),

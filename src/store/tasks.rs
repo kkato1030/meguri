@@ -3,7 +3,7 @@
 //! at the heart of the [`TaskSource`](crate::tasks::TaskSource) contract.
 
 use anyhow::Result;
-use rusqlite::{Row, params};
+use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
 
 use super::{Store, now};
@@ -114,6 +114,91 @@ impl Store {
 
     /// Actionable tasks of a kind: queued or needs_human (a re-claim clears
     /// the escalation, mirroring the label version). Oldest first.
+    /// The most recent task row imported from `origin` (`github:<N>`), any
+    /// status — the intake's idempotency key.
+    pub fn task_by_origin(&self, project_id: &str, origin: &str) -> Result<Option<TaskRow>> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT * FROM tasks WHERE project_id = ?1 AND origin = ?2
+                     ORDER BY id DESC LIMIT 1",
+                    params![project_id, origin],
+                    task_from_row,
+                )
+                .optional()?;
+            Ok(row)
+        })
+    }
+
+    /// The queued, dispatchable tasks of `kind` — the reconcile pass's read.
+    /// Unlike [`Store::discover_tasks`] this excludes `needs_human` (an
+    /// escalated task never re-enqueues without a human action) and applies
+    /// the `not_before` gate in SQL (`now` is our RFC3339 UTC shape, whose
+    /// lexicographic order is chronological).
+    pub fn queued_tasks(&self, project_id: &str, kind: &str, now: &str) -> Result<Vec<TaskRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM tasks WHERE project_id = ?1 AND kind = ?2
+                   AND status = 'queued'
+                   AND (not_before IS NULL OR not_before <= ?3)
+                 ORDER BY id ASC",
+            )?;
+            let tasks = stmt
+                .query_map(params![project_id, kind, now], task_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(tasks)
+        })
+    }
+
+    /// All held tasks of a project (the intake's unhold sync reads these).
+    pub fn held_tasks(&self, project_id: &str) -> Result<Vec<TaskRow>> {
+        self.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT * FROM tasks WHERE project_id = ?1 AND status = 'held'")?;
+            let tasks = stmt
+                .query_map(params![project_id], task_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(tasks)
+        })
+    }
+
+    /// Hold a queued task (`meguri:hold` on the origin issue, or `meguri
+    /// pause` semantics at the queue level). Only a queued task holds; a
+    /// claimed/terminal one is left as-is.
+    pub fn hold_task(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET status = 'held' WHERE id = ?1 AND status = 'queued'",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Release a hold back to the queue.
+    pub fn unhold_task(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET status = 'queued' WHERE id = ?1 AND status = 'held'",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Re-queue an escalated task (the human removed `meguri:needs-human` on
+    /// the origin issue, or re-queued it locally). Clears the reason.
+    pub fn requeue_task(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET status = 'queued', reason = NULL
+                 WHERE id = ?1 AND status = 'needs_human'",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     pub fn discover_tasks(&self, project_id: &str, kind: &str) -> Result<Vec<TaskRow>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(

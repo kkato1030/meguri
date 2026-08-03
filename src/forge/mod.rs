@@ -150,10 +150,6 @@ pub trait Forge: Send + Sync {
     async fn issue_state(&self, number: i64) -> Result<IssueState>;
     /// Open issues carrying `label` (candidates for discovery).
     async fn list_issues_with_label(&self, label: &str) -> Result<Vec<Issue>>;
-    /// Every open issue, label-agnostic (triage discovery, issue #85). The
-    /// caller filters by label/hold/blocker — no forge-side search is used, so
-    /// "untriaged = no workflow label" stays a single client-side rule.
-    async fn list_open_issues(&self) -> Result<Vec<Issue>>;
     /// Issues blocking `issue` via the forge-native dependency graph
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
@@ -181,7 +177,6 @@ pub trait Forge: Send + Sync {
         draft: bool,
         labels: &[&str],
     ) -> Result<CreatedPr>;
-    async fn get_pr(&self, number: i64) -> Result<PullRequest>;
     /// The PR whose head is `branch`, if any — open PRs win over closed or
     /// merged ones. The reaper uses the merged state to recognize squash and
     /// rebase merges, whose branch tips never become ancestors of the base.

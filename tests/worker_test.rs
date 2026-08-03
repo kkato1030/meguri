@@ -91,7 +91,7 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     };
 
     let mux = Arc::new(FakeMux::new(false));
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
         forge.clone(),

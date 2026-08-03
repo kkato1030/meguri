@@ -57,9 +57,11 @@ impl Scheduler {
         self.recover(&store).await?;
 
         let mut running: JoinSet<String> = JoinSet::new();
-        // run_id → slot weight (issue #111): most runs weigh 1, a collab-advisor
-        // run weighs 2. The budget is the sum, not the count.
+        // run_id → slot weight (every run books one slot).
         let mut active_run_ids: HashMap<String, usize> = HashMap::new();
+        // Last GitHub intake per project (権威反転): the label read runs on
+        // its own, slower cadence. Absent = run it on the first tick.
+        let mut last_intake: HashMap<String, std::time::Instant> = HashMap::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -126,8 +128,19 @@ impl Scheduler {
                 // plus every folded act/arm — Op(Finalize) and the
                 // issue-/local-side deciders' enqueue — one level-triggered
                 // pass per project.
+                // GitHub intake on its own cadence (権威反転): labels → task
+                // rows, the only recurring GitHub reads.
+                let intake_due = last_intake.get(&deps.project.id).is_none_or(|t| {
+                    t.elapsed().as_secs() >= deps.config.scheduler.intake_interval_secs
+                });
+                if intake_due {
+                    if let Err(e) = super::issue_reconciler::intake(deps).await {
+                        tracing::warn!("intake failed for {}: {e:#}", deps.project.id);
+                    }
+                    last_intake.insert(deps.project.id.clone(), std::time::Instant::now());
+                }
                 if let Err(e) = super::issue_reconciler::sweep(deps).await {
-                    tracing::warn!("issue reconcile failed for {}: {e:#}", deps.project.id);
+                    tracing::warn!("task reconcile failed for {}: {e:#}", deps.project.id);
                 }
             }
 

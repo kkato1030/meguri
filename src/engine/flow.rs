@@ -2132,7 +2132,7 @@ mod tests {
             worktree_setup,
             prompts: Default::default(),
         };
-        let deps = Deps::with_label_source(
+        let deps = Deps::with_github_source(
             store,
             std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
             forge,
