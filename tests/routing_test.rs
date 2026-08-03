@@ -181,13 +181,7 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
     let clone = init_origin_and_clone(root.path()).await;
     let worktree_root = root.path().join("worktrees");
 
-    // The claim re-verifies the arm against the phase label (ADR 0012 S4
-    // 決定1), so the trigger label must match the loop kind under test.
-    let trigger = if loop_kind == "planner" {
-        meguri::forge::LABEL_PLAN
-    } else {
-        LABEL_READY
-    };
+    let trigger = LABEL_READY;
     let forge = Arc::new(FakeForge::with_issue(
         7,
         "Add greeting file",
@@ -206,7 +200,6 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         pr: None,
         mode: Default::default(),
         deliver: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,
@@ -245,10 +238,8 @@ async fn every_loop_kind_spawns_from_its_role_resolved_profile() {
     // kinds that share a role (worker/spec-worker; fixer/ci-fixer/
     // conflict-resolver) resolve to the same profile as their sibling.
     let cases = [
-        ("planner", "p-planner", "planner-cli", "planner"),
         ("pr-reviewer", "p-reviewer", "reviewer-cli", "reviewer"),
         ("worker", "p-worker", "worker-cli", "worker"),
-        ("spec-worker", "p-worker", "worker-cli", "worker"),
         ("fixer", "p-fixer", "fixer-cli", "fixer"),
         ("ci-fixer", "p-fixer", "fixer-cli", "fixer"),
         ("conflict-resolver", "p-fixer", "fixer-cli", "fixer"),
@@ -463,7 +454,6 @@ async fn drive_worker_scenario(
         pr: None,
         mode: Default::default(),
         deliver: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,

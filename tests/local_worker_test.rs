@@ -63,7 +63,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,

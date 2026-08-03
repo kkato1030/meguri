@@ -97,18 +97,17 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 pub async fn cmd_add(
     project: Option<&str>,
     text: Option<&str>,
-    plan: bool,
     ready: bool,
     file: Option<&str>,
 ) -> Result<()> {
     let cfg = Config::load()?;
     let cwd = std::env::current_dir().context("resolving the current directory")?;
     let project = infer_project(&cfg, project, &cwd)?;
-    check_add_flags(project, plan, ready, file.is_some())?;
+    check_add_flags(project, ready, file.is_some())?;
     match project.mode {
         ProjectMode::Github => {
             let text = github_memo(text)?;
-            add_github(&cfg, project, text, plan, ready).await
+            add_github(&cfg, project, text, ready).await
         }
         ProjectMode::Local => add_local(project, text, file),
     }
@@ -130,15 +129,7 @@ pub fn github_memo(text: Option<&str>) -> Result<&str> {
 /// `PlannerLoop::discover` returns nothing without a forge — so a local plan
 /// task would sit queued forever. Reject it up front, mirroring the
 /// config-side check that refuses a local-mode `plan` schedule.
-pub fn check_add_flags(
-    project: &ProjectConfig,
-    plan: bool,
-    ready: bool,
-    has_file: bool,
-) -> Result<()> {
-    if plan && ready {
-        bail!("--plan and --ready are mutually exclusive — pick one");
-    }
+pub fn check_add_flags(project: &ProjectConfig, ready: bool, has_file: bool) -> Result<()> {
     match project.mode {
         ProjectMode::Github => {
             if has_file {
@@ -155,14 +146,6 @@ pub fn check_add_flags(
                      queues a work task"
                 );
             }
-            if plan {
-                bail!(
-                    "project {:?} is mode = \"local\" but --plan queues planner work \
-                     (local mode has no planner yet — issue #54 — so the task would \
-                     never be consumed); use a github-mode project for --plan",
-                    project.id
-                );
-            }
         }
     }
     Ok(())
@@ -171,22 +154,13 @@ pub fn check_add_flags(
 /// github-mode capture: an issue is created immediately with the raw memo.
 /// Lives outside the issue↔pane↔session lifetime model (#92): only the config
 /// and the forge — no run, no pane.
-async fn add_github(
-    cfg: &Config,
-    project: &ProjectConfig,
-    text: &str,
-    plan: bool,
-    ready: bool,
-) -> Result<()> {
+async fn add_github(cfg: &Config, project: &ProjectConfig, text: &str, ready: bool) -> Result<()> {
     let repo_slug = project.repo_slug.as_deref().context(
         "github-mode project has no repo_slug (config validation should have caught this)",
     )?;
     let forge = GhForge::new(repo_slug);
 
     let mut labels: Vec<&str> = Vec::new();
-    if plan {
-        labels.push(crate::forge::LABEL_PLAN);
-    }
     if ready {
         labels.push(crate::forge::LABEL_READY);
     }
@@ -879,17 +853,6 @@ fn print_run_outcome(outcome: WorkerOutcome) -> Result<()> {
             println!("⏭️  skipped: {reason}");
             Ok(())
         }
-        WorkerOutcome::NeedsPlan(reason) => {
-            println!(
-                "📝 needs a plan first — issue handed to {}: {reason}",
-                crate::forge::LABEL_PLAN
-            );
-            Ok(())
-        }
-        WorkerOutcome::Decomposed(reason) => {
-            println!("🧩 decomposed into sub-issues: {reason}");
-            Ok(())
-        }
     }
 }
 
@@ -924,12 +887,9 @@ pub async fn cmd_watch() -> Result<()> {
     }
 
     println!(
-        "watching {} project(s) for {}/{} issues and {}/{} PRs (poll {}s, slots {})",
+        "watching {} project(s) for {} issues (poll {}s, slots {})",
         projects.len(),
         crate::forge::LABEL_READY,
-        crate::forge::LABEL_PLAN,
-        crate::forge::LABEL_SPEC_REVIEWING,
-        crate::forge::LABEL_SPEC_READY,
         cfg.scheduler.poll_interval_secs,
         cfg.scheduler.max_concurrent_runs,
     );

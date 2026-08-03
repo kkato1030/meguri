@@ -50,19 +50,9 @@ async fn main() -> Result<()> {
         Command::Add {
             text,
             project,
-            plan,
             ready,
             file,
-        } => {
-            app::cmd_add(
-                project.as_deref(),
-                text.as_deref(),
-                plan,
-                ready,
-                file.as_deref(),
-            )
-            .await
-        }
+        } => app::cmd_add(project.as_deref(), text.as_deref(), ready, file.as_deref()).await,
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
         Command::Ps { all } => app::cmd_ps(all),
         Command::Logs { run } => app::cmd_logs(&run).await,

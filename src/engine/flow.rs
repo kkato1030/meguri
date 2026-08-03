@@ -20,7 +20,7 @@ use crate::gitops;
 use crate::launch;
 use crate::mux::{PaneId, PaneSpec};
 use crate::routing;
-use crate::store::{InteractionState, LANE_AUTHOR, RunRecord, RunStatus};
+use crate::store::{LANE_AUTHOR, RunRecord, RunStatus};
 use crate::tasks::{self, TaskKey};
 use crate::turn::{
     TurnConfig, TurnEngine, TurnOutcome, TurnResultFile, TurnStatus, prepare_turn,
@@ -37,13 +37,11 @@ pub const STEP_VALIDATE: &str = "validate";
 pub const STEP_SELF_REVIEW: &str = "self-review";
 pub const STEP_OPEN_PR: &str = "open-pr";
 
-/// Which side of the symmetric plan/impl loop a run is on (ADR 0008). The
-/// self-review turn frames its lenses differently for a spec/ADR document
-/// (Plan) than for a code diff (Impl); the pr-reviewer reads it too.
+/// The review framing of a run's deliverable. Only the implementation side
+/// remains (the plan side is dormant, docs/adr/STATUS.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    Plan,
     #[default]
     Impl,
 }
@@ -51,7 +49,6 @@ pub enum Kind {
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Plan => "plan",
             Self::Impl => "impl",
         }
     }
@@ -59,7 +56,6 @@ impl Kind {
     /// Whether the project's guard is enabled for this kind (ADR 0008 §1).
     pub fn guard_enabled(self, review: &crate::config::ReviewConfig) -> bool {
         match self {
-            Self::Plan => review.guard.plan,
             Self::Impl => review.guard.impl_enabled,
         }
     }
@@ -75,13 +71,6 @@ pub trait Flavor: Send + Sync {
     /// Label that queues an issue for this loop; re-checked at claim time by
     /// the default [`Flavor::prepare_work`].
     fn trigger_label(&self) -> &'static str;
-
-    /// Which side of the symmetric loop this flavor drives (ADR 0008): the
-    /// planner is `Plan`, everything else `Impl`. Steers the self-review
-    /// framing (spec document vs code diff).
-    fn kind(&self) -> Kind {
-        Kind::Impl
-    }
 
     /// Whether this loop runs the internal self-review phase (ADR 0006/0008)
     /// between `validate` and `open-pr`. Default: no (the historical
@@ -191,48 +180,6 @@ pub trait Flavor: Send + Sync {
     /// reason), with a launch-mode-aware attach hint (issue #169).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         super::escalation::escalate_task(deps, run, reason).await;
-    }
-
-    /// The agent ended its execute turn with `needs_plan`: a design decision
-    /// must precede implementation (issue #22). Returns the run's terminal
-    /// outcome. Default: no plan handoff exists for this loop — a human must
-    /// look (only the worker overrides this to demote the issue to
-    /// `meguri:plan`).
-    async fn on_needs_plan(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        worktree: &Path,
-        reason: &str,
-    ) -> Result<WorkerOutcome> {
-        let _ = (deps, worktree);
-        Err(NeedsHuman(format!(
-            "agent asked for a plan on issue #{} but this loop has no plan \
-             handoff: {reason}",
-            run.issue_number
-        ))
-        .into())
-    }
-
-    /// The agent ended its execute turn with `decompose`: the issue is too
-    /// big for one deliverable and should be split into sub-issues
-    /// (issue #24). Returns the run's terminal outcome. Default: no
-    /// decompose handoff exists for this loop — a human must look (only the
-    /// planner overrides this to file the sub-issues).
-    async fn on_decompose(
-        &self,
-        deps: &Deps,
-        run: &RunRecord,
-        cp: &Checkpoint,
-        result: &TurnResultFile,
-    ) -> Result<WorkerOutcome> {
-        let _ = (deps, cp);
-        Err(NeedsHuman(format!(
-            "agent asked to decompose issue #{} but this loop has no \
-             decompose handoff: {}",
-            run.issue_number, result.summary
-        ))
-        .into())
     }
 }
 
@@ -405,18 +352,6 @@ pub async fn run_flow(deps: &Deps, run_id: &str, flavor: &dyn Flavor) -> Result<
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
                 }
-                WorkerOutcome::NeedsPlan(reason) => {
-                    deps.store
-                        .update_run_status(run_id, RunStatus::NeedsPlan, Some(reason))?;
-                    deps.store
-                        .emit(Some(run_id), "run.needs_plan", json!({ "reason": reason }))?;
-                }
-                WorkerOutcome::Decomposed(reason) => {
-                    deps.store
-                        .update_run_status(run_id, RunStatus::Decomposed, Some(reason))?;
-                    deps.store
-                        .emit(Some(run_id), "run.decomposed", json!({ "reason": reason }))?;
-                }
             }
             Ok(outcome)
         }
@@ -517,18 +452,6 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
-            StepFlow::NeedsPlan(reason) => {
-                let outcome = flavor.on_needs_plan(deps, &run, &worktree, &reason).await?;
-                finish_pane(deps, &run).await;
-                return Ok(outcome);
-            }
-            StepFlow::Decompose(result) => {
-                let outcome = flavor
-                    .on_decompose(deps, &run, &checkpoint, &result)
-                    .await?;
-                finish_pane(deps, &run).await;
-                return Ok(outcome);
-            }
         }
         step = save_step(deps, &run, STEP_VALIDATE, &checkpoint)?;
     }
@@ -538,24 +461,6 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
             StepFlow::Continue => {}
             StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
-            StepFlow::NeedsPlan(reason) => {
-                // Unreachable: validate() escalates a needs_plan fix turn
-                // (the work is already committed by then).
-                return Err(NeedsHuman(format!(
-                    "agent asked for a plan during validation on issue #{}: {reason}",
-                    run.issue_number
-                ))
-                .into());
-            }
-            StepFlow::Decompose(result) => {
-                // Unreachable: validate() escalates a decompose fix turn
-                // (the work is already committed by then).
-                return Err(NeedsHuman(format!(
-                    "agent asked to decompose during validation on issue #{}: {}",
-                    run.issue_number, result.summary
-                ))
-                .into());
-            }
         }
         step = save_step(deps, &run, STEP_SELF_REVIEW, &checkpoint)?;
     }
@@ -568,22 +473,6 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
                 StepFlow::Continue => {}
                 StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
                 StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
-                StepFlow::NeedsPlan(reason) => {
-                    // needs_plan makes no sense once work is committed and
-                    // under self-review — a human looks.
-                    return Err(NeedsHuman(format!(
-                        "agent asked for a plan during self-review on issue #{}: {reason}",
-                        run.issue_number
-                    ))
-                    .into());
-                }
-                StepFlow::Decompose(result) => {
-                    return Err(NeedsHuman(format!(
-                        "agent asked to decompose during self-review on issue #{}: {}",
-                        run.issue_number, result.summary
-                    ))
-                    .into());
-                }
             }
         }
         step = save_step(deps, &run, STEP_OPEN_PR, &checkpoint)?;
@@ -605,13 +494,6 @@ pub(crate) enum StepFlow {
     Continue,
     Stopped,
     Interrupted(String),
-    /// The agent's execute turn ended with `needs_plan` (+ the reason); the
-    /// flavor's [`Flavor::on_needs_plan`] decides the terminal outcome.
-    NeedsPlan(String),
-    /// The agent's execute turn ended with `decompose` (the full result
-    /// carries the proposed children); the flavor's
-    /// [`Flavor::on_decompose`] decides the terminal outcome.
-    Decompose(TurnResultFile),
 }
 
 /// Apply the keep_pane policy when a run succeeds. The default
@@ -631,40 +513,6 @@ pub(crate) async fn finish_pane(deps: &Deps, run: &RunRecord) {
         )
         .await;
     }
-}
-
-/// Park a finished review run on a human (ADR 0009 / issue #153). The run has
-/// ended (or is about to end) `Succeeded`, but the PR now waits on a human —
-/// plan findings the author must fix, or a clean spec PR the human must merge.
-/// Raise an *active* signal off the conversation timeline:
-///
-/// 1. set the run's `interaction_state` to `AwaitingHuman` (survives the
-///    `Succeeded` status — `update_run_status` never clears it), so the
-///    dashboard's parked-review query surfaces it;
-/// 2. emit `review.awaiting_human` — the durable proof the park ran, and what
-///    the dashboard query keys off (not the state alone).
-///
-/// Kind- and verdict-agnostic on purpose: both pr-reviewer(Plan) branches and
-/// a future spec_fixer round-limit escalation call this one seam.
-pub(crate) async fn signal_review_parked(
-    deps: &Deps,
-    run: &RunRecord,
-    pr_number: i64,
-    pr_url: &str,
-    verdict: &str,
-    head_sha: &str,
-) {
-    if let Err(e) = deps
-        .store
-        .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
-    {
-        tracing::warn!("cannot park run {} on a human: {e:#}", run.id);
-    }
-    let _ = deps.store.emit(
-        Some(&run.id),
-        "review.awaiting_human",
-        json!({ "pr": pr_number, "url": pr_url, "verdict": verdict, "head": head_sha }),
-    );
 }
 
 /// The PR this run claimed, from its persisted checkpoint (release/escalate
@@ -689,8 +537,6 @@ fn claims_pr_by_label(loop_kind: &str) -> bool {
     loop_kind == super::fixer::KIND
         || loop_kind == super::ci_fixer::KIND
         || loop_kind == super::conflict_resolver::KIND
-        || loop_kind == super::spec_fixer::KIND
-        || loop_kind == super::spec_worker::KIND
         || loop_kind == super::pr_reviewer::KIND
 }
 
@@ -807,20 +653,6 @@ async fn claim_task(deps: &Deps, run: &RunRecord, cp: &mut Checkpoint) -> Result
     match deps.task_source.claim(&key, tasks::LOCAL_HOST).await? {
         // Arm-tagged re-verification (ADR 0012 S4 決定1): the claim must still
         // match the arm this run was enqueued as. A phase label that moved
-        // between the reconcile and the claim (plan added over ready, or plan
-        // dropped) re-routes ownership to the other arm — this run then steps
-        // aside as a benign race and the next resync enqueues the right one.
-        Some(task)
-            if (run.loop_kind == super::worker::KIND && task.kind == tasks::TaskKind::Plan)
-                || (run.loop_kind == super::planner::KIND
-                    && task.kind == tasks::TaskKind::Work) =>
-        {
-            let _ = deps.task_source.release(&key).await;
-            Ok(PreparedWork::Skip(format!(
-                "phase moved to {:?} after this {} run was enqueued (benign race)",
-                task.kind, run.loop_kind
-            )))
-        }
         Some(task) => {
             // Carry the auto-merge opt-in from the issue to the PR (auto-merge
             // 1/3, #41): recorded now, applied in open-pr (non-draft + label
@@ -2109,12 +1941,6 @@ async fn execute(
                 ))
                 .into());
             }
-            TurnStatus::NeedsPlan => {
-                return Ok(StepFlow::NeedsPlan(result.summary));
-            }
-            TurnStatus::Decompose => {
-                return Ok(StepFlow::Decompose(result));
-            }
         }
 
         // Trust but verify: success means commits exist, nothing dangles,
@@ -2272,12 +2098,7 @@ pub(crate) async fn validate(
                     save_step(deps, run, persist_step, cp)?;
                     continue;
                 }
-                // needs_plan/decompose make no sense once work is committed
-                // and failing validation — escalate like the other two.
-                TurnStatus::Failure
-                | TurnStatus::NeedsHuman
-                | TurnStatus::NeedsPlan
-                | TurnStatus::Decompose => {
+                TurnStatus::Failure | TurnStatus::NeedsHuman => {
                     return Err(NeedsHuman(format!(
                         "agent could not fix validation: {}",
                         r.summary
@@ -2843,7 +2664,6 @@ mod tests {
             subject: subject.map(str::to_string),
             pr_body: None,
             agent_session_id: None,
-            children: vec![],
         };
 
         // Implementation-shaping turn: subject is established.
@@ -2873,7 +2693,6 @@ mod tests {
             subject: Some("   ".into()),
             pr_body: None,
             agent_session_id: None,
-            children: vec![],
         };
 
         apply_execute_result(&mut cp, result, true);
@@ -2897,7 +2716,6 @@ mod tests {
             subject: Some("  Add caching  ".into()),
             pr_body: None,
             agent_session_id: None,
-            children: vec![],
         };
 
         apply_execute_result(&mut cp, result, true);
@@ -3003,7 +2821,6 @@ mod tests {
             check_command: None,
             worktree_root: Some(worktree_root),
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup,
             autonomy: None,
@@ -3062,7 +2879,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -3127,7 +2943,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -3182,7 +2997,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -3507,7 +3321,6 @@ mod tests {
             check_command: None,
             worktree_root: Some(wt_root.path().to_path_buf()),
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             prompts: Default::default(),

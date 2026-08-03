@@ -156,18 +156,9 @@ fn default_kind() -> Kind {
     Kind::Impl
 }
 
-/// Whether `pr` is a plan (spec/ADR) target: it carries `meguri:spec-reviewing`.
-fn is_plan_pr(pr: &PullRequest) -> bool {
-    pr.has_label(forge::LABEL_SPEC_REVIEWING)
-}
-
-/// The pr-reviewer's kind for a PR (plan iff it is a spec-reviewing PR).
-fn kind_of(pr: &PullRequest) -> Kind {
-    if is_plan_pr(pr) {
-        Kind::Plan
-    } else {
-        Kind::Impl
-    }
+/// The pr-reviewer's kind for a PR (the plan side is dormant — always impl).
+fn kind_of(_pr: &PullRequest) -> Kind {
+    Kind::Impl
 }
 
 /// The kind this PR is a pr-review candidate for, or `None` if it is not
@@ -194,14 +185,10 @@ async fn candidate_kind(deps: &Deps, pr: &PullRequest) -> Result<Option<Kind>> {
         return Ok(None);
     }
     match kind {
-        Kind::Plan => {} // spec-reviewing PRs are always reviewable
         Kind::Impl => {
-            // Same ownership guard as the fixer: meguri branch only, and no
-            // spec-phase label (spec-ready is the combined spec worker's
-            // territory). needs-human is handled in common above.
-            if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX)
-                || pr.has_label(forge::LABEL_SPEC_READY)
-            {
+            // Same ownership guard as the fixer: meguri branch only.
+            // needs-human is handled in common above.
+            if !pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX) {
                 return Ok(None);
             }
             // Only review a settled-green head: Failure is the ci-fixer's,
@@ -263,11 +250,6 @@ pub async fn run_pr_reviewer(deps: &Deps, run_id: &str) -> Result<WorkerOutcome>
                         .update_run_status(run_id, RunStatus::Skipped, Some(reason))?;
                     deps.store
                         .emit(Some(run_id), "run.skipped", json!({ "reason": reason }))?;
-                }
-                WorkerOutcome::NeedsPlan(reason) | WorkerOutcome::Decomposed(reason) => {
-                    // Unreachable: review turns escalate these instead.
-                    deps.store
-                        .update_run_status(run_id, RunStatus::Failed, Some(reason))?;
                 }
             }
             Ok(outcome)
@@ -333,20 +315,6 @@ async fn drive(deps: &Deps, run: &RunRecord) -> Result<WorkerOutcome> {
             flow::StepFlow::Continue => {}
             flow::StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
             flow::StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
-            flow::StepFlow::NeedsPlan(reason) => {
-                return Err(NeedsHuman(format!(
-                    "agent asked for a plan reviewing issue #{}: {reason}",
-                    run.issue_number
-                ))
-                .into());
-            }
-            flow::StepFlow::Decompose(result) => {
-                return Err(NeedsHuman(format!(
-                    "agent asked to decompose reviewing issue #{}: {}",
-                    run.issue_number, result.summary
-                ))
-                .into());
-            }
         }
         step = save_step(deps, &run, STEP_SETTLE, &cp)?;
     }
@@ -476,28 +444,11 @@ async fn prepare_worktree(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint)
 
 fn execute_prompt(cp: &PrReviewCheckpoint, language: Option<&str>) -> String {
     let subject = match cp.kind {
-        Kind::Plan => "spec/ADR pull request",
         Kind::Impl => "implementation pull request",
     };
-    // Plan keeps the quality review (spec_fixer converges its findings). Impl
-    // retreats to a safety tripwire — self-review already converged quality, so
+    // Impl is a safety tripwire — self-review already converged quality, so
     // guard only blocks on a named safety category (ADR 0025).
     let task = match cp.kind {
-        Kind::Plan => format!(
-            "- Review the spec for correctness, completeness, and fit with the \
-               repository's conventions. A summary-style review is enough — no \
-               inline threads.\n\
-             - Do NOT modify, commit, or push anything; the review file below is \
-               your only deliverable.\n\
-             - Write your review to `{review}` as JSON:\n\
-               `{{\"verdict\": \"clean\" | \"blocking\", \"review\": \"<Markdown review>\"}}`\n\
-               - \"clean\": nothing must change before this PR can proceed (pure \
-                 nitpicks do not block; mention them in `review`).\n\
-               - \"blocking\": something must change; list every finding in `review`.\n\
-             - A completed review is a success regardless of verdict; report \
-               \"failure\"/\"needs_human\" only when you cannot review at all.",
-            review = REVIEW_FILE,
-        ),
         Kind::Impl => format!(
             "- The internal self-review has already converged this change's \
                quality. You are the safety tripwire, NOT a second quality gate — \
@@ -646,7 +597,7 @@ async fn execute(
                 ))
                 .into());
             }
-            TurnStatus::NeedsHuman | TurnStatus::NeedsPlan | TurnStatus::Decompose => {
+            TurnStatus::NeedsHuman => {
                 return Err(NeedsHuman(format!(
                     "agent needs a human reviewing PR #{pr}: {}",
                     result.summary
@@ -770,15 +721,12 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
     // its fix loop); impl treats advisory as a passing, recorded verdict and
     // stops only on a blocking safety category.
     let stops = match cp.kind {
-        Kind::Plan => verdict != ReviewVerdict::Clean,
         Kind::Impl => verdict == ReviewVerdict::Blocking,
     };
     let desc = match (cp.kind, verdict) {
         (_, ReviewVerdict::Clean) => "clean".to_string(),
         (Kind::Impl, ReviewVerdict::Advisory) => "advisory — see the PR body".to_string(),
         (Kind::Impl, ReviewVerdict::Blocking) => "blocking — see the PR body".to_string(),
-        // Plan advisory (defensive) folds into the findings path.
-        (Kind::Plan, _) => "findings — see the PR body".to_string(),
     };
     let state = if stops {
         CommitStatusState::Failure
@@ -801,43 +749,12 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
                 "categories": cp.blocking_categories }),
     )?;
 
-    // Plan review drives the label state machine (ADR 0008 §3): a clean spec
-    // review flips spec-reviewing → spec-ready (the combined spec worker keys
-    // off it). The impl review never touches spec labels.
-    if cp.kind == Kind::Plan && verdict == ReviewVerdict::Clean {
-        deps.forge()
-            .add_pr_label(pr, forge::LABEL_SPEC_READY)
-            .await?;
-        deps.forge()
-            .remove_pr_label(pr, forge::LABEL_SPEC_REVIEWING)
-            .await
-            .ok();
-    }
-
     match (cp.kind, verdict) {
         (_, ReviewVerdict::Clean) => {
             deps.forge()
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
-            // Parked-review signal (ADR 0009 / issue #153): a clean plan review
-            // under `plan_delivery=separate` leaves the human to merge the spec
-            // PR — nothing else picks this up (spec_fixer drives only
-            // *findings*). Raise the active signal (interaction_state + notify +
-            // event), off the conversation timeline. Combined hands the
-            // spec-ready PR to the spec worker (not a park); impl clean is never
-            // a park.
-            if cp.kind == Kind::Plan && plan_clean_parks(deps) {
-                flow::signal_review_parked(
-                    deps,
-                    run,
-                    pr,
-                    &cp.pr_url,
-                    verdict_str(verdict),
-                    &cp.head_sha,
-                )
-                .await;
-            }
         }
         // Impl advisory: a passing verdict (ADR 0025). It is recorded in the PR
         // body and the status stays success, so auto-merge proceeds — advisory
@@ -847,27 +764,6 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
                 .remove_pr_label(pr, forge::LABEL_WORKING)
                 .await
                 .ok();
-        }
-        // Plan non-clean (advisory folded in defensively): `spec_fixer` (ADR
-        // 0013) is the plan-side human gate — it discovers `spec-reviewing` PRs
-        // whose head `meguri/pr-review` is `Failure` and drives the fix itself,
-        // paging a human (ADR 0009 / issue #153) only once its round budget runs
-        // out. Adding `needs-human` here would starve that discover query (it
-        // skips escalated PRs) before spec_fixer ever runs — the same lockout ADR
-        // 0007 avoids by having the merge tail defer to fixer loops instead of
-        // escalating first. Drop the working claim (this settle's turn is done)
-        // but leave the label/status as-is; the parked-review page moves to
-        // spec_fixer's round limit.
-        (Kind::Plan, ReviewVerdict::Advisory | ReviewVerdict::Blocking) => {
-            deps.forge()
-                .remove_pr_label(pr, forge::LABEL_WORKING)
-                .await
-                .ok();
-            deps.store.emit(
-                Some(&run.id),
-                "pr_review.deferred_to_spec_fixer",
-                json!({ "pr": pr, "kind": cp.kind.as_str(), "head": cp.head_sha }),
-            )?;
         }
         // Impl blocking: the safety tripwire fired (ADR 0025). No auto-fix loop
         // drives impl PRs off guard findings, and a blocking safety issue is the
@@ -896,21 +792,6 @@ async fn settle(deps: &Deps, run: &RunRecord, cp: &PrReviewCheckpoint) -> Result
     Ok(cp.pr_url.clone())
 }
 
-/// Whether a clean plan review leaves a human to merge the spec PR (ADR 0009).
-/// Only under `plan_delivery=separate`; combined hands the `spec-ready` PR to
-/// the spec worker automatically, so it is not a park.
-fn plan_clean_parks(deps: &Deps) -> bool {
-    deps.project.plan_delivery != crate::config::PlanDelivery::Combined
-}
-
-fn verdict_str(verdict: ReviewVerdict) -> &'static str {
-    match verdict {
-        ReviewVerdict::Clean => "clean",
-        ReviewVerdict::Advisory => "advisory",
-        ReviewVerdict::Blocking => "blocking",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,29 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn kind_of_keys_off_spec_reviewing() {
-        let base = PullRequest {
-            number: 1,
-            title: String::new(),
-            body: String::new(),
-            url: String::new(),
-            head_branch: "meguri/1-x".into(),
-            head_sha: "sha".into(),
-            state: "open".into(),
-            is_draft: false,
-            labels: vec![forge::LABEL_SPEC_REVIEWING.to_string()],
-        };
-        assert_eq!(kind_of(&base), Kind::Plan);
-        let impl_pr = PullRequest {
-            labels: vec![forge::LABEL_IMPLEMENTING.to_string()],
-            ..base.clone()
-        };
-        assert_eq!(kind_of(&impl_pr), Kind::Impl);
-    }
-
-    #[test]
     fn prompt_demands_review_not_changes() {
-        let prompt = execute_prompt(&cp(Kind::Plan, "deadbeef"), None);
+        let prompt = execute_prompt(&cp(Kind::Impl, "deadbeef"), None);
         assert!(prompt.contains("pull request #12"));
         assert!(prompt.contains("# PR: Spec: Add caching (#5)"));
         assert!(prompt.contains(DIFF_FILE));
@@ -967,24 +827,6 @@ mod tests {
         let prompt = execute_prompt(&cp(Kind::Impl, "abc"), Some("日本語"));
         assert!(prompt.contains("implementation pull request"));
         assert!(prompt.contains("# Output language"));
-    }
-
-    /// The impl prompt is a safety tripwire (ADR 0025): it names the closed
-    /// blocking categories and steers doubt to advisory; the plan prompt keeps
-    /// the quality review and never offers advisory.
-    #[test]
-    fn impl_prompt_is_a_safety_tripwire_plan_stays_quality() {
-        let impl_prompt = execute_prompt(&cp(Kind::Impl, "abc"), None);
-        assert!(impl_prompt.contains("safety tripwire"));
-        assert!(impl_prompt.contains("security"));
-        assert!(impl_prompt.contains("data-loss"));
-        assert!(impl_prompt.contains("cost"));
-        assert!(impl_prompt.contains("performance"));
-        assert!(impl_prompt.contains("merely suspicious, it is advisory"));
-
-        let plan_prompt = execute_prompt(&cp(Kind::Plan, "abc"), None);
-        assert!(plan_prompt.contains("correctness, completeness"));
-        assert!(!plan_prompt.contains("advisory"));
     }
 
     #[test]
@@ -1008,7 +850,7 @@ mod tests {
         let body = "Refs #5.\n\nBody text.";
         let first = upsert_pr_review_details(
             body,
-            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Blocking),
+            &pr_review_details(&cp(Kind::Impl, "aaa"), ReviewVerdict::Blocking),
         );
         assert!(first.starts_with("Refs #5."));
         assert!(first.contains("Body text."));
@@ -1017,7 +859,7 @@ mod tests {
         // Re-reviewing the new head replaces the block, never stacks it.
         let second = upsert_pr_review_details(
             &first,
-            &pr_review_details(&cp(Kind::Plan, "bbb"), ReviewVerdict::Clean),
+            &pr_review_details(&cp(Kind::Impl, "bbb"), ReviewVerdict::Clean),
         );
         assert_eq!(second.matches(PR_REVIEW_BODY_MARKER).count(), 1);
         assert!(second.contains("clean at `bbb`"));
@@ -1033,7 +875,7 @@ mod tests {
         // With a block: everything from the marker to the end (issue #188).
         let body = upsert_pr_review_details(
             "Refs #5.",
-            &pr_review_details(&cp(Kind::Plan, "aaa"), ReviewVerdict::Blocking),
+            &pr_review_details(&cp(Kind::Impl, "aaa"), ReviewVerdict::Blocking),
         );
         let block = extract_pr_review_details(&body).unwrap();
         assert!(block.starts_with(PR_REVIEW_BODY_MARKER));
@@ -1041,88 +883,6 @@ mod tests {
         assert!(
             !block.contains("Refs #5."),
             "only the review block: {block}"
-        );
-    }
-
-    /// The plan review's settle drives the spec label state machine (ADR 0008
-    /// §3): clean flips `spec-reviewing → spec-ready`, findings keep
-    /// `spec-reviewing` so the next push (spec_fixer, issue #188) triggers a
-    /// re-review.
-    #[tokio::test]
-    async fn plan_settle_drives_the_spec_label_state_machine() {
-        async fn settle_verdict(
-            verdict: ReviewVerdict,
-        ) -> std::sync::Arc<crate::forge::fake::FakeForge> {
-            let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
-            forge.add_pr(
-                7,
-                "Spec: caching (#5)",
-                "Refs #5.",
-                &[forge::LABEL_SPEC_REVIEWING],
-                "meguri/5-add-caching-abc",
-                "deadbeef",
-            );
-            let project = crate::config::ProjectConfig {
-                id: "proj".into(),
-                repo_path: Some("/tmp/unused".into()),
-                repo_slug: Some("me/proj".into()),
-                mode: Default::default(),
-                deliver: None,
-                default_branch: "main".into(),
-                check_command: None,
-                worktree_root: None,
-                language: None,
-                pr: None,
-                plan_delivery: Default::default(),
-                review: None,
-                worktree_setup: Default::default(),
-                autonomy: None,
-                prompts: Default::default(),
-            };
-            let deps = Deps::with_label_source(
-                crate::store::Store::open_in_memory().unwrap(),
-                std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
-                forge.clone(),
-                crate::config::Config::default(),
-                project,
-            );
-            let run = deps
-                .store
-                .create_run_for_loop("proj", KIND, 5, "Spec: caching (#5)")
-                .unwrap();
-            let mut c = cp(Kind::Plan, "deadbeef");
-            c.pr_number = Some(7);
-            c.pr_url = "https://fake.example/pr/7".into();
-            c.verdict = Some(verdict);
-            settle(&deps, &run, &c).await.unwrap();
-            forge
-        }
-
-        // Clean: spec-reviewing removed, spec-ready added.
-        let forge = settle_verdict(ReviewVerdict::Clean).await;
-        let labels = forge.pr_labels(7);
-        assert!(labels.contains(&forge::LABEL_SPEC_READY.to_string()));
-        assert!(!labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
-        assert_eq!(
-            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
-            Some(CommitStatusState::Success)
-        );
-
-        // Non-clean (blocking): spec-reviewing kept (spec_fixer's re-drive
-        // target), no spec-ready, status failure, and — issue #192 — no
-        // needs-human, or spec_fixer's discover (which skips escalated PRs)
-        // would never fire. Plan is unchanged by ADR 0025.
-        let forge = settle_verdict(ReviewVerdict::Blocking).await;
-        let labels = forge.pr_labels(7);
-        assert!(labels.contains(&forge::LABEL_SPEC_REVIEWING.to_string()));
-        assert!(!labels.contains(&forge::LABEL_SPEC_READY.to_string()));
-        assert!(
-            !labels.contains(&forge::LABEL_NEEDS_HUMAN.to_string()),
-            "plan findings must not escalate — spec_fixer (ADR 0013) owns the fix loop: {labels:?}"
-        );
-        assert_eq!(
-            forge.commit_status_of("deadbeef", PR_REVIEW_STATUS),
-            Some(CommitStatusState::Failure)
         );
     }
 
@@ -1139,7 +899,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -1304,13 +1063,6 @@ mod tests {
         let ok = read_review(dir.path(), Kind::Impl).unwrap();
         assert_eq!(ok.verdict, ReviewVerdict::Blocking);
         assert_eq!(ok.blocking_categories, vec![BlockingCategory::Security]);
-
-        // Plan blocking is the quality gate — no category required.
-        write(r#"{"verdict":"blocking","review":"- missing acceptance criteria"}"#);
-        assert_eq!(
-            read_review(dir.path(), Kind::Plan).unwrap().verdict,
-            ReviewVerdict::Blocking
-        );
     }
 
     /// `prepare_worktree` re-points the same detached checkout onto each new
@@ -1355,7 +1107,6 @@ mod tests {
             check_command: None,
             worktree_root: Some(worktree_root.path().to_path_buf()),
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: crate::config::WorktreeSetupConfig {
                 commands: vec!["echo ran > marker.txt".into()],

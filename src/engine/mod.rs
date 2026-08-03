@@ -1,19 +1,14 @@
 pub mod ci_fixer;
 pub mod conflict_resolver;
-pub mod decompose_materializer;
 pub mod escalation;
 pub mod fixer;
 pub mod flow;
 pub mod issue_reconciler;
-pub mod plan_handoff;
-pub mod planner;
 pub mod pr_reviewer;
 pub mod reaper;
 pub mod repo_reconciler;
 pub mod scheduler;
 pub mod self_review;
-pub mod spec_fixer;
-pub mod spec_worker;
 pub mod worker;
 
 use std::sync::Arc;
@@ -21,7 +16,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::config::{Config, PlanDelivery, ProjectConfig};
+use crate::config::{Config, ProjectConfig};
 use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
@@ -210,13 +205,6 @@ pub async fn ensure_project_clone(deps: &Deps) -> Result<()> {
 /// (fixer / ci_fixer / conflict_resolver) only ever touch work meguri opened.
 pub(crate) const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
-/// Whether the project uses combined plan delivery (ADR 0008) — the mode in
-/// which a `spec-ready` PR's branch belongs to the spec worker, so no
-/// fixer-family loop may touch it.
-pub(crate) fn is_combined(deps: &Deps) -> bool {
-    deps.project.plan_delivery == PlanDelivery::Combined
-}
-
 /// Whether a fixer-family loop (fixer / ci_fixer / conflict_resolver) may
 /// touch `pr` at all, independent of the loop's own symptom (review threads /
 /// red CI / conflicts). The three loops used to carry near-identical copies
@@ -226,13 +214,7 @@ pub(crate) fn is_combined(deps: &Deps) -> bool {
 /// worker still owned. Lifted here so the shared gates cannot drift again;
 /// only each loop's own symptom check stays outside.
 ///
-/// `skip_spec_ready` is the one gate that legitimately varies: pass
-/// `is_combined(deps)`. Under combined delivery a `spec-ready` PR's branch
-/// belongs to the spec worker's takeover (ADR 0008 §6), so no fixer-family
-/// loop may touch it; under separate delivery the spec worker never takes
-/// the branch over, so a `spec-ready` spec/ADR PR is a standalone PR like any
-/// other.
-pub fn pr_is_touchable(pr: &PullRequest, skip_spec_ready: bool) -> Option<String> {
+pub fn pr_is_touchable(pr: &PullRequest) -> Option<String> {
     if pr.state != "open" {
         return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
     }
@@ -240,13 +222,6 @@ pub fn pr_is_touchable(pr: &PullRequest, skip_spec_ready: bool) -> Option<String
         return Some(format!(
             "PR #{} head `{}` was not opened by meguri",
             pr.number, pr.head_branch
-        ));
-    }
-    if skip_spec_ready && pr.has_label(forge::LABEL_SPEC_READY) {
-        return Some(format!(
-            "PR #{} is {} (the spec worker owns the branch)",
-            pr.number,
-            forge::LABEL_SPEC_READY
         ));
     }
     if pr.has_label(forge::LABEL_HOLD) {
@@ -369,14 +344,6 @@ pub enum WorkerOutcome {
     /// Benign race: the issue was held or de-labeled between discovery and
     /// claim (e.g. another run already shipped it). No escalation.
     Skipped(String),
-    /// The agent found a design decision must precede implementation; the
-    /// issue was handed to the planner (issue #22). A normal ending, not a
-    /// failure — the reason (agent's summary) is left as an issue comment.
-    NeedsPlan(String),
-    /// The planner split the issue into sub-issues instead of writing a spec
-    /// (issue #24). The second normal planner ending — the rationale
-    /// (agent's summary) is left as an issue comment.
-    Decomposed(String),
 }
 
 /// The dispatch priority of a `runs.loop_kind` (ADR 0001 → ADR 0012 §5): the
@@ -390,11 +357,8 @@ pub fn dispatch_rank(loop_kind: &str) -> u8 {
         conflict_resolver::KIND => 0,
         ci_fixer::KIND => 1,
         fixer::KIND => 2,
-        spec_fixer::KIND => 3,
-        spec_worker::KIND => 4,
-        pr_reviewer::KIND => 5,
-        worker::KIND => 6,
-        planner::KIND => 7,
+        pr_reviewer::KIND => 3,
+        worker::KIND => 4,
         _ => u8::MAX,
     }
 }
@@ -431,9 +395,6 @@ pub fn default_recipe() -> RecipeFn {
 pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<WorkerOutcome> {
     match loop_kind {
         worker::KIND => worker::run_worker(deps, run_id).await,
-        planner::KIND => planner::run_planner(deps, run_id).await,
-        spec_worker::KIND => spec_worker::run_spec_worker(deps, run_id).await,
-        spec_fixer::KIND => spec_fixer::run_spec_fixer(deps, run_id).await,
         pr_reviewer::KIND => pr_reviewer::run_pr_reviewer(deps, run_id).await,
         conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
         ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
@@ -535,67 +496,47 @@ mod tests {
     }
 
     #[test]
-    fn spec_fixer_sits_in_the_fixer_family_above_new_work() {
-        // dispatch_rank is priority (issue #188 → ADR 0012 決定7): the
-        // spec-fixer must unpark a spec PR before the worker/planner start
-        // new work, and it belongs after the fixer.
-        assert!(dispatch_rank("fixer") < dispatch_rank("spec-fixer"));
-        assert!(dispatch_rank("spec-fixer") < dispatch_rank("spec-worker"));
-        assert!(dispatch_rank("spec-fixer") < dispatch_rank("worker"));
-        assert!(dispatch_rank("spec-fixer") < dispatch_rank("planner"));
+    fn dispatch_rank_orders_merge_proximity_first() {
+        // dispatch_rank is priority (ADR 0001 → ADR 0012 決定7): the fixer
+        // family sits above review, review above new work.
+        assert!(dispatch_rank("fixer") < dispatch_rank("pr-reviewer"));
+        assert!(dispatch_rank("pr-reviewer") < dispatch_rank("worker"));
         assert_eq!(dispatch_rank("nonsense"), u8::MAX);
     }
 
     #[test]
     fn touchable_guards_state_ownership_and_claim_labels() {
         let base = pr(3, "meguri/9-add-feature-abc123", "");
-        assert!(pr_is_touchable(&base, true).is_none());
+        assert!(pr_is_touchable(&base).is_none());
 
         let merged = PullRequest {
             state: "merged".into(),
             ..base.clone()
         };
-        assert!(pr_is_touchable(&merged, true).unwrap().contains("merged"));
+        assert!(pr_is_touchable(&merged).unwrap().contains("merged"));
 
         let human = PullRequest {
             head_branch: "feature/manual".into(),
             ..base.clone()
         };
         assert!(
-            pr_is_touchable(&human, true)
+            pr_is_touchable(&human)
                 .unwrap()
                 .contains("not opened by meguri")
-        );
-
-        // spec-ready: skipped only under combined delivery (the spec worker
-        // owns the branch); an ordinary standalone PR under separate (ADR
-        // 0008 §6, issue #170).
-        let spec_ready = PullRequest {
-            labels: vec![forge::LABEL_SPEC_READY.to_string()],
-            ..base.clone()
-        };
-        assert!(
-            pr_is_touchable(&spec_ready, true)
-                .unwrap()
-                .contains(forge::LABEL_SPEC_READY)
-        );
-        assert!(
-            pr_is_touchable(&spec_ready, false).is_none(),
-            "separate delivery: a spec-ready PR is touchable"
         );
 
         let held = PullRequest {
             labels: vec![forge::LABEL_HOLD.to_string()],
             ..base.clone()
         };
-        assert!(pr_is_touchable(&held, true).unwrap().contains("hold"));
+        assert!(pr_is_touchable(&held).unwrap().contains("hold"));
 
         let working = PullRequest {
             labels: vec![forge::LABEL_WORKING.to_string()],
             ..base.clone()
         };
         assert!(
-            pr_is_touchable(&working, true)
+            pr_is_touchable(&working)
                 .unwrap()
                 .contains(forge::LABEL_WORKING)
         );
@@ -605,7 +546,7 @@ mod tests {
             ..base
         };
         assert!(
-            pr_is_touchable(&needs_human, true)
+            pr_is_touchable(&needs_human)
                 .unwrap()
                 .contains(forge::LABEL_NEEDS_HUMAN)
         );
@@ -624,7 +565,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,

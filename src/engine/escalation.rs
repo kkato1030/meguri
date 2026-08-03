@@ -325,7 +325,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
