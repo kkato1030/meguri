@@ -70,7 +70,6 @@ async fn setup() -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
-    config.review.enabled = false; // resume/session behavior, not self-review, is under test
     config.agent.session_dir = Some(session_root.clone());
     let project = ProjectConfig {
         id: "proj".into(),
@@ -83,7 +82,6 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),
@@ -363,7 +361,6 @@ worker = "p-worker"
     let mut config: Config = toml::from_str(toml).unwrap();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
-    config.review.enabled = false; // resume behavior, not self-review, is under test
     config
 }
 

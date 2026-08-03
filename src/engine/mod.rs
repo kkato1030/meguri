@@ -4,11 +4,9 @@ pub mod escalation;
 pub mod fixer;
 pub mod flow;
 pub mod issue_reconciler;
-pub mod pr_reviewer;
 pub mod reaper;
 pub mod repo_reconciler;
 pub mod scheduler;
-pub mod self_review;
 pub mod worker;
 
 use std::sync::Arc;
@@ -20,7 +18,7 @@ use crate::config::{Config, ProjectConfig};
 use crate::forge::{self, Forge, PullRequest};
 use crate::gitops;
 use crate::mux::Multiplexer;
-use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, LANE_PR_REVIEW, Store};
+use crate::store::{DesiredState, InteractionState, LANE_AUTHOR, Store};
 use crate::tasks::TaskSource;
 use crate::turn::TurnControl;
 
@@ -319,18 +317,10 @@ pub async fn open_pr_for_issue(deps: &Deps, issue: i64) -> Result<Option<PullReq
     }
 }
 
-/// The pane lane a loop's runs live in: the pr-reviewer keeps its independent
-/// `pr-review` lane; every other loop shares the issue's `author` lane (the
-/// cleaner's report issue is only ever touched by the cleaner, so the default
-/// lane cannot collide). The internal self-review turn runs in its own
-/// `self-review` lane, but that lane is entered explicitly by the flow, not
-/// via a loop_kind, so it is not resolved here.
-pub fn lane_for_loop(loop_kind: &str) -> &'static str {
-    if loop_kind == pr_reviewer::KIND {
-        LANE_PR_REVIEW
-    } else {
-        LANE_AUTHOR
-    }
+/// The pane lane a loop's runs live in: every loop shares the issue's
+/// `author` lane.
+pub fn lane_for_loop(_loop_kind: &str) -> &'static str {
+    LANE_AUTHOR
 }
 
 /// Terminal outcomes of driving one run (shared by every loop).
@@ -357,8 +347,7 @@ pub fn dispatch_rank(loop_kind: &str) -> u8 {
         conflict_resolver::KIND => 0,
         ci_fixer::KIND => 1,
         fixer::KIND => 2,
-        pr_reviewer::KIND => 3,
-        worker::KIND => 4,
+        worker::KIND => 3,
         _ => u8::MAX,
     }
 }
@@ -395,7 +384,6 @@ pub fn default_recipe() -> RecipeFn {
 pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<WorkerOutcome> {
     match loop_kind {
         worker::KIND => worker::run_worker(deps, run_id).await,
-        pr_reviewer::KIND => pr_reviewer::run_pr_reviewer(deps, run_id).await,
         conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
         ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
         fixer::KIND => fixer::run_fixer(deps, run_id).await,
@@ -480,17 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_is_pr_review_only_for_the_pr_reviewer() {
-        assert_eq!(lane_for_loop(pr_reviewer::KIND), LANE_PR_REVIEW);
-        for kind in [
-            "worker",
-            "planner",
-            "spec-worker",
-            "spec-fixer",
-            "fixer",
-            "ci-fixer",
-            "conflict-resolver",
-        ] {
+    fn every_loop_lives_in_the_author_lane() {
+        for kind in ["worker", "fixer", "ci-fixer", "conflict-resolver"] {
             assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
     }
@@ -498,9 +477,9 @@ mod tests {
     #[test]
     fn dispatch_rank_orders_merge_proximity_first() {
         // dispatch_rank is priority (ADR 0001 → ADR 0012 決定7): the fixer
-        // family sits above review, review above new work.
-        assert!(dispatch_rank("fixer") < dispatch_rank("pr-reviewer"));
-        assert!(dispatch_rank("pr-reviewer") < dispatch_rank("worker"));
+        // family sits above new work.
+        assert!(dispatch_rank("conflict-resolver") < dispatch_rank("fixer"));
+        assert!(dispatch_rank("fixer") < dispatch_rank("worker"));
         assert_eq!(dispatch_rank("nonsense"), u8::MAX);
     }
 
@@ -565,7 +544,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),

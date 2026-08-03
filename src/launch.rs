@@ -31,10 +31,8 @@ use crate::routing::{self, KNOWN_ROLES};
 ///
 /// Unknown roles default to `Pane`, the historically safe behavior.
 pub fn recommended_mode(role: &str) -> LaunchMode {
-    match routing::canonical_role(role) {
-        "self-reviewer" | "cleaner" => LaunchMode::Direct,
-        _ => LaunchMode::Pane,
-    }
+    let _ = routing::canonical_role(role);
+    LaunchMode::Pane
 }
 
 /// Resolve a role's launch mode: an explicit `[launch.roles]` entry (honoring
@@ -85,12 +83,8 @@ mod tests {
     #[test]
     fn no_launch_section_uses_the_recommended_table() {
         let cfg = Config::default();
-        assert_eq!(resolve(&cfg, "planner"), LaunchMode::Pane);
         assert_eq!(resolve(&cfg, "worker"), LaunchMode::Pane);
         assert_eq!(resolve(&cfg, "fixer"), LaunchMode::Pane);
-        assert_eq!(resolve(&cfg, "pr-reviewer"), LaunchMode::Pane);
-        assert_eq!(resolve(&cfg, "self-reviewer"), LaunchMode::Direct);
-        assert_eq!(resolve(&cfg, "cleaner"), LaunchMode::Direct);
     }
 
     #[test]
@@ -98,15 +92,12 @@ mod tests {
         let cfg = cfg_from(
             r#"
 [launch.roles]
-pr-reviewer = "direct"
-self-reviewer = "pane"
+worker = "direct"
 "#,
         );
-        assert_eq!(resolve(&cfg, "pr-reviewer"), LaunchMode::Direct);
-        assert_eq!(resolve(&cfg, "self-reviewer"), LaunchMode::Pane);
+        assert_eq!(resolve(&cfg, "worker"), LaunchMode::Direct);
         // Untouched roles still fall through to the recommended table.
-        assert_eq!(resolve(&cfg, "worker"), LaunchMode::Pane);
-        assert_eq!(resolve(&cfg, "cleaner"), LaunchMode::Direct);
+        assert_eq!(resolve(&cfg, "fixer"), LaunchMode::Pane);
     }
 
     #[test]
@@ -114,11 +105,9 @@ self-reviewer = "pane"
         let cfg = cfg_from(
             r#"
 [launch.roles]
-guard = "direct"
 spec-worker = "direct"
 "#,
         );
-        assert_eq!(resolve(&cfg, "pr-reviewer"), LaunchMode::Direct);
         assert_eq!(resolve(&cfg, "worker"), LaunchMode::Direct);
         validate(&cfg).unwrap();
     }

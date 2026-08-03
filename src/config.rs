@@ -213,20 +213,12 @@ pub struct Config {
     /// through the built-in recommendation table.
     #[serde(default)]
     pub launch: LaunchConfig,
-    /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
-    /// #66). Top-level like `[drift]` so toggling it never materializes
-    /// `[routing]` and flips role routing on. Only fires when routing is
-    /// active (a common gate in the flow).
-    #[serde(default)]
-    pub escalation: EscalationConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub pr: PrConfig,
-    #[serde(default)]
-    pub review: ReviewConfig,
     /// How autonomous meguri may be (issue #176). Global default; a project may
     /// override wholesale via its own `autonomy`. See [`Autonomy`].
     #[serde(default)]
@@ -248,98 +240,6 @@ pub struct Config {
     /// without `[[workspaces]]` behaves exactly as before. See ADR 0009.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceConfig>,
-}
-
-/// Settings for the internal self-review phase (ADR 0006/0008): the review→fix
-/// loop that runs before the PR opens, now symmetric across plan and impl
-/// (ADR 0008). The old `impl_enabled` / `impl_max_rounds` keys (the forge-based
-/// impl-reviewer loop, ADR 0004) are still accepted as serde aliases so
-/// existing configs keep working.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewConfig {
-    /// Kill switch: false skips the internal self-review phase entirely
-    /// (e.g. when an external review bot already covers PRs).
-    #[serde(default = "default_self_review_enabled", alias = "impl_enabled")]
-    pub enabled: bool,
-    /// Max self-review rounds per run — the cap that keeps the internal
-    /// review→fix loop finite. On reaching it the behavior branches (ADR 0022,
-    /// issue #212): a genuine ping-pong (a finding still open after two fix
-    /// turns), a needs_human verdict, or a disputed recorded decision escalate
-    /// to a human; anything else (only minor blocking findings left) runs one
-    /// final fix + validate and publishes, with a PR footer noting the last fix
-    /// was not re-reviewed (the human merge gate is the backstop).
-    #[serde(default = "default_self_review_max_rounds", alias = "impl_max_rounds")]
-    pub max_rounds: u32,
-    /// The review lenses the self-review turn applies each round (ADR 0008):
-    /// one review turn considers every configured perspective. Defaults to
-    /// `correctness / tests / simplicity / security`; add or drop to taste.
-    #[serde(default = "default_review_lenses")]
-    pub lenses: Vec<String>,
-    /// External GitHub guard review, enabled per kind (ADR 0008 §1/§3).
-    #[serde(default)]
-    pub guard: GuardConfig,
-    /// Parallel round-1 reviewers (issue #214, ADR 0023). Empty (the default)
-    /// keeps the historical single self-reviewer, byte-for-byte. Non-empty fans
-    /// round 1 out to one reviewer per entry, each writing its own review file;
-    /// the findings are union-merged. Round 2+ stays the single anchor reviewer.
-    /// This is host-only: `profile` is a trust declaration, so `[review]` lives
-    /// only in host `config.toml`, never in a repo `meguri.toml` (ADR 0011/0024).
-    #[serde(default)]
-    pub reviewers: Vec<ReviewerConfig>,
-}
-
-impl Default for ReviewConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_self_review_enabled(),
-            max_rounds: default_self_review_max_rounds(),
-            lenses: default_review_lenses(),
-            guard: GuardConfig::default(),
-            reviewers: Vec::new(),
-        }
-    }
-}
-
-/// One parallel round-1 reviewer (`[[review.reviewers]]`, issue #214, ADR 0023).
-/// Each entry becomes one fanned-out review turn in round 1.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ReviewerConfig {
-    /// The launch profile (CLI + model) this reviewer runs under. `None` falls
-    /// back to the `self-reviewer` routing profile — the anchor model. Point it
-    /// at a heterogeneous model (e.g. `claude-opus`, `codex`) to diversify
-    /// round-1 attention.
-    #[serde(default)]
-    pub profile: Option<String>,
-    /// The lenses this reviewer applies. `None` means all configured
-    /// `review.lenses`. Split the lenses across same-profile entries to build
-    /// non-correlated attention in a single-model ensemble (ADR 0023 §3).
-    #[serde(default)]
-    pub lenses: Option<Vec<String>>,
-}
-
-fn default_self_review_enabled() -> bool {
-    true
-}
-fn default_self_review_max_rounds() -> u32 {
-    3
-}
-fn default_review_lenses() -> Vec<String> {
-    ["correctness", "tests", "simplicity", "security"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// `[review.guard]` — the optional external GitHub guard review, toggled
-/// independently for the plan (spec/ADR) and impl kinds (ADR 0008). Plan guard
-/// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
-/// off (opt-in; external-bot compatible). Its output is a `meguri/pr-review`
-/// commit status + a folded PR-body `<details>` — never inline threads.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GuardConfig {
-    /// Guard the implementation PR (default off).
-    #[serde(default, rename = "impl")]
-    pub impl_enabled: bool,
 }
 
 /// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
@@ -754,52 +654,6 @@ pub struct RoutingConfig {
     /// Values are profile names. An explicit entry always beats auto.
     #[serde(default)]
     pub roles: HashMap<String, String>,
-    /// Fraction (0.0–1.0) of runs assigned to a comparison ("explore")
-    /// profile instead of the mainline pick (routing 3/3, issue #66). Default
-    /// `0.0` = off: no run is diverted, so behavior matches routing 1/3. The
-    /// selection is deterministic by target number, and lives inside
-    /// `[routing]` because explore is part of how routing assigns profiles —
-    /// you only set it when routing is already wanted.
-    #[serde(default)]
-    pub explore_ratio: f64,
-}
-
-/// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
-/// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
-/// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
-/// switches role routing on (see [`crate::routing`]), so a `[routing.escalation]`
-/// table would silently activate routing for a user who only wanted to turn
-/// escalation off — the same reason ADR 0007 gave `[drift]` a top-level home.
-/// Escalation still only fires when routing is active (a common gate in the
-/// flow), so `[escalation]` alone changes nothing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EscalationConfig {
-    /// Kill switch. Default `true`, but escalation only fires for roles that
-    /// have an escalation chain AND when routing is active, so the default is
-    /// inert until both hold.
-    #[serde(default = "default_escalation_enabled")]
-    pub enabled: bool,
-    /// Per-role chain overrides. Keys are the 6 routing roles (see
-    /// `crate::routing::KNOWN_ROLES`); values are ordered profile-name chains
-    /// (weakest → strongest), e.g. `worker = ["claude-sonnet", "claude-opus"]`.
-    /// An empty chain (`worker = []`) turns escalation off for that role
-    /// without touching the others. Flattened so `enabled` and the role chains
-    /// share the one `[escalation]` table.
-    #[serde(flatten, default)]
-    pub roles: HashMap<String, Vec<String>>,
-}
-
-impl Default for EscalationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_escalation_enabled(),
-            roles: HashMap::new(),
-        }
-    }
-}
-
-fn default_escalation_enabled() -> bool {
-    true
 }
 
 fn default_agent_command() -> String {
@@ -1052,10 +906,6 @@ pub struct ProjectConfig {
     /// github, `branch` for local — resolved via [`Config::deliver_for`].
     #[serde(default)]
     pub deliver: Option<Deliver>,
-    /// Per-project self-review / guard settings; overrides the global
-    /// `[review]` section wholesale (like `pr` / `clean`).
-    #[serde(default)]
-    pub review: Option<ReviewConfig>,
     /// Per-project autonomy mode; overrides the global `autonomy` wholesale
     /// (issue #176). See [`Autonomy`].
     #[serde(default)]
@@ -1400,12 +1250,6 @@ impl Config {
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
-    }
-
-    /// Effective self-review / guard settings for a project (project override
-    /// wins wholesale, like `pr_for`).
-    pub fn review_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a ReviewConfig {
-        project.review.as_ref().unwrap_or(&self.review)
     }
 
     /// Effective autonomy mode for a project (project override wins wholesale,
@@ -1952,75 +1796,6 @@ mod tests {
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
         assert!(back.pr.draft);
-        assert!(back.review.enabled);
-        assert_eq!(back.review.max_rounds, 3);
-    }
-
-    #[test]
-    fn review_section_overrides_defaults() {
-        let raw = r#"
-[review]
-enabled = false
-max_rounds = 1
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(!cfg.review.enabled);
-        assert_eq!(cfg.review.max_rounds, 1);
-        // No `[[review.reviewers]]` → empty → the single-reviewer path (#214).
-        assert!(cfg.review.reviewers.is_empty());
-    }
-
-    #[test]
-    fn review_reviewers_parse() {
-        // Issue #214: `[[review.reviewers]]` fans round 1 out. A profile-only
-        // entry and a lens-split entry both parse; absent lenses stay None.
-        let raw = r#"
-[[review.reviewers]]
-profile = "claude-opus"
-
-[[review.reviewers]]
-profile = "codex"
-lenses = ["security"]
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert_eq!(cfg.review.reviewers.len(), 2);
-        assert_eq!(
-            cfg.review.reviewers[0].profile.as_deref(),
-            Some("claude-opus")
-        );
-        assert!(cfg.review.reviewers[0].lenses.is_none());
-        assert_eq!(
-            cfg.review.reviewers[1].lenses.as_deref(),
-            Some(["security".to_string()].as_slice())
-        );
-    }
-
-    #[test]
-    fn review_is_host_only_rejected_in_repo_config() {
-        // Issue #214 / ADR 0011/0024: `[review]` is a trust declaration, so a
-        // repo `meguri.toml` carrying it is a parse error (RepoConfig denies it),
-        // keeping `[[review.reviewers]]` host-only.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("meguri.toml"),
-            "[[review.reviewers]]\nprofile = \"codex\"\n",
-        )
-        .unwrap();
-        assert!(RepoConfig::load_from_worktree(dir.path()).is_err());
-    }
-
-    #[test]
-    fn review_section_accepts_deprecated_impl_keys() {
-        // The ADR-0004 key names still load (serde aliases) so existing
-        // configs keep working after the ADR-0006 rename.
-        let raw = r#"
-[review]
-impl_enabled = false
-impl_max_rounds = 5
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(!cfg.review.enabled);
-        assert_eq!(cfg.review.max_rounds, 5);
     }
 
     #[test]
@@ -2452,47 +2227,6 @@ language = "English"
     }
 
     #[test]
-    fn escalation_defaults_and_does_not_activate_routing() {
-        // No `[escalation]` section: enabled by default, no role chains, and it
-        // certainly doesn't imply `[routing]`.
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.escalation.enabled);
-        assert!(cfg.escalation.roles.is_empty());
-        assert!(cfg.routing.is_none());
-
-        // A top-level `[escalation]` table parses `enabled` + per-role chains
-        // from the one flattened section, and must NOT materialize `[routing]`
-        // (the whole point of keeping it out of `[routing.escalation]`).
-        let cfg: Config = toml::from_str(
-            r#"
-[escalation]
-enabled = false
-worker = ["claude-sonnet", "claude-opus"]
-fixer = []
-"#,
-        )
-        .unwrap();
-        assert!(!cfg.escalation.enabled);
-        assert_eq!(
-            cfg.escalation.roles["worker"],
-            vec!["claude-sonnet", "claude-opus"]
-        );
-        assert_eq!(cfg.escalation.roles["fixer"], Vec::<String>::new());
-        assert!(
-            cfg.routing.is_none(),
-            "[escalation] must stay legacy for routing"
-        );
-    }
-
-    #[test]
-    fn explore_ratio_defaults_off_and_lives_under_routing() {
-        let cfg: Config = toml::from_str("[routing]\n").unwrap();
-        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.0);
-        let cfg: Config = toml::from_str("[routing]\nexplore_ratio = 0.1\n").unwrap();
-        assert_eq!(cfg.routing.as_ref().unwrap().explore_ratio, 0.1);
-    }
-
-    #[test]
     fn parses_profiles_and_routing() {
         let raw = r#"
 [agents.profiles.claude-opus]
@@ -2818,7 +2552,7 @@ timeout_secs = 60
     fn prompts_parse_and_key_validation() {
         // Known roles, deprecated aliases, and `all` all load and validate.
         let raw = format!(
-            "[prompts]\nall = \"a.md\"\nworker = \"w.md\"\nspec-reviewer = \"r.md\"\n{A_PROJECT}"
+            "[prompts]\nall = \"a.md\"\nworker = \"w.md\"\nci-fixer = \"f.md\"\n{A_PROJECT}"
         );
         let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
         assert_eq!(cfg.prompts.get("all").map(String::as_str), Some("a.md"));
@@ -2831,8 +2565,7 @@ timeout_secs = 60
 
     #[test]
     fn prompts_alias_and_canonical_collision_rejected() {
-        let bad =
-            format!("[prompts]\npr-reviewer = \"a.md\"\nspec-reviewer = \"b.md\"\n{A_PROJECT}");
+        let bad = format!("[prompts]\nfixer = \"a.md\"\nci-fixer = \"b.md\"\n{A_PROJECT}");
         let err = Config::parse(&bad, Path::new("t.toml")).unwrap_err();
         assert!(format!("{err:#}").contains("more than once"), "{err:#}");
     }
@@ -2878,7 +2611,7 @@ timeout_secs = 60
         );
         // a role with no entry falls back to just `all`.
         assert_eq!(
-            cfg.preambles_for(p, "planner"),
+            cfg.preambles_for(p, "fixer"),
             vec![("all".to_string(), "all.md".to_string())]
         );
     }
@@ -2980,27 +2713,27 @@ timeout_secs = 60
         // Old name at top-level, canonical name per-project: project wins, and
         // the alias still resolves for the canonical role.
         let raw = format!(
-            "[prompts]\nspec-reviewer = \"top-review.md\"\n\
-             {A_PROJECT}[projects.prompts]\npr-reviewer = \"proj-review.md\"\n"
+            "[prompts]\nci-fixer = \"top-fix.md\"\n\
+             {A_PROJECT}[projects.prompts]\nfixer = \"proj-fix.md\"\n"
         );
         let cfg = Config::parse(&raw, Path::new("t.toml")).unwrap();
         let p = cfg.project("p").unwrap();
         assert_eq!(
-            cfg.preambles_for(p, "pr-reviewer"),
-            vec![("pr-reviewer".to_string(), "proj-review.md".to_string())]
+            cfg.preambles_for(p, "fixer"),
+            vec![("fixer".to_string(), "proj-fix.md".to_string())]
         );
 
         // Old name only, at top-level, resolves for the canonical role turn.
-        let raw2 = format!("[prompts]\nspec-reviewer = \"review.md\"\n{A_PROJECT}");
+        let raw2 = format!("[prompts]\nci-fixer = \"fix.md\"\n{A_PROJECT}");
         let cfg2 = Config::parse(&raw2, Path::new("t.toml")).unwrap();
         let p2 = cfg2.project("p").unwrap();
         assert_eq!(
-            cfg2.preambles_for(p2, "pr-reviewer"),
-            vec![("pr-reviewer".to_string(), "review.md".to_string())]
+            cfg2.preambles_for(p2, "fixer"),
+            vec![("fixer".to_string(), "fix.md".to_string())]
         );
 
         // A role with nothing configured returns nothing.
-        assert!(cfg2.preambles_for(p2, "cleaner").is_empty());
+        assert!(cfg2.preambles_for(p2, "worker").is_empty());
     }
 
     #[cfg(unix)]

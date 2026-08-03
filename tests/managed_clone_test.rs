@@ -31,7 +31,6 @@ fn managed_project(id: &str, repo_path: Option<PathBuf>, mode: ProjectMode) -> P
         check_command: None,
         worktree_root: None,
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),

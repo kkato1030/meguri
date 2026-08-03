@@ -24,13 +24,11 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::pr_reviewer::PR_REVIEW_STATUS;
 use super::{Deps, canonical_key};
 use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn, Autonomy};
 use crate::forge::{
-    self, ArmOutcome, CheckRollup, CheckState, CommitStatusState, MergePolicy, MergeState,
-    MergeStateStatus, MergeStrategy, MergeableState, PrObservation, PullRequest,
-    UpdateBranchOutcome,
+    self, ArmOutcome, CheckRollup, CheckState, MergePolicy, MergeState, MergeStateStatus,
+    MergeStrategy, MergeableState, PrObservation, PullRequest, UpdateBranchOutcome,
 };
 use crate::store::parse_ts;
 
@@ -160,9 +158,6 @@ pub enum Arm {
     CiFixer,
     /// An open review thread awaiting meguri — address the comments.
     Fixer,
-    /// An unreviewed head (a green meguri PR) — run the guard review in the
-    /// independent `pr-review` lane (決定2).
-    PrReviewer,
 }
 
 impl Arm {
@@ -172,7 +167,6 @@ impl Arm {
             Arm::ConflictResolver => super::conflict_resolver::KIND,
             Arm::CiFixer => super::ci_fixer::KIND,
             Arm::Fixer => super::fixer::KIND,
-            Arm::PrReviewer => super::pr_reviewer::KIND,
         }
     }
 
@@ -194,17 +188,6 @@ pub enum Step {
     Op(Op),
     Wait(&'static str),
     Skip(&'static str),
-}
-
-/// The pr-review gate's verdict (ADR 0008 §5), pre-reduced into the Snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrReviewGate {
-    /// Review disabled, or a success status on the head — arming may proceed.
-    Proceed,
-    /// Review enabled but the status is absent/pending — wait.
-    Wait,
-    /// Review enabled and the head's status is a failure — escalate.
-    Failed,
 }
 
 /// The pure inputs [`next_step`] decides on: no wall-clock, no I/O. The sweep
@@ -245,8 +228,6 @@ pub struct Snapshot {
     pub arm_candidate: bool,
     /// An unresolved review thread is open (arm waits on resolution).
     pub has_unresolved_thread: bool,
-    /// The pr-review gate verdict.
-    pub pr_review: PrReviewGate,
     /// The project runs at `full` autonomy (else a human is the merge gate).
     pub autonomy_full: bool,
     /// Auto-merge is enabled in config (`[pr.auto_merge] enabled`). The fixer
@@ -260,16 +241,6 @@ pub struct Snapshot {
     pub mode: AutoMergeMode,
     /// The PR carries `working` (a run's claim label).
     pub pr_working: bool,
-    /// The head's `meguri/pr-review` commit status, raw (`None` = this head
-    /// was never reviewed — the PrReviewer arm's trigger).
-    pub review_head_status: Option<CommitStatusState>,
-    /// The impl guard toggle (`[projects.review.guard]`).
-    pub impl_guard_enabled: bool,
-    /// The real CI rollup (meguri's own advisory statuses stripped) is green.
-    pub ci_green: bool,
-    /// An active pr-reviewer run already covers this issue (its own lane —
-    /// `issue_busy` deliberately excludes it).
-    pub reviewer_busy: bool,
 }
 
 impl Snapshot {
@@ -279,26 +250,6 @@ impl Snapshot {
     fn can_write(&self) -> bool {
         self.arm_candidate && self.autonomy_full && self.policy_ok
     }
-}
-
-/// The pr-reviewer candidacy (決定2): `Some(step)` when the review lane owns
-/// this observation, `None` when the rest of the decision ladder proceeds.
-/// Mirrors the old `PrReviewerLoop::candidate_kind` gates exactly.
-fn pr_review_arm(s: &Snapshot) -> Option<Step> {
-    if s.pr_working {
-        return None; // a claim label parks reviews too (historical gate)
-    }
-    // Impl review: meguri branch, settled-green CI.
-    if !s.impl_guard_enabled || !s.is_meguri_branch || !s.ci_green {
-        return None;
-    }
-    if s.review_head_status.is_some() {
-        return None; // this head is already reviewed (or under review)
-    }
-    if s.reviewer_busy {
-        return None; // an active reviewer run already covers the issue
-    }
-    Some(Step::Agent(Arm::PrReviewer))
 }
 
 /// The pure decision (ADR 0012 §3). Ordering encodes precedence: the fixer
@@ -315,13 +266,6 @@ pub fn next_step(s: &Snapshot) -> Step {
     // brake that makes a Stuck / review-failed / budget escalation fire once.
     if s.human_stop {
         return Step::Skip("human stop (hold/needs-human)");
-    }
-    // The pr-reviewer arm (決定2): its `pr-review` lane runs parallel to the
-    // author lane, so it is decided before the busy / branch gates. A
-    // candidate is a green meguri PR; the head's review status is the dedup
-    // key.
-    if let Some(step) = pr_review_arm(s) {
-        return step;
     }
     if !s.is_meguri_branch {
         return Step::Skip("not a meguri branch");
@@ -400,14 +344,6 @@ pub fn next_step(s: &Snapshot) -> Step {
     if s.has_unresolved_thread {
         return Step::Wait("unresolved review thread");
     }
-    // pr-review failure escalates before the autonomy gate: escalation is
-    // mode-independent (ADR 0012 §5), so a review-failed head gets its
-    // needs-human backstop even when arming is off under `attended`.
-    match s.pr_review {
-        PrReviewGate::Failed => return Step::Op(Op::Escalate),
-        PrReviewGate::Wait => return Step::Wait("pr-review pending"),
-        PrReviewGate::Proceed => {}
-    }
     if !s.autonomy_full {
         return Step::Skip("autonomy not full (a human merges)");
     }
@@ -447,7 +383,6 @@ fn arm_allowed(arm: Arm, p: &crate::config::StepPolicyConfig) -> bool {
         Arm::ConflictResolver => p.conflict_resolver,
         Arm::CiFixer => p.ci_fixer,
         Arm::Fixer => p.fixer,
-        Arm::PrReviewer => p.pr_reviewer,
     }
 }
 
@@ -521,15 +456,6 @@ async fn build_snapshot(
         }
         None => false,
     };
-    let pr_review = if !deps.config.review_for(&deps.project).guard.impl_enabled {
-        PrReviewGate::Proceed
-    } else {
-        match obs.pr_review {
-            Some(CommitStatusState::Success) => PrReviewGate::Proceed,
-            Some(CommitStatusState::Failure) => PrReviewGate::Failed,
-            Some(CommitStatusState::Pending) | None => PrReviewGate::Wait,
-        }
-    };
     let stale = armed_since_any_head(&obs.comments)
         .is_some_and(|since| now.saturating_sub(since) > STALE_AFTER_SECS);
     // Conservative fallback for a clipped observe window: a `hold` / `needs-human`
@@ -585,12 +511,7 @@ async fn build_snapshot(
     }
     .state()
         == CheckState::Failure;
-    let review = deps.config.review_for(&deps.project);
     let pr_working = pr.has_label(forge::LABEL_WORKING);
-    let ci_green = real_rollup(obs).state() == CheckState::Success;
-    let reviewer_busy =
-        deps.store
-            .issue_has_active_loop_run(&deps.project.id, super::pr_reviewer::KIND, issue)?;
     Ok(Snapshot {
         open: pr.state == "open",
         is_meguri_branch: pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX),
@@ -605,16 +526,11 @@ async fn build_snapshot(
         ci_exhausted,
         arm_candidate,
         has_unresolved_thread,
-        pr_review,
         autonomy_full: deps.config.autonomy_for(&deps.project) == Autonomy::Full,
         auto_merge_config_enabled: am.enabled,
         policy_ok,
         mode: am.mode,
         pr_working,
-        review_head_status: obs.pr_review,
-        impl_guard_enabled: review.guard.impl_enabled,
-        ci_green,
-        reviewer_busy,
     })
 }
 
@@ -648,7 +564,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     // observe: one bulk query, its API cost measured and recorded (issue #221,
     // acceptance 2). The pr-review context is passed in so the forge stays free
     // of engine vocabulary.
-    let observation = deps.forge().observe_open_prs(PR_REVIEW_STATUS).await?;
+    let observation = deps.forge().observe_open_prs().await?;
     let _ = deps.store.emit(
         None,
         "reconciler.observe_cost",
@@ -702,7 +618,7 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
 /// `run --pr`, ADR 0016). `None` when the PR is not in the open set.
 pub async fn observe_pr_step(deps: &Deps, number: i64) -> Result<Option<(Snapshot, Step)>> {
     let am = deps.config.pr_for(&deps.project).auto_merge.clone();
-    let observation = deps.forge().observe_open_prs(PR_REVIEW_STATUS).await?;
+    let observation = deps.forge().observe_open_prs().await?;
     let Some(obs) = observation.prs.iter().find(|o| o.pr.number == number) else {
         return Ok(None);
     };
@@ -767,15 +683,6 @@ async fn process(
 /// create failure is the usual benign race.
 async fn enqueue_spec_stage(deps: &Deps, obs: &PrObservation, arm: Arm) -> Result<()> {
     let pr = &obs.pr;
-    // Degraded mode (pr-reviewer历史挙動): an unresolvable canonical issue is
-    // observable, not fatal — the run keys off the PR number instead.
-    if arm == Arm::PrReviewer && super::canonical_issue(pr).is_none() {
-        deps.store.emit(
-            None,
-            "canonical_issue.unresolved",
-            json!({ "pr": pr.number, "head_branch": pr.head_branch }),
-        )?;
-    }
     let issue = canonical_key(pr);
     if let Ok(run) =
         deps.store
@@ -1131,11 +1038,6 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest, arm: Arm) {
             "its checks are still failing",
         ),
         Arm::Fixer => (0, "addressed this PR's review comments", "they persist"),
-        // The review arm never routes here: it has no budget escalation.
-        Arm::PrReviewer => {
-            debug_assert!(false, "no budget escalation for {arm:?}");
-            return;
-        }
     };
     let comment = super::escalation::pr_needs_human_comment(
         &format!("{what} {rounds} times but {cta}, and needs a human."),
@@ -1368,7 +1270,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -1399,7 +1300,6 @@ mod tests {
             comments: vec![comment],
             review_threads: vec![],
             rollup: CheckRollup::default(),
-            pr_review: None,
             labels_complete: true,
             review_threads_complete: true,
             comments_complete: true,
@@ -1456,7 +1356,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -1480,7 +1379,7 @@ mod tests {
             .unwrap();
 
         // Live run → the marker is left intact.
-        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        let obs = &forge.observe_open_prs().await.unwrap().prs[0];
         reclaim_stale_claims(&deps, obs).await;
         assert!(
             forge
@@ -1494,7 +1393,7 @@ mod tests {
         deps.store
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
-        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        let obs = &forge.observe_open_prs().await.unwrap().prs[0];
         reclaim_stale_claims(&deps, obs).await;
         assert!(
             !forge
@@ -1516,7 +1415,7 @@ mod tests {
             &claim_marker("attacker", "run-forged"),
             "2026-01-01T00:00:00Z",
         );
-        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        let obs = &forge.observe_open_prs().await.unwrap().prs[0];
         reclaim_stale_claims(&deps, obs).await;
         assert!(
             forge
@@ -1544,7 +1443,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -1568,7 +1466,7 @@ mod tests {
         deps.store
             .update_run_status(&run.id, RunStatus::Succeeded, None)
             .unwrap();
-        let obs = &forge.observe_open_prs(PR_REVIEW_STATUS).await.unwrap().prs[0];
+        let obs = &forge.observe_open_prs().await.unwrap().prs[0];
         // Must not panic; the edit failure is recorded and the marker stays
         // (reclaimed next resync). Correctness rides on run-liveness regardless.
         reclaim_stale_claims(&deps, obs).await;
@@ -1670,7 +1568,6 @@ mod tests {
             ci_exhausted: false,
             arm_candidate: true,
             has_unresolved_thread: false,
-            pr_review: PrReviewGate::Proceed,
             autonomy_full: true,
             auto_merge_config_enabled: true,
             policy_ok: true,
@@ -1678,10 +1575,6 @@ mod tests {
             // An already-reviewed head with the guard off keeps the
             // pr-reviewer arm quiet for the merge-tail baselines.
             pr_working: false,
-            review_head_status: Some(CommitStatusState::Success),
-            impl_guard_enabled: false,
-            ci_green: true,
-            reviewer_busy: false,
         }
     }
 
@@ -1882,54 +1775,6 @@ mod tests {
     }
 
     #[test]
-    fn impl_review_arm_requires_green_unlabeled_meguri_head() {
-        // 決定2: the impl-review candidacy — guard on, meguri branch, no
-        // spec-phase label, settled-green CI, unreviewed head.
-        let candidate = Snapshot {
-            impl_guard_enabled: true,
-            review_head_status: None,
-            ..armed_snapshot()
-        };
-        assert_eq!(next_step(&candidate), Step::Agent(Arm::PrReviewer));
-        for (name, tweak) in [
-            (
-                "guard off",
-                Snapshot {
-                    impl_guard_enabled: false,
-                    review_head_status: None,
-                    ..armed_snapshot()
-                },
-            ),
-            (
-                "ci not green",
-                Snapshot {
-                    ci_green: false,
-                    ..candidate.clone()
-                },
-            ),
-            (
-                "claimed (working)",
-                Snapshot {
-                    pr_working: true,
-                    ..candidate.clone()
-                },
-            ),
-            (
-                "reviewer already running",
-                Snapshot {
-                    reviewer_busy: true,
-                    ..candidate.clone()
-                },
-            ),
-        ] {
-            assert!(
-                !matches!(next_step(&tweak), Step::Agent(Arm::PrReviewer)),
-                "{name} must not launch the reviewer"
-            );
-        }
-    }
-
-    #[test]
     fn busy_issue_is_skipped_even_with_a_live_symptom() {
         // A PR whose issue has a live author-lane run is left alone even with a
         // live fixer symptom, so the reconciler does not churn (f1). This is
@@ -1997,58 +1842,6 @@ mod tests {
     #[test]
     fn native_candidate_arms() {
         assert_eq!(next_step(&arm_snapshot()), Step::Op(Op::ArmAutoMerge));
-    }
-
-    #[test]
-    fn non_candidate_and_thread_and_pr_review_gates() {
-        assert_eq!(
-            next_step(&Snapshot {
-                arm_candidate: false,
-                ..arm_snapshot()
-            }),
-            Step::Skip("not an arm candidate (label / link / opt-in)")
-        );
-        assert_eq!(
-            next_step(&Snapshot {
-                has_unresolved_thread: true,
-                ..arm_snapshot()
-            }),
-            Step::Wait("unresolved review thread")
-        );
-        assert_eq!(
-            next_step(&Snapshot {
-                pr_review: PrReviewGate::Failed,
-                ..arm_snapshot()
-            }),
-            Step::Op(Op::Escalate)
-        );
-        assert_eq!(
-            next_step(&Snapshot {
-                pr_review: PrReviewGate::Wait,
-                ..arm_snapshot()
-            }),
-            Step::Wait("pr-review pending")
-        );
-    }
-
-    #[test]
-    fn pr_review_failure_escalates_before_the_autonomy_gate() {
-        // Under `attended`, a review-failed head still escalates (ADR 0012 §5).
-        let s = Snapshot {
-            autonomy_full: false,
-            pr_review: PrReviewGate::Failed,
-            ..arm_snapshot()
-        };
-        assert_eq!(next_step(&s), Step::Op(Op::Escalate));
-        // …but a green head under `attended` is left for a human (no arm).
-        let green = Snapshot {
-            autonomy_full: false,
-            ..arm_snapshot()
-        };
-        assert_eq!(
-            next_step(&green),
-            Step::Skip("autonomy not full (a human merges)")
-        );
     }
 
     #[test]

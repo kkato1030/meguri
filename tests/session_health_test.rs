@@ -74,7 +74,6 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> TestEnv {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600; // scripted agent: no nudging wanted
     config.limits.result_grace_secs = 1; // FakeMux always reads Working; don't linger
-    config.review.enabled = false; // session health, not self-review, is under test
     config.agent.session_dir = Some(session_root.clone());
     tune(&mut config);
     let project = ProjectConfig {
@@ -88,7 +87,6 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),

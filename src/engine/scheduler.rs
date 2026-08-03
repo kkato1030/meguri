@@ -17,12 +17,9 @@ use crate::store::{RunRecord, RunStatus, Store};
 /// The slot budget is spent by *weight*, not run count (issue #111, #214). Two
 /// phases spawn extra concurrent agents:
 ///
-/// - parallel round-1 self-review (ADR 0023) fans out N reviewer agents at once
-///   (during self-review), so the run must reserve N slots then; every other
-///   run weighs 1.
-fn run_weight(deps: &Deps, run: &RunRecord) -> usize {
-    crate::engine::self_review::parallel_reviewer_count(&deps.config, &deps.project, &run.loop_kind)
-        .max(1)
+/// Every run books one slot.
+fn run_weight(_deps: &Deps, _run: &RunRecord) -> usize {
+    1
 }
 
 fn active_weight(active: &HashMap<String, usize>) -> usize {
@@ -303,47 +300,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
-    use crate::config::{Config, ProjectConfig};
-    use crate::forge::fake::FakeForge;
-    use crate::store::Store;
-
-    fn test_deps() -> Deps {
-        let config = Config::default();
-        let project = ProjectConfig {
-            id: "proj".into(),
-            repo_path: Some("/tmp/unused".into()),
-            repo_slug: Some("me/proj".into()),
-            mode: Default::default(),
-            deliver: None,
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: None,
-            pr: None,
-            review: None,
-            worktree_setup: Default::default(),
-            prompts: Default::default(),
-            autonomy: None,
-        };
-        Deps::with_label_source(
-            Store::open_in_memory().unwrap(),
-            Arc::new(crate::mux::fake::FakeMux::new(false)),
-            Arc::new(FakeForge::default()),
-            config,
-            project,
-        )
-    }
-
-    fn run_of_kind(deps: &Deps, loop_kind: &str) -> RunRecord {
-        let run = deps
-            .store
-            .create_run_for_loop("proj", loop_kind, 7, "t")
-            .unwrap();
-        deps.store.get_run(&run.id).unwrap().unwrap()
-    }
 
     #[test]
     fn active_weight_sums_weights() {
@@ -352,25 +310,6 @@ mod tests {
         m.insert("b".to_string(), 2usize);
         assert_eq!(active_weight(&m), 3);
         assert_eq!(active_weight(&HashMap::new()), 0);
-    }
-
-    #[test]
-    fn parallel_reviewers_book_reviewer_count() {
-        // Issue #214: a run with N parallel round-1 reviewers reserves N slots
-        // (peak concurrent reviewer agents).
-        use crate::config::ReviewerConfig;
-        let mut deps = test_deps();
-        deps.config.review.reviewers = vec![
-            ReviewerConfig::default(),
-            ReviewerConfig::default(),
-            ReviewerConfig::default(),
-        ];
-        assert_eq!(
-            run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
-            3
-        );
-        // A non-self-reviewing loop is unaffected (fixer never self-reviews).
-        assert_eq!(run_weight(&deps, &run_of_kind(&deps, "fixer")), 1);
     }
 
     fn empty_scheduler(max: usize) -> Scheduler {

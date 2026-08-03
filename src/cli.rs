@@ -127,9 +127,6 @@ pub enum Command {
         /// Local task id — resolved to its latest run's pane
         #[arg(long)]
         task: Option<i64>,
-        /// Attach the issue's review-lane pane instead of the author pane
-        #[arg(long)]
-        review: bool,
     },
     /// Stop injecting prompts; keep the pane alive
     Pause { run: String },

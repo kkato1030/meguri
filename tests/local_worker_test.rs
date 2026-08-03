@@ -50,7 +50,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
     // These happy-path local tests don't exercise the self-review phase (the
     // scripted agent only answers the execute turn); the dedicated self-review
     // tests enable it explicitly.
-    config.review.enabled = false;
 
     let project = ProjectConfig {
         id: "proj".into(),
@@ -63,7 +62,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         check_command: check_command.map(str::to_string),
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),

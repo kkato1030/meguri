@@ -79,7 +79,6 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        review: None,
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),

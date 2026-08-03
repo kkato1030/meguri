@@ -194,7 +194,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),

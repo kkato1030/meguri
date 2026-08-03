@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
-    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy,
-    MergeTailObservation, MergeableState, ObserveCost, PrComment, PrObservation, PullRequest,
-    ReviewComment, ReviewCommentDraft, ReviewThread, UpdateBranchOutcome,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
+    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeTailObservation, MergeableState,
+    ObserveCost, PrComment, PrObservation, PullRequest, ReviewComment, ReviewThread,
+    UpdateBranchOutcome,
 };
 
 /// The `gh` binary itself could not be started (missing, not executable, a
@@ -355,36 +355,6 @@ impl GhForge {
         }
     }
 
-    /// Like [`Self::gh`] but with a JSON payload on stdin (`--input -`), for
-    /// endpoints whose body nests arrays that `-f` flags cannot express.
-    async fn gh_stdin(&self, args: &[&str], input: &str) -> Result<String> {
-        use tokio::io::AsyncWriteExt;
-        let mut child = tokio::process::Command::new("gh")
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(GhSpawnFailed)?;
-        child
-            .stdin
-            .take()
-            .context("gh stdin unavailable")?
-            .write_all(input.as_bytes())
-            .await
-            .context("writing gh stdin")?;
-        let out = child.wait_with_output().await.context("waiting for gh")?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
-        } else {
-            bail!(
-                "gh {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-    }
-
     fn issue_from_json(v: &Value) -> Option<Issue> {
         Some(Issue {
             number: v.get("number")?.as_i64()?,
@@ -600,7 +570,7 @@ impl GhForge {
     /// the pr-review status is pulled out of the rollup contexts by the caller's
     /// `pr_review_context`, and the raw comments travel on so the engine can
     /// extract the arm marker (an engine concept the forge stays free of).
-    fn pr_observation_from_node(node: &Value, pr_review_context: &str) -> Option<PrObservation> {
+    fn pr_observation_from_node(node: &Value) -> Option<PrObservation> {
         let str_of = |key: &str| {
             node.get(key)
                 .and_then(Value::as_str)
@@ -702,23 +672,12 @@ impl GhForge {
             .cloned()
             .unwrap_or_default();
         let checks = Self::checks_from_rollup_nodes(&rollup_nodes);
-        // The pr-review status rides in the rollup as a StatusContext named by
-        // the caller's context; map its CheckState back to a CommitStatusState.
-        let pr_review = checks
-            .iter()
-            .find(|c| c.name == pr_review_context)
-            .map(|c| match c.state {
-                CheckState::Success => CommitStatusState::Success,
-                CheckState::Failure => CommitStatusState::Failure,
-                CheckState::Pending => CommitStatusState::Pending,
-            });
         Some(PrObservation {
             pr,
             merge,
             comments,
             review_threads,
             rollup: CheckRollup { checks },
-            pr_review,
             labels_complete,
             review_threads_complete,
             // The bulk window is complete unless the overflow pagination (the
@@ -1721,40 +1680,6 @@ impl Forge for GhForge {
             .collect())
     }
 
-    async fn create_pr_review(
-        &self,
-        pr: i64,
-        body: &str,
-        comments: &[ReviewCommentDraft],
-    ) -> Result<()> {
-        let payload = serde_json::json!({
-            "event": "COMMENT",
-            "body": body,
-            "comments": comments
-                .iter()
-                .map(|c| serde_json::json!({
-                    "path": c.path,
-                    "line": c.line,
-                    "side": "RIGHT",
-                    "body": c.body,
-                }))
-                .collect::<Vec<_>>(),
-        });
-        self.gh_stdin(
-            &[
-                "api",
-                &format!("repos/{}/pulls/{pr}/reviews", self.repo),
-                "--method",
-                "POST",
-                "--input",
-                "-",
-            ],
-            &payload.to_string(),
-        )
-        .await?;
-        Ok(())
-    }
-
     async fn reply_review_thread(&self, _pr: i64, thread_id: &str, body: &str) -> Result<()> {
         let mutation = REPLY_REVIEW_THREAD_MUTATION;
         self.gh(&[
@@ -1829,7 +1754,7 @@ impl Forge for GhForge {
         }
     }
 
-    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self) -> Result<MergeTailObservation> {
         // Informer-cache observe (issue #221, ADR 0012 decision 3): one GraphQL
         // query folds every signal the two old sweeps read per PR (merge state,
         // arm-marker comments, review threads, the check rollup, the pr-review
@@ -1869,7 +1794,7 @@ impl Forge for GhForge {
         let mut requests: u32 = 1;
         let mut prs = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            let Some(mut obs) = Self::pr_observation_from_node(node, pr_review_context) else {
+            let Some(mut obs) = Self::pr_observation_from_node(node) else {
                 continue;
             };
             // Window clipped older comments → paginate the full set via GraphQL
@@ -1920,55 +1845,6 @@ impl Forge for GhForge {
             Err(stderr) if stderr.to_ascii_lowercase().contains("already") => Ok(()),
             Err(stderr) => bail!("closing PR #{pr}: {stderr}"),
         }
-    }
-
-    async fn set_commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-        state: CommitStatusState,
-        description: &str,
-    ) -> Result<()> {
-        // GitHub truncates the description at 140 chars; keep it short.
-        let description: String = description.chars().take(140).collect();
-        self.gh(&[
-            "api",
-            "-X",
-            "POST",
-            &format!("repos/{}/statuses/{head_sha}", self.repo),
-            "-f",
-            &format!("state={}", state.as_str()),
-            "-f",
-            &format!("context={context}"),
-            "-f",
-            &format!("description={description}"),
-        ])
-        .await?;
-        Ok(())
-    }
-
-    async fn commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-    ) -> Result<Option<CommitStatusState>> {
-        // `.../commits/{sha}/statuses` lists statuses newest-first; take the
-        // most recent entry for the requested context.
-        let raw = self
-            .gh(&[
-                "api",
-                &format!("repos/{}/commits/{head_sha}/statuses", self.repo),
-            ])
-            .await?;
-        let v: Value = serde_json::from_str(&raw).context("parsing commit statuses output")?;
-        let state = v.as_array().and_then(|items| {
-            items
-                .iter()
-                .find(|s| s.get("context").and_then(Value::as_str) == Some(context))
-                .and_then(|s| s.get("state").and_then(Value::as_str))
-                .and_then(CommitStatusState::from_gh)
-        });
-        Ok(state)
     }
 
     async fn merge_policy(

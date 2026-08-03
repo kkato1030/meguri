@@ -418,7 +418,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),

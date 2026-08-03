@@ -7,10 +7,10 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CommitStatusState, CreatedPr, Forge,
-    Issue, IssueState, MergePolicy, MergeState, MergeStateStatus, MergeStrategy,
-    MergeTailObservation, MergeableState, ObserveCost, PrComment, PrObservation, PullRequest,
-    ReviewComment, ReviewCommentDraft, ReviewThread, UpdateBranchOutcome,
+    ArmOutcome, Blocker, CheckRollup, CheckRun, CheckState, CreatedPr, Forge, Issue, IssueState,
+    MergePolicy, MergeState, MergeStateStatus, MergeStrategy, MergeTailObservation, MergeableState,
+    ObserveCost, PrComment, PrObservation, PullRequest, ReviewComment, ReviewThread,
+    UpdateBranchOutcome,
 };
 
 /// The FakeForge's default merge policy: everything allowed and the base
@@ -99,12 +99,6 @@ pub struct FakeForge {
     pub checks: Mutex<HashMap<i64, Vec<CheckRun>>>,
     /// What pr_failed_check_logs returns, per PR number.
     pub failed_check_logs: Mutex<HashMap<i64, String>>,
-    /// Bodies of PR reviews posted via create_pr_review, per PR number
-    /// (the inline comments land in `threads`).
-    pub pr_reviews: Mutex<Vec<(i64, String)>>,
-    /// PRs whose create_pr_review call fails (inline-anchor-rejected
-    /// scenarios; exercised even though no current loop calls it).
-    pub create_pr_review_errors: Mutex<HashSet<i64>>,
     /// Issues whose update_issue_body fails (`meguri add` refine-writeback
     /// forge-hiccup scenarios).
     pub update_body_errors: Mutex<HashSet<i64>>,
@@ -113,9 +107,6 @@ pub struct FakeForge {
     /// Issues whose `comment` fails (forge-hiccup scenarios, e.g. triage
     /// auto-promote rolling a label back when the reason comment can't post).
     pub comment_errors: Mutex<HashSet<i64>>,
-    /// Commit statuses meguri wrote: (head_sha, context) → latest state
-    /// (ADR 0008 inspection history). Re-posting a context overwrites it.
-    pub commit_statuses: Mutex<HashMap<(String, String), CommitStatusState>>,
     /// Cross-repo blocker metadata: blocker number → (repo slug, body). A
     /// cross-repo decomposition child lives in a sibling fake's store, so this
     /// fake cannot read its body; seed it here (as GitHub's dependency endpoint
@@ -223,23 +214,6 @@ impl FakeForge {
             .lock()
             .unwrap()
             .insert(branch.to_string());
-    }
-
-    /// Make create_pr_review fail for `pr` (e.g. GitHub rejecting an inline
-    /// anchor that is not part of the diff).
-    pub fn fail_create_pr_review(&self, pr: i64) {
-        self.create_pr_review_errors.lock().unwrap().insert(pr);
-    }
-
-    /// Review bodies posted on `pr` via create_pr_review.
-    pub fn pr_reviews_of(&self, pr: i64) -> Vec<String> {
-        self.pr_reviews
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(n, _)| *n == pr)
-            .map(|(_, b)| b.clone())
-            .collect()
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
@@ -521,29 +495,6 @@ impl FakeForge {
     /// `AlreadyClean` for it, exercising the clean-status finalize path.
     pub fn set_clean(&self, pr: i64) {
         self.clean_prs.lock().unwrap().insert(pr);
-    }
-
-    /// The latest commit-status state meguri wrote for (sha, context), if any.
-    pub fn commit_status_of(&self, head_sha: &str, context: &str) -> Option<CommitStatusState> {
-        self.commit_statuses
-            .lock()
-            .unwrap()
-            .get(&(head_sha.to_string(), context.to_string()))
-            .copied()
-    }
-
-    /// Seed a commit status directly (e.g. a guard verdict a prior run left on
-    /// the PR head), so the auto-merger's guard gate can be exercised.
-    pub fn set_commit_status_direct(
-        &self,
-        head_sha: &str,
-        context: &str,
-        state: CommitStatusState,
-    ) {
-        self.commit_statuses
-            .lock()
-            .unwrap()
-            .insert((head_sha.to_string(), context.to_string()), state);
     }
 
     /// Override the repository's merge policy (default: everything allowed +
@@ -1171,7 +1122,7 @@ impl Forge for FakeForge {
         Ok(UpdateBranchOutcome::Updated)
     }
 
-    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation> {
+    async fn observe_open_prs(&self) -> Result<MergeTailObservation> {
         let open: Vec<RecordedPr> = self
             .prs
             .lock()
@@ -1232,19 +1183,12 @@ impl Forge for FakeForge {
                     .cloned()
                     .unwrap_or_default(),
             };
-            let pr_review = self
-                .commit_statuses
-                .lock()
-                .unwrap()
-                .get(&(rec.head_sha.clone(), pr_review_context.to_string()))
-                .copied();
             prs.push(PrObservation {
                 pr: Self::pr_to_public(rec),
                 merge,
                 comments,
                 review_threads,
                 rollup,
-                pr_review,
                 // The fake returns every label / thread, so both are complete —
                 // unless a test forced a clipped window to exercise the engine's
                 // conservative fallback.
@@ -1262,28 +1206,6 @@ impl Forge for FakeForge {
                 graphql_cost: None,
             },
         })
-    }
-
-    async fn set_commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-        state: CommitStatusState,
-        _description: &str,
-    ) -> Result<()> {
-        self.commit_statuses
-            .lock()
-            .unwrap()
-            .insert((head_sha.to_string(), context.to_string()), state);
-        Ok(())
-    }
-
-    async fn commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-    ) -> Result<Option<CommitStatusState>> {
-        Ok(self.commit_status_of(head_sha, context))
     }
 
     async fn mark_pr_ready(&self, pr: i64) -> Result<()> {
@@ -1332,36 +1254,6 @@ impl Forge for FakeForge {
             );
         }
         Ok(policy)
-    }
-
-    async fn create_pr_review(
-        &self,
-        pr: i64,
-        body: &str,
-        comments: &[ReviewCommentDraft],
-    ) -> Result<()> {
-        if self.create_pr_review_errors.lock().unwrap().contains(&pr) {
-            bail!("create_pr_review on PR #{pr} rejected (fake)");
-        }
-        self.pr_reviews.lock().unwrap().push((pr, body.into()));
-        let mut threads = self.threads.lock().unwrap();
-        for draft in comments {
-            let id = format!("fake-thread-{}", threads.len() + 1);
-            threads.push((
-                pr,
-                ReviewThread {
-                    id,
-                    resolved: false,
-                    path: Some(draft.path.clone()),
-                    line: Some(draft.line as i64),
-                    comments: vec![ReviewComment {
-                        author: "meguri".into(),
-                        body: draft.body.clone(),
-                    }],
-                },
-            ));
-        }
-        Ok(())
     }
 }
 
