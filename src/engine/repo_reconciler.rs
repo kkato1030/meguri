@@ -85,7 +85,6 @@ mod tests {
             language: None,
             pr: None,
             worktree_setup: Default::default(),
-            autonomy: None,
             prompts: Default::default(),
         };
         let deps = super::super::Deps::with_label_source(

@@ -684,57 +684,28 @@ pub async fn cmd_run(
             let outcome = engine::run_recipe(&deps, &run.id, &run.loop_kind).await?;
             print_run_outcome(outcome)
         }
-        RunSelector::Pr(n) => run_pr_side(&deps, n).await,
+        RunSelector::Pr(n) => {
+            // The PR-side decider is dormant; resolve the PR to its canonical
+            // issue and drive the issue side.
+            let pr_obj = engine::open_pr_by_number(&deps, n)
+                .await?
+                .with_context(|| format!("no open PR #{n}"))?;
+            let issue = engine::canonical_key(&pr_obj);
+            println!("PR #{n} → issue #{issue}");
+            run_issue_side(&deps, issue).await
+        }
         RunSelector::Task(id) => run_local_task(&deps, id).await,
         RunSelector::Issue(n) => {
-            // Ownership boundary (決定1): an open meguri PR owns the identity,
-            // so `run --issue` on such an issue drives the PR-side decider.
+            // Ownership boundary (決定1): an issue with an open meguri PR is
+            // owned by that PR until it reaches terminal — nothing to launch.
             if let Some(pr) = engine::open_pr_for_issue(&deps, n).await? {
                 println!(
-                    "issue #{n} is owned by its open PR #{} — routing to the PR side",
+                    "issue #{n} is owned by its open PR #{} — merge or close it first",
                     pr.number
                 );
-                return run_pr_side(&deps, pr.number).await;
+                return Ok(());
             }
             run_issue_side(&deps, n).await
-        }
-    }
-}
-
-/// PR-side manual run: fresh observe → the PR decider's step. An `Agent` arm
-/// dispatches; anything else is explained and nothing launches.
-async fn run_pr_side(deps: &engine::Deps, pr: i64) -> Result<()> {
-    use crate::engine::issue_reconciler::{self, Step};
-    let Some((_, step)) = issue_reconciler::observe_pr_step(deps, pr).await? else {
-        bail!("PR #{pr} is not an open PR of this project");
-    };
-    match step {
-        Step::Agent(arm) => {
-            let obs_pr = engine::open_pr_by_number(deps, pr)
-                .await?
-                .with_context(|| format!("PR #{pr} vanished between observe and dispatch"))?;
-            let issue = engine::canonical_key(&obs_pr);
-            let run = match deps.store.create_run_for_loop(
-                &deps.project.id,
-                arm.loop_kind(),
-                issue,
-                &obs_pr.title,
-            ) {
-                Ok(run) => run,
-                Err(_) => resume_existing(deps, issue)?,
-            };
-            println!(
-                "run {} — PR #{pr} → {} — watch with: meguri attach {}",
-                run.id,
-                arm.loop_kind(),
-                run.id
-            );
-            let outcome = engine::run_recipe(deps, &run.id, arm.loop_kind()).await?;
-            print_run_outcome(outcome)
-        }
-        other => {
-            println!("nothing to launch for PR #{pr}: {other:?}");
-            Ok(())
         }
     }
 }
@@ -879,13 +850,6 @@ pub async fn cmd_watch() -> Result<()> {
         projects.push(build_deps(&cfg, project, None)?);
     }
 
-    // Auto-merge fail-fast (ADR 0003): if a project enabled auto-merge but its
-    // repository can't honor it, refuse to start rather than degrade silently
-    // at merge time.
-    for deps in &projects {
-        auto_merge_preflight(deps).await?;
-    }
-
     println!(
         "watching {} project(s) for {} issues (poll {}s, slots {})",
         projects.len(),
@@ -943,41 +907,6 @@ fn acquire_watch_lock(home: &Path) -> Result<std::fs::File> {
             Err(e).with_context(|| format!("cannot lock {}", path.display()))
         }
     }
-}
-
-/// Startup fail-fast for one project's auto-merge config (ADR 0003): if
-/// enabled, the repository must allow auto-merge, permit the configured
-/// strategy, and (when required) carry required-checks branch protection.
-/// A miss bails with every reason so the operator fixes them at once.
-async fn auto_merge_preflight(deps: &Deps) -> Result<()> {
-    let am = &deps.config.pr_for(&deps.project).auto_merge;
-    if !am.enabled {
-        return Ok(());
-    }
-    // Auto-merge is a GitHub-PR concern; a forge-less (local-mode) project has
-    // no PRs to arm, so there is nothing to fail-fast on.
-    let Some(forge) = &deps.forge else {
-        return Ok(());
-    };
-    let slug = deps
-        .project
-        .repo_slug
-        .as_deref()
-        .unwrap_or(&deps.project.id);
-    let policy = forge
-        .merge_policy(&deps.project.default_branch, am.require_branch_protection)
-        .await
-        .with_context(|| format!("cannot read merge settings for {slug} to validate auto-merge"))?;
-    if let Err(problems) = crate::engine::issue_reconciler::validate_policy(am, &policy) {
-        bail!(
-            "auto-merge is enabled for project `{}` ({}) but the repository cannot \
-             honor it:\n  - {}",
-            deps.project.id,
-            slug,
-            problems.join("\n  - "),
-        );
-    }
-    Ok(())
 }
 
 pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Result<()> {

@@ -195,7 +195,6 @@ mod tests {
             worktree_root: None,
             pr: None,
             worktree_setup: Default::default(),
-            autonomy: None,
             prompts: Default::default(),
         };
         let deps = Deps::with_label_source(

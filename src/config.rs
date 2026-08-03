@@ -219,10 +219,6 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub pr: PrConfig,
-    /// How autonomous meguri may be (issue #176). Global default; a project may
-    /// override wholesale via its own `autonomy`. See [`Autonomy`].
-    #[serde(default)]
-    pub autonomy: Autonomy,
     #[serde(default)]
     pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -240,22 +236,6 @@ pub struct Config {
     /// without `[[workspaces]]` behaves exactly as before. See ADR 0009.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceConfig>,
-}
-
-/// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
-/// The mode's single runtime effect is the auto-merge arm gate: `Full` lets the
-/// auto-merger arm a green PR (meguri may reach a merge with no human), `Attended`
-/// stops at green for a human to merge. Escalation is **mode-independent** — the
-/// "human-needed ⇒ needs-human" invariant holds in both modes. Orthogonal to
-/// `auto_merge.opt_in` (that selects *which* PRs; this permits arming *at all*).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Autonomy {
-    /// A human is the merge gate: meguri never arms auto-merge (default).
-    #[default]
-    Attended,
-    /// meguri may arm auto-merge on a green, guard-clean PR.
-    Full,
 }
 
 /// Settings for the Issue Kind reconciler (`[reconciler]`, ADR 0012 slice 3):
@@ -348,96 +328,18 @@ pub struct PrConfig {
     /// Open pull requests as drafts (a human promotes them when ready).
     #[serde(default = "default_pr_draft")]
     pub draft: bool,
-    /// GitHub-native auto-merge (auto-merge 1/3, issue #41).
-    #[serde(default)]
-    pub auto_merge: AutoMergeConfig,
 }
 
 impl Default for PrConfig {
     fn default() -> Self {
         Self {
             draft: default_pr_draft(),
-            auto_merge: AutoMergeConfig::default(),
         }
     }
 }
 
 fn default_pr_draft() -> bool {
     true
-}
-
-/// How a PR opts into auto-merge: `label` requires the `meguri:automerge`
-/// label (on the issue or the PR), `all` arms every eligible meguri PR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AutoMergeOptIn {
-    Label,
-    All,
-}
-
-/// How auto-merge finalizes an eligible PR (ADR 0003 / 0009). `native` arms
-/// GitHub-native auto-merge and lets GitHub (branch protection + required
-/// checks) decide. `orchestrator` is the fallback for repos where native
-/// auto-merge can't be enabled (private + Free): meguri merges the PR itself
-/// once GitHub reports it MERGEABLE, accepting its own pre-PR verification
-/// (`check_command` + self-review) as the only gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AutoMergeMode {
-    Native,
-    Orchestrator,
-}
-
-/// `[pr.auto_merge]` — opt-in GitHub-native auto-merge. meguri never decides
-/// "safe to merge"; it arms auto-merge on eligible PRs and GitHub (branch
-/// protection + required checks) decides (ADR 0003).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoMergeConfig {
-    /// Master switch; off by default.
-    #[serde(default = "default_auto_merge_enabled")]
-    pub enabled: bool,
-    /// How eligible PRs are finalized: arm GitHub-native auto-merge (`native`,
-    /// the default) or merge them directly (`orchestrator`, the private+Free
-    /// fallback).
-    #[serde(default = "default_auto_merge_mode")]
-    pub mode: AutoMergeMode,
-    /// Merge strategy to arm with (no fallback if the repo forbids it).
-    #[serde(default = "default_merge_strategy")]
-    pub strategy: crate::forge::MergeStrategy,
-    /// Refuse to arm unless the base has required-checks branch protection.
-    #[serde(default = "default_require_branch_protection")]
-    pub require_branch_protection: bool,
-    /// Which PRs are eligible (label opt-in vs all meguri PRs).
-    #[serde(default = "default_auto_merge_opt_in")]
-    pub opt_in: AutoMergeOptIn,
-}
-
-impl Default for AutoMergeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_auto_merge_enabled(),
-            mode: default_auto_merge_mode(),
-            strategy: default_merge_strategy(),
-            require_branch_protection: default_require_branch_protection(),
-            opt_in: default_auto_merge_opt_in(),
-        }
-    }
-}
-
-fn default_auto_merge_enabled() -> bool {
-    false
-}
-fn default_auto_merge_mode() -> AutoMergeMode {
-    AutoMergeMode::Native
-}
-fn default_merge_strategy() -> crate::forge::MergeStrategy {
-    crate::forge::MergeStrategy::Squash
-}
-fn default_require_branch_protection() -> bool {
-    true
-}
-fn default_auto_merge_opt_in() -> AutoMergeOptIn {
-    AutoMergeOptIn::Label
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -906,10 +808,6 @@ pub struct ProjectConfig {
     /// github, `branch` for local — resolved via [`Config::deliver_for`].
     #[serde(default)]
     pub deliver: Option<Deliver>,
-    /// Per-project autonomy mode; overrides the global `autonomy` wholesale
-    /// (issue #176). See [`Autonomy`].
-    #[serde(default)]
-    pub autonomy: Option<Autonomy>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Per-project deliverable language; overrides the top-level `language`.
@@ -1155,21 +1053,6 @@ impl Config {
                     p.id
                 );
             }
-            // orchestrator auto-merge assumes no branch protection (ADR 0009):
-            // it is the fallback for repos where server-side gates don't exist.
-            // Pairing it with `require_branch_protection = true` is a
-            // contradiction — reject it so the operator explicitly opts out and
-            // acknowledges meguri's own verification is the only gate.
-            let am = &self.pr_for(p).auto_merge;
-            if am.mode == AutoMergeMode::Orchestrator && am.require_branch_protection {
-                anyhow::bail!(
-                    "project {:?} has auto_merge.mode = \"orchestrator\" but \
-                     require_branch_protection = true — orchestrator mode has no \
-                     server-side gate, so set require_branch_protection = false to \
-                     acknowledge meguri's own verification is the only gate",
-                    p.id
-                );
-            }
         }
         // Workspace invariants are global, not per-project — validate once here
         // (issue #222 f4: this used to hang off `validate_schedules`, which the
@@ -1250,12 +1133,6 @@ impl Config {
     /// Effective PR settings for a project (project override wins).
     pub fn pr_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a PrConfig {
         project.pr.as_ref().unwrap_or(&self.pr)
-    }
-
-    /// Effective autonomy mode for a project (project override wins wholesale,
-    /// issue #176).
-    pub fn autonomy_for(&self, project: &ProjectConfig) -> Autonomy {
-        project.autonomy.unwrap_or(self.autonomy)
     }
 
     /// Effective deliverable language for a project (project override wins).
@@ -1872,151 +1749,6 @@ draft = false
         assert!(cfg.pr.draft, "global default stays true");
         let p = cfg.project("demo").unwrap();
         assert!(!cfg.pr_for(p).draft);
-    }
-
-    #[test]
-    fn auto_merge_defaults_are_conservative() {
-        let cfg: Config = toml::from_str("").unwrap();
-        let am = &cfg.pr.auto_merge;
-        assert!(!am.enabled);
-        assert_eq!(am.mode, AutoMergeMode::Native);
-        assert_eq!(am.strategy, crate::forge::MergeStrategy::Squash);
-        assert!(am.require_branch_protection);
-        assert_eq!(am.opt_in, AutoMergeOptIn::Label);
-    }
-
-    #[test]
-    fn auto_merge_parses_overrides() {
-        let raw = r#"
-[pr.auto_merge]
-enabled = true
-mode = "orchestrator"
-strategy = "rebase"
-require_branch_protection = false
-opt_in = "all"
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let am = &cfg.pr.auto_merge;
-        assert!(am.enabled);
-        assert_eq!(am.mode, AutoMergeMode::Orchestrator);
-        assert_eq!(am.strategy, crate::forge::MergeStrategy::Rebase);
-        assert!(!am.require_branch_protection);
-        assert_eq!(am.opt_in, AutoMergeOptIn::All);
-    }
-
-    #[test]
-    fn orchestrator_mode_rejects_required_branch_protection() {
-        // orchestrator + the default require_branch_protection = true is a
-        // contradiction and must fail validation (ADR 0009).
-        let raw = r#"
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[projects.pr.auto_merge]
-enabled = true
-mode = "orchestrator"
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("orchestrator"), "{err}");
-        assert!(err.contains("require_branch_protection"), "{err}");
-    }
-
-    #[test]
-    fn orchestrator_mode_with_protection_off_validates() {
-        let raw = r#"
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[projects.pr.auto_merge]
-enabled = true
-mode = "orchestrator"
-require_branch_protection = false
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        cfg.validate().unwrap();
-        let p = cfg.project("demo").unwrap();
-        assert_eq!(cfg.pr_for(p).auto_merge.mode, AutoMergeMode::Orchestrator);
-    }
-
-    #[test]
-    fn auto_merge_rejects_unknown_strategy_at_load() {
-        let err =
-            toml::from_str::<Config>("[pr.auto_merge]\nstrategy = \"fast-forward\"\n").unwrap_err();
-        assert!(err.to_string().contains("strategy"), "{err}");
-    }
-
-    #[test]
-    fn auto_merge_project_override_wins_whole_section() {
-        // pr_for takes the project's [pr] section wholesale; a project that
-        // sets only draft gets the default auto_merge, not the global one.
-        let raw = r#"
-[pr.auto_merge]
-enabled = true
-
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[projects.pr]
-draft = false
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(cfg.pr.auto_merge.enabled, "global stays enabled");
-        let p = cfg.project("demo").unwrap();
-        assert!(
-            !cfg.pr_for(p).auto_merge.enabled,
-            "project [pr] wins wholesale, so auto_merge falls back to default (disabled)"
-        );
-    }
-
-    #[test]
-    fn autonomy_defaults_to_attended() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.autonomy, Autonomy::Attended);
-        let raw = r#"
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let p = cfg.project("demo").unwrap();
-        assert_eq!(cfg.autonomy_for(p), Autonomy::Attended);
-    }
-
-    #[test]
-    fn autonomy_project_override_wins() {
-        // Global full, one project pins itself back to attended (issue #176).
-        let raw = r#"
-autonomy = "full"
-
-[[projects]]
-id = "auto"
-repo_path = "/tmp/auto"
-repo_slug = "me/auto"
-
-[[projects]]
-id = "manual"
-repo_path = "/tmp/manual"
-repo_slug = "me/manual"
-autonomy = "attended"
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert_eq!(cfg.autonomy, Autonomy::Full);
-        assert_eq!(
-            cfg.autonomy_for(cfg.project("auto").unwrap()),
-            Autonomy::Full
-        );
-        assert_eq!(
-            cfg.autonomy_for(cfg.project("manual").unwrap()),
-            Autonomy::Attended
-        );
     }
 
     #[test]

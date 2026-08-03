@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 pub mod fake;
 pub mod gh;
@@ -30,10 +29,6 @@ pub const LABEL_WORKING: &str = "meguri:working";
 pub const LABEL_HOLD: &str = "meguri:hold";
 /// meguri gave up and a human needs to look (a comment explains why).
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
-/// Opt-in to GitHub-native auto-merge (auto-merge 1/3, issue #41). A human
-/// applies it to an issue (the worker copies it onto the PR) or straight to a
-/// PR; the auto-merger sweep arms auto-merge on PRs carrying it.
-pub const LABEL_AUTOMERGE: &str = "meguri:automerge";
 /// The cleaner loop's per-project report issue (one per project; its body is
 /// a snapshot of the current divergence, rewritten on every sweep).
 pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
@@ -61,140 +56,6 @@ pub const TRIAGE_PROPOSAL_LABELS: [&str; 3] = [
     LABEL_TRIAGE_NEEDS_HUMAN,
 ];
 
-/// GitHub's three merge strategies. This is the forge's vocabulary and config
-/// deserializes straight into it (`serde(lowercase)`); ADR 0003 forbids
-/// falling back between them, so an unavailable strategy is an error, never a
-/// silent substitution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MergeStrategy {
-    Squash,
-    Merge,
-    Rebase,
-}
-
-impl MergeStrategy {
-    /// The `gh pr merge` flag that selects this strategy.
-    pub fn flag(self) -> &'static str {
-        match self {
-            Self::Squash => "--squash",
-            Self::Merge => "--merge",
-            Self::Rebase => "--rebase",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Squash => "squash",
-            Self::Merge => "merge",
-            Self::Rebase => "rebase",
-        }
-    }
-}
-
-/// A snapshot of a repository's merge configuration for one base branch — the
-/// input to the auto-merge fail-fast (ADR 0003) and the sweep's arm gate.
-#[derive(Debug, Clone)]
-pub struct MergePolicy {
-    /// The repo's "Allow auto-merge" toggle (`allow_auto_merge`).
-    pub auto_merge_allowed: bool,
-    /// Strategies the repo permits (`allow_squash_merge` / `allow_merge_commit`
-    /// / `allow_rebase_merge`).
-    pub allowed_strategies: Vec<MergeStrategy>,
-    /// Whether the base branch carries classic branch protection with required
-    /// status checks. Rulesets are not detected (ADR 0003) — a rulesets-only
-    /// repo reads as `false`, and `require_branch_protection = false` is the
-    /// escape hatch.
-    pub protected_with_required_checks: bool,
-}
-
-impl MergePolicy {
-    pub fn allows(&self, strategy: MergeStrategy) -> bool {
-        self.allowed_strategies.contains(&strategy)
-    }
-}
-
-/// The result of trying to arm GitHub-native auto-merge on a PR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArmOutcome {
-    /// auto-merge was reserved; GitHub merges the PR once required checks pass.
-    Armed,
-    /// GitHub already considers the PR mergeable (clean status), so there was
-    /// no block to reserve against — the caller finalizes with `merge_pr`.
-    AlreadyClean,
-}
-
-/// The result of merging the base branch into a PR's head (the BEHIND fix,
-/// issue #221). Mirrors [`ArmOutcome`]: a state distinction the caller acts on,
-/// not an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateBranchOutcome {
-    /// The base was merged into the PR branch; the head advanced.
-    Updated,
-    /// The branch was already up to date — nothing to do.
-    AlreadyUpToDate,
-    /// The observed head no longer matches (`expected_head_sha` was stale) so
-    /// the forge refused, TOCTOU-safe. The next sweep re-derives from the new
-    /// head — a silent skip, not an error.
-    HeadMoved,
-}
-
-/// The API cost of one [`Forge::observe_open_prs`] call — the measured value
-/// ADR 0012 (decision 3) wants observable (issue #221). `requests` counts the
-/// HTTP round-trips the observe took; `graphql_cost` is GitHub's own
-/// `rateLimit.cost` when the query returned it, `None` otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObserveCost {
-    pub requests: u32,
-    pub graphql_cost: Option<u32>,
-}
-
-/// One open PR's raw merge-tail signals from the informer-cache bulk query
-/// (issue #221). The forge returns raw observations; the engine's pure
-/// `next_step` reduces them to its decision Snapshot. The arm marker is engine
-/// vocabulary, read by the engine out of [`Self::comments`].
-#[derive(Debug, Clone)]
-pub struct PrObservation {
-    pub pr: PullRequest,
-    /// GitHub's merge-readiness snapshot, or `None` when the per-PR read failed
-    /// (the TransientError signal — never escalate on it).
-    pub merge: Option<MergeState>,
-    /// PR conversation comments (body + `createdAt`) — the engine extracts the
-    /// head-keyed arm marker (idempotency / re-arm) and the head-independent
-    /// arm-since (staleness) from these.
-    pub comments: Vec<PrComment>,
-    /// The PR's review threads — the engine reduces to "any unresolved".
-    pub review_threads: Vec<ReviewThread>,
-    /// The head's CI check rollup (the required-vs-not split for a Blocked PR).
-    pub rollup: CheckRollup,
-    /// Whether [`Self::pr`]'s label set is the PR's *complete* set. A bulk query
-    /// with a bounded label window sets this false when it clipped some; the
-    /// engine then reads the safety labels (`hold` / `needs-human`) conservatively
-    /// so a stop label hidden past the window can never be missed (a wrongful
-    /// arm / update / merge). Always true for a lossless source.
-    pub labels_complete: bool,
-    /// Whether [`Self::review_threads`] is the PR's *complete* thread set. False
-    /// when a bounded window clipped some; the engine then assumes an unresolved
-    /// thread exists (arm waits) rather than arming past a hidden one.
-    pub review_threads_complete: bool,
-    /// Whether [`Self::comments`] is the PR's *complete* conversation. False
-    /// when the overflow pagination hit its page budget or a non-advancing
-    /// cursor (a pathologically chatty PR must not be able to spend unbounded
-    /// API cost every resync). The engine then treats the PR as a human stop:
-    /// an arm/claim marker hidden past the truncation can never be missed, and
-    /// the chatty PR parks instead of being re-paginated forever.
-    pub comments_complete: bool,
-}
-
-/// The whole merge tail's observation for one sweep, plus the API cost it took
-/// (issue #221, ADR 0012 decision 3 — one informer-cache query with a measured
-/// cost instead of per-loop individual reads).
-#[derive(Debug, Clone)]
-pub struct MergeTailObservation {
-    pub prs: Vec<PrObservation>,
-    pub cost: ObserveCost,
-}
-
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
 /// reclaimed.
@@ -202,130 +63,6 @@ pub struct MergeTailObservation {
 pub enum IssueState {
     Open,
     Closed,
-}
-
-/// Whether a PR can merge into its base, as computed by the forge — the
-/// trigger for the conflict-resolver loop. `Unknown` is GitHub's transient
-/// "still computing" state; discovery treats it as not actionable and simply
-/// retries on the next poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeableState {
-    Mergeable,
-    Conflicting,
-    Unknown,
-}
-
-/// GitHub's `mergeStateStatus` — the platform's own verdict on why (or
-/// whether) a PR can merge right now. merge-watch (auto-merge 2/3, #42) leans
-/// on this instead of re-deriving required-vs-optional checks itself: the
-/// required-check authority stays with GitHub (ADR 0003 / 0007). Notably
-/// `Unstable` (a non-required check failing) still merges under auto-merge,
-/// while `Blocked` (a required check failing or a required review missing)
-/// does not — that split is exactly the "required checks only" rule the issue
-/// asks for, computed by GitHub rather than by meguri.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeStateStatus {
-    /// Mergeable and every required check green — auto-merge fires immediately.
-    Clean,
-    /// A required check failed, a required review is missing, or other required
-    /// protection blocks the merge.
-    Blocked,
-    /// The base moved ahead; the branch needs an update before merging.
-    Behind,
-    /// Conflicts with the base (the `mergeStateStatus` face of CONFLICTING).
-    Dirty,
-    /// Mergeable, but a non-required check is failing or pending — GitHub still
-    /// merges once the required checks pass.
-    Unstable,
-    /// The PR is a draft.
-    Draft,
-    /// A pre-receive hook blocks the merge.
-    HasHooks,
-    /// GitHub is still computing the state.
-    Unknown,
-}
-
-impl MergeStateStatus {
-    /// Map GitHub's uppercase `mergeStateStatus` string; anything unrecognized
-    /// (including the empty string) degrades to [`Self::Unknown`], never to a
-    /// state that would make merge-watch act.
-    pub fn from_gh(s: &str) -> Self {
-        match s.to_ascii_uppercase().as_str() {
-            "CLEAN" => Self::Clean,
-            "BLOCKED" => Self::Blocked,
-            "BEHIND" => Self::Behind,
-            "DIRTY" => Self::Dirty,
-            "UNSTABLE" => Self::Unstable,
-            "DRAFT" => Self::Draft,
-            "HAS_HOOKS" => Self::HasHooks,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-/// A snapshot of one PR's merge readiness for merge-watch (auto-merge 2/3,
-/// #42): GitHub's mergeability, its `mergeStateStatus` verdict, and whether
-/// auto-merge is currently armed (`autoMergeRequest` non-null).
-#[derive(Debug, Clone)]
-pub struct MergeState {
-    pub mergeable: MergeableState,
-    pub status: MergeStateStatus,
-    /// Whether GitHub-native auto-merge is armed on the PR right now. A human
-    /// disabling it (arm marker present but this false) is the HumanDisabled
-    /// signal merge-watch backs off from.
-    pub auto_merge_enabled: bool,
-}
-
-/// Verdict of one CI check on a PR head, reduced to the axis the ci-fixer
-/// cares about: done-and-green, done-and-red, or still running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckState {
-    Success,
-    Failure,
-    Pending,
-}
-
-/// One CI check on the PR's head commit (a GitHub Actions check run or a
-/// classic commit status).
-#[derive(Debug, Clone)]
-pub struct CheckRun {
-    pub name: String,
-    pub state: CheckState,
-    /// Detail page of the check; on GitHub Actions this carries the workflow
-    /// run id the failed-log fetch needs. Empty when the forge has none.
-    pub url: String,
-}
-
-/// The check/status rollup of a PR's head commit — the trigger for the
-/// ci-fixer loop.
-#[derive(Debug, Clone, Default)]
-pub struct CheckRollup {
-    pub checks: Vec<CheckRun>,
-}
-
-impl CheckRollup {
-    /// Aggregate verdict. Pending wins over Failure: while anything is still
-    /// running the picture is incomplete — the ci-fixer must not start on a
-    /// head whose CI could still change under it (and whose failed logs may
-    /// not exist yet). No checks at all is Success: a project without CI has
-    /// nothing to fix.
-    pub fn state(&self) -> CheckState {
-        if self.checks.iter().any(|c| c.state == CheckState::Pending) {
-            CheckState::Pending
-        } else if self.checks.iter().any(|c| c.state == CheckState::Failure) {
-            CheckState::Failure
-        } else {
-            CheckState::Success
-        }
-    }
-
-    /// The failing checks (prompt rendering, failed-log fetching).
-    pub fn failed(&self) -> Vec<&CheckRun> {
-        self.checks
-            .iter()
-            .filter(|c| c.state == CheckState::Failure)
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -406,45 +143,6 @@ impl PullRequest {
     }
 }
 
-/// One PR conversation comment with its creation time (RFC3339 UTC, as GitHub
-/// returns `createdAt`). merge-watch reads the #41 arm marker's `createdAt` to
-/// know how long a PR has been armed (arm-since) without any local state.
-#[derive(Debug, Clone, Default)]
-pub struct PrComment {
-    pub body: String,
-    /// GitHub's `createdAt`, e.g. `2026-07-13T09:00:00Z`; empty when the forge
-    /// did not supply one (`store::parse_ts` then yields None → never stale).
-    pub created_at: String,
-    /// The comment's GraphQL node id — how the reconciler edits its own claim
-    /// marker to a tombstone on release (ADR 0027 / §7). Empty when the forge
-    /// did not supply one.
-    pub id: String,
-    /// Whether the viewer (meguri's token) authored this comment. The claim
-    /// marker is trusted only when self-authored, so a third party cannot forge
-    /// a claim to freeze no-steal (ADR 0027 / §7). False for a lossy source.
-    pub viewer_did_author: bool,
-}
-
-/// One comment inside a review thread.
-#[derive(Debug, Clone)]
-pub struct ReviewComment {
-    pub author: String,
-    pub body: String,
-}
-
-/// A review-comment thread on a PR; resolution state is the reviewer's
-/// durable verdict, replies are how the fixer signals "addressed".
-#[derive(Debug, Clone)]
-pub struct ReviewThread {
-    /// Forge-native thread id (GraphQL node id on GitHub).
-    pub id: String,
-    pub resolved: bool,
-    /// File the thread is anchored to, if any.
-    pub path: Option<String>,
-    pub line: Option<i64>,
-    pub comments: Vec<ReviewComment>,
-}
-
 #[async_trait]
 pub trait Forge: Send + Sync {
     async fn get_issue(&self, number: i64) -> Result<Issue>;
@@ -462,68 +160,13 @@ pub trait Forge: Send + Sync {
     /// File a new issue; returns its number (planner decomposition,
     /// issue #24; the cleaner's report issue, issue #44).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
-    /// The number of an issue whose body contains `marker`, searching **all
-    /// states** (open and closed) — the decompose materializer's backstop for
-    /// recognizing an already-created child after a crash between creating it
-    /// and linking it into the parent's dependency graph (issue #134). `None`
-    /// when no such issue exists. The parent dependency graph is the primary
-    /// authority; this covers the brief create→link window and tolerates
-    /// GitHub's search-index lag.
-    async fn find_issue_by_marker(&self, marker: &str) -> Result<Option<i64>>;
-    /// Record `issue` (in this forge's repo) as blocked by `blocker` in the
-    /// forge-native dependency graph (the same graph [`Forge::blocked_by`]
-    /// reads). Idempotent: re-adding an edge that already exists is a no-op
-    /// success — the decompose materializer re-wires every sweep until the
-    /// proposal PR closes, so a duplicate add must not fail (issue #134).
-    async fn add_blocked_by(&self, issue: i64, blocker: i64) -> Result<()>;
-    /// Like [`Forge::add_blocked_by`] but the blocker lives in `blocker_repo`
-    /// (`owner/repo`), which may differ from this forge's own repo — the
-    /// cross-repo decomposition case (issue #154). The dependent `issue` is
-    /// still in this forge's repo; only the blocker's home repo changes. When
-    /// `blocker_repo` equals this forge's repo the two are equivalent.
-    /// Idempotent like [`Forge::add_blocked_by`]: an existing edge re-adds as a
-    /// no-op success.
-    async fn add_blocked_by_in(&self, issue: i64, blocker_repo: &str, blocker: i64) -> Result<()>;
-    /// Overwrite an issue's body wholesale (snapshot-style report updates).
-    async fn update_issue_body(&self, number: i64, body: &str) -> Result<()>;
-    /// Overwrite an issue's title (the `meguri add` refine step retitles a
-    /// raw one-liner into a summarized title, issue #120).
-    async fn update_issue_title(&self, number: i64, title: &str) -> Result<()>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
     /// Add a label to a pull request (issues and PRs share GitHub's number
     /// space but need different edit commands).
     async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()>;
-    /// Overwrite a pull request's title (the spec worker retitles a takeover
-    /// PR from `Spec: X` to `X` once implementation lands, issue #98).
-    async fn update_pr_title(&self, pr: i64, title: &str) -> Result<()>;
-    /// Overwrite a pull request's body wholesale (the spec worker replaces the
-    /// planner's spec description with the implementation one, issue #98).
-    async fn update_pr_body(&self, pr: i64, body: &str) -> Result<()>;
-    /// Open pull requests carrying `label` (candidates for review discovery).
-    async fn list_prs_with_label(&self, label: &str) -> Result<Vec<PullRequest>>;
-    /// The PR's full unified diff against its base.
-    async fn pr_diff(&self, number: i64) -> Result<String>;
-    /// Bodies of the PR's conversation comments (review-marker lookups).
-    async fn pr_comments(&self, number: i64) -> Result<Vec<String>>;
-    /// The PR's conversation comments with creation timestamps — merge-watch
-    /// reads the arm marker's `createdAt` for arm-since (auto-merge 2/3, #42).
-    async fn pr_comments_meta(&self, number: i64) -> Result<Vec<PrComment>>;
-    /// Post a conversation comment on a pull request.
-    async fn comment_pr(&self, pr: i64, body: &str) -> Result<()>;
-    /// Edit a conversation comment by its node id — how the reconciler
-    /// tombstones its own claim marker on release (ADR 0027 / §7). Best-effort:
-    /// correctness does not depend on it (a stale marker is reclaimed by
-    /// run-liveness), so callers log a failure rather than abort.
-    async fn update_comment(&self, comment_id: &str, body: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
-    /// Bodies of an issue's conversation comments, oldest first (triage
-    /// advise's hidden-marker lookup, issue #87 — the per-issue mirror of
-    /// [`Forge::pr_comments`]).
-    async fn issue_comments(&self, issue: i64) -> Result<Vec<String>>;
-    /// Comment on a pull request (same number space, different command).
-    async fn pr_comment(&self, pr: i64, body: &str) -> Result<()>;
     /// Open a pull request. `labels` are applied as part of creation (a single
     /// forge operation), so the PR is never observable unlabeled — the
     /// escalate-time needs-human draft (issue #209) relies on this to be
@@ -550,72 +193,8 @@ pub trait Forge: Send + Sync {
     /// so a rail-external PR that already covers the issue is never
     /// duplicated.
     async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>>;
-    /// Whether the PR can merge into its base (conflict-resolver discovery).
-    async fn pr_mergeable(&self, number: i64) -> Result<MergeableState>;
-    /// The PR's merge-readiness snapshot for merge-watch (auto-merge 2/3, #42):
-    /// mergeability + `mergeStateStatus` + whether auto-merge is armed, in one
-    /// `gh pr view`. A forge error here is the TransientError signal — the
-    /// caller must not escalate on it (ADR 0007).
-    async fn pr_merge_state(&self, number: i64) -> Result<MergeState>;
-    /// The check/status rollup of the PR's head commit (ci-fixer discovery).
-    async fn pr_check_rollup(&self, number: i64) -> Result<CheckRollup>;
-    /// Failed-job logs of the PR's failing checks, pre-trimmed for a prompt.
-    /// Best-effort per check: a check whose logs cannot be fetched
-    /// contributes a note instead of failing the whole call.
-    async fn pr_failed_check_logs(&self, number: i64) -> Result<String>;
     /// Open PRs (candidates for fixer discovery).
     async fn list_open_prs(&self) -> Result<Vec<PullRequest>>;
-    /// All review threads on a PR, resolved or not.
-    async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>>;
-    /// Reply inside an existing review thread.
-    async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()>;
-    /// Arm GitHub-native auto-merge, pinned to `head_sha`
-    /// (`--match-head-commit`). Already-armed is treated as success
-    /// (idempotent). The [`ArmOutcome`] distinguishes a reservation
-    /// ([`ArmOutcome::Armed`]) from GitHub already judging the PR mergeable
-    /// ([`ArmOutcome::AlreadyClean`]) — the caller `merge_pr`s the latter.
-    async fn enable_auto_merge(
-        &self,
-        pr: i64,
-        strategy: MergeStrategy,
-        head_sha: &str,
-    ) -> Result<ArmOutcome>;
-    /// Finalize a PR GitHub already judged clean, pinned to `head_sha`
-    /// (`gh pr merge --match-head-commit`, no `--auto`). A moved head is
-    /// rejected by GitHub, so no head other than the confirmed one merges.
-    async fn merge_pr(&self, pr: i64, strategy: MergeStrategy, head_sha: &str) -> Result<()>;
-
-    /// Merge the base branch into a PR's head branch — the BEHIND fix
-    /// (issue #221): `PUT /repos/{repo}/pulls/{n}/update-branch`, pinned to
-    /// `expected_head_sha` so a head that moved since the observation is
-    /// rejected by GitHub (TOCTOU-safe, the `--match-head-commit` of updates).
-    async fn update_branch(&self, pr: i64, expected_head_sha: &str) -> Result<UpdateBranchOutcome>;
-
-    /// Observe every open PR's merge-tail signals in one bulk query — the
-    /// informer-cache observe (issue #221, ADR 0012 decision 3). Returns the
-    /// per-PR raw observation plus the API cost the query took.
-    /// One bulk observation of every open PR's merge-tail signals.
-    async fn observe_open_prs(&self) -> Result<MergeTailObservation>;
-    /// Ready a draft PR (`gh pr ready`).
-    async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
-    /// Close a pull request **without merging** (`gh pr close`). The decompose
-    /// materializer's single commit point: once the children are filed it
-    /// closes the disposable proposal PR so `docs/specs/` never lands on the
-    /// default branch (issue #134). Idempotent from the caller's view — an
-    /// already-closed PR closes again cleanly.
-    async fn close_pr(&self, pr: i64) -> Result<()>;
-
-    /// The repository's merge configuration for `base_branch` (ADR 0003
-    /// fail-fast + arm gate). When `require_branch_protection` is false the
-    /// branch-protection probe is skipped and `protected_with_required_checks`
-    /// comes back false — the caller opted out, so the (admin-only, 403-prone)
-    /// probe must not run and must not be able to fail startup. When true, the
-    /// probe runs and a 403 (non-admin token) surfaces as an error.
-    async fn merge_policy(
-        &self,
-        base_branch: &str,
-        require_branch_protection: bool,
-    ) -> Result<MergePolicy>;
 }
 
 /// Builds a [`Forge`] for a given repo slug (`owner/repo`). Cross-repo
@@ -639,50 +218,6 @@ mod tests {
             body: String::new(),
             repo: String::new(),
         }
-    }
-
-    fn check(state: CheckState) -> CheckRun {
-        CheckRun {
-            name: "ci".into(),
-            state,
-            url: String::new(),
-        }
-    }
-
-    #[test]
-    fn rollup_state_is_pending_over_failure_over_success() {
-        // No checks: nothing to fix, never a trigger.
-        assert_eq!(CheckRollup::default().state(), CheckState::Success);
-
-        let green = CheckRollup {
-            checks: vec![check(CheckState::Success), check(CheckState::Success)],
-        };
-        assert_eq!(green.state(), CheckState::Success);
-
-        let red = CheckRollup {
-            checks: vec![check(CheckState::Success), check(CheckState::Failure)],
-        };
-        assert_eq!(red.state(), CheckState::Failure);
-
-        // A failure with anything still running stays Pending: the picture
-        // is incomplete until CI settles.
-        let mixed = CheckRollup {
-            checks: vec![check(CheckState::Failure), check(CheckState::Pending)],
-        };
-        assert_eq!(mixed.state(), CheckState::Pending);
-    }
-
-    #[test]
-    fn rollup_failed_lists_only_failing_checks() {
-        let rollup = CheckRollup {
-            checks: vec![
-                check(CheckState::Success),
-                check(CheckState::Failure),
-                check(CheckState::Pending),
-            ],
-        };
-        assert_eq!(rollup.failed().len(), 1);
-        assert_eq!(rollup.failed()[0].state, CheckState::Failure);
     }
 
     #[test]

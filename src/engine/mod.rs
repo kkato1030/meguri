@@ -1,7 +1,4 @@
-pub mod ci_fixer;
-pub mod conflict_resolver;
 pub mod escalation;
-pub mod fixer;
 pub mod flow;
 pub mod issue_reconciler;
 pub mod reaper;
@@ -96,10 +93,8 @@ impl Deps {
     /// host project already set wins wholesale; otherwise the repo value fills
     /// it in. Cheap — `Deps` shares its store/mux/forge via `Arc`.
     ///
-    /// `[pr]` is the one section with a key-level boundary (ADR 0011): the
-    /// host's `[projects.pr]` still wins wholesale (draft *and* auto_merge), but
-    /// when the host set no project `[pr]`, the repo's `draft` applies while
-    /// `auto_merge` stays host-global — the repo can never arm auto-merge.
+    /// `[pr]` keeps a key-level boundary (ADR 0011): the host's
+    /// `[projects.pr]` wins wholesale; otherwise the repo's `draft` applies.
     pub fn with_repo_config(&self, repo: &crate::config::RepoConfig) -> Self {
         let mut project = self.project.clone();
         if project.language.is_none() {
@@ -111,10 +106,7 @@ impl Deps {
         if project.pr.is_none()
             && let Some(draft) = repo.pr.as_ref().and_then(|p| p.draft)
         {
-            project.pr = Some(crate::config::PrConfig {
-                draft,
-                auto_merge: self.config.pr.auto_merge.clone(),
-            });
+            project.pr = Some(crate::config::PrConfig { draft });
         }
         let mut deps = self.clone();
         deps.project = project;
@@ -344,10 +336,7 @@ pub enum WorkerOutcome {
 /// order. An unknown loop_kind sorts last (kept stable, never panics).
 pub fn dispatch_rank(loop_kind: &str) -> u8 {
     match loop_kind {
-        conflict_resolver::KIND => 0,
-        ci_fixer::KIND => 1,
-        fixer::KIND => 2,
-        worker::KIND => 3,
+        worker::KIND => 0,
         _ => u8::MAX,
     }
 }
@@ -384,9 +373,6 @@ pub fn default_recipe() -> RecipeFn {
 pub async fn run_recipe(deps: &Deps, run_id: &str, loop_kind: &str) -> Result<WorkerOutcome> {
     match loop_kind {
         worker::KIND => worker::run_worker(deps, run_id).await,
-        conflict_resolver::KIND => conflict_resolver::run_conflict_resolver(deps, run_id).await,
-        ci_fixer::KIND => ci_fixer::run_ci_fixer(deps, run_id).await,
-        fixer::KIND => fixer::run_fixer(deps, run_id).await,
         other => anyhow::bail!("run {run_id}: unknown loop kind {other:?}"),
     }
 }
@@ -475,11 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_rank_orders_merge_proximity_first() {
-        // dispatch_rank is priority (ADR 0001 → ADR 0012 決定7): the fixer
-        // family sits above new work.
-        assert!(dispatch_rank("conflict-resolver") < dispatch_rank("fixer"));
-        assert!(dispatch_rank("fixer") < dispatch_rank("worker"));
+    fn dispatch_rank_orders_known_kinds_first() {
+        assert!(dispatch_rank("worker") < dispatch_rank("nonsense"));
         assert_eq!(dispatch_rank("nonsense"), u8::MAX);
     }
 
@@ -545,7 +528,6 @@ mod tests {
             language: None,
             pr: None,
             worktree_setup: Default::default(),
-            autonomy: None,
             prompts: Default::default(),
         };
         Deps::with_label_source(

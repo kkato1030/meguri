@@ -74,22 +74,6 @@ pub async fn escalate_issue(deps: &Deps, issue: i64, reason: &str) {
     );
 }
 
-/// Park a pull request on `needs-human`: add the label, drop the `working`
-/// claim, post `comment`, and emit the event. The ONE place a PR receives the
-/// needs-human label. `comment` is the caller's fully-composed human message
-/// (use [`pr_needs_human_comment`] for the standard shape).
-pub async fn escalate_pr(deps: &Deps, pr: i64, comment: &str) {
-    let forge = deps.forge();
-    let _ = forge.add_pr_label(pr, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = forge.remove_pr_label(pr, forge::LABEL_WORKING).await;
-    let _ = forge.pr_comment(pr, comment).await;
-    let _ = deps.store.emit(
-        None,
-        "escalation.raised",
-        json!({ "target": "pr", "pr": pr }),
-    );
-}
-
 /// Classify a run failure as a forge/mux command fault rather than something
 /// a human must judge (issue #250). Looks for a [`crate::mux::MuxError`] (a
 /// stopped mux, a dead pane, a command it refused) or a
@@ -294,15 +278,6 @@ pub fn sanitize_pane_tail(lines: &[String]) -> String {
     format!("{fence}\n{text}\n{fence}")
 }
 
-/// The standard needs-human PR comment. `lead` is the site-specific clause
-/// (e.g. "could not resolve the merge conflicts on this PR and needs a human."),
-/// `reason` the underlying detail (quoted below it), and `hint` the closing
-/// "how to look at this" sentence — launch-mode-aware, from [`flow::attach_hint`]
-/// (issue #169). Pass [`tasks::DEFAULT_ATTACH_HINT`] where there is no run.
-pub fn pr_needs_human_comment(lead: &str, reason: &str, hint: &str) -> String {
-    format!("🔁 **meguri** {lead}\n\n> {reason}\n\n{hint}")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -326,7 +301,6 @@ mod tests {
             language: None,
             pr: None,
             worktree_setup: Default::default(),
-            autonomy: None,
             prompts: Default::default(),
         };
         Deps::with_label_source(

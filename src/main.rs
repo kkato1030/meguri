@@ -195,7 +195,6 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             ok &= doctor_clones(cfg).await;
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
-            ok &= check_auto_merge(cfg).await;
             // Repo config (issue #165): lint each project's `meguri.toml` on the
             // default branch, failing on a host-only key or TOML error.
             ok &= doctor_repo_configs(cfg).await;
@@ -214,80 +213,6 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
     } else {
         bail!("doctor found problems");
     }
-}
-
-/// Doctor item: for every project that enabled auto-merge, confirm the
-/// repository can honor it (the same validation `meguri watch` fail-fasts on,
-/// ADR 0003). Returns false if any enabled project fails; projects that did
-/// not enable auto-merge print nothing.
-async fn check_auto_merge(cfg: &Config) -> bool {
-    use meguri::config::AutoMergeMode;
-    use meguri::engine::issue_reconciler::validate_policy;
-    use meguri::forge::Forge;
-    use meguri::forge::gh::GhForge;
-
-    let mut ok = true;
-    for project in &cfg.projects {
-        let am = &cfg.pr_for(project).auto_merge;
-        if !am.enabled {
-            continue;
-        }
-        // Inconsistency warn (issue #176): auto-merge is on, but the project is
-        // `attended`, so meguri will never arm it. Advisory only — not a failure.
-        if cfg.autonomy_for(project) != meguri::config::Autonomy::Full {
-            println!(
-                "⚠️  auto-merge ({}): enabled but autonomy=attended — meguri will not arm \
-                 auto-merge (set autonomy = \"full\" to arm; ADR 0012)",
-                project.id
-            );
-        }
-        // Auto-merge is a GitHub-PR concern; a local-mode project has no slug
-        // and no PRs to arm, so there is nothing to check.
-        let Some(slug) = &project.repo_slug else {
-            continue;
-        };
-        let forge = GhForge::new(slug);
-        let label = format!("auto-merge ({})", project.id);
-        match forge
-            .merge_policy(&project.default_branch, am.require_branch_protection)
-            .await
-        {
-            Ok(policy) => match validate_policy(am, &policy) {
-                Ok(()) => match am.mode {
-                    AutoMergeMode::Native => println!(
-                        "✅ {label}: repo settings OK (mode=native, strategy={}, protection {})",
-                        am.strategy.as_str(),
-                        if policy.protected_with_required_checks {
-                            "present"
-                        } else {
-                            "not required"
-                        },
-                    ),
-                    AutoMergeMode::Orchestrator => {
-                        // No server-side gate exists in this mode — remind the
-                        // operator that meguri's own verification is the gate.
-                        println!(
-                            "✅ {label}: repo settings OK (mode=orchestrator, strategy={})",
-                            am.strategy.as_str(),
-                        );
-                        println!(
-                            "   ⚠️  orchestrator mode: no server-side merge gate — \
-                             meguri's own check_command + self-review is the only gate"
-                        );
-                    }
-                },
-                Err(problems) => {
-                    println!("❌ {label}: {}", problems.join("; "));
-                    ok = false;
-                }
-            },
-            Err(e) => {
-                println!("❌ {label}: cannot read repo merge settings: {e:#}");
-                ok = false;
-            }
-        }
-    }
-    ok
 }
 
 /// Whether a project's effective clone is usable for the git-backed doctor

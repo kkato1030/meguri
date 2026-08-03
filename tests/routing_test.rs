@@ -200,7 +200,6 @@ async fn drive_loop_kind(loop_kind: &str) -> (Vec<Vec<String>>, Option<String>) 
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
     let deps = Deps::with_label_source(

@@ -56,7 +56,6 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         worktree_root: Some(root.join("worktrees")),
         pr: None,
         worktree_setup: Default::default(),
-        autonomy: None,
         prompts: Default::default(),
     };
     Deps::with_label_source(
@@ -590,33 +589,6 @@ async fn wait_for_dispatches(order: &DispatchLog, expected: usize) -> Vec<(Strin
     }
 }
 
-/// Loop-list order is dispatch priority: with one slot, the first loop's
-/// target wins even though the other loop's issue number is smaller.
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_prioritizes_runs_by_dispatch_rank() {
-    let root = tempfile::tempdir().unwrap();
-    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let order: DispatchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    // The worker run has the smaller issue number; only dispatch_rank
-    // (fixer = closer to merge) can put the fixer run ahead of it.
-    seed_queued_run(&deps.store, "proj", "fixer", 200);
-    seed_queued_run(&deps.store, "proj", "worker", 100);
-    let scheduler = Scheduler {
-        projects: vec![deps],
-        poll_interval: Duration::from_millis(100),
-        max_concurrent: 1,
-        reload: None,
-        recipe: recording_recipe(order.clone()),
-    };
-    let watch = tokio::spawn(async move { scheduler.watch().await });
-    let log = wait_for_dispatches(&order, 2).await;
-    watch.abort();
-
-    assert_eq!(log[0], ("fixer".into(), "proj".into(), 200));
-    assert_eq!(log[1], ("worker".into(), "proj".into(), 100));
-}
-
 /// Within one kind, runs dispatch oldest-first (FIFO by issue number) no
 /// matter what order they were enqueued in.
 #[tokio::test(flavor = "multi_thread")]
@@ -641,33 +613,6 @@ async fn watch_dispatches_runs_of_one_kind_in_fifo_order() {
 
     let issues: Vec<i64> = log.iter().map(|(_, _, n)| *n).collect();
     assert_eq!(issues, vec![11, 22, 33]);
-}
-
-/// dispatch_rank beats project order: project B's fixer run takes the slot
-/// before project A's planner run (nest inversion).
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_prioritizes_dispatch_rank_over_project_order() {
-    let root = tempfile::tempdir().unwrap();
-    let deps_a = setup(root.path(), Arc::new(FakeForge::default())).await;
-    let mut deps_b = deps_a.clone();
-    deps_b.project.id = "proj-b".into();
-    let order: DispatchLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    seed_queued_run(&deps_a.store, "proj", "planner", 1);
-    seed_queued_run(&deps_a.store, "proj-b", "fixer", 300);
-    let scheduler = Scheduler {
-        projects: vec![deps_a, deps_b],
-        poll_interval: Duration::from_millis(100),
-        max_concurrent: 1,
-        reload: None,
-        recipe: recording_recipe(order.clone()),
-    };
-    let watch = tokio::spawn(async move { scheduler.watch().await });
-    let log = wait_for_dispatches(&order, 2).await;
-    watch.abort();
-
-    assert_eq!(log[0], ("fixer".into(), "proj-b".into(), 300));
-    assert_eq!(log[1], ("planner".into(), "proj".into(), 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -727,29 +672,6 @@ async fn drive_order(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn discovery_dispatches_loops_in_priority_order() {
-    let root = tempfile::tempdir().unwrap();
-    let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
-
-    // The worker run has the smaller issue number; only dispatch_rank can
-    // put the fixer run ahead of it.
-    let order = drive_order(
-        vec![deps],
-        vec![("proj", "fixer", 201), ("proj", "worker", 101)],
-        2,
-    )
-    .await;
-
-    assert_eq!(
-        order,
-        vec![
-            ("fixer".into(), "proj".into(), 201),
-            ("worker".into(), "proj".into(), 101),
-        ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn discovery_orders_targets_within_a_loop_by_issue_number() {
     let root = tempfile::tempdir().unwrap();
     let deps = setup(root.path(), Arc::new(FakeForge::default())).await;
@@ -768,30 +690,6 @@ async fn discovery_orders_targets_within_a_loop_by_issue_number() {
 
     let issues: Vec<i64> = order.iter().map(|(_, _, n)| *n).collect();
     assert_eq!(issues, vec![301, 303, 305]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn discovery_prefers_loop_priority_over_project_order() {
-    let root = tempfile::tempdir().unwrap();
-    let forge = Arc::new(FakeForge::default());
-    // Two projects sharing one store; "alpha" is listed first.
-    let mut deps_a = setup(&root.path().join("alpha"), forge.clone()).await;
-    deps_a.project.id = "alpha".into();
-    let mut deps_b = setup(&root.path().join("beta"), forge).await;
-    deps_b.store = deps_a.store.clone();
-    deps_b.project.id = "beta".into();
-
-    // Project beta only has fixer work, project alpha only planner work;
-    // the fixer rank must win even though alpha comes first.
-    let order = drive_order(
-        vec![deps_a, deps_b],
-        vec![("beta", "fixer", 501), ("alpha", "planner", 401)],
-        2,
-    )
-    .await;
-
-    assert_eq!(order[0], ("fixer".into(), "beta".into(), 501));
-    assert_eq!(order[1], ("planner".into(), "alpha".into(), 401));
 }
 
 #[tokio::test(flavor = "multi_thread")]
