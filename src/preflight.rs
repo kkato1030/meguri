@@ -34,8 +34,11 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{self, AgentProfile};
-use crate::gate::REAP_DEADLINE;
 use crate::routing;
+
+/// How long to wait for a killed prime child to be reapable before giving up
+/// and leaking it as a zombie — an unbounded `wait()` would hang the launch.
+pub const REAP_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How long the prime may run before it is killed and the pane launched
 /// anyway. Longer than the doctor gate-probe's 8s because the prime is a real

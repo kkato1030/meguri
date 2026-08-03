@@ -1,12 +1,8 @@
-use std::io::{IsTerminal, Write};
-
 use anyhow::{Result, bail};
 use clap::Parser;
-use meguri::agent_skills;
 use meguri::app;
-use meguri::cli::{AgentSkillsCommand, Cli, Command, DaemonCommand, StatsCommand};
+use meguri::cli::{Cli, Command};
 use meguri::config::{self, Config, ProjectConfig};
-use meguri::daemon;
 use meguri::store::Store;
 
 #[tokio::main]
@@ -40,15 +36,6 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Watch => app::cmd_watch().await,
-        Command::Daemon { command } => match command {
-            DaemonCommand::Start => daemon::cmd_start(),
-            DaemonCommand::Stop => daemon::cmd_stop(),
-            DaemonCommand::Restart => daemon::cmd_restart(),
-            DaemonCommand::Status => daemon::cmd_status(),
-            DaemonCommand::Logs { follow } => daemon::cmd_logs(follow),
-            DaemonCommand::Install { mode } => daemon::launchd::cmd_install(&mode),
-            DaemonCommand::Uninstall => daemon::launchd::cmd_uninstall(),
-        },
         Command::Run {
             project,
             issue,
@@ -60,50 +47,24 @@ async fn main() -> Result<()> {
             let sel = app::selector(issue, pr, run, task)?;
             app::cmd_run(project.as_deref(), sel, mux.as_deref()).await
         }
-        Command::Why {
-            project,
-            issue,
-            pr,
-            run,
-            task,
-        } => {
-            let sel = app::selector(issue, pr, run, task)?;
-            app::cmd_why(project.as_deref(), sel).await
-        }
         Command::Add {
             text,
             project,
             plan,
             ready,
-            raw,
             file,
-            not_before,
         } => {
             app::cmd_add(
                 project.as_deref(),
                 text.as_deref(),
                 plan,
                 ready,
-                raw,
                 file.as_deref(),
-                not_before.as_deref(),
             )
             .await
         }
         Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
-        Command::Schedules { project } => app::cmd_schedules(project.as_deref()).await,
         Command::Ps { all } => app::cmd_ps(all),
-        Command::Stats { command } => match command {
-            StatsCommand::Routing { project } => app::cmd_stats_routing(project.as_deref()),
-            StatsCommand::Collab { project } => app::cmd_stats_collab(project.as_deref()),
-            StatsCommand::Review { project } => app::cmd_stats_review(project.as_deref()),
-        },
-        Command::Top { mux, interval } => app::cmd_top(mux.as_deref(), interval).await,
-        Command::TopStatus {
-            mux,
-            dashboard,
-            interval,
-        } => app::cmd_top_status(mux.as_deref(), &dashboard, interval).await,
         Command::Logs { run } => app::cmd_logs(&run).await,
         Command::Attach {
             run,
@@ -123,19 +84,6 @@ async fn main() -> Result<()> {
             dry_run,
             force,
         } => app::cmd_prune(project.as_deref(), dry_run, force).await,
-        Command::AgentSkills { command } => match command {
-            AgentSkillsCommand::Install {
-                target,
-                project,
-                repo,
-                force,
-            } => app::cmd_agent_skills_install(&target, project, repo.as_deref(), force),
-            AgentSkillsCommand::Status {
-                target,
-                project,
-                repo,
-            } => app::cmd_agent_skills_status(&target, project, repo.as_deref()),
-        },
     }
 }
 
@@ -159,54 +107,11 @@ fn cmd_init() -> Result<()> {
          (or `--local <path>` for a local-mode project). It appends to {}.",
         cfg_path.display()
     );
-    offer_agent_skills_install();
     Ok(())
-}
-
-/// After `meguri init`, offer the user-level Claude Code skill (issue #150)
-/// so an agent working nearby can learn about and propose meguri on its
-/// own. Interactive only — a non-interactive run (CI, scripted setup) just
-/// gets the pointer, never a silent write to `~/.claude/`.
-fn offer_agent_skills_install() {
-    println!();
-    if !std::io::stdin().is_terminal() {
-        println!(
-            "Tip: `meguri agent-skills install` sets up a Claude Code skill \
-             (~/.claude/skills/meguri/) so agents working nearby can learn about meguri."
-        );
-        return;
-    }
-    print!("Also install the meguri skill for Claude Code (~/.claude/skills/meguri/)? [y/N] ");
-    if std::io::stdout().flush().is_err() {
-        return;
-    }
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return;
-    }
-    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-        println!("Skipped — run `meguri agent-skills install` any time.");
-        return;
-    }
-    let home = match agent_skills::resolve_home() {
-        Ok(home) => home,
-        Err(e) => {
-            println!("⚠️  could not install agent skill: {e:#}");
-            return;
-        }
-    };
-    match agent_skills::install_user_skill(agent_skills::Target::Claude, &home, false) {
-        Ok(report) => app::print_agent_skills_install_report(&report),
-        Err(e) => println!("⚠️  could not install agent skill: {e:#}"),
-    }
 }
 
 async fn cmd_doctor(probe: bool) -> Result<()> {
     let mut ok = true;
-
-    // Best-effort: the DB backs CLI-version drift and routing-drift display.
-    // A missing/broken store just means those checks are skipped, not a fail.
-    let store = Store::open(&config::db_path()).ok();
 
     let check = |name: &str, pass: bool, detail: String| {
         println!("{} {name}: {detail}", if pass { "✅" } else { "❌" });
@@ -283,7 +188,7 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
 
     match &cfg {
         Ok(cfg) => {
-            ok &= doctor_agents(cfg, store.as_ref(), probe);
+            ok &= doctor_agents(cfg, probe);
             let n = cfg.projects.len();
             println!(
                 "{} projects: {n} configured{}",
@@ -294,15 +199,6 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
-            // Outcome-based routing drift (routing 2/3, #65): surface any
-            // active drift the watch's sweep recorded. Read-only, all-project.
-            if let Some(store) = &store {
-                doctor_drift(store);
-                // Sweep failures in the last hour (issue #251, design doc
-                // P6.5 item 3): the same events `sweep_health.rs` emits on
-                // every failure, read here purely for visibility.
-                doctor_sweep_health(store, cfg);
-            }
             doctor_workspaces(cfg);
             // Managed clones (issue #195): show each project's clone state
             // (present / not cloned yet / broken) and whether the gh token can
@@ -311,22 +207,12 @@ async fn cmd_doctor(probe: bool) -> Result<()> {
             // Auto-merge preconditions (ADR 0003): only for projects that
             // enabled it — the same gate `meguri watch` fail-fasts on.
             ok &= check_auto_merge(cfg).await;
-            // Cron schedules (issue #146): cron/name/body validity already
-            // fail-fast at load; here we check body_file existence and show
-            // the next fire.
-            ok &= doctor_schedules(cfg).await;
-            // Cadence rules (issue #148): shape is already validated at load;
-            // here we show each rule's current window consumption.
-            doctor_cadence(cfg, store.as_ref());
             // Repo config (issue #165): lint each project's `meguri.toml` on the
             // default branch, failing on a host-only key or TOML error.
             ok &= doctor_repo_configs(cfg).await;
             // Role preambles (issue #149): each configured path must resolve to
             // a regular file on the default branch (ADR 0015).
             ok &= doctor_prompts(cfg).await;
-            // Notify sink (issue #205): validate the webhook config, and with
-            // --probe send a real test message.
-            ok &= doctor_notify(cfg, probe).await;
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));
@@ -512,189 +398,6 @@ async fn doctor_clones(cfg: &Config) -> bool {
     ok
 }
 
-/// Doctor's schedules section (issue #146 / #222): print each project's
-/// *effective* schedule set — host `[[projects.schedules]]` ∪ the repo's own
-/// `meguri.toml` on the default branch — via the same resolver the sweep uses,
-/// so display and firing agree (ADR 0026). Per-schedule / collection / cron /
-/// local-mode-plan validity is enforced at config load for host schedules and
-/// by the resolver for repo schedules; here we additionally check each
-/// `body_file` is a regular file on the default branch (ADR 0015) and surface
-/// the resolver's diagnostics. Returns false on an invalid repo config or an
-/// unreadable `body_file`. Reads only — it never emits the diagnostics (f6).
-async fn doctor_schedules(cfg: &Config) -> bool {
-    use meguri::engine::schedule::{Diagnostic, resolve_effective_schedules};
-    use meguri::gitops::{self, DefaultBranchFile};
-    use meguri::store::format_epoch;
-
-    let now = meguri::engine::schedule::epoch_now();
-    let mut ok = true;
-    let mut printed_header = false;
-    for project in &cfg.projects {
-        let repo_path = cfg.repo_path_for(project);
-        // A managed clone that isn't materialized yet can't be read/fetched from;
-        // that is normal (doctor_clones reports it), so skip the body_file check.
-        let cloned = matches!(
-            project_clone_state(cfg, project).await,
-            ProjectCloneState::Present
-        );
-        let resolved = resolve_effective_schedules(
-            &repo_path,
-            &project.default_branch,
-            project.mode,
-            &project.schedules,
-        )
-        .await;
-        if resolved.schedules.is_empty() && resolved.diagnostics.is_empty() {
-            continue; // nothing configured for this project
-        }
-        if !printed_header {
-            println!("\nschedules:");
-            printed_header = true;
-        }
-
-        for d in &resolved.diagnostics {
-            match d {
-                Diagnostic::Shadowed { name } => println!(
-                    "  ⚠️  {}/{name} — repo schedule shadowed by a host schedule (host wins)",
-                    project.id
-                ),
-                Diagnostic::RepoInvalid { detail } => {
-                    ok = false;
-                    println!(
-                        "  ❌ {} — repo meguri.toml schedules invalid: {detail}",
-                        project.id
-                    );
-                }
-                Diagnostic::RepoScheduleDropped { detail } => {
-                    ok = false;
-                    println!("  ❌ {} — repo schedule dropped: {detail}", project.id);
-                }
-                Diagnostic::RepoUnavailable { detail } => println!(
-                    "  ⚠️  {} — repo schedules unavailable this check (fetch): {detail}",
-                    project.id
-                ),
-            }
-        }
-
-        for s in &resolved.schedules {
-            let c = &s.config;
-            let next = meguri::cron::Cron::parse(&c.cron)
-                .ok()
-                .and_then(|cr| cr.next_after(now))
-                .map(format_epoch)
-                .unwrap_or_else(|| "never".into());
-            // body_file must be a regular file on the pinned snapshot (repo) or
-            // the default branch (host on a fetch-failed tick); inline is fine.
-            let (line_ok, body_detail) = match &c.body_file {
-                _ if !cloned => (true, "body_file check skipped (clone pending)".to_string()),
-                Some(rel) => {
-                    let read = match &s.pin_sha {
-                        Some(sha) => gitops::read_file_at_ref(&repo_path, sha, rel).await,
-                        None => {
-                            gitops::read_file_at_default_branch(
-                                &repo_path,
-                                &project.default_branch,
-                                rel,
-                            )
-                            .await
-                        }
-                    };
-                    match read {
-                        Ok(DefaultBranchFile::Content(_)) => (true, format!("body_file {rel}")),
-                        Ok(DefaultBranchFile::Absent) => {
-                            (false, format!("body_file {rel} not on default branch"))
-                        }
-                        Ok(DefaultBranchFile::NotRegularFile) => (
-                            false,
-                            format!("body_file {rel} is not a regular file on default branch"),
-                        ),
-                        Err(e) => (false, format!("body_file {rel}: {e:#}")),
-                    }
-                }
-                None => (true, "inline body".to_string()),
-            };
-            ok &= line_ok;
-            println!(
-                "  {} {}/{} [{}] ({} {}, next {next} UTC) — {body_detail}",
-                if line_ok { "✅" } else { "❌" },
-                project.id,
-                c.name,
-                s.source.as_str(),
-                c.kind.as_str(),
-                c.cron,
-            );
-        }
-    }
-    ok
-}
-
-/// Doctor's notify section (issue #205): if a webhook is configured, show the
-/// resolved flavor (Slack / ntfy / json), and with `--probe` send a real test
-/// message. Prints nothing when no webhook is set. The `events` allowlist is
-/// already validated at config load, so it is not re-checked here.
-async fn doctor_notify(cfg: &Config, probe: bool) -> bool {
-    let n = &cfg.notifications;
-    let Some(url) = &n.webhook_url else {
-        return true;
-    };
-    println!("\nnotify:");
-    let kind = meguri::notify::resolve_kind(n, url);
-    println!("  ✅ webhook: {kind:?}, events {:?}", n.events);
-    if !probe {
-        println!("  (pass --probe to send a test message)");
-        return true;
-    }
-    match meguri::notify::probe_webhook(n, url).await {
-        Ok(()) => {
-            println!("  ✅ probe: test message delivered");
-            true
-        }
-        Err(e) => {
-            println!("  ❌ probe: {e:#}");
-            false
-        }
-    }
-}
-
-/// Doctor's cadence section (issue #148): the config shape (label uniqueness,
-/// period mode, positive values) already fail-fasts at load, so here we simply
-/// show each rule's current window consumption — "N/M used, K left" — so an
-/// operator can see why a labelled issue is being held back. Projects without
-/// cadence rules print nothing; a missing store just omits the counts.
-fn doctor_cadence(cfg: &Config, store: Option<&Store>) {
-    use meguri::cadence;
-
-    let has_any = cfg.projects.iter().any(|p| !p.cadence.is_empty());
-    if !has_any {
-        return;
-    }
-    let now = meguri::engine::schedule::epoch_now();
-    println!("\ncadence:");
-    for project in &cfg.projects {
-        for rule in &project.cadence {
-            let mode = match rule.per_hours {
-                Some(h) => format!("per {h}h"),
-                None => "per day (UTC)".to_string(),
-            };
-            let max = cadence::limit(rule);
-            let usage = match store {
-                Some(store) => {
-                    let start = cadence::window_start(rule, now);
-                    match store.cadence_consumed(&project.id, &rule.label, start) {
-                        Ok(consumed) => {
-                            let left = (max as i64 - consumed).max(0);
-                            format!("{consumed}/{max} used, {left} left")
-                        }
-                        Err(_) => format!("max {max} (count unavailable)"),
-                    }
-                }
-                None => format!("max {max}"),
-            };
-            println!("  ✅ {}/{} ({mode}) — {usage}", project.id, rule.label);
-        }
-    }
-}
-
 /// Doctor's repo-config section (issue #165): lint each project's repo root
 /// `meguri.toml`. Doctor holds no run, so it reads the default branch's
 /// `meguri.toml` (ADR 0015), not the working tree — advisory, not the run's
@@ -845,7 +548,7 @@ fn doctor_workspaces(cfg: &Config) {
 /// table, and print the role→profile resolution. Returns whether the mandatory
 /// `default` profile CLI is present, explicit routing validates, and no probe
 /// found an invalid model.
-fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
+fn doctor_agents(cfg: &Config, probe: bool) -> bool {
     use meguri::routing;
 
     // Merged profile set: builtins first, user profiles override same names.
@@ -860,10 +563,6 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
     }
     names.sort();
 
-    // CLI major-version drift is per command, but several profiles can share a
-    // command (claude-opus / claude-sonnet → `claude`): check each command once.
-    let mut version_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     println!("\nagent profiles:");
     // The default profile is required: a missing CLI here breaks every legacy
     // and fall-through run.
@@ -877,10 +576,6 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
         headless_note(&cfg.agent),
         default_detail.clone().unwrap_or_else(|e| e),
     );
-    if let (Ok(v), Some(store)) = (&default_detail, store) {
-        doctor_version_drift(store, &cfg.agent.command, v, &mut version_checked);
-    }
-
     let mut ok = default_ok;
     if probe {
         ok &= doctor_probe("default", &cfg.agent, &routing::probe_profile);
@@ -899,9 +594,6 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
             headless_note(&profile),
             detail.clone().unwrap_or_else(|e| e),
         );
-        if let (Ok(v), Some(store)) = (&detail, store) {
-            doctor_version_drift(store, &profile.command, v, &mut version_checked);
-        }
         // Probe only profiles whose CLI was detected — a missing CLI is
         // already reported above and can't be launched.
         if probe && detail.is_ok() {
@@ -967,54 +659,6 @@ fn doctor_agents(cfg: &Config, store: Option<&Store>, probe: bool) -> bool {
     }
 
     ok &= doctor_launch(cfg);
-    if probe {
-        ok &= doctor_gate(cfg, &meguri::gate::spawn_pty_probe);
-    }
-    ok &= doctor_collab(cfg);
-    ok
-}
-
-/// Bypass-permissions gate probe (issue #234): for every profile a `Pane`
-/// launch would actually reach (`meguri::gate::pane_gate_targets`), fire a
-/// short interactive PTY launch and classify the screen against known
-/// dialog/ready text. Only runs under `--probe`, alongside the model-alias
-/// probe — like that one, it launches a real CLI rather than just checking
-/// `--version`. `launch` is the injected PTY seam so this stays unit-
-/// testable without a real subprocess.
-fn doctor_gate(
-    cfg: &Config,
-    launch: &dyn Fn(&meguri::gate::GateTarget) -> meguri::gate::PtyCapture,
-) -> bool {
-    use meguri::{gate, routing};
-
-    let targets = gate::pane_gate_targets(cfg, &routing::detect_command);
-    if targets.is_empty() {
-        return true;
-    }
-    println!("\nbypass gate (pane-launched profiles):");
-    let mut ok = true;
-    for target in &targets {
-        let labels = target.labels.join(", ");
-        match gate::probe_gate(target, launch) {
-            gate::GateOutcome::Clear => {
-                println!("  ✅ {labels} [{}]: bypass gate accepted", target.command);
-            }
-            gate::GateOutcome::Blocked => {
-                println!(
-                    "  ❌ {labels} [{}]: bypass 受諾ダイアログで停止 — {}",
-                    target.command,
-                    gate::remediation_line(target),
-                );
-                ok = false;
-            }
-            gate::GateOutcome::Inconclusive => {
-                println!(
-                    "  ⚠️  {labels} [{}]: probe inconclusive (timeout/unknown output) — doctor は fail させない",
-                    target.command,
-                );
-            }
-        }
-    }
     ok
 }
 
@@ -1028,31 +672,6 @@ fn headless_note(profile: &meguri::config::AgentProfile) -> &'static str {
         None if effective_headless_args(profile).is_some() => "headless: inherited",
         None => "headless: none",
     }
-}
-
-/// Collab advisor (issue #111): report `[collab]` and surface the same startup
-/// error `meguri watch` / `meguri run` would raise (agmsg missing / unknown
-/// advisor role), so `meguri doctor` catches a misconfigured advisor early.
-fn doctor_collab(cfg: &Config) -> bool {
-    use meguri::{collab, routing};
-    match &cfg.collab {
-        None => return true,
-        Some(c) if c.mode == meguri::config::CollabMode::Off => {
-            println!("collab: off (`[collab] mode = \"off\"`)");
-            return true;
-        }
-        Some(c) => {
-            println!("collab: advisor (role {})", c.advisor_role);
-        }
-    }
-    if let Err(e) = collab::validate(cfg, &routing::detect_command) {
-        println!("  ❌ collab config: {e:#}");
-        return false;
-    }
-    if let Some(script) = collab::agmsg_version_script() {
-        println!("  agmsg skill  → {}", script.display());
-    }
-    true
 }
 
 /// Per-role launch mode (issue #169, ADR 0012): pane vs. direct, always
@@ -1071,41 +690,6 @@ fn doctor_launch(cfg: &Config) -> bool {
         println!("  {role:<18} → {}", launch::resolve(cfg, role).as_str());
     }
     ok
-}
-
-/// Compare a CLI's detected version against the last one doctor recorded and
-/// warn on a major-version bump (behavior may have shifted; re-evaluate
-/// routing), then persist the current version. Each command is checked once
-/// per doctor run.
-fn doctor_version_drift(
-    store: &Store,
-    command: &str,
-    version_line: &str,
-    checked: &mut std::collections::HashSet<String>,
-) {
-    use meguri::routing;
-
-    if !checked.insert(command.to_string()) {
-        return;
-    }
-    let major = routing::major_version(version_line);
-    match store.get_cli_version(command) {
-        Ok(Some((_, Some(prev_major)))) => {
-            if let Some(now_major) = major
-                && now_major as i64 > prev_major
-            {
-                println!(
-                    "⚠️  {command}: メジャーバージョンが {prev_major} → {now_major} に変化 — \
-                     挙動が変わっている可能性。ルーティング再評価を推奨"
-                );
-            }
-        }
-        Ok(_) => {} // first sighting: just record below.
-        Err(e) => tracing::warn!("cli version read failed for {command}: {e:#}"),
-    }
-    if let Err(e) = store.record_cli_version(command, version_line, major.map(|m| m as i64)) {
-        tracing::warn!("cli version write failed for {command}: {e:#}");
-    }
 }
 
 /// doctor's severity for one profile's live probe. `ModelInvalid` is fatal (the
@@ -1136,86 +720,6 @@ fn doctor_probe(
     };
     println!("  {symbol} probe {label}: {detail}");
     !fatal
-}
-
-/// Doctor's routing-drift section: list every project's unresolved outcome
-/// drift (recorded by the watch's sweep, routing 2/3 #65). Read-only; a run of
-/// doctor never computes drift itself.
-fn doctor_drift(store: &Store) {
-    let drifts = match store.active_drift(None) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("routing drift read failed: {e:#}");
-            return;
-        }
-    };
-    if drifts.is_empty() {
-        return;
-    }
-    println!("\nrouting drift:");
-    for d in drifts {
-        let profile = if d.agent_profile.is_empty() {
-            "default"
-        } else {
-            &d.agent_profile
-        };
-        println!(
-            "  ⚠️  [{}] {}/{} の成績が悪化 — CLI 更新かモデル変更の影響の可能性",
-            d.project_id, d.loop_kind, profile
-        );
-    }
-}
-
-/// Doctor's sweep-health section (issue #251, design doc P6.5 item 3): the
-/// per-(project, sweep) `sweep.failed` **rate** over the last hour, read
-/// straight from `events` — no dedicated state table, since `sweep_health.rs`
-/// already emits one event per failure. Read-only and never fails doctor;
-/// this is visibility into an ongoing outage, not a precondition check.
-///
-/// `events` alone has no denominator — sweeps that succeed leave no trace,
-/// on purpose (an event per success, every ~`poll_interval_secs`, for every
-/// sweep × project, would be pure event-log noise for a number doctor can
-/// derive instead). So the denominator is computed from config: one sweep
-/// attempt per project per tick, and `window_secs / poll_interval_secs` ticks
-/// fit in the window (issue #251 self-review f3 — a bare failure *count*
-/// means something different at a 30s poll interval than a 5-minute one, and
-/// says nothing about a sweep that has been failing every single tick versus
-/// one that fails only occasionally).
-fn doctor_sweep_health(store: &Store, cfg: &Config) {
-    const WINDOW_SECS: u64 = 3600;
-    let since = meguri::store::format_epoch(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(WINDOW_SECS),
-    );
-    let failures = match store.events_since("sweep.failed", &since) {
-        Ok(events) => events,
-        Err(e) => {
-            tracing::warn!("sweep-health read failed: {e:#}");
-            return;
-        }
-    };
-    if failures.is_empty() {
-        return;
-    }
-    // Every ready project runs every sweep once per tick (`scheduler.rs`), so
-    // this is the same expected attempt count for every (project, sweep) pair
-    // — an approximation (a project not yet cloned, or a daemon restart mid-
-    // window, attempts fewer), always erring toward *understating* the rate.
-    let expected_attempts = (WINDOW_SECS / cfg.scheduler.poll_interval_secs.max(1)).max(1);
-    let mut counts: std::collections::BTreeMap<(String, String), usize> = Default::default();
-    for e in &failures {
-        let project = e.data["project"].as_str().unwrap_or("?").to_string();
-        let sweep = e.data["sweep"].as_str().unwrap_or("?").to_string();
-        *counts.entry((project, sweep)).or_default() += 1;
-    }
-    println!("\nsweep 失敗率 (直近1時間、想定 {expected_attempts} 回試行):");
-    for ((project, sweep), n) in counts {
-        let rate = n as f64 / expected_attempts as f64 * 100.0;
-        println!("  ⚠️  [{project}] {sweep}: {n}/{expected_attempts} 回 ({rate:.0}%)");
-    }
 }
 
 fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
@@ -1261,32 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn doctor_gate_fails_on_a_blocked_target_and_stays_green_when_clear() {
-        // Legacy config collapses every pane role onto the `default` profile
-        // (see gate::pane_gate_targets tests), so exactly one target is
-        // probed here.
-        let cfg = Config::default();
-        let blocked = |_: &meguri::gate::GateTarget| {
-            meguri::gate::PtyCapture::Output("Bypass Permissions mode".to_string())
-        };
-        assert!(!doctor_gate(&cfg, &blocked));
-
-        let clear = |_: &meguri::gate::GateTarget| {
-            meguri::gate::PtyCapture::Output("Welcome to Claude Code!".to_string())
-        };
-        assert!(doctor_gate(&cfg, &clear));
-    }
-
-    #[test]
-    fn doctor_gate_does_not_fail_on_inconclusive_outcomes() {
-        let cfg = Config::default();
-        let timeout = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::Timeout;
-        assert!(doctor_gate(&cfg, &timeout));
-        let spawn_failed = |_: &meguri::gate::GateTarget| meguri::gate::PtyCapture::SpawnFailed;
-        assert!(doctor_gate(&cfg, &spawn_failed));
-    }
-
-    #[test]
     fn can_push_accepts_write_and_up_only() {
         // The write-scope decision is pure and now shared with add-project
         // (`meguri::app::can_push`), so doctor can test it without gh.
@@ -1305,34 +783,5 @@ mod tests {
         assert!(doctor_probe("default", &p, &flaky));
         let ok = |_: &config::AgentProfile| ProbeOutcome::Ok;
         assert!(doctor_probe("default", &p, &ok));
-    }
-
-    #[test]
-    fn version_drift_warns_only_on_major_bump_and_records() {
-        let store = Store::open_in_memory().unwrap();
-        let mut checked = std::collections::HashSet::new();
-
-        // First sighting records, no comparison.
-        doctor_version_drift(&store, "claude", "claude 1.2.3", &mut checked);
-        assert_eq!(
-            store.get_cli_version("claude").unwrap(),
-            Some(("claude 1.2.3".to_string(), Some(1)))
-        );
-
-        // Same command is only checked once per doctor run (dedup within run).
-        doctor_version_drift(&store, "claude", "claude 9.9.9", &mut checked);
-        assert_eq!(
-            store.get_cli_version("claude").unwrap(),
-            Some(("claude 1.2.3".to_string(), Some(1))),
-            "second call in same run is a no-op"
-        );
-
-        // A fresh run (new set) sees the major bump and re-records.
-        let mut next_run = std::collections::HashSet::new();
-        doctor_version_drift(&store, "claude", "claude 2.0.0", &mut next_run);
-        assert_eq!(
-            store.get_cli_version("claude").unwrap(),
-            Some(("claude 2.0.0".to_string(), Some(2)))
-        );
     }
 }

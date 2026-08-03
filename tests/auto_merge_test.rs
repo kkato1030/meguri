@@ -31,16 +31,11 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         check_command: None,
         worktree_root: None,
         pr: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
     Deps::with_label_source(
         meguri::store::Store::open_in_memory().unwrap(),

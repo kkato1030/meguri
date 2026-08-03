@@ -79,18 +79,13 @@ async fn setup() -> TestEnv {
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         mode: Default::default(),
         deliver: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));

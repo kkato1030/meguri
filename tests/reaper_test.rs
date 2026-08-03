@@ -50,16 +50,11 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         check_command: None,
         worktree_root: Some(root.join("worktrees")),
         pr: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
     Deps::with_label_source(
         Store::open_in_memory().unwrap(),

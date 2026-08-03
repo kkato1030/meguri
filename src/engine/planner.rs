@@ -321,13 +321,6 @@ impl Flavor for PlannerFlavor {
                 decompose_child_footer_ref(&parent_ref)
             );
             let number = forge.create_issue(&child.title, &body, &labels).await?;
-            // Watched-label notify only for children filed in this project's
-            // own repo; a sibling's issues are not governed by this project's
-            // `[projects.notify]` (issue #205).
-            if slug == parent_slug {
-                deps.notify_created_issue(number, &child.title, &labels)
-                    .await;
-            }
             // Sibling dependencies: the dependency gate (issue #23) keys off
             // these, so they decide the implementation order. The blocker may
             // live in another repo, so name it by its slug.
@@ -942,16 +935,11 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),

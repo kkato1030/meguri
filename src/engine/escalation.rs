@@ -31,7 +31,6 @@ use serde_json::json;
 use super::Deps;
 use super::flow;
 use crate::forge;
-use crate::notify::Notification;
 use crate::store::RunRecord;
 use crate::tasks::{self, TaskKey};
 
@@ -51,9 +50,6 @@ pub async fn escalate_task(deps: &Deps, run: &RunRecord, reason: &str) {
         "escalation.raised",
         json!({ "target": target, "id": key.number(), "reason": reason }),
     );
-    deps.notifier
-        .notify(&Notification::escalation_task(key.number(), target, reason))
-        .await;
 }
 
 /// Escalate a github issue directly through the forge: needs-human label,
@@ -76,9 +72,6 @@ pub async fn escalate_issue(deps: &Deps, issue: i64, reason: &str) {
         "escalation.raised",
         json!({ "target": "issue", "issue": issue, "reason": reason }),
     );
-    deps.notifier
-        .notify(&Notification::escalation_task(issue, "issue", reason))
-        .await;
 }
 
 /// Park a pull request on `needs-human`: add the label, drop the `working`
@@ -95,7 +88,6 @@ pub async fn escalate_pr(deps: &Deps, pr: i64, comment: &str) {
         "escalation.raised",
         json!({ "target": "pr", "pr": pr }),
     );
-    deps.notifier.notify(&Notification::escalation_pr(pr)).await;
 }
 
 /// Classify a run failure as a forge/mux command fault rather than something
@@ -230,11 +222,7 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
                 let _ = deps.store.park_task_until(id, INFRA_PARKED_UNTIL);
             }
         }
-        return;
     }
-    deps.notifier
-        .notify(&Notification::infra(reason, detail))
-        .await;
 }
 
 /// Max lines a sanitized pane tail keeps.
@@ -323,10 +311,9 @@ mod tests {
     use crate::config::ProjectConfig;
     use crate::forge::fake::FakeForge;
     use crate::mux::fake::FakeMux;
-    use crate::notify::fake::{FakeGateway, recording_notifier_with_events};
     use crate::store::Store;
 
-    fn deps_with(forge: Arc<FakeForge>, events: &[&str]) -> (Deps, Arc<FakeGateway>) {
+    fn deps_with(forge: Arc<FakeForge>) -> Deps {
         let project = ProjectConfig {
             id: "proj".into(),
             repo_path: Some("/tmp/unused".into()),
@@ -338,54 +325,19 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
-        let mut deps = Deps::with_label_source(
+        Deps::with_label_source(
             Store::open_in_memory().unwrap(),
             Arc::new(FakeMux::new(false)),
             forge,
             crate::config::Config::default(),
             project,
-        );
-        let (notifier, gw) = recording_notifier_with_events(events);
-        deps.notifier = notifier;
-        (deps, gw)
-    }
-
-    #[tokio::test]
-    async fn escalate_issue_pages_when_escalation_subscribed() {
-        let forge = Arc::new(FakeForge::default());
-        forge.add_issue(7, "t", "b", &[]);
-        let (deps, gw) = deps_with(forge, &["escalation"]);
-
-        escalate_issue(&deps, 7, "ci red").await;
-
-        let delivered = gw.delivered();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].event, "escalation");
-        assert_eq!(delivered[0].dedup_key, "issue:7");
-        assert!(delivered[0].body.contains("ci red"));
-    }
-
-    #[tokio::test]
-    async fn escalate_issue_is_silent_when_escalation_not_subscribed() {
-        let forge = Arc::new(FakeForge::default());
-        forge.add_issue(7, "t", "b", &[]);
-        // Default allowlist (awaiting_human only): escalation must not page.
-        let (deps, gw) = deps_with(forge, &["awaiting_human"]);
-
-        escalate_issue(&deps, 7, "ci red").await;
-
-        assert!(gw.delivered().is_empty());
+        )
     }
 
     #[test]
@@ -487,10 +439,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_infra_never_touches_needs_human_and_pages_once_per_reason() {
+    async fn escalate_infra_never_touches_needs_human() {
         let forge = Arc::new(FakeForge::default());
         forge.add_issue(7, "t", "b", &[forge::LABEL_WORKING]);
-        let (deps, gw) = deps_with(forge.clone(), &["infra"]);
+        let deps = deps_with(forge.clone());
         let run = deps.store.create_run("proj", 7, "t").unwrap();
 
         escalate_infra(&deps, &run, "mux_connection_refused", "connection refused").await;
@@ -501,18 +453,13 @@ mod tests {
 
         let events = deps.store.events_for_run(&run.id, 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "infra.raised"));
-
-        let delivered = gw.delivered();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].event, "infra");
-        assert_eq!(delivered[0].dedup_key, "infra:mux_connection_refused");
     }
 
     #[tokio::test]
     async fn escalate_infra_caps_retries_then_hands_the_target_to_a_human() {
         let forge = Arc::new(FakeForge::default());
         forge.add_issue(7, "t", "b", &[forge::LABEL_WORKING]);
-        let (deps, _gw) = deps_with(forge.clone(), &["infra"]);
+        let deps = deps_with(forge.clone());
         let run = deps.store.create_run("proj", 7, "t").unwrap();
 
         // Up to the cap: infra only — no needs-human.
@@ -544,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn escalate_infra_cap_parks_a_local_task_behind_not_before() {
         let forge = Arc::new(FakeForge::default());
-        let (deps, _gw) = deps_with(forge, &["infra"]);
+        let deps = deps_with(forge);
         let task_id = deps
             .store
             .create_task("proj", "work", "t", "b", "local")
@@ -567,18 +514,5 @@ mod tests {
             Some(INFRA_PARKED_UNTIL),
             "a capped local task must be parked behind not_before"
         );
-    }
-
-    #[tokio::test]
-    async fn escalate_infra_is_silent_when_infra_not_subscribed() {
-        let forge = Arc::new(FakeForge::default());
-        forge.add_issue(7, "t", "b", &[]);
-        // Default allowlist (awaiting_human only): infra must not page.
-        let (deps, gw) = deps_with(forge, &["awaiting_human"]);
-        let run = deps.store.create_run("proj", 7, "t").unwrap();
-
-        escalate_infra(&deps, &run, "mux_connection_refused", "boom").await;
-
-        assert!(gw.delivered().is_empty());
     }
 }

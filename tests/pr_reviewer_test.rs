@@ -24,7 +24,6 @@ use meguri::forge::{
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
-use meguri::notify::fake::{recording_notifier, recording_notifier_with_events};
 use meguri::store::{InteractionState, LANE_PR_REVIEW, RunStatus, Store};
 
 const PR: i64 = 12;
@@ -135,16 +134,11 @@ async fn setup_with(
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        clean: None,
-        triage: None,
         plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
-        schedules: Vec::new(),
         autonomy: None,
-        cadence: Vec::new(),
         prompts: Default::default(),
-        notify: None,
     };
 
     let mux = Arc::new(FakeMux::new(false));
@@ -843,11 +837,6 @@ async fn direct_pr_reviewer_releases_the_lanes_leftover_pane_mode_pane() {
 
 // --- parked-review signal (ADR 0009 / issue #153) ---------------------------
 
-/// The URL FakeForge assigns the PR under review (its `list_open_prs` shape).
-fn pr_url() -> String {
-    format!("https://fake.example/pr/{PR}")
-}
-
 /// Whether the run emitted the parked-review event.
 fn emitted_park_event(env: &TestEnv, run_id: &str) -> bool {
     env.deps
@@ -891,10 +880,8 @@ async fn run_review_cats(
 /// (criteria 1, 2, 4, 5, 7).
 #[tokio::test(flavor = "multi_thread")]
 async fn plan_clean_parks_under_separate_delivery() {
-    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     assert_eq!(env.deps.project.plan_delivery, PlanDelivery::Separate);
-    let (notifier, gw) = recording_notifier();
-    env.deps.notifier = notifier;
     let run = create_pr_reviewer_run(&env);
 
     run_review(&env, "clean", &run.id).await;
@@ -911,16 +898,6 @@ async fn plan_clean_parks_under_separate_delivery() {
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].id, run.id);
 
-    let delivered = gw.delivered();
-    assert_eq!(delivered.len(), 1, "one page per parked head");
-    assert_eq!(delivered[0].event, "awaiting_human");
-    assert!(
-        delivered[0].body.contains("spec レビュー"),
-        "reason surfaces in the body: {}",
-        delivered[0].body
-    );
-    assert_eq!(delivered[0].url.as_deref(), Some(pr_url().as_str()));
-
     // The label transition is unchanged.
     let labels = env.forge.pr_labels_of(PR);
     assert!(labels.contains(&LABEL_SPEC_READY.to_string()), "{labels:?}");
@@ -932,8 +909,6 @@ async fn plan_clean_parks_under_separate_delivery() {
 async fn plan_clean_does_not_park_under_combined_delivery() {
     let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
     env.deps.project.plan_delivery = PlanDelivery::Combined;
-    let (notifier, gw) = recording_notifier();
-    env.deps.notifier = notifier;
     let run = create_pr_reviewer_run(&env);
 
     run_review(&env, "clean", &run.id).await;
@@ -945,7 +920,6 @@ async fn plan_clean_does_not_park_under_combined_delivery() {
         "combined clean is not a park"
     );
     assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
-    assert!(gw.delivered().is_empty());
     // But the handoff label still lands.
     assert!(
         env.forge
@@ -960,12 +934,7 @@ async fn plan_clean_does_not_park_under_combined_delivery() {
 /// regression).
 #[tokio::test(flavor = "multi_thread")]
 async fn impl_blocking_does_not_park() {
-    let mut env = setup(&[LABEL_IMPLEMENTING], true).await;
-    // Subscribe only awaiting_human: this test asserts the absence of the
-    // *parked-review* page, not the escalation notification the needs-human
-    // path now also emits under issue #205.
-    let (notifier, gw) = recording_notifier_with_events(&["awaiting_human"]);
-    env.deps.notifier = notifier;
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
     let run = create_pr_reviewer_run(&env);
 
     run_review_cats(&env, "blocking", &["security"], &run.id).await;
@@ -976,10 +945,6 @@ async fn impl_blocking_does_not_park() {
         Some(InteractionState::AwaitingHuman)
     );
     assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
-    assert!(
-        gw.delivered().is_empty(),
-        "no parked-review page for impl findings"
-    );
     assert!(!emitted_park_event(&env, &run.id));
 }
 

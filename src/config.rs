@@ -208,25 +208,11 @@ pub struct Config {
     /// loop runs the `default` profile, no detection.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
-    /// Collab advisor layer (`[collab]`, issue #111). Absent = feature off:
-    /// byte-for-byte the historical behavior (no advisor pane, worker prompt
-    /// unchanged). See [`crate::collab`] and ADR 0006 (collab-advisor).
-    #[serde(default)]
-    pub collab: Option<CollabConfig>,
     /// Role→launch-mode overrides (`[launch]`, issue #169). Always active
     /// (no legacy/off state) — a role with no entry here still resolves
     /// through the built-in recommendation table.
     #[serde(default)]
     pub launch: LaunchConfig,
-    /// Outcome-based routing drift thresholds (`[drift]`). Deliberately a
-    /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere
-    /// presence switches role routing on (see [`routing`]), so a
-    /// `[routing.drift]` table would silently activate routing for a user who
-    /// only wanted to tune drift. Drift detection is independent of routing
-    /// being active — legacy runs all use `default`, so `(role, default)`
-    /// regressions are still caught.
-    #[serde(default)]
-    pub drift: DriftConfig,
     /// Signal-driven profile escalation (`[escalation]`, routing 3/3, issue
     /// #66). Top-level like `[drift]` so toggling it never materializes
     /// `[routing]` and flips role routing on. Only fires when routing is
@@ -238,15 +224,7 @@ pub struct Config {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
-    pub daemon: DaemonConfig,
-    #[serde(default)]
-    pub notifications: NotificationsConfig,
-    #[serde(default)]
     pub pr: PrConfig,
-    #[serde(default)]
-    pub clean: CleanConfig,
-    #[serde(default)]
-    pub triage: TriageConfig,
     #[serde(default)]
     pub review: ReviewConfig,
     /// How autonomous meguri may be (issue #176). Global default; a project may
@@ -255,8 +233,6 @@ pub struct Config {
     pub autonomy: Autonomy,
     #[serde(default)]
     pub decompose: DecomposeConfig,
-    #[serde(default)]
-    pub reconcile: ReconcileConfig,
     #[serde(default)]
     pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
@@ -421,38 +397,6 @@ pub enum Autonomy {
     Full,
 }
 
-/// Settings for the reconcile loop (issue #142): detecting that a once-shipped
-/// issue's body was edited and treating it as a re-attention signal.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ReconcileConfig {
-    /// Kill switch: false restores the pre-#142 behavior — a succeeded run
-    /// suppresses the issue permanently regardless of later body edits (half A
-    /// and half B both go inert).
-    #[serde(default = "default_reconcile_body_edits")]
-    pub body_edits: bool,
-    /// Whether the poll sweep (half B) posts the "本文が更新されました" signal
-    /// comment on a changed-body issue. False emits the `issue.body_changed`
-    /// event only (no forge write).
-    #[serde(default = "default_reconcile_signal_comment")]
-    pub signal_comment: bool,
-}
-
-impl Default for ReconcileConfig {
-    fn default() -> Self {
-        Self {
-            body_edits: default_reconcile_body_edits(),
-            signal_comment: default_reconcile_signal_comment(),
-        }
-    }
-}
-
-fn default_reconcile_body_edits() -> bool {
-    true
-}
-fn default_reconcile_signal_comment() -> bool {
-    true
-}
-
 /// Settings for the Issue Kind reconciler (`[reconciler]`, ADR 0012 slice 3):
 /// the step-policy allow-set (ADR 0026 — a disabled arm becomes
 /// `Wait(PolicyDisabled)`) and the claim instance id (ADR 0027).
@@ -516,40 +460,6 @@ impl Default for StepPolicyConfig {
     }
 }
 
-/// Settings for the cleaner loop (read-only repository sweeps).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CleanConfig {
-    /// Minimum hours between sweeps; a moved head alone does not trigger one.
-    #[serde(default = "default_clean_interval_hours")]
-    pub interval_hours: u64,
-    /// Remote branches whose last commit is older than this many days are
-    /// reported as stale (merged branches are reported regardless of age).
-    #[serde(default = "default_stale_branch_days")]
-    pub stale_branch_days: u64,
-    /// False-positive silencer: findings whose file/note (or branch name /
-    /// `#N` reference) contains any of these substrings are dropped from the
-    /// report at render time.
-    #[serde(default)]
-    pub ignore: Vec<String>,
-}
-
-impl Default for CleanConfig {
-    fn default() -> Self {
-        Self {
-            interval_hours: default_clean_interval_hours(),
-            stale_branch_days: default_stale_branch_days(),
-            ignore: Vec::new(),
-        }
-    }
-}
-
-fn default_clean_interval_hours() -> u64 {
-    24
-}
-fn default_stale_branch_days() -> u64 {
-    30
-}
-
 /// How far the triage loop is allowed to act (issue #85). The series stages
 /// the automation of triage from read-only up: `off` (the opt-in default) →
 /// `report` (v0, this issue) → `advise` (v1 #87) → `auto` (v2 #88). v0 only
@@ -581,71 +491,6 @@ pub enum TriageMode {
 pub enum TriageAction {
     Ready,
     Plan,
-}
-
-/// Settings for the triage loop (read-only recommendation sweeps, issue #85).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriageConfig {
-    /// How far triage may act. Default `off`: triage is fully opt-in (cleaner
-    /// runs always, but triage automates a decision, so it stays quiet until
-    /// asked). v0 sweeps only when this is `report`.
-    #[serde(default)]
-    pub mode: TriageMode,
-    /// Minimum hours between sweeps; a moved head or a new issue alone does not
-    /// trigger one before the interval elapses.
-    #[serde(default = "default_triage_interval_hours")]
-    pub interval_hours: u64,
-    /// False-positive silencer: recommendations whose rendered row contains any
-    /// of these substrings are dropped from the report at render time (same
-    /// idea as `clean.ignore`); in `advise` mode it also suppresses the
-    /// per-issue label/comment for that recommendation.
-    #[serde(default)]
-    pub ignore: Vec<String>,
-    /// `advise` mode only (issue #87): max issues proposed-to (label +
-    /// evidence comment) per sweep. Rate-limits the forge writes a single
-    /// tick can make; issues left over wait for the next sweep (their content
-    /// is unchanged, so they stay candidates).
-    #[serde(default = "default_triage_max_actions_per_tick")]
-    pub max_actions_per_tick: u64,
-    /// `auto` mode only (issue #88): minimum agent-reported confidence for a
-    /// recommendation to be promoted to a real label. Below this, the
-    /// recommendation is left where it is (report/proposal only). Validated to
-    /// `0.0..=1.0` at load (a negative value would promote everything, a value
-    /// above 1.0 would silently promote nothing).
-    #[serde(default = "default_triage_confidence_threshold")]
-    pub confidence_threshold: f64,
-    /// `auto` mode only (issue #88): which recommendation kinds are promoted to
-    /// their real phase label. Default `["ready"]` — the safe staged-rollout
-    /// starting point (ADR 0017 decision 2); add `"plan"` once triage has
-    /// earned trust, since the planner is expensive.
-    #[serde(default = "default_triage_apply")]
-    pub apply: Vec<TriageAction>,
-}
-
-impl Default for TriageConfig {
-    fn default() -> Self {
-        Self {
-            mode: TriageMode::default(),
-            interval_hours: default_triage_interval_hours(),
-            ignore: Vec::new(),
-            max_actions_per_tick: default_triage_max_actions_per_tick(),
-            confidence_threshold: default_triage_confidence_threshold(),
-            apply: default_triage_apply(),
-        }
-    }
-}
-
-fn default_triage_interval_hours() -> u64 {
-    6
-}
-fn default_triage_max_actions_per_tick() -> u64 {
-    3
-}
-fn default_triage_confidence_threshold() -> f64 {
-    0.7
-}
-fn default_triage_apply() -> Vec<TriageAction> {
-    vec![TriageAction::Ready]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,48 +814,6 @@ pub struct RoutingConfig {
     pub explore_ratio: f64,
 }
 
-/// Whether the collab advisor layer is active (`[collab] mode`, issue #111).
-/// `Off` (the default when the section is present) is byte-for-byte identical
-/// to no `[collab]` section — an explicit, inert placeholder; `Advisor` turns
-/// the layer on, which pairs with the startup agmsg detection
-/// ([`crate::collab::validate`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CollabMode {
-    #[default]
-    Off,
-    Advisor,
-}
-
-/// `[collab]`: the opt-in advisor layer (issue #111, ADR 0006). Present with
-/// `mode = "advisor"` spawns a plan-author advisor pane alongside each worker
-/// run; absent or `mode = "off"` is the historical behavior. Process-bound
-/// like `mux.kind` / `[daemon]` — pinned at startup, not hot-reloaded — because
-/// its validity is only guaranteed by the startup agmsg check.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollabConfig {
-    #[serde(default)]
-    pub mode: CollabMode,
-    /// The routing role whose profile the advisor borrows (default
-    /// `"planner"` — the model that wrote the spec). No new routing role is
-    /// introduced; see [`crate::collab`].
-    #[serde(default = "default_advisor_role")]
-    pub advisor_role: String,
-}
-
-impl Default for CollabConfig {
-    fn default() -> Self {
-        Self {
-            mode: CollabMode::default(),
-            advisor_role: default_advisor_role(),
-        }
-    }
-}
-
-fn default_advisor_role() -> String {
-    "planner".into()
-}
-
 /// `[escalation]`: signal-driven profile escalation (routing 3/3, issue #66).
 /// "Cheap model first; if it gets stuck, a stronger one." Deliberately a
 /// top-level section, NOT nested under `[routing]`: `[routing]`'s mere presence
@@ -1047,44 +850,6 @@ impl Default for EscalationConfig {
 
 fn default_escalation_enabled() -> bool {
     true
-}
-
-/// `[drift]`: outcome-based routing drift thresholds (routing 2/3, issue #65).
-/// The scheduler compares the most recent `window` runs of each
-/// `(role, profile)` against the preceding `window` and flags a regression
-/// when the success rate drops by `success_rate_drop_pt` points OR the mean
-/// turn count rises by `turns_increase_pct` percent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftConfig {
-    /// Success-rate drop (in percentage points, 0–100) that trips a warning.
-    #[serde(default = "default_success_rate_drop_pt")]
-    pub success_rate_drop_pt: f64,
-    /// Mean-turn-count increase (in percent) that trips a warning.
-    #[serde(default = "default_turns_increase_pct")]
-    pub turns_increase_pct: f64,
-    /// Runs per comparison window (recent vs. preceding).
-    #[serde(default = "default_drift_window")]
-    pub window: usize,
-}
-
-impl Default for DriftConfig {
-    fn default() -> Self {
-        Self {
-            success_rate_drop_pt: default_success_rate_drop_pt(),
-            turns_increase_pct: default_turns_increase_pct(),
-            window: default_drift_window(),
-        }
-    }
-}
-
-fn default_success_rate_drop_pt() -> f64 {
-    20.0
-}
-fn default_turns_increase_pct() -> f64 {
-    50.0
-}
-fn default_drift_window() -> usize {
-    20
 }
 
 fn default_agent_command() -> String {
@@ -1226,60 +991,6 @@ impl RestartPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DaemonConfig {
-    #[serde(default = "default_restart_policy")]
-    pub restart_policy: RestartPolicy,
-    /// Minimum seconds between supervisor restarts (launchd `ThrottleInterval`).
-    #[serde(default = "default_throttle_secs")]
-    pub throttle_secs: u64,
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            restart_policy: default_restart_policy(),
-            throttle_secs: default_throttle_secs(),
-        }
-    }
-}
-
-fn default_restart_policy() -> RestartPolicy {
-    RestartPolicy::OnFailure
-}
-fn default_throttle_secs() -> u64 {
-    10
-}
-
-/// Notifications paged to a human (issue #7, generalized in #205). The
-/// `events` allowlist selects which store events reach the webhook; the
-/// default keeps the pre-#205 behavior (page a human on the three
-/// awaiting_human paths). See `src/notify/`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NotificationsConfig {
-    /// macOS notification via `osascript` (no-op on other platforms).
-    #[serde(default = "default_notifications_macos")]
-    pub macos: bool,
-    /// Webhook URL POSTed a per-event payload. `${ENV}` references are expanded
-    /// at load. None disables the webhook.
-    #[serde(default)]
-    pub webhook_url: Option<String>,
-    /// Explicit webhook flavor; None auto-detects from the URL host (Slack /
-    /// ntfy / generic JSON). Only needed for self-hosted Slack-compatible
-    /// endpoints whose URL the auto-detection cannot recognize.
-    #[serde(default)]
-    pub kind: Option<WebhookKind>,
-    /// Which event tokens are delivered (`awaiting_human` / `escalation` /
-    /// `schedule.failed` / `schedule.skipped` / `infra` / `sweep.degraded`).
-    /// Default `["awaiting_human"]` preserves the pre-#205 behavior. Per-project label
-    /// watching is configured separately via `[projects.notify]`, not here.
-    #[serde(default = "default_notifications_events")]
-    pub events: Vec<String>,
-    /// Minimum seconds between notifications for the same dedup key.
-    #[serde(default = "default_notifications_throttle")]
-    pub throttle_secs: u64,
-}
-
 /// Webhook body flavor. Slack wants `{"text": ...}`, ntfy takes a plain body
 /// plus headers, `json` gets the structured payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1288,28 +999,6 @@ pub enum WebhookKind {
     Slack,
     Ntfy,
     Json,
-}
-
-impl Default for NotificationsConfig {
-    fn default() -> Self {
-        Self {
-            macos: default_notifications_macos(),
-            webhook_url: None,
-            kind: None,
-            events: default_notifications_events(),
-            throttle_secs: default_notifications_throttle(),
-        }
-    }
-}
-
-fn default_notifications_macos() -> bool {
-    true
-}
-fn default_notifications_events() -> Vec<String> {
-    vec!["awaiting_human".to_string()]
-}
-fn default_notifications_throttle() -> u64 {
-    60
 }
 
 /// How a project coordinates work: through GitHub labels (the default), or
@@ -1416,79 +1105,6 @@ fn default_worktree_setup_timeout_secs() -> u64 {
     300
 }
 
-/// Which loop a fired schedule targets. `ready` enqueues worker work
-/// (`meguri:ready` / task kind `work`); `plan` enqueues planner work
-/// (`meguri:plan`) and is github-only (local mode has no planner yet, so the
-/// task would never be consumed — rejected by [`Config::validate`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ScheduleKind {
-    #[default]
-    Ready,
-    Plan,
-}
-
-impl ScheduleKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Plan => "plan",
-        }
-    }
-}
-
-/// One `[[projects.schedules]]` entry (issue #146): a cron definition that
-/// periodically enqueues an issue (github mode) or local task (local mode).
-/// Firing only puts one item on the queue — the existing worker/planner loops
-/// consume it (ADR 0009). The last-fired time is *not* here; it lives in
-/// sqlite (`schedule_state`) so a hot-reload edit to the definition never
-/// loses it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleConfig {
-    /// Unique within the project; the sqlite state key and the body marker id.
-    pub name: String,
-    /// Standard 5-field cron expression (minute hour day-of-month month
-    /// day-of-week), interpreted as UTC. Parsed by [`crate::cron`].
-    pub cron: String,
-    /// Worker-bound (`ready`, default) or planner-bound (`plan`, github-only).
-    #[serde(default)]
-    pub kind: ScheduleKind,
-    /// Title template. The only variable is `{{date}}` (the fire date,
-    /// `YYYY-MM-DD` UTC).
-    pub title: String,
-    /// Repo-relative path to a file whose contents become the body. Mutually
-    /// exclusive with `body`; exactly one is required.
-    #[serde(default)]
-    pub body_file: Option<String>,
-    /// Inline body. Mutually exclusive with `body_file`.
-    #[serde(default)]
-    pub body: Option<String>,
-    /// When false (default), skip firing if the schedule's last-created
-    /// issue/task is still open; true fires every occurrence.
-    #[serde(default)]
-    pub allow_overlap: bool,
-}
-
-/// One `[[projects.cadence]]` entry (issue #148): a per-label消化レート上限。
-/// `label`(例: `sns`)を持つ issue を、窓あたり上限件数までしか消化しない。
-/// 期間モードは `max_per_day`(UTC 暦日あたり)**または** `per_hours` + `max`
-/// (ローリング窓)のちょうど一方(`[`Config::validate`] が保証)。消化実績は
-/// forge ではなくローカル run 履歴(`runs.cadence_label`)で数える(ADR 0011)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CadenceRule {
-    /// 対象 issue ラベル(github mode 専用。local タスクにラベル軸は無い)。
-    pub label: String,
-    /// UTC 暦日あたりの上限。`per_hours`/`max` と排他。
-    #[serde(default)]
-    pub max_per_day: Option<u32>,
-    /// ローリング窓の長さ(時間)。`max` と対で使い、`max_per_day` と排他。
-    #[serde(default)]
-    pub per_hours: Option<u32>,
-    /// ローリング窓あたりの上限。`per_hours` と対で使う。
-    #[serde(default)]
-    pub max: Option<u32>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub id: String,
@@ -1536,68 +1152,19 @@ pub struct ProjectConfig {
     /// Per-project PR settings; overrides the global `[pr]` section.
     #[serde(default)]
     pub pr: Option<PrConfig>,
-    /// Per-project cleaner settings; overrides the global `[clean]` section
-    /// (the ignore list in particular is inherently project-specific).
-    #[serde(default)]
-    pub clean: Option<CleanConfig>,
-    /// Per-project triage settings; overrides the global `[triage]` section
-    /// (opt-in per project, and the ignore list is project-specific).
-    #[serde(default)]
-    pub triage: Option<TriageConfig>,
     /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
     #[serde(default)]
     pub worktree_setup: WorktreeSetupConfig,
-    /// Cron schedules that periodically enqueue issues/tasks (issue #146).
-    #[serde(default)]
-    pub schedules: Vec<ScheduleConfig>,
-    /// Per-label消化レート上限(issue #148)。github mode 専用。
-    #[serde(default)]
-    pub cadence: Vec<CadenceRule>,
     /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
     /// Same shape as the top-level `[prompts]`; a per-project entry overrides
     /// the top-level one for the same canonical role key. See
     /// [`Config::preambles_for`] and ADR 0012.
     #[serde(default)]
     pub prompts: HashMap<String, String>,
-    /// Per-project notify watches (`[projects.notify]`, issue #205): issue
-    /// creation carrying one of these labels is pushed to the webhook. Uses the
-    /// global `[notifications]` webhook; the labels are an additive watch on top
-    /// of the global `events` allowlist.
-    #[serde(default)]
-    pub notify: Option<ProjectNotifyConfig>,
-}
-
-/// Per-project notify watch (issue #205). Currently just watched labels: an
-/// issue meguri creates carrying one of these labels is pushed to the webhook.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct ProjectNotifyConfig {
-    #[serde(default)]
-    pub labels: Vec<String>,
 }
 
 fn default_branch() -> String {
     "main".into()
-}
-
-/// Replace every `${NAME}` in `input` with the environment variable `NAME`.
-/// Errors on an unterminated `${` or an unset variable — a webhook that would
-/// silently POST to a literal `${...}` URL is worse than a clear load failure
-/// (issue #205).
-fn expand_env_vars(input: &str) -> Result<String> {
-    let mut out = String::new();
-    let mut rest = input;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after.find('}').context("unterminated ${...} reference")?;
-        let name = &after[..end];
-        let val = std::env::var(name)
-            .with_context(|| format!("env var {name} referenced by ${{{name}}} is not set"))?;
-        out.push_str(&val);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
 }
 
 /// Repo-eligible config declared in the repo root `meguri.toml` (issue #165):
@@ -1694,13 +1261,9 @@ impl RepoConfig {
 /// - `deny_unknown_fields` over the *complete* key set detects a host-only key
 ///   (`repo_slug`, `agent`, …) as a parse error, while still accepting the
 ///   legitimate `check_command` / `language` / `pr`.
-/// - `schedules` is a fully shape-tolerant `Option<toml::Value>`: neither a
-///   malformed `[[schedules]]` entry NOR a wrong-shaped `schedules` field
-///   (`schedules = "x"`, `[schedules]`) fails the envelope parse, so nothing on
-///   the schedule layer can ever blank the completion-contract pin (issue #222
-///   f2). The typed interpretation happens later, in [`typed_schedules`] /
-///   the resolver: a wrong shape is a schedule-layer collection error and a bad
-///   entry drops just itself (issue #222 f1) — the pin survives both.
+/// - `schedules` is accepted shape-tolerantly and **ignored** (the schedule
+///   layer is dormant, docs/adr/STATUS.md): a repo `meguri.toml` still carrying
+///   `[[schedules]]` must not blank the completion-contract pin (issue #222 f2).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoManifest {
@@ -1710,8 +1273,8 @@ pub struct RepoManifest {
     pub check_command: Option<String>,
     #[serde(default)]
     pub pr: Option<RepoPrConfig>,
-    /// The raw `schedules` value, if present, in any shape. Interpreted by
-    /// [`typed_schedules`], never by the pin.
+    /// Accepted and ignored (dormant schedule layer): tolerating any shape
+    /// here keeps a leftover `[[schedules]]` from failing the pin parse.
     #[serde(default)]
     pub schedules: Option<toml::Value>,
 }
@@ -1722,9 +1285,8 @@ impl RepoManifest {
         toml::from_str(raw).context("invalid repo config")
     }
 
-    /// Derive the completion-contract pin (the run-flow keys only). `schedules`
-    /// is dropped here — the run never reads it, and (crucially) its shape can
-    /// never make this fail: the pin is immune to schedule-layer errors.
+    /// Derive the completion-contract pin (the run-flow keys only). A leftover
+    /// `schedules` value is dropped here — the run never reads it.
     pub fn pinned(&self) -> RepoConfig {
         RepoConfig {
             language: self.language.clone(),
@@ -1732,81 +1294,6 @@ impl RepoManifest {
             pr: self.pr.clone(),
         }
     }
-
-    /// Interpret the raw `schedules` value into typed [`ScheduleConfig`]s.
-    /// - `Ok((entries, entry_errors))`: `schedules` is a well-formed array;
-    ///   `entries` parsed and `entry_errors` are the per-entry drops the resolver
-    ///   surfaces individually (a missing `title` etc., issue #222 f1).
-    /// - `Err(_)`: the `schedules` field has the wrong shape (not an array of
-    ///   tables) — a schedule-layer collection error. The pin is unaffected
-    ///   because it does not go through here (issue #222 f2).
-    pub fn typed_schedules(&self) -> Result<(Vec<ScheduleConfig>, Vec<anyhow::Error>)> {
-        let Some(value) = &self.schedules else {
-            return Ok((Vec::new(), Vec::new())); // absent = opt-out
-        };
-        let toml::Value::Array(items) = value else {
-            anyhow::bail!("`schedules` must be an array of tables (`[[schedules]]`)");
-        };
-        let mut ok = Vec::new();
-        let mut errs = Vec::new();
-        for (i, v) in items.iter().enumerate() {
-            match v.clone().try_into() {
-                Ok(s) => ok.push(s),
-                Err(e) => errs.push(anyhow::anyhow!("schedule entry #{i}: {e}")),
-            }
-        }
-        Ok((ok, errs))
-    }
-}
-
-/// Per-schedule validation (issue #222): a bad cron, both/neither of
-/// `body`/`body_file`, an unsafe `body_file` path, or a local-mode `plan`
-/// schedule. Shared by host config load, the repo-schedule resolver, and
-/// `doctor`. Deliberately does NOT check duplicate names — that is a collection
-/// property ([`validate_schedule_set_names`]), kept separate so a caller can
-/// classify the disposition (drop one malformed entry vs. drop the whole set).
-pub fn validate_schedule(mode: ProjectMode, s: &ScheduleConfig) -> Result<()> {
-    if let Err(e) = crate::cron::Cron::parse(&s.cron) {
-        anyhow::bail!("schedule {:?} has invalid cron {:?}: {e}", s.name, s.cron);
-    }
-    match (&s.body, &s.body_file) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "schedule {:?} sets both `body` and `body_file` (mutually exclusive)",
-            s.name
-        ),
-        (None, None) => anyhow::bail!(
-            "schedule {:?} sets neither `body` nor `body_file` (one is required)",
-            s.name
-        ),
-        // `body_file` is read from the default branch at fire time (ADR 0015);
-        // reject `..`/absolute/trailing-slash here so the read can trust the path
-        // is a repo-relative regular file.
-        (None, Some(rel)) => validate_repo_relative(rel)
-            .with_context(|| format!("schedule {:?} body_file", s.name))?,
-        (Some(_), None) => {}
-    }
-    if mode == ProjectMode::Local && s.kind == ScheduleKind::Plan {
-        anyhow::bail!(
-            "schedule {:?} has kind = \"plan\" but mode = \"local\" \
-             (local mode has no planner, so the task would never be consumed)",
-            s.name
-        );
-    }
-    Ok(())
-}
-
-/// Collection-level schedule check (issue #222): no two schedules share a
-/// `name` (the sqlite `schedule_state` key). Separate from [`validate_schedule`]
-/// so callers can drop the whole set on a name clash while dropping only the
-/// individual entries that fail per-schedule validation.
-pub fn validate_schedule_set_names(schedules: &[ScheduleConfig]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for s in schedules {
-        if !seen.insert(s.name.as_str()) {
-            anyhow::bail!("duplicate schedule name {:?}", s.name);
-        }
-    }
-    Ok(())
 }
 
 /// `[[workspaces]]` — a static grouping of related projects (issue #154).
@@ -1848,20 +1335,8 @@ impl Config {
     }
 
     fn parse(raw: &str, path: &Path) -> Result<Self> {
-        let mut cfg: Config =
+        let cfg: Config =
             toml::from_str(raw).with_context(|| format!("invalid config at {}", path.display()))?;
-        // Expand `${ENV}` references in the webhook URL so a Slack/ntfy secret
-        // can live in the environment instead of plaintext in config.toml
-        // (issue #205). Only the webhook URL is expanded — it is the one field
-        // that carries a secret.
-        if let Some(url) = &cfg.notifications.webhook_url
-            && url.contains("${")
-        {
-            cfg.notifications.webhook_url = Some(
-                expand_env_vars(url)
-                    .with_context(|| format!("notifications.webhook_url in {}", path.display()))?,
-            );
-        }
         cfg.validate()
             .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(cfg)
@@ -1923,108 +1398,11 @@ impl Config {
                     p.id
                 );
             }
-            // Host schedules hard-fail at load (issue #222). The collection
-            // check and the per-schedule checks are separate calls so the repo
-            // resolver can classify their dispositions differently; here both
-            // are fatal. `{e:#}` folds the inner reason into one message so the
-            // project id and the specific error stay in `to_string()`.
-            validate_schedule_set_names(&p.schedules)
-                .map_err(|e| anyhow::anyhow!("project {:?}: {e:#}", p.id))?;
-            for s in &p.schedules {
-                validate_schedule(p.mode, s)
-                    .map_err(|e| anyhow::anyhow!("project {:?}: {e:#}", p.id))?;
-            }
-            self.validate_cadence(p)?;
-            self.validate_triage(p)?;
-        }
-        // A threshold of 0 would escalate on the very first failure, i.e.
-        // exactly the per-tick spam the edge-triggered design (issue #251)
-        // exists to avoid — reject it rather than silently degrade the
-        // feature to "notify on every failure".
-        if self.scheduler.sweep_degraded_threshold == 0 {
-            anyhow::bail!("scheduler.sweep_degraded_threshold must be >= 1");
         }
         // Workspace invariants are global, not per-project — validate once here
         // (issue #222 f4: this used to hang off `validate_schedules`, which the
         // schedule-validator split removed).
         self.validate_workspaces()?;
-        // Reject unknown notify event tokens so a typo fails fast at load
-        // instead of silently never delivering (issue #205). Global config, so
-        // it runs regardless of whether any project is defined.
-        for e in &self.notifications.events {
-            if !crate::notify::NOTIFY_EVENT_TOKENS.contains(&e.as_str()) {
-                anyhow::bail!(
-                    "notifications.events has unknown token {e:?} (valid: {:?})",
-                    crate::notify::NOTIFY_EVENT_TOKENS
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Reject a triage config whose `auto`-mode safety gate is nonsensical: a
-    /// `confidence_threshold` outside `0.0..=1.0` (issue #88). A negative value
-    /// would clear every recommendation (runaway promotion); a value above 1.0
-    /// would promote nothing while looking configured (a silent halt). Both are
-    /// misconfigurations, so fail fast rather than act on them.
-    fn validate_triage(&self, p: &ProjectConfig) -> Result<()> {
-        let t = self.triage_for(p);
-        if !(0.0..=1.0).contains(&t.confidence_threshold) {
-            anyhow::bail!(
-                "project {:?} has triage.confidence_threshold = {} (must be within 0.0..=1.0)",
-                p.id,
-                t.confidence_threshold
-            );
-        }
-        Ok(())
-    }
-
-    /// Reject cadence rules that would never enforce cleanly: an empty or
-    /// duplicate `label`, or a period mode that is neither exactly `max_per_day`
-    /// nor exactly (`per_hours` + `max`), or a non-positive limit. github-only
-    /// is not rejected here (a local project simply carries unused rules — the
-    /// local task source has no labels to match), matching how the local
-    /// planner is left dormant rather than errored.
-    fn validate_cadence(&self, p: &ProjectConfig) -> Result<()> {
-        let mut seen = std::collections::HashSet::new();
-        for c in &p.cadence {
-            if c.label.trim().is_empty() {
-                anyhow::bail!("project {:?} has a cadence rule with an empty label", p.id);
-            }
-            if !seen.insert(c.label.as_str()) {
-                anyhow::bail!(
-                    "project {:?} has duplicate cadence label {:?}",
-                    p.id,
-                    c.label
-                );
-            }
-            match (c.max_per_day, c.per_hours, c.max) {
-                (Some(n), None, None) => {
-                    if n == 0 {
-                        anyhow::bail!(
-                            "project {:?} cadence label {:?} has max_per_day = 0 (must be > 0)",
-                            p.id,
-                            c.label
-                        );
-                    }
-                }
-                (None, Some(h), Some(m)) => {
-                    if h == 0 || m == 0 {
-                        anyhow::bail!(
-                            "project {:?} cadence label {:?} has per_hours/max = 0 (both must be > 0)",
-                            p.id,
-                            c.label
-                        );
-                    }
-                }
-                _ => anyhow::bail!(
-                    "project {:?} cadence label {:?} must set exactly one of `max_per_day` \
-                     or (`per_hours` + `max`)",
-                    p.id,
-                    c.label
-                ),
-            }
-        }
         self.validate_prompts()?;
         Ok(())
     }
@@ -2149,16 +1527,6 @@ impl Config {
     /// explicit `repo_path` (the host's own clone — meguri never clones over it).
     pub fn is_managed_clone(&self, project: &ProjectConfig) -> bool {
         project.repo_path.is_none()
-    }
-
-    /// Effective cleaner settings for a project (project override wins).
-    pub fn clean_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a CleanConfig {
-        project.clean.as_ref().unwrap_or(&self.clean)
-    }
-
-    /// Effective triage settings for a project (project override wins).
-    pub fn triage_for<'a>(&'a self, project: &'a ProjectConfig) -> &'a TriageConfig {
-        project.triage.as_ref().unwrap_or(&self.triage)
     }
 
     /// The preamble paths to inject for a role, in injection order: the shared
@@ -2544,26 +1912,6 @@ impl ConfigReloader {
             next.mux.kind = self.current.mux.kind.clone();
             next.mux.session = self.current.mux.session.clone();
         }
-        if next.daemon != self.current.daemon {
-            tracing::warn!(
-                "[daemon] settings apply at start/install time — \
-                 restart (or `meguri daemon install`) to apply them"
-            );
-            next.daemon = self.current.daemon.clone();
-        }
-        // `[collab]` is process-bound (issue #111): `mode = "advisor"` is only
-        // ever validated against the agmsg CLI at startup (`collab::validate`),
-        // and `ConfigReloader::poll` deliberately does not re-run that startup
-        // validation. Pinning it here keeps a mid-flight edit from letting an
-        // un-validated `[collab]` take effect — which would turn a would-be
-        // loud startup error into a silent best-effort spawn failure.
-        if next.collab != self.current.collab {
-            tracing::warn!(
-                "[collab] is fixed for the daemon's lifetime — \
-                 restart `meguri watch` to apply it"
-            );
-            next.collab = self.current.collab.clone();
-        }
 
         match apply(&self.current, &next) {
             Ok(applied) => {
@@ -2681,22 +2029,9 @@ mod tests {
         assert_eq!(back.mux.keep_pane, "until-issue-closed");
         assert_eq!(back.limits.idle_grace_secs, 90);
         assert_eq!(back.scheduler.max_concurrent_runs, 2);
-        assert_eq!(back.daemon.restart_policy, RestartPolicy::OnFailure);
-        assert_eq!(back.daemon.throttle_secs, 10);
         assert!(back.pr.draft);
-        assert!(back.notifications.macos);
-        assert_eq!(back.notifications.webhook_url, None);
-        assert_eq!(back.notifications.throttle_secs, 60);
-        assert_eq!(
-            back.notifications.events,
-            vec!["awaiting_human".to_string()]
-        );
-        assert_eq!(back.notifications.kind, None);
         assert!(back.review.enabled);
         assert_eq!(back.review.max_rounds, 3);
-        assert_eq!(back.triage.mode, TriageMode::Off);
-        assert_eq!(back.triage.interval_hours, 6);
-        assert_eq!(back.triage.max_actions_per_tick, 3);
     }
 
     #[test]
@@ -2753,38 +2088,6 @@ lenses = ["security"]
     }
 
     #[test]
-    fn unknown_notify_event_token_is_rejected_at_load() {
-        let raw = r#"
-[notifications]
-events = ["escalation", "bogus"]
-"#;
-        let err = Config::parse(raw, Path::new("test.toml")).unwrap_err();
-        assert!(format!("{err:#}").contains("bogus"), "{err:#}");
-    }
-
-    #[test]
-    fn webhook_url_env_reference_is_expanded_at_load() {
-        // PATH is reliably set; reuse it rather than mutating the environment
-        // (set_var is unsafe on edition 2024).
-        let path = std::env::var("PATH").unwrap();
-        let raw = "[notifications]\nwebhook_url = \"https://h/${PATH}\"\n";
-        let cfg = Config::parse(raw, Path::new("test.toml")).unwrap();
-        assert_eq!(
-            cfg.notifications.webhook_url.as_deref(),
-            Some(format!("https://h/{path}").as_str())
-        );
-    }
-
-    #[test]
-    fn expand_env_vars_passthrough_and_missing() {
-        assert_eq!(
-            expand_env_vars("https://example.com/hook").unwrap(),
-            "https://example.com/hook"
-        );
-        assert!(expand_env_vars("${MEGURI_DEFINITELY_UNSET_VAR_205}").is_err());
-    }
-
-    #[test]
     fn review_section_accepts_deprecated_impl_keys() {
         // The ADR-0004 key names still load (serde aliases) so existing
         // configs keep working after the ADR-0006 rename.
@@ -2799,22 +2102,6 @@ impl_max_rounds = 5
     }
 
     #[test]
-    fn reconcile_defaults_are_on_and_overridable() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.reconcile.body_edits);
-        assert!(cfg.reconcile.signal_comment);
-
-        let raw = r#"
-[reconcile]
-body_edits = false
-signal_comment = false
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(!cfg.reconcile.body_edits);
-        assert!(!cfg.reconcile.signal_comment);
-    }
-
-    #[test]
     fn unknown_keep_pane_is_rejected_at_load() {
         let path = Path::new("test.toml");
         for value in ["until-issue-closed", "never"] {
@@ -2825,45 +2112,6 @@ signal_comment = false
         // now it fails loudly instead of no-opping.
         let err = Config::parse("[mux]\nkeep_pane = \"on-failure\"\n", path).unwrap_err();
         assert!(format!("{err:#}").contains("keep_pane"), "{err:#}");
-    }
-
-    #[test]
-    fn notifications_defaults_apply_without_section() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.notifications.macos);
-        assert_eq!(cfg.notifications.webhook_url, None);
-        assert_eq!(cfg.notifications.throttle_secs, 60);
-    }
-
-    #[test]
-    fn notifications_section_overrides_defaults() {
-        let raw = r#"
-[notifications]
-macos = false
-webhook_url = "https://example.com/hook"
-throttle_secs = 10
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(!cfg.notifications.macos);
-        assert_eq!(
-            cfg.notifications.webhook_url.as_deref(),
-            Some("https://example.com/hook")
-        );
-        assert_eq!(cfg.notifications.throttle_secs, 10);
-    }
-
-    #[test]
-    fn daemon_config_parses_kebab_case_policy() {
-        let cfg: Config =
-            toml::from_str("[daemon]\nrestart_policy = \"on-failure\"\nthrottle_secs = 30\n")
-                .unwrap();
-        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::OnFailure);
-        assert_eq!(cfg.daemon.throttle_secs, 30);
-        let cfg: Config = toml::from_str("[daemon]\nrestart_policy = \"always\"\n").unwrap();
-        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::Always);
-        assert_eq!(cfg.daemon.throttle_secs, 10);
-        let cfg: Config = toml::from_str("[daemon]\nrestart_policy = \"never\"\n").unwrap();
-        assert_eq!(cfg.daemon.restart_policy, RestartPolicy::Never);
     }
 
     #[test]
@@ -3253,72 +2501,6 @@ language = "English"
     }
 
     #[test]
-    fn reloader_pins_process_bound_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        write_config(&path, "");
-        let mut r = ConfigReloader::load(&path).unwrap();
-
-        write_config(
-            &path,
-            "language = \"B\"\n[mux]\nsession = \"other\"\nkind = \"tmux\"\n[daemon]\nthrottle_secs = 99",
-        );
-        let got = r.poll(|_, next| Ok(next.clone())).unwrap();
-        // The reloadable change went through…
-        assert_eq!(got.language.as_deref(), Some("B"));
-        // …but process-bound settings keep their startup values.
-        assert_eq!(got.mux.session, "meguri");
-        assert_eq!(got.mux.kind, "auto");
-        assert_eq!(got.daemon.throttle_secs, 10);
-        assert_eq!(r.current().mux.session, "meguri");
-    }
-
-    #[test]
-    fn collab_defaults_to_none() {
-        // Absent section = feature off (issue #111).
-        let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.collab.is_none());
-    }
-
-    #[test]
-    fn parses_collab_section() {
-        let cfg: Config =
-            toml::from_str("[collab]\nmode = \"advisor\"\nadvisor_role = \"planner\"\n").unwrap();
-        let collab = cfg.collab.unwrap();
-        assert_eq!(collab.mode, CollabMode::Advisor);
-        assert_eq!(collab.advisor_role, "planner");
-
-        // A bare `[collab]` defaults to inert Off + planner.
-        let cfg: Config = toml::from_str("[collab]\n").unwrap();
-        let collab = cfg.collab.unwrap();
-        assert_eq!(collab.mode, CollabMode::Off);
-        assert_eq!(collab.advisor_role, "planner");
-    }
-
-    #[test]
-    fn reloader_pins_collab() {
-        // `[collab]` is process-bound (issue #111): a mid-flight edit that
-        // turns the advisor on must NOT take effect, because it would bypass
-        // the startup agmsg validation that only runs at `meguri watch` entry.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        write_config(&path, "");
-        let mut r = ConfigReloader::load(&path).unwrap();
-        assert!(r.current().collab.is_none());
-
-        write_config(&path, "language = \"B\"\n[collab]\nmode = \"advisor\"");
-        let got = r.poll(|_, next| Ok(next.clone())).unwrap();
-        // The reloadable change went through…
-        assert_eq!(got.language.as_deref(), Some("B"));
-        // …but `[collab]` kept its startup value (absent = off).
-        assert!(
-            got.collab.is_none(),
-            "collab is pinned to the startup value"
-        );
-        assert!(r.current().collab.is_none());
-    }
-
-    #[test]
     fn reloader_keeps_current_and_retries_when_apply_fails() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3338,105 +2520,6 @@ language = "English"
     }
 
     #[test]
-    fn clean_defaults_apply_without_section() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.clean.interval_hours, 24);
-        assert_eq!(cfg.clean.stale_branch_days, 30);
-        assert!(cfg.clean.ignore.is_empty());
-    }
-
-    #[test]
-    fn triage_defaults_apply_without_section() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.triage.mode, TriageMode::Off);
-        assert_eq!(cfg.triage.interval_hours, 6);
-        assert!(cfg.triage.ignore.is_empty());
-        assert_eq!(cfg.triage.max_actions_per_tick, 3);
-    }
-
-    #[test]
-    fn triage_mode_parses_all_stages() {
-        for (raw, mode) in [
-            ("off", TriageMode::Off),
-            ("report", TriageMode::Report),
-            ("advise", TriageMode::Advise),
-            ("auto", TriageMode::Auto),
-        ] {
-            let cfg: Config = toml::from_str(&format!("[triage]\nmode = \"{raw}\"\n")).unwrap();
-            assert_eq!(cfg.triage.mode, mode, "mode: {raw}");
-        }
-    }
-
-    #[test]
-    fn triage_project_override_wins() {
-        let raw = r##"
-[triage]
-mode = "report"
-interval_hours = 6
-
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[[projects]]
-id = "quiet"
-repo_path = "/tmp/quiet"
-repo_slug = "me/quiet"
-
-[projects.triage]
-mode = "off"
-ignore = ["#42"]
-"##;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let demo = cfg.project("demo").unwrap();
-        assert_eq!(cfg.triage_for(demo).mode, TriageMode::Report);
-        assert_eq!(cfg.triage_for(demo).interval_hours, 6);
-        assert_eq!(cfg.triage_for(demo).max_actions_per_tick, 3);
-
-        let quiet = cfg.project("quiet").unwrap();
-        assert_eq!(cfg.triage_for(quiet).mode, TriageMode::Off);
-        // The override replaces the whole section; omitted keys fall back to
-        // the built-in defaults, not the global section.
-        assert_eq!(cfg.triage_for(quiet).interval_hours, 6);
-        assert_eq!(cfg.triage_for(quiet).ignore, vec!["#42"]);
-        assert_eq!(cfg.triage_for(quiet).max_actions_per_tick, 3);
-    }
-
-    #[test]
-    fn clean_project_override_wins() {
-        let raw = r#"
-[clean]
-interval_hours = 12
-
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[[projects]]
-id = "quiet"
-repo_path = "/tmp/quiet"
-repo_slug = "me/quiet"
-
-[projects.clean]
-interval_hours = 48
-ignore = ["docs/legacy"]
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let demo = cfg.project("demo").unwrap();
-        assert_eq!(cfg.clean_for(demo).interval_hours, 12);
-        assert_eq!(cfg.clean_for(demo).stale_branch_days, 30);
-
-        let quiet = cfg.project("quiet").unwrap();
-        assert_eq!(cfg.clean_for(quiet).interval_hours, 48);
-        // The override replaces the whole section; omitted keys fall back to
-        // the built-in defaults, not the global section.
-        assert_eq!(cfg.clean_for(quiet).stale_branch_days, 30);
-        assert_eq!(cfg.clean_for(quiet).ignore, vec!["docs/legacy"]);
-    }
-
-    #[test]
     fn agents_and_routing_default_to_none() {
         // Back-compat: an empty config (and any config without the new
         // sections) leaves both `agents` and `routing` absent — the legacy
@@ -3444,34 +2527,6 @@ ignore = ["docs/legacy"]
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.agents.is_none());
         assert!(cfg.routing.is_none());
-    }
-
-    #[test]
-    fn drift_defaults_and_does_not_activate_routing() {
-        // Defaults hold with no `[drift]` section.
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.drift.success_rate_drop_pt, 20.0);
-        assert_eq!(cfg.drift.turns_increase_pct, 50.0);
-        assert_eq!(cfg.drift.window, 20);
-
-        // A `[drift]` section tunes the thresholds but is top-level: it must
-        // NOT imply `[routing]` (which would silently switch role routing on).
-        let cfg: Config = toml::from_str(
-            r#"
-[drift]
-success_rate_drop_pt = 10.0
-turns_increase_pct = 25.0
-window = 50
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.drift.success_rate_drop_pt, 10.0);
-        assert_eq!(cfg.drift.turns_increase_pct, 25.0);
-        assert_eq!(cfg.drift.window, 50);
-        assert!(
-            cfg.routing.is_none(),
-            "[drift] must stay legacy for routing"
-        );
     }
 
     #[test]
@@ -3731,216 +2786,6 @@ timeout_secs = 60
         assert_eq!(ws.timeout_secs, 60);
     }
 
-    #[test]
-    fn schedules_parse_as_array_of_project_tables() {
-        let raw = r#"
-[[projects]]
-id = "demo"
-repo_path = "/tmp/demo"
-repo_slug = "me/demo"
-
-[[projects.schedules]]
-name = "daily-tidy"
-cron = "0 9 * * *"
-title = "Daily tidy {{date}}"
-body = "do the thing"
-
-[[projects.schedules]]
-name = "weekly-plan"
-cron = "0 9 * * 1"
-kind = "plan"
-title = "Weekly plan"
-body_file = "ops/plan.md"
-allow_overlap = true
-"#;
-        let cfg: Config = toml::from_str(raw).unwrap();
-        cfg.validate().unwrap();
-        let schedules = &cfg.project("demo").unwrap().schedules;
-        assert_eq!(schedules.len(), 2);
-        assert_eq!(schedules[0].name, "daily-tidy");
-        assert_eq!(schedules[0].kind, ScheduleKind::Ready); // default
-        assert_eq!(schedules[0].body.as_deref(), Some("do the thing"));
-        assert_eq!(schedules[1].kind, ScheduleKind::Plan);
-        assert_eq!(schedules[1].body_file.as_deref(), Some("ops/plan.md"));
-        assert!(schedules[1].allow_overlap);
-    }
-
-    #[test]
-    fn triage_confidence_threshold_out_of_range_is_rejected() {
-        for bad in ["-0.1", "1.5"] {
-            let raw = format!(
-                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                 [triage]\nconfidence_threshold = {bad}\n"
-            );
-            let cfg: Config = toml::from_str(&raw).unwrap();
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("confidence_threshold"), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn triage_confidence_threshold_in_range_and_default_ok() {
-        // Boundaries 0.0 and 1.0 are valid, and the default (no [triage]) is too.
-        for good in ["0.0", "0.7", "1.0"] {
-            let raw = format!(
-                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                 [triage]\nconfidence_threshold = {good}\n"
-            );
-            let cfg: Config = toml::from_str(&raw).unwrap();
-            assert!(cfg.validate().is_ok(), "{good}");
-        }
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.triage.confidence_threshold, 0.7);
-        assert_eq!(cfg.triage.apply, vec![TriageAction::Ready]);
-    }
-
-    #[test]
-    fn triage_apply_rejects_unknown_recommendation_kind() {
-        // needs-human/hold/skip are not promotable, so they are not valid
-        // `apply` values — a typo fails fast at parse time.
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [triage]\napply = [\"ready\", \"needs-human\"]\n";
-        assert!(toml::from_str::<Config>(raw).is_err());
-    }
-
-    #[test]
-    fn schedule_with_invalid_cron_is_rejected() {
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.schedules]]\nname = \"s\"\ncron = \"* * *\"\n\
-                   title = \"t\"\nbody = \"b\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("cron"), "{err}");
-    }
-
-    #[test]
-    fn schedule_with_duplicate_name_is_rejected() {
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
-                   [[projects.schedules]]\nname = \"dup\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate schedule name"), "{err}");
-    }
-
-    #[test]
-    fn schedule_with_both_body_and_body_file_is_rejected() {
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
-                   body = \"b\"\nbody_file = \"f.md\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("mutually exclusive"), "{err}");
-    }
-
-    #[test]
-    fn schedule_body_file_must_be_repo_relative() {
-        // body_file is read from the default branch (ADR 0015); `..`/absolute/
-        // trailing-slash are rejected at load like preamble paths.
-        for bad in ["../escape.md", "/etc/passwd", "ops/"] {
-            let raw = format!(
-                "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                 [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n\
-                 body_file = \"{bad}\"\n"
-            );
-            let cfg: Config = toml::from_str(&raw).unwrap();
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("body_file"), "path {bad:?}: {err}");
-        }
-    }
-
-    #[test]
-    fn schedule_with_neither_body_nor_body_file_is_rejected() {
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("neither"), "{err}");
-    }
-
-    #[test]
-    fn local_mode_plan_schedule_is_rejected() {
-        // local mode has no planner; a plan schedule would enqueue a task that
-        // never gets consumed (spec §doctor / ADR 0009).
-        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
-                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\n\
-                   kind = \"plan\"\ntitle = \"t\"\nbody = \"b\"\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("no planner"), "{err}");
-    }
-
-    #[test]
-    fn local_mode_ready_schedule_is_accepted() {
-        let raw = "[[projects]]\nid = \"l\"\nrepo_path = \"/tmp/l\"\nmode = \"local\"\n\
-                   [[projects.schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
-        let cfg = Config::parse(raw, Path::new("cfg")).unwrap();
-        assert_eq!(cfg.project("l").unwrap().schedules.len(), 1);
-    }
-
-    #[test]
-    fn cadence_rules_parse_both_period_modes() {
-        let raw = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
-                   [[projects.cadence]]\nlabel = \"nl\"\nper_hours = 168\nmax = 2\n";
-        let cfg: Config = toml::from_str(raw).unwrap();
-        cfg.validate().unwrap();
-        let cadence = &cfg.project("d").unwrap().cadence;
-        assert_eq!(cadence.len(), 2);
-        assert_eq!(cadence[0].label, "sns");
-        assert_eq!(cadence[0].max_per_day, Some(1));
-        assert_eq!(cadence[1].per_hours, Some(168));
-        assert_eq!(cadence[1].max, Some(2));
-    }
-
-    #[test]
-    fn cadence_rejects_empty_or_duplicate_label() {
-        let empty = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                     [[projects.cadence]]\nlabel = \"\"\nmax_per_day = 1\n";
-        let err = toml::from_str::<Config>(empty)
-            .unwrap()
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("empty label"), "{err}");
-
-        let dup = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\n\
-                   [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 2\n";
-        let err = toml::from_str::<Config>(dup)
-            .unwrap()
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("duplicate cadence label"), "{err}");
-    }
-
-    #[test]
-    fn cadence_rejects_ambiguous_or_zero_period() {
-        // Both modes set.
-        let both = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 1\nper_hours = 24\nmax = 1\n";
-        // Rolling mode missing its `max`.
-        let missing = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                       [[projects.cadence]]\nlabel = \"sns\"\nper_hours = 24\n";
-        // Neither mode.
-        let none = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                    [[projects.cadence]]\nlabel = \"sns\"\n";
-        // Zero value.
-        let zero = "[[projects]]\nid = \"d\"\nrepo_path = \"/tmp/d\"\nrepo_slug = \"me/d\"\n\
-                    [[projects.cadence]]\nlabel = \"sns\"\nmax_per_day = 0\n";
-        for raw in [both, missing, none, zero] {
-            let err = toml::from_str::<Config>(raw)
-                .unwrap()
-                .validate()
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("cadence label"), "{err}");
-        }
-    }
-
     /// Minimal valid config carrying the given projects plus the extra lines.
     fn config_with_projects(ids: &[&str], extra: &str) -> String {
         let mut raw = String::new();
@@ -4179,99 +3024,6 @@ allow_overlap = true
             .expect("present");
         assert_eq!(repo.check_command.as_deref(), Some("cargo test"));
         assert_eq!(repo.language.as_deref(), Some("日本語"));
-    }
-
-    #[test]
-    fn manifest_detects_host_only_key_even_with_schedules() {
-        // issue #222 f2: the envelope knows the full repo-eligible surface, so a
-        // host-only key is rejected while legitimate keys + schedules are fine.
-        let raw = "check_command = \"x\"\nrepo_slug = \"me/x\"\n\
-                   [[schedules]]\nname = \"s\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n";
-        assert!(RepoManifest::parse_str(raw).is_err());
-    }
-
-    #[test]
-    fn manifest_typed_schedules_drops_only_the_bad_entry() {
-        // A valid entry and a malformed one (missing title): the good one types,
-        // the bad one is reported — the resolver drops just it (issue #222 D6/f1).
-        let raw = "[[schedules]]\nname = \"ok\"\ncron = \"0 9 * * *\"\ntitle = \"t\"\nbody = \"b\"\n\
-                   [[schedules]]\nname = \"bad\"\ncron = \"0 9 * * *\"\n";
-        let manifest = RepoManifest::parse_str(raw).unwrap();
-        let (ok, errs) = manifest.typed_schedules().expect("array shape is fine");
-        assert_eq!(ok.len(), 1);
-        assert_eq!(ok[0].name, "ok");
-        assert_eq!(errs.len(), 1);
-    }
-
-    #[test]
-    fn wrong_shaped_schedules_field_does_not_blank_the_pin() {
-        // issue #222 f2: a `schedules` field of the wrong shape (a string, or a
-        // single `[schedules]` table instead of `[[schedules]]`) is a
-        // schedule-layer error, NOT a pin error — `check_command` survives, and
-        // `typed_schedules` reports the shape problem for the resolver to drop.
-        for bad in [
-            "check_command = \"cargo test\"\nschedules = \"not-an-array\"\n",
-            "check_command = \"cargo test\"\n[schedules]\nname = \"x\"\n",
-        ] {
-            let manifest = RepoManifest::parse_str(bad).expect("pin parse must not fail");
-            assert_eq!(
-                manifest.pinned().check_command.as_deref(),
-                Some("cargo test"),
-                "the completion contract survives a schedule-shape error"
-            );
-            // And the shape error is reported (collection-level), not a panic.
-            assert!(manifest.typed_schedules().is_err(), "{bad}");
-            // The pin path used by the run flow also succeeds.
-            assert_eq!(
-                RepoConfig::parse_str(bad).unwrap().check_command.as_deref(),
-                Some("cargo test")
-            );
-        }
-    }
-
-    #[test]
-    fn pin_type_stays_schedule_free_for_checkpoint_compat() {
-        // issue #222 f1: the pinned `RepoConfig` (serialized into `Checkpoint`)
-        // must NOT gain a `schedules` field, so an older binary can still decode
-        // a newer checkpoint. Its JSON carries only the pin keys.
-        let repo = RepoConfig {
-            check_command: Some("cargo test".into()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&repo).unwrap();
-        assert!(!json.contains("schedules"), "{json}");
-        // And it round-trips through its own (deny_unknown_fields) decoder.
-        let back: RepoConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.check_command.as_deref(), Some("cargo test"));
-    }
-
-    #[test]
-    fn validate_schedule_and_set_names_are_independent() {
-        // issue #222 f5: the two validators are separate so a caller can classify
-        // a collection error (dup name) apart from a per-schedule error.
-        let good = ScheduleConfig {
-            name: "a".into(),
-            cron: "0 9 * * *".into(),
-            kind: ScheduleKind::Ready,
-            title: "t".into(),
-            body_file: None,
-            body: Some("b".into()),
-            allow_overlap: false,
-        };
-        let bad_cron = ScheduleConfig {
-            cron: "nope".into(),
-            ..good.clone()
-        };
-        assert!(validate_schedule(ProjectMode::Github, &good).is_ok());
-        assert!(validate_schedule(ProjectMode::Github, &bad_cron).is_err());
-        // Dup name is a collection error, invisible to per-schedule validation.
-        let dup = vec![good.clone(), good.clone()];
-        assert!(
-            dup.iter()
-                .all(|s| validate_schedule(ProjectMode::Github, s).is_ok())
-        );
-        assert!(validate_schedule_set_names(&dup).is_err());
-        assert!(validate_schedule_set_names(&[good]).is_ok());
     }
 
     #[test]

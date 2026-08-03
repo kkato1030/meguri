@@ -102,22 +102,6 @@ pub(crate) async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest) {
         "spec_fixer.budget_exhausted",
         json!({ "pr": pr.number, "budget": MAX_SPEC_FIX_RUNS }),
     );
-    // Page a human at the round limit (ADR 0009 / issue #153). Run-less: no turn
-    // is running at discovery time, so this points at the PR (not a pane) and
-    // carries no interaction_state (the `needs-human` label above is the
-    // dashboard marker). The synthetic run_id keys the notifier's throttle so a
-    // re-fire before a human clears the label does not re-page. Best-effort like
-    // the rest of this escalation — a delivery failure never blocks the sweep.
-    deps.notifier
-        .notify(&crate::notify::Notification::awaiting_human(
-            format!("spec-fixer-budget-{}", pr.number),
-            issue,
-            Some(pr.title.clone()),
-            flow::REASON_REVIEW_PARKED,
-            None,
-            Some(pr.url.clone()),
-        ))
-        .await;
 }
 
 struct SpecFixerFlavor;
@@ -393,16 +377,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),
@@ -500,9 +479,7 @@ mod tests {
             pr_reviewer::PR_REVIEW_STATUS,
             CommitStatusState::Failure,
         );
-        let mut deps = fake_deps(forge.clone());
-        let (notifier, gw) = crate::notify::fake::recording_notifier();
-        deps.notifier = notifier;
+        let deps = fake_deps(forge.clone());
 
         // Record MAX succeeded spec-fixer runs for the canonical issue #7.
         for _ in 0..MAX_SPEC_FIX_RUNS {
@@ -555,25 +532,6 @@ mod tests {
                 .count_events("spec_fixer.budget_exhausted")
                 .unwrap(),
             1
-        );
-        // …and a human is paged at the round limit (ADR 0009 / issue #153),
-        // pointing at the PR (not a pane — no turn runs at discovery time).
-        let delivered = gw.delivered();
-        assert_eq!(delivered.len(), 1, "the round-limit park pages once");
-        assert_eq!(delivered[0].event, "awaiting_human");
-        assert_eq!(
-            delivered[0].dedup_key, "spec-fixer-budget-42",
-            "keyed by the PR so a re-fire before a human clears it does not re-page"
-        );
-        assert!(
-            delivered[0].title.contains("#7"),
-            "keyed by the canonical issue"
-        );
-        assert!(delivered[0].url.is_some(), "the page points at the PR");
-        assert!(
-            delivered[0].body.contains("spec レビュー"),
-            "reason surfaces in the body: {}",
-            delivered[0].body
         );
     }
 

@@ -6,16 +6,6 @@
 test-threads = 16
 
 [[profile.ci.overrides]]
-# cleaner_test は各テストがハードコードされた 60秒のタイムアウト
-# (run_to_outcome)でくくられている。テスト自体は1ターンで終わる軽い処理だが、
-# 16並列 / 4 vCPU という意図的な過剰並列のもとでは、たまたま他の重いテスト
-# (tmux 実プロセスを使うものなど)にスケジューリングを圧迫されただけで
-# 60秒を超えることがある(実際に CI で1件だけ発生: 60.338s で timeout)。
-# ロジックのバグではなく環境要因のフレークなので、リトライで吸収する。
-filter = 'binary(cleaner_test)'
-retries = 2
-
-[[profile.ci.overrides]]
 # routing_test の escalation_climbs_a_multi_step_chain_without_skipping は
 # 3段エスカレーション連鎖 × never-passing check で全 rung を消化する、
 # スイート最重量のシナリオ。run_worker がハードコードされた 90秒のタイムアウト

@@ -742,26 +742,8 @@ async fn spec_worker_already_shipped(deps: &Deps, pr: &PullRequest) -> Result<bo
     let Some(issue) = crate::gitops::issue_from_branch(&pr.head_branch) else {
         return Ok(true); // human-made head: not a takeover target
     };
-    if deps.config.reconcile.body_edits {
-        let digest = crate::tasks::body_digest(&deps.forge().get_issue(issue).await?.body);
-        if deps
-            .store
-            .issue_processed_current_body(&deps.project.id, kind, issue, &digest)?
-        {
-            return Ok(true);
-        }
-        if deps
-            .store
-            .issue_has_succeeded_run(&deps.project.id, kind, issue)?
-        {
-            deps.store
-                .signal_body_changed_event(&deps.project.id, kind, issue, &digest)?;
-        }
-        Ok(false)
-    } else {
-        deps.store
-            .issue_has_succeeded_run(&deps.project.id, kind, issue)
-    }
+    deps.store
+        .issue_has_succeeded_run(&deps.project.id, kind, issue)
 }
 
 /// Watch-poll sweep: observe every open PR once (informer cache), then drive
@@ -833,14 +815,6 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
         tracing::warn!("finalize failed for {}: {e:#}", deps.project.id);
     }
 
-    // Issue Kind per-resync signal act (ADR 0012 §決定4 / finding 3): body-edit
-    // re-attention on `implementing` issues, folded out of the scheduler tick's
-    // standalone sweep. It never launches an agent nor enqueues — a signal only
-    // — so it sits outside the single-arm ownership partition (like
-    // `reclaim_stale_claims`), and runs exactly once per resync.
-    if let Err(e) = super::reconcile_body_edits::sweep(deps).await {
-        tracing::warn!("body-edit reconcile failed for {}: {e:#}", deps.project.id);
-    }
     // Issue-side reconcile (ADR 0012 §決定1): one bulk observe of every open
     // issue, the pure `next_step_issue` per identity, then enqueue the chosen
     // planner/worker arm or run the `Op(Handoff)` act (決定5 — the old
@@ -1535,16 +1509,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             Store::open_in_memory().unwrap(),
@@ -1629,16 +1598,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         let deps = Deps::with_label_source(
             Store::open_in_memory().unwrap(),
@@ -1723,16 +1687,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         let deps = Deps::with_label_source(
             Store::open_in_memory().unwrap(),
@@ -2617,9 +2576,8 @@ pub async fn reconcile_issues(
     open_pr_issues: &std::collections::HashSet<i64>,
 ) -> Result<()> {
     let issues = deps.forge().list_open_issues().await?;
-    let mut remaining: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for issue in issues {
-        if let Err(e) = process_issue_identity(deps, &issue, open_pr_issues, &mut remaining).await {
+        if let Err(e) = process_issue_identity(deps, &issue, open_pr_issues).await {
             tracing::warn!("issue reconcile failed for #{}: {e:#}", issue.number);
         }
     }
@@ -2631,21 +2589,18 @@ async fn process_issue_identity(
     deps: &Deps,
     issue: &forge::Issue,
     open_pr_issues: &std::collections::HashSet<i64>,
-    remaining: &mut std::collections::HashMap<String, i64>,
 ) -> Result<()> {
-    let (snap, cadence_label) =
-        build_issue_snapshot(deps, issue, open_pr_issues, remaining).await?;
+    let snap = build_issue_snapshot(deps, issue, open_pr_issues).await?;
     match next_step_issue(&snap, Mode::Reconcile) {
         IssueStep::Agent(arm) => {
             // The issue-wide reservation was read into `issue_busy`; the
             // per-loop unique run index is the atomic backstop — a create
             // failure is a benign race, retried next resync.
-            if let Ok(run) = deps.store.create_run_for_loop_cadence(
+            if let Ok(run) = deps.store.create_run_for_loop(
                 &deps.project.id,
                 arm.loop_kind(),
                 issue.number,
                 &issue.title,
-                cadence_label.as_deref(),
             ) {
                 deps.store.emit(
                     Some(&run.id),
@@ -2673,15 +2628,13 @@ async fn process_issue_identity(
     Ok(())
 }
 
-/// Reduce one open issue to the pure [`IssueSnapshot`] plus the cadence stamp
-/// its enqueue would carry. Shared by the reconcile pass and the operator
-/// surface (`meguri why` / manual `run`, ADR 0016).
+/// Reduce one open issue to the pure [`IssueSnapshot`]. Shared by the
+/// reconcile pass and the operator surface (manual `run`, ADR 0016).
 pub async fn build_issue_snapshot(
     deps: &Deps,
     issue: &forge::Issue,
     open_pr_issues: &std::collections::HashSet<i64>,
-    remaining: &mut std::collections::HashMap<String, i64>,
-) -> Result<(IssueSnapshot, Option<String>)> {
+) -> Result<IssueSnapshot> {
     let has = |l: &str| issue.has_label(l);
     let mut snap = IssueSnapshot {
         human_stop: has(forge::LABEL_HOLD) || has(forge::LABEL_NEEDS_HUMAN),
@@ -2699,43 +2652,25 @@ pub async fn build_issue_snapshot(
         has_implementing: has(forge::LABEL_IMPLEMENTING),
         spec_pr_state: None,
         already_shipped: false,
-        not_before_wait: false,
         deps_unmet: false,
-        cadence_full: false,
     };
-    // The discovery gates cost API calls (dependencies) and reserve cadence,
-    // so they are only evaluated when the decider would otherwise reach a
-    // new-work arm — the same laziness the old per-label discover had.
+    // The discovery gates cost API calls (dependencies), so they are only
+    // evaluated when the decider would otherwise reach a new-work arm — the
+    // same laziness the old per-label discover had.
     let reaches_new_work = !snap.human_stop
         && !snap.has_open_meguri_pr
         && !snap.issue_busy
         && (snap.has_plan || snap.has_ready);
-    let mut cadence_label: Option<String> = None;
     if reaches_new_work {
         let loop_kind = if snap.has_plan {
             super::planner::KIND
         } else {
             super::worker::KIND
         };
-        match deps
-            .task_source
-            .evaluate_issue(loop_kind, issue, remaining)
-            .await?
-        {
-            crate::tasks::GateVerdict::Pass { cadence_label: c } => cadence_label = c,
+        match deps.task_source.evaluate_issue(loop_kind, issue).await? {
+            crate::tasks::GateVerdict::Pass => {}
             crate::tasks::GateVerdict::Shipped => snap.already_shipped = true,
-            crate::tasks::GateVerdict::Hold(d) => match d {
-                crate::cadence::Disposition::WaitingNotBefore { .. }
-                | crate::cadence::Disposition::UnparsableNotBefore { .. } => {
-                    snap.not_before_wait = true;
-                }
-                crate::cadence::Disposition::Blocked => snap.deps_unmet = true,
-                crate::cadence::Disposition::WaitingCadence { .. }
-                | crate::cadence::Disposition::ConflictingCadenceLabels { .. } => {
-                    snap.cadence_full = true;
-                }
-                crate::cadence::Disposition::Ready => {}
-            },
+            crate::tasks::GateVerdict::Blocked => snap.deps_unmet = true,
         }
     }
     // A `speccing` issue with no open PR needs its spec PR's terminal state
@@ -2752,7 +2687,7 @@ pub async fn build_issue_snapshot(
     {
         snap.spec_pr_state = observe_spec_pr_state(deps, issue.number).await?;
     }
-    Ok((snap, cadence_label))
+    Ok(snap)
 }
 
 /// The terminal state of a `speccing` issue's recorded spec PR (決定5 / f3):
@@ -2797,9 +2732,7 @@ async fn reconcile_local(deps: &Deps) -> Result<()> {
             human_stop: false,
             issue_busy: false,
             already_shipped: false,
-            not_before_wait: false,
             deps_unmet: false,
-            cadence_full: false,
         };
         if let LocalStep::Agent(LocalArm::Worker) = next_step_local(&snap, Mode::Reconcile)
             && let Ok(run) = deps.store.create_run_for_task(
@@ -2916,15 +2849,10 @@ pub struct IssueSnapshot {
     pub spec_pr_state: Option<SpecPrState>,
     /// Discovery gates for the chosen planner/worker arm (現 `LabelTaskSource`
     /// と同じ判定関数の結果を畳んだ純入力):
-    /// already shipped (body digest unchanged since a succeeded run).
+    /// already shipped (a succeeded run covers this issue).
     pub already_shipped: bool,
-    /// not-before is still in the future (fail-closed: honored even under
-    /// `ManualRun`, per ADR 0011 / finding 2).
-    pub not_before_wait: bool,
     /// A `blocked_by` dependency is still open.
     pub deps_unmet: bool,
-    /// The cadence window is exhausted (`limit - consumed <= 0`).
-    pub cadence_full: bool,
 }
 
 /// The pure decision (ADR 0012 §3, 決定1). Precedence: the ownership /
@@ -2969,23 +2897,15 @@ pub fn next_step_issue(s: &IssueSnapshot, mode: Mode) -> IssueStep {
     IssueStep::Skip("no actionable phase label")
 }
 
-/// Apply the discovery gates to a chosen planner/worker arm. not-before and
-/// dependency gates hold under both modes (fail-closed); `already_shipped` and
-/// the cadence window are the discovery throttles a manual run bypasses.
+/// Apply the discovery gates to a chosen planner/worker arm. The dependency
+/// gate holds under both modes (fail-closed); `already_shipped` is the
+/// discovery throttle a manual run bypasses.
 fn gated_new_work(arm: IssueArm, s: &IssueSnapshot, mode: Mode) -> IssueStep {
-    if s.not_before_wait {
-        return IssueStep::Wait("not-before (fail-closed)");
-    }
     if s.deps_unmet {
         return IssueStep::Wait("blocked by an open dependency");
     }
-    if mode == Mode::Reconcile {
-        if s.already_shipped {
-            return IssueStep::Skip("already shipped, body unchanged");
-        }
-        if s.cadence_full {
-            return IssueStep::Wait("cadence window full");
-        }
+    if mode == Mode::Reconcile && s.already_shipped {
+        return IssueStep::Skip("already shipped");
     }
     IssueStep::Agent(arm)
 }
@@ -3011,9 +2931,7 @@ pub struct LocalSnapshot {
     pub human_stop: bool,
     pub issue_busy: bool,
     pub already_shipped: bool,
-    pub not_before_wait: bool,
     pub deps_unmet: bool,
-    pub cadence_full: bool,
 }
 
 /// The pure decision for a local task (決定1, third decider). Same gate ladder
@@ -3025,19 +2943,11 @@ pub fn next_step_local(s: &LocalSnapshot, mode: Mode) -> LocalStep {
     if s.issue_busy {
         return LocalStep::Skip("a live run owns the task");
     }
-    if s.not_before_wait {
-        return LocalStep::Wait("not-before (fail-closed)");
-    }
     if s.deps_unmet {
         return LocalStep::Wait("blocked by an open dependency");
     }
-    if mode == Mode::Reconcile {
-        if s.already_shipped {
-            return LocalStep::Skip("already shipped, body unchanged");
-        }
-        if s.cadence_full {
-            return LocalStep::Wait("cadence window full");
-        }
+    if mode == Mode::Reconcile && s.already_shipped {
+        return LocalStep::Skip("already shipped");
     }
     LocalStep::Agent(LocalArm::Worker)
 }
@@ -3059,9 +2969,7 @@ mod issue_side_tests {
             has_implementing: false,
             spec_pr_state: None,
             already_shipped: false,
-            not_before_wait: false,
             deps_unmet: false,
-            cadence_full: false,
         }
     }
 
@@ -3156,23 +3064,14 @@ mod issue_side_tests {
 
     #[test]
     fn discovery_gates_hold_under_reconcile_and_manual_bypasses_throttles() {
-        // finding 3: blocked / not-before / cadence-full / already-shipped do not
-        // enqueue under Reconcile.
+        // Blocked / already-shipped do not enqueue under Reconcile.
         let shipped = IssueSnapshot {
             already_shipped: true,
             ..ready_snapshot()
         };
         assert_eq!(
             next_step_issue(&shipped, Mode::Reconcile),
-            IssueStep::Skip("already shipped, body unchanged")
-        );
-        let full = IssueSnapshot {
-            cadence_full: true,
-            ..ready_snapshot()
-        };
-        assert_eq!(
-            next_step_issue(&full, Mode::Reconcile),
-            IssueStep::Wait("cadence window full")
+            IssueStep::Skip("already shipped")
         );
         let blocked = IssueSnapshot {
             deps_unmet: true,
@@ -3182,25 +3081,12 @@ mod issue_side_tests {
             next_step_issue(&blocked, Mode::Reconcile),
             IssueStep::Wait("blocked by an open dependency")
         );
-        // finding 2: ManualRun bypasses already_shipped + cadence window …
+        // ManualRun bypasses already_shipped …
         assert_eq!(
             next_step_issue(&shipped, Mode::ManualRun),
             IssueStep::Agent(IssueArm::Worker)
         );
-        assert_eq!(
-            next_step_issue(&full, Mode::ManualRun),
-            IssueStep::Agent(IssueArm::Worker)
-        );
-        // … but not-before stays fail-closed even under ManualRun, and a human
-        // stop / dependency block still hold.
-        let nb = IssueSnapshot {
-            not_before_wait: true,
-            ..ready_snapshot()
-        };
-        assert_eq!(
-            next_step_issue(&nb, Mode::ManualRun),
-            IssueStep::Wait("not-before (fail-closed)")
-        );
+        // … but a dependency block still holds (fail-closed).
         assert_eq!(
             next_step_issue(&blocked, Mode::ManualRun),
             IssueStep::Wait("blocked by an open dependency")
@@ -3213,9 +3099,7 @@ mod issue_side_tests {
             human_stop: false,
             issue_busy: false,
             already_shipped: false,
-            not_before_wait: false,
             deps_unmet: false,
-            cadence_full: false,
         };
         assert_eq!(
             next_step_local(&base, Mode::Reconcile),
@@ -3265,33 +3149,25 @@ mod issue_side_tests {
                                         Some(SpecPrState::ClosedUnmerged),
                                     ] {
                                         for &shipped in &[true, false] {
-                                            for &nb in &[true, false] {
-                                                for &deps in &[true, false] {
-                                                    for &cadence in &[true, false] {
-                                                        for mode in
-                                                            [Mode::Reconcile, Mode::ManualRun]
-                                                        {
-                                                            let s = IssueSnapshot {
-                                                                human_stop,
-                                                                has_open_meguri_pr: has_open_pr,
-                                                                issue_busy: busy,
-                                                                has_plan: plan,
-                                                                has_ready: ready,
-                                                                has_speccing: speccing,
-                                                                has_implementing: implementing,
-                                                                spec_pr_state: spec_pr,
-                                                                already_shipped: shipped,
-                                                                not_before_wait: nb,
-                                                                deps_unmet: deps,
-                                                                cadence_full: cadence,
-                                                            };
-                                                            assert_eq!(
-                                                                next_step_issue(&s, mode),
-                                                                expected(&s, mode),
-                                                                "{s:?} {mode:?}"
-                                                            );
-                                                        }
-                                                    }
+                                            for &deps in &[true, false] {
+                                                for mode in [Mode::Reconcile, Mode::ManualRun] {
+                                                    let s = IssueSnapshot {
+                                                        human_stop,
+                                                        has_open_meguri_pr: has_open_pr,
+                                                        issue_busy: busy,
+                                                        has_plan: plan,
+                                                        has_ready: ready,
+                                                        has_speccing: speccing,
+                                                        has_implementing: implementing,
+                                                        spec_pr_state: spec_pr,
+                                                        already_shipped: shipped,
+                                                        deps_unmet: deps,
+                                                    };
+                                                    assert_eq!(
+                                                        next_step_issue(&s, mode),
+                                                        expected(&s, mode),
+                                                        "{s:?} {mode:?}"
+                                                    );
                                                 }
                                             }
                                         }
@@ -3318,14 +3194,10 @@ mod issue_side_tests {
             return IssueStep::Skip("a live run owns the issue");
         }
         let gated = |arm: IssueArm| {
-            if s.not_before_wait {
-                IssueStep::Wait("not-before (fail-closed)")
-            } else if s.deps_unmet {
+            if s.deps_unmet {
                 IssueStep::Wait("blocked by an open dependency")
             } else if mode == Mode::Reconcile && s.already_shipped {
-                IssueStep::Skip("already shipped, body unchanged")
-            } else if mode == Mode::Reconcile && s.cadence_full {
-                IssueStep::Wait("cadence window full")
+                IssueStep::Skip("already shipped")
             } else {
                 IssueStep::Agent(arm)
             }

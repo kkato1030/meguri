@@ -1073,16 +1073,11 @@ mod tests {
                 worktree_root: None,
                 language: None,
                 pr: None,
-                clean: None,
-                triage: None,
                 plan_delivery: Default::default(),
                 review: None,
                 worktree_setup: Default::default(),
-                schedules: Vec::new(),
                 autonomy: None,
-                cadence: Vec::new(),
                 prompts: Default::default(),
-                notify: None,
             };
             let deps = Deps::with_label_source(
                 crate::store::Store::open_in_memory().unwrap(),
@@ -1144,16 +1139,11 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         Deps::with_label_source(
             crate::store::Store::open_in_memory().unwrap(),
@@ -1365,19 +1355,14 @@ mod tests {
             check_command: None,
             worktree_root: Some(worktree_root.path().to_path_buf()),
             pr: None,
-            clean: None,
-            triage: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: crate::config::WorktreeSetupConfig {
                 commands: vec!["echo ran > marker.txt".into()],
                 ..Default::default()
             },
-            schedules: Vec::new(),
             autonomy: None,
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
         };
         let deps = Deps::with_label_source(
             store,

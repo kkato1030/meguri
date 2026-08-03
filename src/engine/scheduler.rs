@@ -17,29 +17,12 @@ use crate::store::{RunRecord, RunStatus, Store};
 /// The slot budget is spent by *weight*, not run count (issue #111, #214). Two
 /// phases spawn extra concurrent agents:
 ///
-/// - a collab advisor is a real agent on the subscription quota, so a run that
-///   actually spawns one weighs 2 (during execute); every other run weighs 1.
-///   This must use the same `run_gets_advisor` predicate flow's `ensure_advisor`
-///   does — a run that gets no advisor (e.g. a local task) must not book it.
 /// - parallel round-1 self-review (ADR 0023) fans out N reviewer agents at once
-///   (during self-review), so the run must reserve N slots then.
-///
-/// The two phases do not overlap in time (advisor runs during execute, reviewers
-/// during self-review), so the weight is the **max**, not the sum — the peak
-/// concurrent agent count. An empty `[[review.reviewers]]` leaves the weight at
-/// the historical advisor value (byte-for-byte).
+///   (during self-review), so the run must reserve N slots then; every other
+///   run weighs 1.
 fn run_weight(deps: &Deps, run: &RunRecord) -> usize {
-    let advisor_weight = if crate::collab::run_gets_advisor(&deps.config, run) {
-        2
-    } else {
-        1
-    };
-    let review_weight = crate::engine::self_review::parallel_reviewer_count(
-        &deps.config,
-        &deps.project,
-        &run.loop_kind,
-    );
-    advisor_weight.max(review_weight)
+    crate::engine::self_review::parallel_reviewer_count(&deps.config, &deps.project, &run.loop_kind)
+        .max(1)
 }
 
 fn active_weight(active: &HashMap<String, usize>) -> usize {
@@ -80,13 +63,6 @@ impl Scheduler {
         // run_id → slot weight (issue #111): most runs weigh 1, a collab-advisor
         // run weighs 2. The budget is the sum, not the count.
         let mut active_run_ids: HashMap<String, usize> = HashMap::new();
-        // Per-project memory for edge-triggered schedule diagnostics (issue
-        // #222 f6): lives across ticks so a persisting condition emits once.
-        let mut schedule_diag: super::schedule::DiagMemory = HashMap::new();
-        // Consecutive-failure streaks for the sweeps below (issue #251): a
-        // streak past the configured threshold escalates once to
-        // `sweep.degraded` + a notification instead of staying a silent WARN.
-        let mut sweep_health = super::sweep_health::SweepHealth::new();
 
         loop {
             // Pick up config edits before this tick's discovery, so a change
@@ -139,12 +115,6 @@ impl Scheduler {
                 tracing::warn!("redispatch failed: {e:#}");
             }
 
-            // Ride the poll: fire due cron schedules (issue #146). An
-            // out-of-band enqueue like the sweeps below — it creates an
-            // issue/task that the loops above discover next tick. `now` is
-            // sampled once so every project's schedules see the same instant.
-            let now = super::schedule::epoch_now();
-
             // Ride the poll: reclaim panes and worktrees whose issue closed
             // (the issue is the unit of lifetime — one author pane plus one
             // review pane per issue, kept until it closes; #13, #92).
@@ -155,48 +125,13 @@ impl Scheduler {
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
-                // Every sweep below routes its outcome through `sweep_health`
-                // (issue #251, design doc P6.5) instead of a bare
-                // `tracing::warn!`: each failure is still logged and now also
-                // an event, and a streak that survives past the configured
-                // threshold escalates once to `sweep.degraded` + a
-                // notification — the silent-failure gap #227's GraphQL bug
-                // fell through (a sweep failing every poll for hours with no
-                // trace beyond the log).
-                sweep_health
-                    .record(
-                        deps,
-                        "schedule",
-                        super::schedule::sweep(deps, now, &mut schedule_diag).await,
-                    )
-                    .await;
-                // Ride the poll: the merge tail (ADR 0012 slice 1, #221). One
-                // informer-cache observe drives arm (ADR 0003) / orchestrator
-                // merge (ADR 0009) / the BEHIND fix (Op(UpdateBranch)) / the
-                // Stuck backstop in a single level-triggered pass — folding the
-                // former auto_merger + merge_watch sweeps. A light API sweep,
-                // no run record, no pane.
                 // The Issue Kind reconcile pass (ADR 0012 S4): the merge tail
-                // plus every folded act/arm — body-edit re-attention,
-                // separate-delivery handoff, decompose materialize,
-                // Op(Finalize), and the issue-/local-side deciders' enqueue —
-                // one level-triggered pass per project.
-                sweep_health
-                    .record(
-                        deps,
-                        "issue-reconcile",
-                        super::issue_reconciler::sweep(deps).await,
-                    )
-                    .await;
-                // Repo Kind per-resync pass (ADR 0012 §決定3): routing-drift
-                // recompute + the cleaner/triage scan arms.
-                sweep_health
-                    .record(
-                        deps,
-                        "repo-reconcile",
-                        super::repo_reconciler::reconcile_repo(deps).await,
-                    )
-                    .await;
+                // plus every folded act/arm — Op(Finalize) and the
+                // issue-/local-side deciders' enqueue — one level-triggered
+                // pass per project.
+                if let Err(e) = super::issue_reconciler::sweep(deps).await {
+                    tracing::warn!("issue reconcile failed for {}: {e:#}", deps.project.id);
+                }
             }
 
             tokio::select! {
@@ -371,18 +306,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::config::{CollabConfig, CollabMode, Config, ProjectConfig};
+    use crate::config::{Config, ProjectConfig};
     use crate::forge::fake::FakeForge;
     use crate::store::Store;
 
-    fn deps_with_collab(mode: Option<CollabMode>) -> Deps {
-        let mut config = Config::default();
-        if let Some(mode) = mode {
-            config.collab = Some(CollabConfig {
-                mode,
-                advisor_role: "planner".into(),
-            });
-        }
+    fn test_deps() -> Deps {
+        let config = Config::default();
         let project = ProjectConfig {
             id: "proj".into(),
             repo_path: Some("/tmp/unused".into()),
@@ -394,15 +323,10 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            clean: None,
             plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
-            schedules: Vec::new(),
-            cadence: Vec::new(),
             prompts: Default::default(),
-            notify: None,
-            triage: None,
             autonomy: None,
         };
         Deps::with_label_source(
@@ -422,14 +346,6 @@ mod tests {
         deps.store.get_run(&run.id).unwrap().unwrap()
     }
 
-    fn local_run_of_kind(deps: &Deps, loop_kind: &str) -> RunRecord {
-        let run = deps
-            .store
-            .create_run_for_task("proj", loop_kind, 42, "t")
-            .unwrap();
-        deps.store.get_run(&run.id).unwrap().unwrap()
-    }
-
     #[test]
     fn active_weight_sums_weights() {
         let mut m = HashMap::new();
@@ -440,39 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn collab_advisor_run_weighs_two() {
-        // With `[collab] mode = "advisor"`, an advisor-eligible run books two
-        // slots (issue #111): the worker plus its advisor.
-        let deps = deps_with_collab(Some(CollabMode::Advisor));
-        assert_eq!(
-            run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
-            2
-        );
-        assert_eq!(
-            run_weight(&deps, &run_of_kind(&deps, crate::engine::spec_worker::KIND)),
-            2
-        );
-        // A non-advisor loop still weighs 1 even with collab on.
-        assert_eq!(run_weight(&deps, &run_of_kind(&deps, "planner")), 1);
-        // A *local* worker run gets no advisor (no issue lane), so it must not
-        // book the extra slot even with collab on.
-        assert_eq!(
-            run_weight(
-                &deps,
-                &local_run_of_kind(&deps, crate::engine::worker::KIND)
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn parallel_reviewers_book_max_of_advisor_and_reviewer_count() {
+    fn parallel_reviewers_book_reviewer_count() {
         // Issue #214: a run with N parallel round-1 reviewers reserves N slots
-        // (peak concurrent reviewer agents), and the weight is max(advisor, N)
-        // since advisor and review phases don't overlap.
+        // (peak concurrent reviewer agents).
         use crate::config::ReviewerConfig;
-        // Collab off: 3 reviewers → weight 3; empty reviewers → weight 1.
-        let mut deps = deps_with_collab(Some(CollabMode::Off));
+        let mut deps = test_deps();
         deps.config.review.reviewers = vec![
             ReviewerConfig::default(),
             ReviewerConfig::default(),
@@ -484,28 +372,6 @@ mod tests {
         );
         // A non-self-reviewing loop is unaffected (fixer never self-reviews).
         assert_eq!(run_weight(&deps, &run_of_kind(&deps, "fixer")), 1);
-
-        // Advisor on: reuse one worker run (a second create on the same store
-        // would hit the (project, loop, issue) unique index) and vary reviewers.
-        let mut deps = deps_with_collab(Some(CollabMode::Advisor));
-        let worker = run_of_kind(&deps, crate::engine::worker::KIND);
-        // 1 reviewer → max(2, 1) = 2 (advisor dominates).
-        deps.config.review.reviewers = vec![ReviewerConfig::default()];
-        assert_eq!(run_weight(&deps, &worker), 2);
-        // 4 reviewers → max(2, 4) = 4 (reviewers dominate).
-        deps.config.review.reviewers = vec![ReviewerConfig::default(); 4];
-        assert_eq!(run_weight(&deps, &worker), 4);
-    }
-
-    #[test]
-    fn collab_off_every_run_weighs_one() {
-        for mode in [None, Some(CollabMode::Off)] {
-            let deps = deps_with_collab(mode);
-            assert_eq!(
-                run_weight(&deps, &run_of_kind(&deps, crate::engine::worker::KIND)),
-                1
-            );
-        }
     }
 
     fn empty_scheduler(max: usize) -> Scheduler {
@@ -536,16 +402,5 @@ mod tests {
         assert!(s.admits(&active_map(&[("a", 1)]), 1));
         // Full: nothing more admits.
         assert!(!s.admits(&active_map(&[("a", 2)]), 1));
-    }
-
-    #[test]
-    fn admits_lets_a_lone_advisor_run_start_at_max_one() {
-        // Criterion 8: a single collab-advisor run (weight 2) must start even
-        // at max_concurrent = 1 (the idle-scheduler escape) …
-        let s = empty_scheduler(1);
-        assert!(s.admits(&active_map(&[]), 2));
-        // … but nothing starts alongside it.
-        assert!(!s.admits(&active_map(&[("a", 2)]), 1));
-        assert!(!s.admits(&active_map(&[("a", 1)]), 1));
     }
 }
