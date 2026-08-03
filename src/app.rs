@@ -89,10 +89,11 @@ fn pick_project<'a>(cfg: &'a Config, id: Option<&str>) -> Result<&'a ProjectConf
 }
 
 /// `meguri add` — low-friction capture; the behavior follows the project mode.
-/// github → create a GitHub issue immediately (never via the LLM) and refine it
-/// best-effort (ADR 0006). local → queue a task in the sqlite `tasks` table for
-/// the watch (issue #148 / ADR 0003). Both share the "capture now, sort later"
-/// intent; the mode-specific flags are rejected on the wrong mode.
+/// github → create a GitHub issue immediately (never via the LLM; `--ready`
+/// also imports the task row so the queue skips the intake wait). local →
+/// queue a task in the sqlite `tasks` table for the watch (ADR 0003). Both
+/// share the "capture now, sort later" intent; the mode-specific flags are
+/// rejected on the wrong mode.
 pub async fn cmd_add(
     project: Option<&str>,
     text: Option<&str>,
@@ -122,12 +123,9 @@ pub fn github_memo(text: Option<&str>) -> Result<&str> {
         .context("give `meguri add` a one-line memo to capture")
 }
 
-/// Flag ↔ mode compatibility for `meguri add`, factored out of [`cmd_add`] so
-/// it is testable without a config file on disk. Notably, `--plan` needs a
-/// github-mode project: local mode has no planner yet (issue #54 Phase 3) —
-/// `PlannerLoop::discover` returns nothing without a forge — so a local plan
-/// task would sit queued forever. Reject it up front, mirroring the
-/// config-side check that refuses a local-mode `plan` schedule.
+/// Flag ↔ mode compatibility for `meguri add`, factored out of [`cmd_add`]
+/// so it is testable without a config file on disk: `--file` is local-only,
+/// a github capture needs the memo text.
 pub fn check_add_flags(project: &ProjectConfig, ready: bool, has_file: bool) -> Result<()> {
     match project.mode {
         ProjectMode::Github => {
@@ -195,11 +193,9 @@ pub struct AddParams<'a> {
     pub repo_slug: &'a str,
 }
 
-/// The capture→refine→write-back core, split out from [`cmd_add`] so tests can
-/// drive it with a fake forge and a fake refiner. Returns the created issue
-/// number. `create_issue` failing is a real error (no issue exists); every
-/// later failure — including refiner resolution itself, which only runs after
-/// capture — leaves the raw issue in place and reports capture success.
+/// The capture core, split out from [`cmd_add`] so tests can drive it with a
+/// fake forge. Returns the created issue number; `create_issue` failing is a
+/// real error (no issue exists yet).
 pub async fn add_core(forge: &dyn Forge, params: AddParams<'_>) -> Result<i64> {
     // The memo is stored verbatim (ADR 0006 原則2): the raw `params.text`
     // becomes the body, so quoted leading/trailing whitespace and newlines
@@ -280,7 +276,7 @@ pub fn issue_url(repo_slug: &str, number: i64) -> String {
     format!("https://github.com/{repo_slug}/issues/{number}")
 }
 
-/// Pre-refine title from a raw memo: the first non-empty line, trimmed and
+/// Title from a raw memo: the first non-empty line, trimmed and
 /// truncated so a paragraph-long memo doesn't become a monstrous title. The
 /// full memo still lands in the body verbatim, so nothing is lost.
 pub fn initial_title(text: &str) -> String {
@@ -297,15 +293,6 @@ pub fn initial_title(text: &str) -> String {
     } else {
         line.to_string()
     }
-}
-
-/// Refined body followed by the verbatim original memo. This preservation is
-/// the orchestrator's job, never the model's (ADR 0006 原則2): the model's
-/// output is the scaffold, the original memo keeps authoring authority. The
-/// original is embedded byte-for-byte (no trimming) — quoted whitespace and
-/// newlines are part of what the author wrote.
-pub fn compose_refined_body(refined_body: &str, original: &str) -> String {
-    format!("{}\n\n---\n## 原文メモ\n{}", refined_body.trim(), original)
 }
 
 /// The typed identity selector the three operator verbs share (ADR 0016):
@@ -669,10 +656,9 @@ fn require_run(store: &Store, needle: &str) -> Result<RunRecord> {
         .with_context(|| format!("no run matches {needle:?} (try `meguri ps --all`)"))
 }
 
-/// local-mode capture: queue a task in the sqlite `tasks` table for the watch
-/// to pick up (issue #148 / ADR 0003). The project is already resolved and
-/// mode-checked by [`cmd_add`]. Always `TaskKind::Work` — `--plan` is rejected
-/// by [`check_add_flags`] until local mode grows a planner (issue #54).
+/// local-mode capture: queue a task in the sqlite `tasks` table for the
+/// watch to pick up (ADR 0003). The project is already resolved and
+/// mode-checked by [`cmd_add`]. Always `TaskKind::Work`.
 fn add_local(project: &ProjectConfig, title: Option<&str>, file: Option<&str>) -> Result<()> {
     let (title, body) = resolve_task_input(title, file)?;
     let kind = TaskKind::Work;
@@ -1029,13 +1015,11 @@ pub async fn cmd_stop(needle: &str) -> Result<()> {
                 // whatever this run targets (github: the working label; local:
                 // back to queued).
                 let _ = deps.task_source.release(&run.task_key()).await;
-                // A PR-claiming loop (fixer family, spec_worker, pr-reviewer)
-                // tracks its claim in the run's checkpoint, not the
-                // coordination layer above — the live-driver finalize path
-                // (`engine::flow::finalize_cancelled` / pr_reviewer's own)
-                // knows to drop it via each loop's `Flavor`, but this
-                // no-driver path never reaches a `Flavor`. Mirror that
-                // release directly (issue #252).
+                // A PR-side claim marker (ADR 0027) lives in the run's
+                // checkpoint, not the coordination layer above — the
+                // live-driver finalize path drops it via the `Flavor`, but
+                // this no-driver path never reaches one. Mirror that release
+                // directly (issue #252).
                 engine::flow::release_stray_pr_claim(&deps, &run).await;
                 released.is_some()
             }

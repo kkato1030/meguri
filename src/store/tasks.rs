@@ -162,6 +162,32 @@ impl Store {
         })
     }
 
+    /// Every queued task of a project, `not_before` included (the intake's
+    /// retraction sweep must see parked rows too).
+    pub fn queued_tasks_any(&self, project_id: &str) -> Result<Vec<TaskRow>> {
+        self.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT * FROM tasks WHERE project_id = ?1 AND status = 'queued'")?;
+            let tasks = stmt
+                .query_map(params![project_id], task_from_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(tasks)
+        })
+    }
+
+    /// Retract a queued task (the human removed `meguri:ready` before it was
+    /// claimed). Only a queued row cancels — an in-flight claim keeps its run
+    /// (stop it with `meguri stop`).
+    pub fn cancel_task(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET status = 'cancelled' WHERE id = ?1 AND status = 'queued'",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// Hold a queued task (`meguri:hold` on the origin issue, or `meguri
     /// pause` semantics at the queue level). Only a queued task holds; a
     /// claimed/terminal one is left as-is.
@@ -250,7 +276,7 @@ impl Store {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE tasks SET status = 'queued', claimed_by = NULL, lease_until = NULL
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'claimed'",
                 params![id],
             )?;
             Ok(())
@@ -263,7 +289,7 @@ impl Store {
             c.execute(
                 "UPDATE tasks SET status = 'needs_human', reason = ?2, claimed_by = NULL,
                    lease_until = NULL
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status IN ('queued', 'claimed')",
                 params![id, reason],
             )?;
             Ok(())
@@ -275,7 +301,7 @@ impl Store {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE tasks SET status = 'done', claimed_by = NULL, lease_until = NULL
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status IN ('queued', 'claimed', 'needs_human', 'held')",
                 params![id],
             )?;
             Ok(())

@@ -48,20 +48,8 @@ fn label_scheme(label: &str) -> (&'static str, &'static str) {
         LABEL_WORKING => ("FBCA04", "meguri: an agent is working on it"),
         LABEL_NEEDS_HUMAN => ("B60205", "meguri: a human needs to look (see comment)"),
         LABEL_HOLD => ("CFD3D7", "meguri: intentionally paused by a human"),
-        // PR-side spec review labels.
-        // Bookkeeping.
-        LABEL_CLEAN_REPORT => (DEFAULT_LABEL_COLOR, "meguri: cleaner report issue"),
         _ => (DEFAULT_LABEL_COLOR, "managed by meguri"),
     }
-}
-
-/// Extract an `owner/repo` slug from a GitHub API `repository_url`
-/// (`https://api.github.com/repos/owner/repo`). Used to tag each blocker with
-/// its home repo for cross-repo decomposition (issue #134).
-fn slug_from_repository_url(url: &str) -> Option<String> {
-    url.split("/repos/")
-        .nth(1)
-        .map(|s| s.trim_end_matches('/').to_string())
 }
 
 /// Create a GitHub repository from scratch, initial commit included
@@ -185,7 +173,6 @@ impl GhForge {
                 .and_then(Value::as_str)
                 .unwrap_or("open")
                 .to_lowercase(),
-            is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             labels: Self::labels_from_json(v),
         })
     }
@@ -225,7 +212,6 @@ impl GhForge {
                 .and_then(Value::as_str)
                 .unwrap_or("OPEN")
                 .to_lowercase(),
-            is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             labels: v
                 .pointer("/labels/nodes")
                 .and_then(Value::as_array)
@@ -369,20 +355,6 @@ impl Forge for GhForge {
                             .get("state_reason")
                             .and_then(Value::as_str)
                             .map(str::to_lowercase),
-                        // The dependency endpoint returns the whole blocker
-                        // issue object, so its body and home repo come for free
-                        // — no extra get_issue per blocker (issue #134). Missing
-                        // fields degrade to empty (never matches a marker).
-                        body: b
-                            .get("body")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        repo: b
-                            .get("repository_url")
-                            .and_then(Value::as_str)
-                            .and_then(slug_from_repository_url)
-                            .unwrap_or_default(),
                     })
                     .collect()
             })
@@ -444,21 +416,6 @@ impl Forge for GhForge {
         Ok(())
     }
 
-    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
-        self.ensure_label(label).await;
-        self.gh(&[
-            "pr",
-            "edit",
-            &pr.to_string(),
-            "--repo",
-            &self.repo,
-            "--add-label",
-            label,
-        ])
-        .await?;
-        Ok(())
-    }
-
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()> {
         self.gh(&[
             "pr",
@@ -503,7 +460,7 @@ impl Forge for GhForge {
     /// Open PRs the forge's timeline cross-references to `issue` (GitHub's
     /// "Development" linkage: any PR whose body/comment mentions `#issue`,
     /// closing-keyword or not). One page of 100 is generous for this —
-    /// worker/planner call it once right before opening a PR, never in a
+    /// the worker calls it once right before opening a PR, never in a
     /// hot loop, so the bounded-window idioms `observe_open_prs` needs
     /// (incomplete-tracking, pagination) would be overkill here.
     async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>> {
@@ -627,7 +584,7 @@ mod tests {
     // sweep in production on 2026-07-21, #227) only surfaces via this
     // parse-level check — hence every literal query *and mutation* is a
     // module-level const covered here, not just the one #242 fixed (issue
-    // #251, design doc P6.5 item 2; self-review f1 added the two mutations).
+    // #251, design doc P6.5 item 2).
     fn assert_braces_balance(name: &str, query: &str) {
         let mut depth = 0i64;
         for (i, c) in query.chars().enumerate() {

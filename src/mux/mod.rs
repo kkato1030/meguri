@@ -36,14 +36,6 @@ impl AgentState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct MuxCapabilities {
-    /// True when the mux itself detects agent state (herdr manifests).
-    /// When false, callers must treat state as a weak hint and rely on
-    /// out-of-band signals (the result-file contract).
-    pub native_agent_state: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxKind {
     Herdr,
@@ -67,40 +59,6 @@ impl std::fmt::Display for PaneId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// Opaque handle to the container that tiles the live agent panes of a
-/// `meguri top` dashboard (herdr tab id like "wD:t4", tmux session name).
-/// It lives inside a *dedicated* dashboard workspace/session, separate from
-/// the workspace that holds the agent panes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DashboardId(pub String);
-
-impl std::fmt::Display for DashboardId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// A `meguri top` dashboard: a dedicated workspace/session holding a status
-/// pane (which renders the header) and a tiling container for agent panes.
-#[derive(Debug, Clone)]
-pub struct Dashboard {
-    /// Container that agent panes are tiled into (`tile_pane`'s target).
-    pub tile: DashboardId,
-    /// The status pane running the header loop — `Some` only when this call
-    /// created the dashboard, so callers start the loop exactly once.
-    pub status_pane: Option<PaneId>,
-    /// True when this call created the dashboard (vs reused an existing one).
-    /// Callers launch the status-render loop only on a fresh dashboard.
-    pub fresh: bool,
-}
-
-/// Direction to grow a tile when placing a pane into a dashboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Split {
-    Right,
-    Down,
 }
 
 #[derive(Debug, Clone)]
@@ -132,8 +90,6 @@ pub type MuxResult<T> = Result<T, MuxError>;
 #[async_trait]
 pub trait Multiplexer: Send + Sync {
     fn kind(&self) -> MuxKind;
-    fn capabilities(&self) -> MuxCapabilities;
-
     /// Make sure the meguri session/workspace exists.
     async fn ensure_session(&self) -> MuxResult<()>;
 
@@ -196,31 +152,10 @@ pub trait Multiplexer: Send + Sync {
 
     /// Shell command a human runs to attach to this pane.
     fn attach_command(&self, pane: &PaneId) -> String;
-
-    // --- Dashboard layout (`meguri top`, issues #96 / #104) ---------------
     //
     // These only move panes between containers; they never touch the agent
     // process, so meguri keeps driving each pane by its `PaneId` regardless of
     // which workspace/session it lives in.
-
-    /// Ensure the dedicated dashboard workspace/session labeled `label` exists,
-    /// returning its tiling container plus (on a fresh create) the status pane
-    /// to run the header loop in. Idempotent: an existing dashboard is reused
-    /// and reported with `fresh == false` so the loop is not double-started.
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard>;
-
-    /// Run `argv` inside an existing pane (herdr `pane run`, tmux
-    /// `respawn-pane`). Used to launch the status-render loop in a dashboard's
-    /// status pane.
-    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()>;
-
-    /// Move a live agent pane into the dashboard, tiling it in `dir`. The
-    /// pane's process is preserved (herdr `pane move`, tmux `join-pane`), so
-    /// the orchestrator keeps driving it by id.
-    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()>;
-
-    /// Shell command a human runs to attach to the dashboard workspace/session.
-    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String;
 }
 
 /// herdr workspace label for a project. Each project gets its own workspace

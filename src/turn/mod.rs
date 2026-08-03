@@ -1,17 +1,12 @@
 //! The turn engine: drive one agent turn to completion, tolerating (and
-//! expecting) human intervention at any point. Two executors share the same
-//! completion authority — the result file (`.meguri/result.json` with a
-//! matching turn id) — never the screen:
+//! expecting) human intervention at any point. Completion authority is the
+//! result file (`.meguri/result.json` with a matching turn id) — never the
+//! screen.
 //!
-//! - [`TurnEngine::await_completion`] (pane launch mode): the agent lives in
-//!   a mux pane. Mux agent state refines behavior — Blocked pauses timers and
-//!   pings a human; Working defers acceptance briefly; Idle feeds the
-//!   stagnation clock that triggers nudges.
-//! - [`TurnEngine::await_completion_direct`] (direct launch mode, issue
-//!   #169): the agent is a plain non-interactive subprocess for exactly one
-//!   turn. There is no screen to read, no nudging (nothing to type into), no
-//!   Blocked state — the executor only waits for the process to exit, then
-//!   reads the result file.
+//! [`TurnEngine::await_completion`]: the agent lives in a mux pane. Mux agent
+//! state refines behavior — Blocked pauses timers and pings a human; Working
+//! defers acceptance briefly; Idle feeds the stagnation clock that triggers
+//! nudges.
 
 pub mod prompts;
 
@@ -64,10 +59,8 @@ pub enum TurnOutcome {
     Completed(TurnResultFile),
     /// `meguri stop` was requested; caller cleans up.
     Stopped,
-    /// The executor died before completing: a pane died (pane launch mode),
-    /// or a direct subprocess exited without writing a matching result file
-    /// (direct launch mode, issue #169). Both map to the same Interrupted
-    /// handling upstream — callers never need to know which executor ran.
+    /// The pane died before the agent wrote a matching result file; maps to
+    /// Interrupted handling upstream.
     PaneDied,
     /// The agent exhausted its nudges without producing a result (issue
     /// #245): the pane is alive but the session may be unrecoverable

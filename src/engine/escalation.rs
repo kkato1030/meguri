@@ -4,21 +4,16 @@
 //! in a single spot instead of being re-implemented (and occasionally forgotten)
 //! per loop.
 //!
-//! Three destinations, one per coordination surface:
-//! - [`escalate_task`] — issue/local task via the coordination layer
-//!   (`task_source`): github ⇒ needs-human label + comment, local ⇒
-//!   `status=needs_human` + reason. Used by the worker/planner default path.
-//! - [`escalate_issue`] — a github issue directly through the forge, for the
-//!   forge-native loops that hold an issue number but no task handle
-//!   (spec worker, and the guard/conflict fallbacks before a PR is claimed).
-//! - [`escalate_pr`] — a pull request: park it on needs-human, drop the
-//!   `working` claim, and leave a human-facing comment.
+//! The human-facing destination is [`escalate_task`] — issue/local task via
+//! the coordination layer (`task_source`): github ⇒ needs-human label +
+//! comment, local ⇒ `status=needs_human` + reason. Used by the worker's
+//! default `Flavor::escalate`.
 //!
 //! Every helper emits an `escalation.raised` event so "which site called a
 //! human, and how often" is observable — a regression in the aggregation
 //! (a forgotten label) shows up as a missing event.
 //!
-//! A fourth destination, [`escalate_infra`], deliberately does NOT hand the
+//! A second destination, [`escalate_infra`], deliberately does NOT hand the
 //! task to a human. A run that fails because forge/mux itself is unreachable
 //! (a stopped mux, a dropped connection) says nothing about the issue — it is
 //! retryable once the dependency recovers, and must not occupy the
@@ -32,11 +27,10 @@ use super::Deps;
 use super::flow;
 use crate::forge;
 use crate::store::RunRecord;
-use crate::tasks::{self, TaskKey};
+use crate::tasks::TaskKey;
 
-/// Escalate an issue or local task through the coordination layer. The worker
-/// and planner default `Flavor::escalate` funnels here. The closing attach hint
-/// is launch-mode-aware (issue #169), derived from the run's lane.
+/// Escalate a task through the coordination layer: the authority flip in
+/// sqlite plus the best-effort forge projection, ending with an attach hint.
 pub async fn escalate_task(deps: &Deps, run: &RunRecord, reason: &str) {
     let key = run.task_key();
     let hint = flow::attach_hint(deps, run);
@@ -52,28 +46,6 @@ pub async fn escalate_task(deps: &Deps, run: &RunRecord, reason: &str) {
     );
 }
 
-/// Escalate a github issue directly through the forge: needs-human label,
-/// drop `working`, and post the standard needs-human comment. For forge-native
-/// loops that only hold an issue number (replaces the old
-/// `flow::escalate_on_forge`); its callers all default to `pane` launch mode, so
-/// the generic attach hint applies (issue #169, ADR 0012).
-pub async fn escalate_issue(deps: &Deps, issue: i64, reason: &str) {
-    let forge = deps.forge();
-    let _ = forge.add_label(issue, forge::LABEL_NEEDS_HUMAN).await;
-    let _ = forge.remove_label(issue, forge::LABEL_WORKING).await;
-    let _ = forge
-        .comment(
-            issue,
-            &tasks::needs_human_comment(reason, tasks::DEFAULT_ATTACH_HINT),
-        )
-        .await;
-    let _ = deps.store.emit(
-        None,
-        "escalation.raised",
-        json!({ "target": "issue", "issue": issue, "reason": reason }),
-    );
-}
-
 /// Classify a run failure as a forge/mux command fault rather than something
 /// a human must judge (issue #250). Looks for a [`crate::mux::MuxError`] (a
 /// stopped mux, a dead pane, a command it refused) or a
@@ -81,9 +53,9 @@ pub async fn escalate_issue(deps: &Deps, issue: i64, reason: &str) {
 /// started) anywhere in the error chain — both say "a command to a
 /// dependency failed", never "the agent needs a decision".
 ///
-/// Deliberately NOT a bare `std::io::Error` check (issue #250 f1, self-review
-/// finding): `io::Error` also comes from git (`src/gitops.rs`), the
-/// direct-mode agent's own `cmd.spawn()`, and plain prompt/log file writes —
+/// Deliberately NOT a bare `std::io::Error` check (issue #250 f1):
+/// `io::Error` also comes from git (`src/gitops.rs`) and plain prompt/log
+/// file writes —
 /// none of those are forge/mux command faults, and misclassifying them would
 /// silently drop genuine failures from the needs-human queue and retry them
 /// forever instead. Everything else (including forge's own business-logic

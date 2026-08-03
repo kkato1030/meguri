@@ -56,7 +56,7 @@ pub fn worktrees_root() -> PathBuf {
 /// Pre-flight state directory: `~/.meguri/preflight`. Holds the meguri-owned
 /// deny-all `--settings` file the prime runs under and the per-identity "done"
 /// markers (issue #235). Deliberately under [`meguri_home`], NOT inside a
-/// worktree/advisor cwd, so an ephemeral cwd's teardown never wipes the marker
+/// worktree cwd, so an ephemeral cwd's teardown never wipes the marker
 /// and re-triggers a redundant prime.
 pub fn preflight_dir() -> PathBuf {
     meguri_home().join("preflight")
@@ -156,8 +156,8 @@ pub struct Config {
     pub language: Option<String>,
     #[serde(default)]
     pub mux: MuxConfig,
-    /// The `default` profile: the CLI launched when no routing steers a role
-    /// elsewhere. Keeps the historical `[agent]` section shape and semantics.
+    /// The `default` profile: the CLI launched when a project pins no other
+    /// profile. Keeps the historical `[agent]` section shape and semantics.
     #[serde(default)]
     pub agent: AgentProfile,
     /// Named launch profiles (`[agents.profiles.<name>]`), selectable per
@@ -170,47 +170,14 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub pr: PrConfig,
-    /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
-    /// the shared `all` key) → repo-relative path to a file whose contents are
-    /// injected into the turn prompt. Per-project `[projects.prompts]` overrides
-    /// it per canonical key. See [`Config::preambles_for`] and ADR 0012.
+    /// Top-level preamble map (`[prompts]`): key (`worker`, or the shared
+    /// `all`) → repo-relative path to a file whose contents are injected into
+    /// the turn prompt. Per-project `[projects.prompts]` overrides it per key.
+    /// See [`Config::preambles_for`].
     #[serde(default)]
     pub prompts: HashMap<String, String>,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
-}
-
-/// How far the triage loop is allowed to act (issue #85). The series stages
-/// the automation of triage from read-only up: `off` (the opt-in default) →
-/// `report` (v0, this issue) → `advise` (v1 #87) → `auto` (v2 #88). v0 only
-/// acts on `report`; `advise`/`auto` parse for forward-compat but stay idle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TriageMode {
-    /// Triage is disabled — discovery returns nothing (the default).
-    #[default]
-    Off,
-    /// v0: read-only sweep into a single `meguri:triage-report` issue.
-    Report,
-    /// v1 #87: `report`, plus a proposal label (`meguri:triage-*`) and an
-    /// evidence comment on each recommended issue. A human promotes the
-    /// proposal to the real label; meguri never does.
-    Advise,
-    /// v2 #88: apply `meguri:ready`/`meguri:plan` directly (not yet built).
-    Auto,
-}
-
-/// A triage recommendation that `auto` mode (issue #88) may promote to its
-/// real phase label. Only `ready`/`plan` are promotable: they are the two-axis
-/// phase labels worker/planner discovery keys on (ADR 0005). `needs-human`
-/// (a ball label), `hold`, and `skip` are deliberately not accepted — an
-/// unknown value is a parse error, so a misconfigured `apply` fails fast (ADR
-/// 0017 decision 8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TriageAction {
-    Ready,
-    Plan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,33 +260,6 @@ pub struct AgentProfile {
     /// Defaults to Claude Code's `--resume`.
     #[serde(default = "default_agent_resume_args")]
     pub resume_args: Vec<String>,
-    /// Complete argv for a headless one-shot invocation (`meguri add`'s
-    /// refine), placed between `command` and the prompt: `{command}
-    /// {headless_args} <prompt>`. It is NOT combined with `args` — `args`
-    /// carries yolo (`--dangerously-skip-permissions`) and the model flag
-    /// fused together, so appending would leak yolo into a read-only refine
-    /// and replacing would drop the model. A distinct full argv keeps refine
-    /// read-only by construction while preserving the routed model.
-    ///
-    /// This is distinct from `direct_args` (a `direct` launch mode that keeps
-    /// `args`, yolo included, for full runs): refine must stay read-only, so
-    /// it cannot reuse a yolo-carrying arg set.
-    ///
-    /// Resolution (see [`crate::profile::effective_headless_args`]): a
-    /// non-empty value is used as-is; an explicit empty `[]` declares "no
-    /// headless mode" (opt-out, since TOML can't write `None`); absence falls
-    /// back to a known-CLI default (`claude` → `["-p"]`) so a zero-config
-    /// `meguri init` still refines; an unknown `command` with no value means
-    /// headless is unsupported and refine is skipped with a warning.
-    #[serde(default)]
-    pub headless_args: Option<Vec<String>>,
-    /// Extra args that make the launch non-interactive, for `direct` launch
-    /// mode (issue #169): the full command line is `{command} {args}
-    /// {direct_args} [{resume_args} <session-id>] <trigger>`, run as a plain
-    /// subprocess instead of inside a mux pane. Defaults to Claude Code's
-    /// `-p` (headless one-shot).
-    #[serde(default = "default_agent_direct_args")]
-    pub direct_args: Vec<String>,
     /// herdr agent name hint (HERDR_AGENT) when detection needs help.
     #[serde(default)]
     pub herdr_agent_hint: Option<String>,
@@ -363,8 +303,6 @@ impl Default for AgentProfile {
             command: default_agent_command(),
             args: default_agent_args(),
             resume_args: default_agent_resume_args(),
-            headless_args: None,
-            direct_args: default_agent_direct_args(),
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
@@ -377,8 +315,7 @@ fn default_resume_transcript_limit_bytes() -> u64 {
     5 * 1024 * 1024
 }
 
-/// `[agents]`: the named-profile registry. Its own section so `[routing]` can
-/// stay a sibling of `[agents]` rather than nesting under it.
+/// `[agents]`: the named-profile registry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentsConfig {
     /// `[agents.profiles.<name>]`. A user entry named the same as a builtin
@@ -398,10 +335,6 @@ fn default_agent_args() -> Vec<String> {
 
 fn default_agent_resume_args() -> Vec<String> {
     vec!["--resume".into()]
-}
-
-fn default_agent_direct_args() -> Vec<String> {
-    vec!["-p".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,38 +434,6 @@ fn default_poll_interval() -> u64 {
 fn default_max_concurrent() -> u32 {
     2
 }
-/// Restart policy for the OS-supervised watch (maps to launchd `KeepAlive`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RestartPolicy {
-    /// Start at load only; never resurrect.
-    Never,
-    /// Restart only after a non-zero exit (default).
-    OnFailure,
-    /// Restart whenever the process exits.
-    Always,
-}
-
-impl RestartPolicy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Never => "never",
-            Self::OnFailure => "on-failure",
-            Self::Always => "always",
-        }
-    }
-}
-
-/// Webhook body flavor. Slack wants `{"text": ...}`, ntfy takes a plain body
-/// plus headers, `json` gets the structured payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WebhookKind {
-    Slack,
-    Ntfy,
-    Json,
-}
-
 /// How a project coordinates work: through GitHub labels (the default), or
 /// entirely locally against a sqlite `tasks` table. `silent` (issue #54
 /// Phase 2 — read issues but never write labels/comments) is not implemented
@@ -638,7 +539,7 @@ pub struct ProjectConfig {
     pub check_command: Option<String>,
     /// The agent profile this project's runs launch under (a name from
     /// `[agents.profiles]`, a builtin, or the reserved `default`). One level
-    /// of override — role routing is dormant.
+    /// of override.
     #[serde(default)]
     pub profile: Option<String>,
     /// Override for the worktree parent directory (default: ~/.meguri/worktrees).
@@ -650,10 +551,9 @@ pub struct ProjectConfig {
     /// Post-worktree-preparation hook (see [`WorktreeSetupConfig`]).
     #[serde(default)]
     pub worktree_setup: WorktreeSetupConfig,
-    /// Per-project role→preamble overrides (`[projects.prompts]`, issue #149).
-    /// Same shape as the top-level `[prompts]`; a per-project entry overrides
-    /// the top-level one for the same canonical role key. See
-    /// [`Config::preambles_for`] and ADR 0012.
+    /// Per-project preamble overrides (`[projects.prompts]`). Same shape as
+    /// the top-level `[prompts]`; a per-project entry overrides the top-level
+    /// one for the same key. See [`Config::preambles_for`].
     #[serde(default)]
     pub prompts: HashMap<String, String>,
 }
@@ -717,9 +617,8 @@ impl Config {
                 );
             }
         }
-        // Workspace invariants are global, not per-project — validate once here
-        // (issue #222 f4: this used to hang off `validate_schedules`, which the
-        // schedule-validator split removed).
+        // Prompt-map invariants span top-level and per-project maps — validate
+        // them once here.
         self.validate_prompts()?;
         Ok(())
     }
@@ -751,12 +650,10 @@ impl Config {
     }
 
     /// The preamble paths to inject for a role, in injection order: the shared
-    /// `all` entry first, then the role-specific one (issue #149, ADR 0012).
-    /// `role` must be canonical (a `KNOWN_ROLES` value); keys in the maps are
-    /// matched after canonicalization, so a deprecated alias such as
-    /// `spec-reviewer` still resolves for the `pr-reviewer` turn. A per-project
-    /// entry overrides the top-level one for the same key. Returns
-    /// `(key, rel_path)` for whichever of `all`/`role` are configured.
+    /// `all` entry first, then the role-specific one (`worker` is the only
+    /// role key today — see [`KNOWN_PROMPT_KEYS`]). A per-project entry
+    /// overrides the top-level one for the same key. Returns `(key, rel_path)`
+    /// for whichever of `all`/`role` are configured.
     pub fn preambles_for(&self, project: &ProjectConfig, role: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for key in ["all", role] {
@@ -769,22 +666,9 @@ impl Config {
         out
     }
 
-    /// Every preamble path that could be injected for `project`, as
-    /// `(canonical_key, rel_path)`, with per-project entries overriding
-    /// top-level ones by canonical key. Used by `meguri doctor` to check that
-    /// each configured path actually resolves inside the project's clone.
-    pub fn effective_prompts(&self, project: &ProjectConfig) -> Vec<(String, String)> {
-        let mut merged: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for (k, v) in self.prompts.iter().chain(project.prompts.iter()) {
-            merged.insert(canonical_preamble_key(k).to_string(), v.clone());
-        }
-        merged.into_iter().collect()
-    }
-
-    /// Preamble config invariants (issue #149): every key is `all` or a known
-    /// routing role (aliases allowed), no alias+canonical pair collides on the
-    /// same role within one map, and every path is safely repo-relative.
+    /// Preamble config invariants: every key is `all` or a known prompt key
+    /// ([`KNOWN_PROMPT_KEYS`]), no key is set twice within one map, and every
+    /// path is safely repo-relative.
     fn validate_prompts(&self) -> Result<()> {
         check_prompt_map(&self.prompts, "[prompts]")?;
         for p in &self.projects {
@@ -795,8 +679,7 @@ impl Config {
     }
 }
 
-/// Find the preamble path for canonical key `want` in one map, matching each
-/// entry's key by its canonical form (`all` matches literally).
+/// Find the preamble path for key `want` in one map.
 fn preamble_in_map(map: &HashMap<String, String>, want: &str) -> Option<String> {
     map.iter()
         .find(|(k, _)| canonical_preamble_key(k) == want)
@@ -834,11 +717,11 @@ fn check_prompt_map(map: &HashMap<String, String>, label: &str) -> Result<()> {
 }
 
 /// Reject a project `id` that is not a single safe path component. The `id`
-/// becomes a filesystem path element — the managed clone root
-/// (the worktree paths) — so `../x`, `a/b`, a leading
-/// `/`, `.`, `..`, or an empty string must fail loudly at load time rather than
-/// silently placing a clone outside `~/.meguri/repos`. Same "interpret as a
-/// path and reject dangerous components" stance as [`validate_repo_relative`].
+/// becomes a filesystem path element (the worktree paths), so `../x`, `a/b`,
+/// a leading `/`, `.`, `..`, or an empty string must fail loudly at load time
+/// rather than silently placing a worktree outside its root. Same "interpret
+/// as a path and reject dangerous components" stance as
+/// [`validate_repo_relative`].
 pub fn validate_project_id(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("project id must not be empty");
@@ -865,7 +748,7 @@ pub fn validate_project_id(id: &str) -> Result<()> {
 
 /// Reject a configured preamble path that could escape the repo lexically: an
 /// absolute path, or one containing a `..` component. This is the first of two
-/// gates (ADR 0012); the second, [`resolve_preamble_within`], follows symlinks
+/// gates; the second, [`resolve_preamble_within`], follows symlinks
 /// at read time. Preamble contents are embedded into the agent prompt, so a
 /// path outside the tree would leak secrets to the agent.
 pub fn validate_repo_relative(rel: &str) -> Result<()> {
@@ -1534,7 +1417,7 @@ timeout_secs = 60
         assert_eq!(ws.timeout_secs, 60);
     }
 
-    // ---- repo config (issue #165) ----
+    // ---- prompt preambles ----
 
     const A_PROJECT: &str =
         "[[projects]]\nid = \"p\"\nrepo_path = \"/tmp/p\"\nrepo_slug = \"me/p\"\n";

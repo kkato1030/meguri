@@ -20,11 +20,6 @@ use crate::store::{LANE_AUTHOR, PaneRecord};
 
 /// Reclamation reason for a pane whose mapping outlived the pane itself.
 pub const REASON_PANE_DEAD: &str = "pane-dead";
-/// An advisor pane (issue #111) with no active run: the ephemeral advisor
-/// outlives its worker run only by leak, so the sweep reclaims it even while
-/// the issue is open — a different discipline from the author/pr-review lanes
-/// that live until the issue closes.
-pub const REASON_ADVISOR_ORPHAN: &str = "advisor-orphan";
 /// Reclamation reason for a pane whose issue closed on the forge.
 pub const REASON_ISSUE_CLOSED: &str = "issue-closed";
 
@@ -138,8 +133,6 @@ pub async fn plan(deps: &Deps) -> Result<Vec<Candidate>> {
 }
 
 /// [`plan`] sharing an issue-state cache with a pane sweep of the same tick.
-/// `open_pr_issues` are the identities an open meguri PR owns (finding 4b) —
-/// their worktrees are never candidates even when the issue is closed.
 pub async fn plan_with(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Candidate>> {
     gitops::prune_worktrees(&deps.repo_path()).await.ok();
     let root = project_worktree_root(deps);
@@ -199,10 +192,6 @@ async fn classify(
         Some(IssueState::Closed) => {}
         None => return Ok(candidate(Verdict::StateUnknown)),
     }
-    // Closed issue, but an open meguri PR still references it (finding 4b):
-    // the ownership boundary hands the identity — and its local resources —
-    // to the PR side while any open PR exists. Never race a fixer for its
-    // worktree context.
     // Closed, but a live pane in the worktree means an agent (or a human
     // investigating) still stands there. The pane sweep of the same tick
     // runs first, so this only trips when the kill failed (or was skipped);
@@ -418,17 +407,15 @@ pub async fn plan_panes(deps: &Deps, states: &mut IssueStates) -> Result<Vec<Pan
             candidates.push(candidate(Verdict::ActiveRun, ""));
             continue;
         }
-        // The advisor lane is ephemeral (issue #111): once no run is active it
-        // has already outlived its worker run, so reclaim it even on an open
-        // issue — never keep it until the issue closes.
-        if record.lane == crate::store::LANE_ADVISOR {
-            candidates.push(candidate(Verdict::Reclaim, REASON_ADVISOR_ORPHAN));
+        // Local mode has no forge to resolve an issue state (and local panes
+        // carry no issue identity anyway): a live pane with no active run just
+        // stays until its run resumes or `meguri prune --force`.
+        if deps.forge.is_none() {
+            candidates.push(candidate(Verdict::Open, ""));
             continue;
         }
         candidates.push(match states.get(deps, record.issue_number).await {
             Some(IssueState::Open) => candidate(Verdict::Open, ""),
-            // Closed issue owned by an open meguri PR (finding 4b): the PR
-            // side keeps its pane/session alive for the fixer family.
             Some(IssueState::Closed) => candidate(Verdict::Reclaim, REASON_ISSUE_CLOSED),
             None => candidate(Verdict::StateUnknown, ""),
         });
@@ -496,21 +483,11 @@ async fn release_pane_record(
     // pane goes, so an early reclaim or a reopened issue can resume. The
     // turn path already saves it after every completed turn; this is the
     // last-resort net for panes that die mid-turn.
-    //
-    // The advisor lane (issue #111) is the deliberate exception: it is never
-    // adopted or resumed ("捨てて張り直す"), so its row must never carry a
-    // session id. Guarding the save here — the single choke point every
-    // release path funnels through (run-end reap, reaper safety-net sweep,
-    // respawn fold) — keeps that invariant for all of them at once.
     let session_root = agent_session::session_root(&deps.config.agent);
-    let agent_session_id = if lane == crate::store::LANE_ADVISOR {
-        None
-    } else {
-        record
-            .worktree_path
-            .as_deref()
-            .and_then(|wt| agent_session::latest_session_id(&session_root, Path::new(wt)))
-    };
+    let agent_session_id = record
+        .worktree_path
+        .as_deref()
+        .and_then(|wt| agent_session::latest_session_id(&session_root, Path::new(wt)));
     if let Some(session) = &agent_session_id {
         deps.store
             .save_pane_session(&deps.project.id, issue, lane, Some(session))?;
@@ -584,39 +561,7 @@ pub async fn finalize(deps: &Deps) -> Result<()> {
             },
         );
     }
-    clear_parked_reviews_of_closed(deps, &mut states).await;
     Ok(())
-}
-
-/// Drop the parked-review signal (ADR 0009 / issue #153) of any closed issue.
-/// A parked run keeps `interaction_state=AwaitingHuman` until something clears
-/// it, but a clean spec PR can be merged and its issue closed with no next
-/// head — the pane sweep above never touches a run that already released its
-/// pane, so without this the dashboard would keep showing the closed issue.
-/// Reuses the sweep's issue-state cache; only parked runs cost a forge call.
-async fn clear_parked_reviews_of_closed(deps: &Deps, states: &mut IssueStates) {
-    let parked = match deps.store.list_parked_reviews() {
-        Ok(parked) => parked,
-        Err(e) => {
-            tracing::warn!("cannot list parked reviews to clear closed ones: {e:#}");
-            return;
-        }
-    };
-    for run in parked {
-        if run.project_id != deps.project.id {
-            continue;
-        }
-        if let Some(IssueState::Closed) = states.get(deps, run.issue_number).await
-            && let Err(e) = deps
-                .store
-                .clear_parked_reviews_for_issue(&deps.project.id, run.issue_number)
-        {
-            tracing::warn!(
-                "cannot clear parked review of closed issue #{}: {e:#}",
-                run.issue_number
-            );
-        }
-    }
 }
 
 /// Recursive on-disk size of a directory (symlinks not followed).

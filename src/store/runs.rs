@@ -138,9 +138,9 @@ pub struct RunRecord {
     /// (reported via the turn contract or the mux); used to `--resume`
     /// the conversation when the pane dies.
     pub agent_session_id: Option<String>,
-    /// Launch profile pinned at the run's first pane spawn (role-based
-    /// routing, issue #64) — or earlier, at the first `worktree_setup` hook
-    /// run (issue #138), if the project configures one; both go through the
+    /// Launch profile pinned at the run's first pane spawn — or earlier, at
+    /// the first `worktree_setup` hook run (issue #138), if the project
+    /// configures one; both go through the
     /// same pin-aware resolver so whichever runs first is authoritative.
     /// NULL until something resolves it; once set, every later spawn,
     /// resume, or hook run of this run reuses it.
@@ -195,20 +195,6 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         finished_at: row.get("finished_at")?,
         created_at: row.get("created_at")?,
     })
-}
-
-/// One agent turn as recorded in the `turns` table (read path for the UI).
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnRecord {
-    pub id: String,
-    pub run_id: String,
-    pub turn_no: i64,
-    pub purpose: String,
-    pub prompt_path: Option<String>,
-    pub result_json: Option<String>,
-    pub outcome: Option<String>,
-    pub started_at: String,
-    pub finished_at: Option<String>,
 }
 
 impl Store {
@@ -310,27 +296,10 @@ impl Store {
         })
     }
 
-    /// Whether a live author-lane run (queued/running/interrupted) already
-    /// owns the issue — the run-liveness half of the `issue_busy` gate
-    /// (finding 3: a stale `working` label from a crashed run must not
-    /// deadlock recovery).
-    pub fn issue_has_active_author_run(&self, project_id: &str, issue_number: i64) -> Result<bool> {
-        self.with_conn(|c| {
-            let active: bool = c
-                .prepare(
-                    "SELECT 1 FROM runs
-                      WHERE project_id = ?1 AND issue_number = ?2
-                        AND status IN ('queued', 'running', 'interrupted')",
-                )?
-                .exists(params![project_id, issue_number])?;
-            Ok(active)
-        })
-    }
-
     /// Whether the issue has already been shipped by a succeeded run of the
-    /// given loop — used by watch discovery to avoid re-filing (and duplicate
-    /// PRs) after the success de-labeled the issue. Scoped by loop kind so
-    /// e.g. a planner success doesn't block a later worker run on the same
+    /// given loop — used by the intake to avoid re-filing (and duplicate
+    /// PRs) after the success de-labeled the issue. Scoped by loop kind so a
+    /// future second loop's success wouldn't block a worker run on the same
     /// issue. `meguri run --issue N` bypasses this.
     pub fn issue_has_succeeded_run(
         &self,
@@ -346,52 +315,6 @@ impl Store {
                 )?
                 .exists(params![project_id, loop_kind, issue_number])?;
             Ok(exists)
-        })
-    }
-
-    /// Number of succeeded runs of a loop for one issue/PR — the conflict
-    /// resolver's resolve budget: a PR that keeps re-conflicting after this
-    /// many successful resolves stops being rediscovered instead of looping
-    /// forever. Skipped/failed runs don't consume the budget (benign races
-    /// and escalations have their own convergence).
-    pub fn succeeded_run_count(
-        &self,
-        project_id: &str,
-        loop_kind: &str,
-        issue_number: i64,
-    ) -> Result<i64> {
-        self.with_conn(|c| {
-            let count = c.query_row(
-                "SELECT COUNT(*) FROM runs WHERE project_id = ?1 AND loop_kind = ?2
-                   AND issue_number = ?3 AND status = 'succeeded'",
-                params![project_id, loop_kind, issue_number],
-                |row| row.get(0),
-            )?;
-            Ok(count)
-        })
-    }
-
-    /// The branch of the most recent run of `loop_kind` for an issue, if one
-    /// recorded a branch. The separate-mode handoff sweep (ADR 0008) uses it to
-    /// find the planner's spec PR branch and check whether it merged.
-    pub fn branch_for_issue(
-        &self,
-        project_id: &str,
-        loop_kind: &str,
-        issue_number: i64,
-    ) -> Result<Option<String>> {
-        self.with_conn(|c| {
-            let branch = c
-                .query_row(
-                    "SELECT branch FROM runs WHERE project_id = ?1 AND loop_kind = ?2
-                       AND issue_number = ?3 AND branch IS NOT NULL
-                     ORDER BY created_at DESC LIMIT 1",
-                    params![project_id, loop_kind, issue_number],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .ok()
-                .flatten();
-            Ok(branch)
         })
     }
 
@@ -490,7 +413,7 @@ impl Store {
         })
     }
 
-    /// Pin the run's launch profile (role-based routing). Written once, at the
+    /// Pin the run's launch profile. Written once, at the
     /// first pane spawn; later spawns and resumes read it back.
     pub fn update_run_agent_profile(&self, id: &str, profile: &str) -> Result<()> {
         self.with_conn(|c| {
@@ -524,52 +447,6 @@ impl Store {
                 params![id, state.map(|s| s.as_str())],
             )?;
             Ok(())
-        })
-    }
-
-    /// Parked reviews for the dashboard (ADR 0009 / issue #153): review runs
-    /// that ended `Succeeded`, still carry `AwaitingHuman`, and actually
-    /// emitted `review.awaiting_human`. The event is the discriminator: a
-    /// turn-scoped `AwaitingHuman` that merely lingered onto a `Succeeded`
-    /// pr-reviewer run (Impl, or combined Plan) never emits it, so it must not
-    /// show as a parked review. `interaction_state='awaiting_human'` keeps
-    /// cleared parks out; `status='succeeded'` guards against aborted runs.
-    pub fn list_parked_reviews(&self) -> Result<Vec<RunRecord>> {
-        self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT * FROM runs
-                 WHERE status = 'succeeded'
-                   AND interaction_state = 'awaiting_human'
-                   AND EXISTS (SELECT 1 FROM events e
-                               WHERE e.run_id = runs.id
-                                 AND e.kind = 'review.awaiting_human')
-                 ORDER BY created_at DESC",
-            )?;
-            let runs = stmt
-                .query_map([], run_from_row)?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(runs)
-        })
-    }
-
-    /// Clear the parked-review signal on every `Succeeded` run of an issue
-    /// (ADR 0009). Called when a fresh review round supersedes the prior head,
-    /// when the separate-delivery handoff receives the merged spec PR, and
-    /// when the issue closes — so a stale park leaves the dashboard.
-    /// Returns how many runs were cleared.
-    pub fn clear_parked_reviews_for_issue(
-        &self,
-        project_id: &str,
-        issue_number: i64,
-    ) -> Result<usize> {
-        self.with_conn(|c| {
-            let n = c.execute(
-                "UPDATE runs SET interaction_state = NULL
-                 WHERE project_id = ?1 AND issue_number = ?2
-                   AND status = 'succeeded' AND interaction_state = 'awaiting_human'",
-                params![project_id, issue_number],
-            )?;
-            Ok(n)
         })
     }
 
@@ -630,32 +507,6 @@ impl Store {
                 params![turn_id, outcome, result_json, now()],
             )?;
             Ok(())
-        })
-    }
-
-    pub fn list_turns(&self, run_id: &str) -> Result<Vec<TurnRecord>> {
-        self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id, run_id, turn_no, purpose, prompt_path, result_json,
-                        outcome, started_at, finished_at
-                 FROM turns WHERE run_id = ?1 ORDER BY turn_no ASC",
-            )?;
-            let turns = stmt
-                .query_map([run_id], |row| {
-                    Ok(TurnRecord {
-                        id: row.get(0)?,
-                        run_id: row.get(1)?,
-                        turn_no: row.get(2)?,
-                        purpose: row.get(3)?,
-                        prompt_path: row.get(4)?,
-                        result_json: row.get(5)?,
-                        outcome: row.get(6)?,
-                        started_at: row.get(7)?,
-                        finished_at: row.get(8)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(turns)
         })
     }
 }
@@ -745,35 +596,13 @@ mod tests {
             .unwrap();
         assert!(store.issue_has_succeeded_run("demo", "worker", 9).unwrap());
         // Scoped: another loop's discovery on the same issue is unaffected.
-        assert!(!store.issue_has_succeeded_run("demo", "planner", 9).unwrap());
+        assert!(
+            !store
+                .issue_has_succeeded_run("demo", "other-loop", 9)
+                .unwrap()
+        );
         assert!(!store.issue_has_succeeded_run("other", "worker", 9).unwrap());
         assert!(!store.issue_has_succeeded_run("demo", "worker", 10).unwrap());
-    }
-
-    #[test]
-    fn succeeded_run_count_counts_only_terminal_successes() {
-        let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
-
-        // Terminal statuses only: an active run would trip the unique
-        // (project, loop, issue) index on the next create.
-        for status in [RunStatus::Skipped, RunStatus::Failed, RunStatus::Cancelled] {
-            let run = store.create_run("demo", 9, "t").unwrap();
-            store.update_run_status(&run.id, status, None).unwrap();
-        }
-        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 0);
-
-        for _ in 0..2 {
-            let run = store.create_run("demo", 9, "t").unwrap();
-            store
-                .update_run_status(&run.id, RunStatus::Succeeded, None)
-                .unwrap();
-        }
-        assert_eq!(store.succeeded_run_count("demo", "worker", 9).unwrap(), 2);
-        // Scoped by loop, project, and issue.
-        assert_eq!(store.succeeded_run_count("demo", "planner", 9).unwrap(), 0);
-        assert_eq!(store.succeeded_run_count("other", "worker", 9).unwrap(), 0);
-        assert_eq!(store.succeeded_run_count("demo", "worker", 10).unwrap(), 0);
     }
 
     #[test]
@@ -874,30 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn list_turns_in_turn_order() {
-        let store = Store::open_in_memory().unwrap();
-        let run = store.create_run("demo", 1, "t").unwrap();
-        assert!(store.list_turns(&run.id).unwrap().is_empty());
-
-        store
-            .begin_turn(&run.id, "turn-1", "execute", "/tmp/p1.md")
-            .unwrap();
-        store.finish_turn("turn-1", "success", Some("{}")).unwrap();
-        store
-            .begin_turn(&run.id, "turn-2", "validate-fix", "/tmp/p2.md")
-            .unwrap();
-
-        let turns = store.list_turns(&run.id).unwrap();
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].turn_no, 1);
-        assert_eq!(turns[0].purpose, "execute");
-        assert_eq!(turns[0].outcome.as_deref(), Some("success"));
-        assert!(turns[0].finished_at.is_some());
-        assert_eq!(turns[1].turn_no, 2);
-        assert_eq!(turns[1].outcome, None);
-    }
-
-    #[test]
     fn run_record_serializes_snake_case_states() {
         let store = Store::open_in_memory().unwrap();
         let run = store.create_run("demo", 5, "t").unwrap();
@@ -918,86 +723,5 @@ mod tests {
         assert_eq!(v["desired_state"], "paused");
         assert!(v["started_at"].is_string());
         assert!(v["finished_at"].is_null());
-    }
-
-    /// Make a run parked: succeeded, awaiting a human, park event emitted.
-    fn park(store: &Store, issue: i64) -> String {
-        let run = store
-            .create_run_for_loop("demo", "pr-reviewer", issue, "t")
-            .unwrap();
-        store
-            .update_interaction_state(&run.id, Some(InteractionState::AwaitingHuman))
-            .unwrap();
-        store
-            .emit(
-                Some(&run.id),
-                "review.awaiting_human",
-                serde_json::json!({}),
-            )
-            .unwrap();
-        store
-            .update_run_status(&run.id, RunStatus::Succeeded, None)
-            .unwrap();
-        run.id
-    }
-
-    #[test]
-    fn list_parked_reviews_needs_succeeded_awaiting_and_the_event() {
-        let store = Store::open_in_memory().unwrap();
-        let parked = park(&store, 7);
-
-        // Turn-linger: succeeded + awaiting_human but no park event (an Impl or
-        // combined-Plan pr-reviewer whose own turn raised awaiting_human). Must
-        // not show.
-        let linger = store
-            .create_run_for_loop("demo", "pr-reviewer", 8, "t")
-            .unwrap();
-        store
-            .update_interaction_state(&linger.id, Some(InteractionState::AwaitingHuman))
-            .unwrap();
-        store
-            .update_run_status(&linger.id, RunStatus::Succeeded, None)
-            .unwrap();
-
-        // Aborted while awaiting a human: the park event is present but the run
-        // did not end succeeded. Must not show.
-        for (issue, status) in [
-            (9, RunStatus::Cancelled),
-            (10, RunStatus::Failed),
-            (11, RunStatus::Skipped),
-        ] {
-            let r = store
-                .create_run_for_loop("demo", "pr-reviewer", issue, "t")
-                .unwrap();
-            store
-                .update_interaction_state(&r.id, Some(InteractionState::AwaitingHuman))
-                .unwrap();
-            store
-                .emit(Some(&r.id), "review.awaiting_human", serde_json::json!({}))
-                .unwrap();
-            store.update_run_status(&r.id, status, None).unwrap();
-        }
-
-        let list = store.list_parked_reviews().unwrap();
-        assert_eq!(list.len(), 1, "only the genuine park shows");
-        assert_eq!(list[0].id, parked);
-    }
-
-    #[test]
-    fn clear_parked_reviews_for_issue_drops_it_from_the_list() {
-        let store = Store::open_in_memory().unwrap();
-        park(&store, 7);
-        park(&store, 8);
-        assert_eq!(store.list_parked_reviews().unwrap().len(), 2);
-
-        let cleared = store.clear_parked_reviews_for_issue("demo", 7).unwrap();
-        assert_eq!(cleared, 1);
-        let list = store.list_parked_reviews().unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].issue_number, 8);
-
-        // A different project's issue #8 is untouched by another project's clear.
-        assert_eq!(store.clear_parked_reviews_for_issue("other", 8).unwrap(), 0);
-        assert_eq!(store.list_parked_reviews().unwrap().len(), 1);
     }
 }
