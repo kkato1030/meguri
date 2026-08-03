@@ -1,258 +1,179 @@
-use anyhow::{Result, bail};
+//! meguri v2 — AI コーディングエージェントを terminal multiplexer の生きた
+//! pane で回すオーケストレーター。
+//!
+//! v0 の範囲: **local task 1 本 → tmux pane のエージェント → 検証済みブランチ**。
+//! watch ループも GitHub も永続化もまだ無い。ただし v1 で消せない概念の核は
+//! v0 から入っている:
+//!
+//! 1. **完了コントラクト** — orchestrator は worktree に prompt ファイルを書き、
+//!    エージェントは `.meguri/result.json` を書くことで完了を申告する。画面は
+//!    読まない([`turn`])。
+//! 2. **trust-but-verify** — `success` の申告は独立に検証する: git tree が
+//!    clean、base より commit が進んでいる、`check_command` が通る([`gitops`])。
+//! 3. **生きた pane** — エージェントは headless ではなく tmux pane の対話
+//!    セッションで動き、人間はいつでも attach して介入できる([`mux`])。
+//!
+//! 読む順番: main.rs(この流れ)→ config.rs → turn.rs → mux.rs → gitops.rs。
+
+mod config;
+mod gitops;
+mod mux;
+mod turn;
+
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use meguri::app;
-use meguri::cli::{Cli, Command};
-use meguri::config::{self, Config};
-use meguri::store::Store;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MEGURI_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meguri=info")),
-        )
-        .with_target(false)
-        .init();
+#[derive(Parser)]
+#[command(
+    name = "meguri",
+    version,
+    about = "AI コーディングエージェントを tmux の生きた pane で回す"
+)]
+enum Cli {
+    /// タスク 1 本を実行する: worktree を切り、pane でエージェントを走らせ、
+    /// 検証済みブランチを残す
+    Run {
+        /// タスクの内容(1 行のメモで良い。エージェントへの指示になる)
+        task: String,
+        /// config.toml のプロジェクト id(1 件だけ設定済みなら省略可)
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
 
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Init => cmd_init(),
-        Command::Doctor => cmd_doctor().await,
-        Command::Watch => app::cmd_watch().await,
-        Command::Run {
-            project,
-            issue,
-            pr,
-            run,
-            task,
-            mux,
-        } => {
-            let sel = app::selector(issue, pr, run, task)?;
-            app::cmd_run(project.as_deref(), sel, mux.as_deref()).await
-        }
-        Command::Add {
-            text,
-            project,
-            ready,
-            file,
-        } => app::cmd_add(project.as_deref(), text.as_deref(), ready, file.as_deref()).await,
-        Command::Tasks { project, all } => app::cmd_tasks(project.as_deref(), all).await,
-        Command::Ps { all } => app::cmd_ps(all),
-        Command::Logs { run } => app::cmd_logs(&run).await,
-        Command::Attach {
-            run,
-            issue,
-            pr,
-            run_id,
-            task,
-        } => app::cmd_attach(run.as_deref(), issue, pr, run_id.as_deref(), task).await,
-        Command::Pause { run } => app::cmd_pause(&run),
-        Command::Resume { run } => app::cmd_resume(&run),
-        Command::Takeover { run } => app::cmd_takeover(&run),
-        Command::Handback { run } => app::cmd_handback(&run),
-        Command::Stop { run } => app::cmd_stop(&run).await,
-        Command::Prune {
-            project,
-            dry_run,
-            force,
-        } => app::cmd_prune(project.as_deref(), dry_run, force).await,
+fn main() -> Result<()> {
+    match Cli::parse() {
+        Cli::Run { task, project } => run(&task, project.as_deref()),
     }
 }
 
-fn cmd_init() -> Result<()> {
-    let cfg_path = config::config_path();
-    if cfg_path.exists() {
-        println!("config already exists: {}", cfg_path.display());
-    } else {
-        if let Some(dir) = cfg_path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&cfg_path, config::INIT_TEMPLATE)?;
-        println!("wrote {}", cfg_path.display());
-    }
-    let db = config::db_path();
-    Store::open(&db)?;
-    println!("db ready: {}", db.display());
-    std::fs::create_dir_all(config::worktrees_root())?;
+/// v0 の全体フロー。上から下へ、1 run の一生がそのまま並んでいる。
+fn run(task: &str, project: Option<&str>) -> Result<()> {
+    let cfg = config::load()?;
+    let project = cfg.project(project)?;
+
+    // --- 1. 作業場所: base ブランチから worktree を切る --------------------
+    let run_id = now_millis().to_string();
+    let branch = format!("meguri/{}-{run_id}", slug(task));
+    let worktree = config::worktrees_root().join(&project.id).join(&run_id);
+    let base_sha = gitops::create_worktree(
+        &project.repo_path,
+        &worktree,
+        &branch,
+        &project.default_branch,
+    )
+    .context("worktree の作成")?;
+    println!("worktree: {} (branch {branch})", worktree.display());
+
+    // --- 2. 完了コントラクト: prompt を書き、pane でエージェントを起動 -----
+    let turn_id = format!("t-{run_id}");
+    let prompt_path =
+        turn::write_prompt(&worktree, &turn_id, task, project.check_command.as_deref())
+            .context("prompt の書き出し")?;
+    let pane = mux::spawn_agent(&project.id, &branch, &worktree, &cfg.agent)
+        .context("エージェント pane の起動")?;
     println!(
-        "\nNext: edit {} to add your first [[projects]] entry.",
-        cfg_path.display()
+        "pane: {} (attach: tmux attach -t {})",
+        pane.id, pane.session
+    );
+    // エージェントの起動を少し待ってから、prompt を読むよう 1 行だけ打ち込む。
+    std::thread::sleep(Duration::from_secs(cfg.limits.spawn_grace_secs));
+    mux::send_line(
+        &pane,
+        &format!(
+            "{} を読んで、その内容を完遂してください。",
+            prompt_path.display()
+        ),
+    )?;
+
+    // --- 3. 申告を待つ(画面は読まない) -----------------------------------
+    let result = wait_for_result(&worktree, &turn_id, &pane, cfg.limits.max_turn_runtime_secs)?;
+    println!("agent: {} — {}", result.status, result.summary);
+
+    // --- 4. trust-but-verify: success の申告を独立に検証する ---------------
+    match result.status.as_str() {
+        "success" => {}
+        "needs_human" => bail!(
+            "エージェントが人間の判断を求めています。pane に attach して続きを: tmux attach -t {}",
+            pane.session
+        ),
+        _ => bail!(
+            "エージェントが失敗を申告しました。pane で経緯を確認してください: tmux attach -t {}",
+            pane.session
+        ),
+    }
+    gitops::verify(&worktree, &base_sha, project.check_command.as_deref())
+        .context("success 申告の独立検証(pane は残してあるので attach して確認できます)")?;
+
+    println!(
+        "done: 検証済みブランチ {branch} が {} にあります",
+        project.repo_path.display()
     );
     Ok(())
 }
 
-async fn cmd_doctor() -> Result<()> {
-    let mut ok = true;
-
-    let check = |name: &str, pass: bool, detail: String| {
-        println!("{} {name}: {detail}", if pass { "✅" } else { "❌" });
-        pass
-    };
-
-    // Whether any configured project talks to GitHub. If every project is
-    // local-mode, gh/gh-auth are informational, not required (issue #54).
-    // A config that fails to load is treated conservatively as needing gh.
-    let cfg = Config::load();
-    let needs_github = match &cfg {
-        Ok(c) => c
-            .projects
-            .iter()
-            .any(|p| p.mode != config::ProjectMode::Local),
-        Err(_) => true,
-    };
-
-    let git = run_capture("git", &["--version"]);
-    ok &= check("git", git.is_ok(), git.unwrap_or_else(|e| e));
-
-    let gh = run_capture("gh", &["--version"]);
-    let gh_present = gh.is_ok();
-    let gh_pass = check(
-        "gh",
-        gh_present,
-        gh.map(|v| v.lines().next().unwrap_or_default().to_string())
-            .unwrap_or_else(|e| e),
-    );
-    if gh_present {
-        let auth = run_capture("gh", &["auth", "status"]);
-        let auth_pass = check(
-            "gh auth",
-            auth.is_ok(),
-            auth.map(|_| "authenticated".into()).unwrap_or_else(|e| e),
-        );
-        if needs_github {
-            ok &= auth_pass;
+/// `.meguri/result.json` の出現を待つ。pane が死んだら諦め、時間を使い切ったら
+/// タイムアウト。どちらも「エージェントの画面を読んで判断する」ことはしない —
+/// 耐久のあるシグナル(ファイルと pane の生死)だけを見る。
+fn wait_for_result(
+    worktree: &Path,
+    turn_id: &str,
+    pane: &mux::Pane,
+    max_secs: u64,
+) -> Result<turn::TurnResult> {
+    let deadline = Instant::now() + Duration::from_secs(max_secs);
+    loop {
+        if let Some(result) = turn::read_result(worktree, turn_id)? {
+            return Ok(result);
         }
-    }
-    if needs_github {
-        ok &= gh_pass;
-    } else if !gh_pass {
-        println!("   (all projects are local-mode — gh is optional)");
-    }
-
-    let herdr = run_capture("herdr", &["--version"]);
-    let herdr_sock = std::env::var("HERDR_SOCKET_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".config/herdr/herdr.sock")
-        });
-    let herdr_live = herdr_sock.exists();
-    check(
-        "herdr",
-        herdr.is_ok(),
-        match (&herdr, herdr_live) {
-            (Ok(v), true) => format!("{v} (socket live: {})", herdr_sock.display()),
-            (Ok(v), false) => format!("{v} (socket not found — start `herdr` first)"),
-            (Err(e), _) => e.clone(),
-        },
-    );
-
-    let tmux = run_capture("tmux", &["-V"]);
-    let tmux_present = tmux.is_ok();
-    check("tmux", tmux_present, tmux.unwrap_or_else(|e| e));
-
-    if !herdr_live && !tmux_present {
-        println!("❌ no usable multiplexer (need a running herdr or installed tmux)");
-        ok = false;
-    }
-
-    match &cfg {
-        Ok(cfg) => {
-            ok &= doctor_agents(cfg);
-            let n = cfg.projects.len();
-            println!(
-                "{} projects: {n} configured{}",
-                if n > 0 { "✅" } else { "⚠️ " },
-                if n > 0 {
-                    ""
-                } else {
-                    " — add one to config.toml before running"
-                },
+        if !mux::pane_alive(pane)? {
+            bail!("エージェントの pane が終了しました(result.json は未提出)");
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "{max_secs} 秒待っても result.json が現れませんでした。pane は生きています: tmux attach -t {}",
+                pane.session
             );
-            // Auto-merge preconditions (ADR 0003): only for projects that
-            // enabled it — the same gate `meguri watch` fail-fasts on.
         }
-        Err(e) => {
-            ok = check("config", false, format!("{e:#}"));
-        }
-    }
-
-    if ok {
-        println!("\nall good — try `meguri run --issue <N>`");
-        Ok(())
-    } else {
-        bail!("doctor found problems");
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
-/// Doctor's profile section: list every defined profile (default + builtin +
-/// user) with its CLI detection, validate the per-project overrides, and show
-/// each project's resolved profile.
-fn doctor_agents(cfg: &Config) -> bool {
-    use meguri::profile;
-
-    let mut names: Vec<String> = profile::builtin_profiles().into_keys().collect();
-    if let Some(agents) = &cfg.agents {
-        for name in agents.profiles.keys() {
-            if !names.contains(name) {
-                names.push(name.clone());
+/// ブランチ名に使える短い slug(ASCII 英数のみ、その他は `-`)。
+fn slug(task: &str) -> String {
+    let s: String = task
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
             }
-        }
-    }
-    names.sort();
-
-    println!("\nagent profiles:");
-    let default_detail = run_capture(&cfg.agent.command, &["--version"])
-        .map(|v| v.lines().next().unwrap_or_default().to_string());
-    let default_ok = default_detail.is_ok();
-    println!(
-        "  {} default ({}): {}",
-        if default_ok { "✅" } else { "❌" },
-        cfg.agent.command,
-        default_detail.unwrap_or_else(|e| e),
-    );
-    let mut ok = default_ok;
-
-    for name in &names {
-        let profile = profile::profile_by_name(cfg, name).expect("listed profile resolves");
-        let detail = run_capture(&profile.command, &["--version"])
-            .map(|v| v.lines().next().unwrap_or_default().to_string());
-        println!(
-            "  {} {name} ({}): {}",
-            if detail.is_ok() { "✅" } else { "⚠️ " },
-            profile.command,
-            detail.unwrap_or_else(|e| e),
-        );
-    }
-
-    if let Err(e) = profile::validate(cfg) {
-        println!("  ❌ profile config: {e:#}");
-        ok = false;
-    }
-    for p in &cfg.projects {
-        match profile::resolve(cfg, p) {
-            Ok(name) => println!("  project {:<12} → {name}", p.id),
-            Err(e) => {
-                println!("  project {:<12} → ❌ {e:#}", p.id);
-                ok = false;
-            }
-        }
-    }
-    ok
+        })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() { "task".into() } else { s }
 }
 
-fn run_capture(cmd: &str, args: &[&str]) -> std::result::Result<String, String> {
-    match std::process::Command::new(cmd).args(args).output() {
-        Ok(out) if out.status.success() => {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        }
-        Ok(out) => Err(format!(
-            "exit {}: {}",
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Err(e) => Err(format!("not found ({e})")),
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_keeps_ascii_and_replaces_the_rest() {
+        assert_eq!(slug("Fix login bug"), "fix-login-bug");
+        assert_eq!(slug("ログインを直す"), "task");
+        assert_eq!(slug("--x--"), "x");
     }
 }

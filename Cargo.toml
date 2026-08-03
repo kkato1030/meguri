@@ -1,6 +1,6 @@
 [package]
 name = "meguri"
-version = "0.1.0"
+version = "2.0.0-dev"
 edition = "2024"
 description = "Run AI coding agents on a loop inside a terminal multiplexer, so humans can step in anytime."
 license = "MIT"
@@ -10,31 +10,17 @@ keywords = ["ai", "agents", "tmux", "automation", "github"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.89"
 
+# v2 の依存方針: 「全行を理解できるコードベース」を守るため、増分ごとに
+# 依存を最小に保つ。新しい crate は、それが解く問題が実際に現れたときに足す。
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
-libc = "0.2"
-regex = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
 toml = "0.9"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
-
-[lib]
-name = "meguri"
-path = "src/lib.rs"
 
 [[bin]]
 name = "meguri"
