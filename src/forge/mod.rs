@@ -151,10 +151,8 @@ pub struct ObserveCost {
 
 /// One open PR's raw merge-tail signals from the informer-cache bulk query
 /// (issue #221). The forge returns raw observations; the engine's pure
-/// `next_step` reduces them to its decision Snapshot. The arm marker and the
-/// pr-review context are engine vocabulary, so the forge stays free of them:
-/// the marker is read by the engine out of [`Self::comments`], and the
-/// pr-review status is the context the caller passed to `observe_open_prs`.
+/// `next_step` reduces them to its decision Snapshot. The arm marker is engine
+/// vocabulary, read by the engine out of [`Self::comments`].
 #[derive(Debug, Clone)]
 pub struct PrObservation {
     pub pr: PullRequest,
@@ -169,9 +167,6 @@ pub struct PrObservation {
     pub review_threads: Vec<ReviewThread>,
     /// The head's CI check rollup (the required-vs-not split for a Blocked PR).
     pub rollup: CheckRollup,
-    /// The `meguri/pr-review` commit status on the head (the gate context the
-    /// caller requested), or `None` if meguri never wrote it.
-    pub pr_review: Option<CommitStatusState>,
     /// Whether [`Self::pr`]'s label set is the PR's *complete* set. A bulk query
     /// with a bounded label window sets this false when it clipped some; the
     /// engine then reads the safety labels (`hold` / `needs-human`) conservatively
@@ -288,39 +283,6 @@ pub enum CheckState {
     Success,
     Failure,
     Pending,
-}
-
-/// The subset of GitHub's commit-status states meguri writes for its inspection
-/// history (`meguri/self-review`, `meguri/pr-review`, ADR 0008). Advisory by
-/// default: a `Failure` status is a red check that does not block a human merge
-/// (GitHub reports the PR `UNSTABLE`) unless the user makes the context a
-/// required check; the auto-merger reads it as its arm gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitStatusState {
-    Success,
-    Failure,
-    Pending,
-}
-
-impl CommitStatusState {
-    /// The GitHub `state` string for the statuses API.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Failure => "failure",
-            Self::Pending => "pending",
-        }
-    }
-
-    /// Parse GitHub's lowercase status state; `error` folds into `Failure`.
-    pub fn from_gh(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "success" => Some(Self::Success),
-            "failure" | "error" => Some(Self::Failure),
-            "pending" => Some(Self::Pending),
-            _ => None,
-        }
-    }
 }
 
 /// One CI check on the PR's head commit (a GitHub Actions check run or a
@@ -483,17 +445,6 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewComment>,
 }
 
-/// Draft of one inline review comment (a thread anchor). The line is
-/// mandatory: GitHub's review REST API only anchors comments to a line of
-/// the diff — anchor-less remarks belong in the review body instead.
-#[derive(Debug, Clone)]
-pub struct ReviewCommentDraft {
-    pub path: String,
-    /// Line on the NEW side of the diff (side=RIGHT).
-    pub line: u64,
-    pub body: String,
-}
-
 #[async_trait]
 pub trait Forge: Send + Sync {
     async fn get_issue(&self, number: i64) -> Result<Issue>;
@@ -618,17 +569,6 @@ pub trait Forge: Send + Sync {
     async fn list_review_threads(&self, pr: i64) -> Result<Vec<ReviewThread>>;
     /// Reply inside an existing review thread.
     async fn reply_review_thread(&self, pr: i64, thread_id: &str, body: &str) -> Result<()>;
-    /// Post a PR review with inline comments — each draft becomes a review
-    /// thread the fixer can pick up. Always event=COMMENT: meguri never
-    /// approves or requests changes; the human merge gate stays human
-    /// (ADR 0004).
-    async fn create_pr_review(
-        &self,
-        pr: i64,
-        body: &str,
-        comments: &[ReviewCommentDraft],
-    ) -> Result<()>;
-
     /// Arm GitHub-native auto-merge, pinned to `head_sha`
     /// (`--match-head-commit`). Already-armed is treated as success
     /// (idempotent). The [`ArmOutcome`] distinguishes a reservation
@@ -654,11 +594,8 @@ pub trait Forge: Send + Sync {
     /// Observe every open PR's merge-tail signals in one bulk query — the
     /// informer-cache observe (issue #221, ADR 0012 decision 3). Returns the
     /// per-PR raw observation plus the API cost the query took.
-    /// `pr_review_context` is the commit-status context whose state gates
-    /// arming (`meguri/pr-review`, ADR 0008); the caller supplies it so the
-    /// forge stays free of engine vocabulary, exactly as [`Forge::commit_status`]
-    /// takes its context.
-    async fn observe_open_prs(&self, pr_review_context: &str) -> Result<MergeTailObservation>;
+    /// One bulk observation of every open PR's merge-tail signals.
+    async fn observe_open_prs(&self) -> Result<MergeTailObservation>;
     /// Ready a draft PR (`gh pr ready`).
     async fn mark_pr_ready(&self, pr: i64) -> Result<()>;
     /// Close a pull request **without merging** (`gh pr close`). The decompose
@@ -668,28 +605,6 @@ pub trait Forge: Send + Sync {
     /// already-closed PR closes again cleanly.
     async fn close_pr(&self, pr: i64) -> Result<()>;
 
-    /// Write a commit status on `head_sha` (`POST /repos/{repo}/statuses/{sha}`)
-    /// — meguri's inspection history for a review (ADR 0008). `context` is the
-    /// status name (`meguri/self-review` / `meguri/pr-review`), `description`
-    /// the one-line verdict. Idempotent from the caller's view: re-posting the
-    /// same context replaces the visible status.
-    async fn set_commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-        state: CommitStatusState,
-        description: &str,
-    ) -> Result<()>;
-
-    /// The latest state of `context` on `head_sha`, or `None` if meguri never
-    /// wrote that context on that commit — the auto-merger's guard gate reads
-    /// it (ADR 0008 §5). `None` means "not decided yet": the caller waits
-    /// rather than escalating.
-    async fn commit_status(
-        &self,
-        head_sha: &str,
-        context: &str,
-    ) -> Result<Option<CommitStatusState>>;
     /// The repository's merge configuration for `base_branch` (ADR 0003
     /// fail-fast + arm gate). When `require_branch_protection` is false the
     /// branch-protection probe is skipped and `protected_with_required_checks`

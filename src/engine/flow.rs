@@ -37,30 +37,6 @@ pub const STEP_VALIDATE: &str = "validate";
 pub const STEP_SELF_REVIEW: &str = "self-review";
 pub const STEP_OPEN_PR: &str = "open-pr";
 
-/// The review framing of a run's deliverable. Only the implementation side
-/// remains (the plan side is dormant, docs/adr/STATUS.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    #[default]
-    Impl,
-}
-
-impl Kind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Impl => "impl",
-        }
-    }
-
-    /// Whether the project's guard is enabled for this kind (ADR 0008 §1).
-    pub fn guard_enabled(self, review: &crate::config::ReviewConfig) -> bool {
-        match self {
-            Self::Impl => review.guard.impl_enabled,
-        }
-    }
-}
-
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
 /// The default method bodies implement the issue-triggered "new branch, new
@@ -223,77 +199,6 @@ pub struct Checkpoint {
     /// sweep can arm it. Recorded at claim time.
     #[serde(default)]
     pub automerge: bool,
-    /// Self-review rounds already spent this run (ADR 0006). Local-only state
-    /// — the internal loop never touches the forge; convergence is bounded by
-    /// this counter, not a forge marker.
-    #[serde(default)]
-    pub self_review_rounds: u32,
-    /// Open findings from the ledger, mirrored here every persist (issue #212).
-    /// The ledger ([`self_review_ledger`]) is the source of truth; this vec is
-    /// kept as a **rollback safety valve** — a binary rolled back past #212 reads
-    /// only this field, so an old binary resuming still sees unresolved findings.
-    /// Retire the mirror once the rollback target includes #212.
-    #[serde(default)]
-    pub self_review_pending: Vec<super::self_review::Finding>,
-    /// The cumulative self-review findings ledger (issue #212, ADR 0022): one
-    /// entry per finding across all rounds, each with its reviewer-confirmed
-    /// status (open/fixed/waived), the author's latest disposition, and how many
-    /// fix turns it has been through. Convergence is "no open entry left"; a real
-    /// ping-pong is an entry still open after two fix turns.
-    #[serde(default)]
-    pub self_review_ledger: Vec<super::self_review::LedgerEntry>,
-    /// The HEAD the last review turn looked at (issue #212). Round 2+ passes the
-    /// incremental diff `self_review_last_head..HEAD` on top of the full base
-    /// diff, so the reviewer sees exactly what the fix turns changed.
-    #[serde(default)]
-    pub self_review_last_head: Option<String>,
-    /// One entry per self-review round (ADR 0008): what the folded PR-body
-    /// `<details>` renders. Carried in the checkpoint so a resumed run keeps
-    /// the history it already built.
-    #[serde(default)]
-    pub self_review_log: Vec<super::self_review::RoundRecord>,
-    /// Set once self-review reached a **clean** verdict: the phase converged and
-    /// the PR may open. Persisted so a resume distinguishes a clean-at-cap
-    /// checkpoint (rounds == max but done) from a genuinely unconverged one
-    /// (issue #176). Kept clean-only on purpose: the cap→final-fix path
-    /// (issue #212) does NOT set this, so a binary rolled back past #212 sees
-    /// `converged == false` and escalates the unreviewed fix instead of
-    /// publishing it as clean.
-    #[serde(default)]
-    pub self_review_converged: bool,
-    /// Set once the cap→final-fix path published (issue #212, ADR 0022): the last
-    /// fix turn was not re-reviewed (check_command + tree verification passed).
-    /// Distinct from [`self_review_converged`] on purpose (rollback safety valve,
-    /// above). Read by `compose_pr_body` / `post_self_review_status` to record
-    /// the non-re-review in the PR footer and commit status, and by the phase's
-    /// resume short-circuit alongside `self_review_converged`.
-    #[serde(default)]
-    pub self_review_final_fix_unreviewed: bool,
-    /// Set (and persisted) the moment the phase commits to the cap→final-fix path,
-    /// before the final fix turn runs (issue #212). It makes the branch decision
-    /// crash-safe: a resume mid-final-fix routes straight back to the final-fix
-    /// path instead of re-running ping-pong detection — the final fix bumps a
-    /// finding's `fix_attempts`, which would otherwise look like a ping-pong and
-    /// wrongly escalate. Cleared implicitly once
-    /// [`self_review_final_fix_unreviewed`] is set (the phase is done).
-    #[serde(default)]
-    pub self_review_final_fix_started: bool,
-    /// How many times this run has escalated its launch profile (routing 3/3,
-    /// issue #66) — a counter for observability (it rides the `run.escalated`
-    /// event's `level`), not a chain index: the next target is derived from the
-    /// currently-pinned profile's position in the chain. Survives a resume so a
-    /// crash mid-escalation doesn't re-climb.
-    #[serde(default)]
-    pub escalation_level: u32,
-    /// Validation-fix turns run under the *current* pinned profile since it was
-    /// (re)pinned (routing 3/3, issue #66). Reset to 0 on each escalation, and
-    /// that reset is persisted *before* the pin advances — so escalation only
-    /// fires once the current profile has actually had a fix turn
-    /// (`>= 1`). This is what makes escalation crash-safe: a resume after the
-    /// pin advanced but before the fix turn ran sees `0` and lets the new pin
-    /// try, instead of skipping it to the next chain entry.
-    #[serde(default)]
-    pub pin_fix_turns: u32,
     /// The repo `meguri.toml` values pinned at claim time (issue #165): read
     /// once from the worktree at the first worktree-ready point, then reused
     /// unchanged for the run's life (a since-tampered worktree or ref cannot
@@ -466,15 +371,8 @@ async fn drive(deps: &Deps, run: &RunRecord, flavor: &dyn Flavor) -> Result<Work
     }
 
     if step == STEP_SELF_REVIEW {
-        if flavor.self_reviews() && deps.config.review_for(&deps.project).enabled {
-            match super::self_review::self_review(deps, &run, &mut checkpoint, &worktree, flavor)
-                .await?
-            {
-                StepFlow::Continue => {}
-                StepFlow::Stopped => return Ok(WorkerOutcome::Stopped),
-                StepFlow::Interrupted(r) => return Ok(WorkerOutcome::Interrupted(r)),
-            }
-        }
+        // The internal self-review phase is dormant (docs/adr/STATUS.md); the
+        // step id is kept so an in-flight checkpoint resumes cleanly.
         step = save_step(deps, &run, STEP_OPEN_PR, &checkpoint)?;
     }
 
@@ -537,7 +435,6 @@ fn claims_pr_by_label(loop_kind: &str) -> bool {
     loop_kind == super::fixer::KIND
         || loop_kind == super::ci_fixer::KIND
         || loop_kind == super::conflict_resolver::KIND
-        || loop_kind == super::pr_reviewer::KIND
 }
 
 /// `meguri stop` on a run with no live driver (queued/interrupted — issue
@@ -612,19 +509,6 @@ pub(crate) fn attach_hint(deps: &Deps, run: &RunRecord) -> String {
             }
         }
     }
-}
-
-/// Failure escalation on the forge ("Authority": the durable record of why
-/// the run stopped lives on the issue, not in meguri's local state). Used by
-/// forge loops that escalate on the issue directly (the spec worker); the
-/// worker/planner default escalate goes through the task source instead.
-/// Thin alias for [`super::escalation::escalate_issue`] — the central helper
-/// (issue #176) — kept so the many forge-loop call sites read unchanged. The
-/// helper posts the generic pane-attach hint; its callers (spec worker, and the
-/// fixer family's before-PR-claimed fallback) all default to `pane` launch mode
-/// (issue #169, ADR 0012's recommendation table).
-pub(crate) async fn escalate_on_forge(deps: &Deps, issue: i64, reason: &str) {
-    super::escalation::escalate_issue(deps, issue, reason).await;
 }
 
 fn save_step(deps: &Deps, run: &RunRecord, step: &str, cp: &Checkpoint) -> Result<String> {
@@ -1207,39 +1091,8 @@ fn resolve_run_profile(
         Some(name) => name,
         None => {
             let role = crate::routing::routing_role_for_loop(&run.loop_kind);
-            let mainline =
+            let name =
                 crate::routing::resolve(&deps.config, role, &crate::routing::detect_command)?;
-            // Explore canary (routing 3/3, issue #66): opt-in, deterministic,
-            // routing-active only (a legacy config has no `[routing]`, so the
-            // ratio reads 0.0 and this never diverts). A selected run is pinned
-            // to the recommendation chain's next candidate instead of the
-            // mainline pick, and marked `explore` so stats keep it separate.
-            let ratio = deps
-                .config
-                .routing
-                .as_ref()
-                .map(|r| r.explore_ratio)
-                .unwrap_or(0.0);
-            let name = if ratio > 0.0
-                && crate::routing::is_explore(run.task_key().number(), ratio)
-                && let Some(alt) = crate::routing::explore_alternative(
-                    &deps.config,
-                    role,
-                    &crate::routing::detect_command,
-                )
-                && alt != mainline
-            {
-                deps.store
-                    .update_run_routing_arm(&run.id, Some("explore"))?;
-                deps.store.emit(
-                    Some(&run.id),
-                    "run.explore_assigned",
-                    json!({ "profile": alt, "alt_of": mainline }),
-                )?;
-                alt
-            } else {
-                mainline
-            };
             deps.store.update_run_agent_profile(&run.id, &name)?;
             deps.store.emit(
                 Some(&run.id),
@@ -1256,90 +1109,6 @@ fn resolve_run_profile(
         )
     })?;
     Ok((name, profile))
-}
-
-/// Signal-driven profile escalation (routing 3/3, issue #66). Called once the
-/// current pinned profile has had a failing fix turn (`cp.pin_fix_turns >= 1`):
-/// if routing is active, escalation is enabled, and the profile has a stronger
-/// entry in its role's escalation chain, re-pin one step up, retire the live
-/// author pane, and clear the session so the next turn spawns fresh (a model
-/// change can't `--resume`). Returns whether it escalated, so the caller can
-/// flag it in the fix prompt. A no-op (returns `false`) past the chain end — the
-/// run then rides the existing `validate_turns` → needs-human backstop, so
-/// escalation is finite.
-///
-/// Crash-safety: `pin_fix_turns` is reset to 0 and **persisted before** the pin
-/// advances. So a crash between the reset and the pin write (or between the pin
-/// write and the fix turn) resumes to `pin_fix_turns == 0`, which blocks a
-/// second escalation until the new pin has actually run a fix turn — no chain
-/// entry is ever skipped without a try.
-async fn maybe_escalate(
-    deps: &Deps,
-    run: &RunRecord,
-    cp: &mut Checkpoint,
-    persist_step: &str,
-) -> Result<bool> {
-    // Common gate: escalation is a refinement of active routing and honors the
-    // top-level kill switch. Both conditions fail in legacy → never escalate.
-    if deps.config.routing.is_none() || !deps.config.escalation.enabled {
-        return Ok(false);
-    }
-    let role = crate::routing::routing_role_for_loop(&run.loop_kind);
-    let (current, _) = resolve_run_profile(deps, run)?;
-    let Some(next) = crate::routing::next_escalation(
-        &deps.config,
-        role,
-        &current,
-        &crate::routing::detect_command,
-    ) else {
-        return Ok(false);
-    };
-
-    // Mark the new pin as "not yet tried" and persist it BEFORE advancing the
-    // pin, so a crash in the window below can't let a resume escalate again off
-    // a profile that never ran (which would skip a chain entry, issue #66).
-    cp.escalation_level += 1;
-    cp.pin_fix_turns = 0;
-    save_step(deps, run, persist_step, cp)?;
-
-    // Re-pin one step stronger; the next author-lane spawn reads this back.
-    deps.store.update_run_agent_profile(&run.id, &next)?;
-
-    // Retire the live author pane and forbid a resume: the model changed, so
-    // `--resume <id>` under the new profile can't restore the old session.
-    // `release_pane` saves the session id first (its default reversibility) —
-    // clear it right after so the fresh spawn re-injects the full context
-    // (validation history) instead of resuming into the old model.
-    let lane = lane_for_loop(&run.loop_kind);
-    super::reaper::release_pane(deps, run.issue_number, lane, "profile escalation").await;
-    deps.store
-        .save_pane_session(&deps.project.id, run.issue_number, lane, None)?;
-    deps.store.update_run_agent_session(&run.id, None)?;
-
-    // Arm bookkeeping: explore takes priority (explore > escalated > main), so
-    // an explore run keeps its arm — the escalation still lands in the event.
-    let already_explore = deps
-        .store
-        .get_run(&run.id)?
-        .and_then(|r| r.routing_arm)
-        .as_deref()
-        == Some("explore");
-    if !already_explore {
-        deps.store
-            .update_run_routing_arm(&run.id, Some("escalated"))?;
-    }
-
-    deps.store.emit(
-        Some(&run.id),
-        "run.escalated",
-        json!({
-            "from": current,
-            "to": next,
-            "level": cp.escalation_level,
-            "reason": "validation failed",
-        }),
-    )?;
-    Ok(true)
 }
 
 /// Watch a freshly resume-spawned pane briefly; false means it died (the
@@ -1384,45 +1153,6 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
     let mode = launch::resolve(&deps.config, routing::routing_role_for_loop(&run.loop_kind));
     Ok(Lane {
         lane: lane.to_string(),
-        profile_name,
-        profile,
-        mode,
-    })
-}
-
-/// The self-review lane: a separate lane keyed by the same issue, launched
-/// under the `self-reviewer` routing profile (formerly `impl-reviewer` /
-/// `self-review`, ADR 0003 revision) so the review turn can be a different
-/// model than the author doing the fixes. Resolved without pinning the run's
-/// own profile. Shared by the plan and impl self-review (the loop is
-/// symmetric). Its launch mode resolves independently too — recommended
-/// `direct` (ADR 0012): an internal loop no human ever attaches to.
-fn self_review_lane(deps: &Deps) -> Result<Lane> {
-    self_review_lane_for(deps, None, crate::store::LANE_SELF_REVIEW.to_string())
-}
-
-/// A self-review lane under a chosen profile and lane key (issue #214). A
-/// parallel round-1 reviewer passes `profile_override = Some(name)` from its
-/// `[[review.reviewers]].profile` and a distinct `lane` key (e.g.
-/// `self-review#0`) so its pane/session never collides with a sibling's. The
-/// **profile** comes from the reviewer config (falling back to the
-/// `self-reviewer` routing profile when `None`), while the **launch mode** is
-/// always resolved from the `self-reviewer` role — profile and mode are resolved
-/// separately (spec §decision 10). `profile_override` naming an undefined
-/// profile is an error the caller decides how to handle (drop-and-continue).
-fn self_review_lane_for(deps: &Deps, profile_override: Option<&str>, lane: String) -> Result<Lane> {
-    let profile_name = match profile_override {
-        Some(name) => name.to_string(),
-        None => crate::routing::resolve(
-            &deps.config,
-            "self-reviewer",
-            &crate::routing::detect_command,
-        )?,
-    };
-    let profile = crate::routing::profile_by_name(&deps.config, &profile_name)?;
-    let mode = launch::resolve(&deps.config, "self-reviewer");
-    Ok(Lane {
-        lane,
         profile_name,
         profile,
         mode,
@@ -1504,58 +1234,6 @@ pub(crate) async fn run_turn(
         purpose,
         prompt_body,
         false,
-    )
-    .await
-}
-
-/// Run one prompt-turn in the worker's self-review lane under the
-/// `self-reviewer` profile.
-pub(crate) async fn run_review_turn(
-    deps: &Deps,
-    run: &RunRecord,
-    worktree: &Path,
-    purpose: &str,
-    prompt_body: &str,
-) -> Result<(TurnOutcome, String)> {
-    let lane = self_review_lane(deps)?;
-    run_turn_in(
-        deps,
-        run,
-        worktree,
-        &lane,
-        "self-reviewer",
-        purpose,
-        prompt_body,
-        false,
-    )
-    .await
-}
-
-/// Run one parallel round-1 review turn (issue #214) under a specific reviewer
-/// `profile` and `lane` key, with an isolated per-turn result file so N of these
-/// can run concurrently without racing on `result.json`. The profile comes from
-/// the reviewer config; the launch mode is the `self-reviewer` role's (spec
-/// §decision 10). An undefined profile surfaces as an `Err` for the caller to
-/// drop-and-continue.
-pub(crate) async fn run_parallel_review_turn(
-    deps: &Deps,
-    run: &RunRecord,
-    worktree: &Path,
-    profile_override: Option<&str>,
-    lane_key: String,
-    purpose: &str,
-    prompt_body: &str,
-) -> Result<(TurnOutcome, String)> {
-    let lane = self_review_lane_for(deps, profile_override, lane_key)?;
-    run_turn_in(
-        deps,
-        run,
-        worktree,
-        &lane,
-        "self-reviewer",
-        purpose,
-        prompt_body,
-        true,
     )
     .await
 }
@@ -2035,18 +1713,6 @@ pub(crate) async fn validate(
             .into());
         }
 
-        // Signal-driven escalation (issue #66): once the current profile has had
-        // a failing fix turn (`pin_fix_turns >= 1`), climb to a stronger profile
-        // if the run's role has an escalation chain. Keying on "did the current
-        // pin try?" instead of `fix_turns_used` keeps it crash-safe — a resume
-        // that re-runs the check can't skip a chain entry that never ran. A
-        // no-op past the chain end, so a genuinely stuck run still exhausts
-        // `validate_turns` and lands on needs-human above.
-        let escalated = if cp.pin_fix_turns >= 1 {
-            maybe_escalate(deps, run, cp, persist_step).await?
-        } else {
-            false
-        };
         save_step(deps, run, persist_step, cp)?;
 
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2067,22 +1733,11 @@ pub(crate) async fn validate(
             json!({ "fix_turn": cp.fix_turns_used }),
         )?;
 
-        // When we just escalated, this pane is a fresh session under a stronger
-        // model with none of the prior conversation — so the prompt carries the
-        // validation history (it always does) plus a note that it is a retry
-        // under a stronger model.
-        let escalation_note = if escalated {
-            "\n\nNote: this run was escalated to a stronger model for this \
-             attempt because validation kept failing. You are a fresh session — \
-             rely on the command output below, not on earlier conversation."
-        } else {
-            ""
-        };
         let prompt = format!(
             "The project's validation command failed. Fix the code so it passes, \
              then commit your fixes.\n\nCommand: `{check}`\nExit code: {}\n\n\
              Last stdout:\n```\n{}\n```\n\nLast stderr:\n```\n{}\n```\n\n\
-             Do not create a pull request; meguri handles that.{escalation_note}",
+             Do not create a pull request; meguri handles that.",
             out.status.code().unwrap_or(-1),
             tail(&stdout),
             tail(&stderr),
@@ -2091,10 +1746,6 @@ pub(crate) async fn validate(
         match outcome {
             TurnOutcome::Completed(r) => match r.status {
                 TurnStatus::Success => {
-                    // The current pin just spent a fix turn; record it so the
-                    // next failure may escalate off it (and a resume knows this
-                    // pin has been tried).
-                    cp.pin_fix_turns += 1;
                     save_step(deps, run, persist_step, cp)?;
                     continue;
                 }
@@ -2197,16 +1848,13 @@ async fn open_pr(
     // internal loop ran pre-open in the worktree; the status makes its outcome
     // visible on the PR head without touching the conversation. Best-effort:
     // a status failure must not fail an otherwise-good PR.
-    post_self_review_status(deps, run, cp, worktree).await;
-
-    let lenses = &deps.config.review_for(&deps.project).lenses;
     let close = flavor.pr_closes_issue(deps);
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
     } else {
         reject_rail_external_duplicate(deps, run).await?;
         let title = flavor.pr_title(run, cp);
-        let body = compose_pr_body(run, cp, lenses, close);
+        let body = compose_pr_body(run, cp, close);
         // Auto-merge opt-in PRs open non-draft: waiting for a human to promote
         // a draft would waste the required-checks run the arm is waiting on
         // (auto-merge 1/3, #41).
@@ -2244,124 +1892,6 @@ async fn open_pr(
     Ok(pr_url)
 }
 
-/// Escalate-time fallback (issue #209, ADR 0021): when self-review cannot
-/// converge and the branch is ahead of base, push it and open a draft PR
-/// labeled `meguri:needs-human` so the half-finished artifact is visible on the
-/// forge instead of trapped in the worktree. The label rides PR creation (a
-/// single forge call), so the draft is never observable unlabeled and
-/// `pr_is_touchable` excludes it from the first moment.
-///
-/// Best-effort throughout: it never returns an error and never changes the
-/// run's terminal outcome — the caller still propagates the original
-/// `NeedsHuman` and escalates the issue with a comment (the draft is the
-/// evidence, the comment is the notification). No-op unless the project
-/// delivers via PR, a forge is present, and the branch has commits ahead of
-/// base. `pr.created` is deliberately NOT emitted (that event means "a verified
-/// deliverable shipped"); an escalate-time draft emits `self_review.escalated_draft`.
-///
-/// Resume-safe like `open_pr`: before creating it looks up any PR already on
-/// the branch (`pr_for_branch`) and adopts it, so a resume from
-/// `STEP_SELF_REVIEW` after a crash — or the same escalation re-running — never
-/// opens a duplicate.
-pub(crate) async fn publish_needs_human_draft(
-    deps: &Deps,
-    run: &RunRecord,
-    cp: &Checkpoint,
-    worktree: &Path,
-    flavor: &dyn Flavor,
-) {
-    if !matches!(deps.config.deliver_for(&deps.project), Deliver::Pr) || deps.forge.is_none() {
-        return;
-    }
-    let Some(branch) = run.branch.clone() else {
-        return;
-    };
-    let base = &deps.project.default_branch;
-
-    // Only publish when there is actually committed work to show; an
-    // unconverged run with an empty branch stays comment-only (the artifact
-    // never made it to a commit).
-    match gitops::commits_ahead(worktree, base).await {
-        Ok(0) => return,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                "issue #{}: cannot check commits ahead for needs-human draft: {e:#}",
-                run.issue_number
-            );
-            return;
-        }
-    }
-
-    // Resume-safety: self-review resumes at STEP_SELF_REVIEW, so a prior
-    // escalation of this run may have already opened the draft (a crash after
-    // create, or the same NeedsHuman path re-running on resume). Never open a
-    // second PR for the branch — adopt whatever exists, and don't resurrect one
-    // a human already closed (the "捨てる" recovery path). A lookup error is
-    // treated as "cannot confirm" and skips rather than risk a duplicate.
-    match deps.forge().pr_for_branch(&branch).await {
-        Ok(Some(pr)) => {
-            let _ = deps.store.emit(
-                Some(&run.id),
-                "self_review.escalated_draft_exists",
-                json!({ "pr": pr.number, "url": pr.url, "state": pr.state }),
-            );
-            return;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(
-                "issue #{}: cannot check for an existing PR on {branch}: {e:#} — \
-                 skipping needs-human draft to avoid a duplicate",
-                run.issue_number
-            );
-            return;
-        }
-    }
-
-    if let Err(e) = gitops::push_branch(worktree, &branch).await {
-        let _ = deps.store.emit(
-            Some(&run.id),
-            "self_review.draft_push_failed",
-            json!({ "branch": branch, "error": format!("{e:#}") }),
-        );
-        return;
-    }
-
-    let title = flavor.pr_title(run, cp);
-    let lenses = &deps.config.review_for(&deps.project).lenses;
-    let body = compose_needs_human_draft_body(run, cp, lenses);
-    match deps
-        .forge()
-        .create_pr(
-            &branch,
-            base,
-            &title,
-            &body,
-            true,
-            &[forge::LABEL_NEEDS_HUMAN],
-        )
-        .await
-    {
-        Ok(pr) => {
-            let _ = deps.store.emit(
-                Some(&run.id),
-                "self_review.escalated_draft",
-                json!({ "pr": pr.number, "url": pr.url,
-                        "rounds": cp.self_review_rounds,
-                        "pending": cp.self_review_pending.len() }),
-            );
-        }
-        Err(e) => {
-            let _ = deps.store.emit(
-                Some(&run.id),
-                "self_review.draft_failed",
-                json!({ "branch": branch, "error": format!("{e:#}") }),
-            );
-        }
-    }
-}
-
 /// The PR-title formula every [`Flavor::pr_title`] shares (issue #136): the
 /// agent-authored `subject` from the turn that established it, or the issue
 /// title when none was ever set (backward compatibility) — followed by the
@@ -2380,34 +1910,18 @@ pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
 /// the meguri footer. Shared by new-PR creation and the spec worker's
 /// spec→implementation body transition so the two paths render an identical
 /// shape (issue #98). `lenses` names the perspectives the self-review applied.
-pub(crate) fn compose_pr_body(
-    run: &RunRecord,
-    cp: &Checkpoint,
-    lenses: &[String],
-    close: bool,
-) -> String {
+pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint, close: bool) -> String {
     let description = cp
         .pr_body
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| cp.summary.trim());
-    // A published PR either converged clean, or took the cap→final-fix path
-    // (issue #212): in the latter the last fix was not re-reviewed, so the body
-    // says so plainly and the human merge gate is the backstop.
-    let final_fix_note = if cp.self_review_final_fix_unreviewed {
-        "> ⚠️ 最終ラウンドの fix は未再レビューです(check_command と tree 検証は通過)。\
-         human merge gate で確認してください。\n\n"
-    } else {
-        ""
-    };
     format!(
-        "{}.\n\n{}{}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
+        "{}.\n\n{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
          from an interactive agent session (run `{}`).",
         issue_reference(run.issue_number, close),
-        final_fix_note,
         description,
-        self_review_details(cp, lenses),
         run.id
     )
 }
@@ -2421,119 +1935,6 @@ pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
         format!("Closes #{issue}")
     } else {
         format!("Refs #{issue}")
-    }
-}
-
-/// The folded self-review summary that rides the PR body (ADR 0008): the
-/// lenses applied and one line per round (verdict + finding count). Empty when
-/// no self-review ran (loops without it, or `review.enabled = false`), so the
-/// body stays clean.
-fn self_review_details(cp: &Checkpoint, lenses: &[String]) -> String {
-    // A published PR either converged clean or took the cap→final-fix path
-    // (issue #212); the outcome headline distinguishes the two.
-    let outcome = if cp.self_review_final_fix_unreviewed {
-        format!("最終 fix 未再レビュー · {} rounds", cp.self_review_rounds)
-    } else {
-        format!("clean after {} rounds", cp.self_review_rounds)
-    };
-    self_review_details_with_outcome(cp, lenses, &outcome)
-}
-
-/// Shared renderer for the folded self-review `<details>`: the `outcome`
-/// headline plus one line per round. Empty when no self-review round ran. The
-/// happy path passes a "clean after N rounds" outcome ([`self_review_details`]);
-/// the escalate-time evidence draft (issue #209) passes an "unconverged" one.
-fn self_review_details_with_outcome(cp: &Checkpoint, lenses: &[String], outcome: &str) -> String {
-    if cp.self_review_log.is_empty() {
-        return String::new();
-    }
-    let rounds = cp
-        .self_review_log
-        .iter()
-        .map(|r| {
-            let verdict = if r.findings == 0 {
-                "clean".to_string()
-            } else {
-                format!("{} findings", r.findings)
-            };
-            format!("- round {}: {verdict}", r.round)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "\n\n<details>\n<summary>🔁 self-review — {outcome}</summary>\n\n\
-         lenses: {lenses}\n\n{rounds}\n</details>",
-        lenses = lenses.join(" / "),
-    )
-}
-
-/// The PR body for an escalate-time needs-human draft (issue #209, ADR 0021).
-/// Unlike [`compose_pr_body`], this is NOT a verified deliverable: self-review
-/// did not converge, so the tree carries no green guarantee. The body says so
-/// plainly, links the issue without closing it (`Refs #N`), and folds in the
-/// self-review round history for context.
-pub(crate) fn compose_needs_human_draft_body(
-    run: &RunRecord,
-    cp: &Checkpoint,
-    lenses: &[String],
-) -> String {
-    let description = cp
-        .pr_body
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| cp.summary.trim());
-    let outcome = format!(
-        "未収束 · {} rounds · {} 件未解決",
-        cp.self_review_rounds,
-        cp.self_review_pending.len()
-    );
-    format!(
-        "{}.\n\n\
-         > ⚠️ **未収束の証拠物件です(グリーン保証なし)。** self-review が収束しなかったため、\
-         meguri が `meguri:needs-human` を付けて draft のまま公開しました。中身を見て活かすなら\
-         手で直して ready + `meguri:spec-ready` に、捨てるならこの PR を閉じてください。\n\n\
-         {}{}\n\n---\n🔁 Opened by [meguri](https://github.com/kkato1030/meguri) \
-         as a needs-human draft from an interactive agent session (run `{}`).",
-        issue_reference(run.issue_number, false),
-        description,
-        self_review_details_with_outcome(cp, lenses, &outcome),
-        run.id
-    )
-}
-
-/// Stamp the self-review verdict as a `meguri/self-review` commit status on
-/// the freshly-pushed head (ADR 0008). Only when a self-review actually ran
-/// and a forge is present; best-effort (the PR is already the durable truth).
-async fn post_self_review_status(deps: &Deps, run: &RunRecord, cp: &Checkpoint, worktree: &Path) {
-    if cp.self_review_log.is_empty() || deps.forge.is_none() {
-        return;
-    }
-    let Ok(head) = gitops::run_git(worktree, &["rev-parse", "HEAD"]).await else {
-        return;
-    };
-    let head = head.trim();
-    // A published PR either converged clean or took the cap→final-fix path
-    // (issue #212); the status is Success either way (check_command + tree
-    // passed), but the description records a non-re-reviewed final fix.
-    let desc = if cp.self_review_final_fix_unreviewed {
-        format!("final fix unreviewed · {} rounds", cp.self_review_rounds)
-    } else {
-        format!("clean · {} rounds", cp.self_review_rounds)
-    };
-    let (state, desc) = (crate::forge::CommitStatusState::Success, desc);
-    if let Err(e) = deps
-        .forge()
-        .set_commit_status(head, "meguri/self-review", state, &desc)
-        .await
-    {
-        deps.store
-            .emit(
-                Some(&run.id),
-                "self_review.status_failed",
-                json!({ "error": format!("{e:#}") }),
-            )
-            .ok();
     }
 }
 
@@ -2618,40 +2019,6 @@ mod tests {
             default_pr_title(&run, &cp),
             "Cache API responses in memory (#7)"
         );
-    }
-
-    /// The cap→final-fix publish (issue #212) records the non-re-review in the
-    /// PR body; a clean convergence does not.
-    #[test]
-    fn compose_pr_body_marks_final_fix_unreviewed() {
-        use super::super::self_review::RoundRecord;
-        let run = fake_run(7);
-        let lenses = vec!["correctness".to_string()];
-        let base = Checkpoint {
-            issue_title: "Add caching".into(),
-            summary: "done".into(),
-            self_review_rounds: 3,
-            self_review_log: vec![RoundRecord {
-                round: 3,
-                findings: 1,
-            }],
-            ..Default::default()
-        };
-
-        // Clean convergence: no final-fix warning, "clean after N rounds".
-        let clean = compose_pr_body(&run, &base, &lenses, true);
-        assert!(!clean.contains("未再レビュー"), "{clean}");
-        assert!(clean.contains("clean after 3 rounds"), "{clean}");
-
-        // Final-fix publish: the warning line and the "最終 fix 未再レビュー"
-        // outcome both appear.
-        let final_fix = Checkpoint {
-            self_review_final_fix_unreviewed: true,
-            ..base
-        };
-        let body = compose_pr_body(&run, &final_fix, &lenses, true);
-        assert!(body.contains("最終ラウンドの fix は未再レビュー"), "{body}");
-        assert!(body.contains("最終 fix 未再レビュー · 3 rounds"), "{body}");
     }
 
     #[test]
@@ -2821,7 +2188,6 @@ mod tests {
             check_command: None,
             worktree_root: Some(worktree_root),
             pr: None,
-            review: None,
             worktree_setup,
             autonomy: None,
             prompts: Default::default(),
@@ -2879,7 +2245,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -2943,7 +2308,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -2997,7 +2361,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            review: None,
             worktree_setup: Default::default(),
             autonomy: None,
             prompts: Default::default(),
@@ -3209,265 +2572,5 @@ mod tests {
         attach_pr_worktree(&deps, &run, &cp).await.unwrap();
 
         assert!(wt.join("marker.txt").exists());
-    }
-
-    /// A minimal worker flavor whose only meaningful method is `pr_title` —
-    /// enough to exercise `publish_needs_human_draft` (issue #209).
-    struct DraftFlavor;
-
-    #[async_trait::async_trait]
-    impl Flavor for DraftFlavor {
-        fn trigger_label(&self) -> &'static str {
-            ""
-        }
-        fn execute_prompt(&self, _: &Deps, _: &RunRecord, _: &Checkpoint, _: &Path) -> String {
-            String::new()
-        }
-        fn verify_work(
-            &self,
-            _: &RunRecord,
-            _: &Checkpoint,
-            _: &Path,
-        ) -> std::result::Result<(), String> {
-            Ok(())
-        }
-        fn pr_title(&self, run: &RunRecord, cp: &Checkpoint) -> String {
-            format!("draft: {} (#{})", cp.issue_title, run.issue_number)
-        }
-        async fn settle_labels(&self, _: &Deps, _: &RunRecord, _: &Checkpoint) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Build a real repo + worktree (optionally ahead of base, optionally wired
-    /// to a bare origin) plus a Deps over a FakeForge, and a run whose
-    /// branch/worktree point at it. The returned TempDirs must be kept alive by
-    /// the caller for the duration of the test.
-    async fn draft_env(
-        ahead: bool,
-        with_origin: bool,
-    ) -> (
-        Deps,
-        std::sync::Arc<crate::forge::fake::FakeForge>,
-        String,
-        PathBuf,
-        Vec<tempfile::TempDir>,
-    ) {
-        use crate::config::{Config, ProjectConfig};
-        use crate::gitops;
-        use crate::store::Store;
-
-        let repo = tempfile::tempdir().unwrap();
-        gitops::run_git(repo.path(), &["init", "-b", "main"])
-            .await
-            .unwrap();
-        gitops::run_git(repo.path(), &["config", "user.email", "t@example.com"])
-            .await
-            .unwrap();
-        gitops::run_git(repo.path(), &["config", "user.name", "t"])
-            .await
-            .unwrap();
-        std::fs::write(repo.path().join("seed.txt"), "seed").unwrap();
-        gitops::run_git(repo.path(), &["add", "."]).await.unwrap();
-        gitops::run_git(repo.path(), &["commit", "-m", "init"])
-            .await
-            .unwrap();
-
-        let origin = tempfile::tempdir().unwrap();
-        if with_origin {
-            let origin_str = origin.path().to_string_lossy().to_string();
-            gitops::run_git(repo.path(), &["clone", "--bare", ".", &origin_str])
-                .await
-                .unwrap();
-            gitops::run_git(repo.path(), &["remote", "add", "origin", &origin_str])
-                .await
-                .unwrap();
-            gitops::run_git(repo.path(), &["fetch", "origin"])
-                .await
-                .unwrap();
-        }
-
-        let wt_root = tempfile::tempdir().unwrap();
-        let branch = "meguri/209-draft-test".to_string();
-        let wt = gitops::worktree_path(wt_root.path(), "proj", &branch);
-        gitops::create_worktree(repo.path(), &wt, &branch, "main", &[])
-            .await
-            .unwrap();
-        if ahead {
-            std::fs::write(wt.join("work.txt"), "wip").unwrap();
-            gitops::run_git(&wt, &["add", "."]).await.unwrap();
-            gitops::run_git(&wt, &["commit", "-m", "wip"])
-                .await
-                .unwrap();
-        }
-
-        let store = Store::open_in_memory().unwrap();
-        let run = store
-            .create_run_for_loop("proj", super::super::worker::KIND, 209, "Add caching")
-            .unwrap();
-        let run_id = run.id.clone();
-        store
-            .update_run_worktree(&run_id, &branch, &wt.to_string_lossy())
-            .unwrap();
-
-        let project = ProjectConfig {
-            id: "proj".into(),
-            repo_path: Some(repo.path().to_path_buf()),
-            repo_slug: Some("me/proj".into()),
-            mode: Default::default(),
-            deliver: None,
-            default_branch: "main".into(),
-            language: None,
-            check_command: None,
-            worktree_root: Some(wt_root.path().to_path_buf()),
-            pr: None,
-            review: None,
-            worktree_setup: Default::default(),
-            prompts: Default::default(),
-            autonomy: None,
-        };
-        let forge = std::sync::Arc::new(crate::forge::fake::FakeForge::default());
-        let deps = Deps::with_label_source(
-            store,
-            std::sync::Arc::new(crate::mux::fake::FakeMux::new(false)),
-            forge.clone(),
-            Config::default(),
-            project,
-        );
-        (deps, forge, run_id, wt, vec![repo, origin, wt_root])
-    }
-
-    /// Escalating with committed work ahead of base opens exactly one draft PR
-    /// labeled `meguri:needs-human` — at creation, not via a follow-up call —
-    /// and emits `self_review.escalated_draft` (never `pr.created`).
-    #[tokio::test]
-    async fn escalate_publishes_needs_human_draft_when_ahead() {
-        let (deps, forge, run_id, wt, _tmp) = draft_env(true, true).await;
-        let run = deps.store.get_run(&run_id).unwrap().unwrap();
-        let cp = Checkpoint {
-            issue_title: "Add caching".into(),
-            summary: "書きかけの要約".into(),
-            ..Default::default()
-        };
-
-        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
-
-        let prs = forge.prs();
-        assert_eq!(prs.len(), 1, "exactly one draft opened");
-        let pr = &prs[0];
-        assert!(pr.draft, "opened as a draft");
-        assert!(
-            pr.labels
-                .iter()
-                .any(|l| l == crate::forge::LABEL_NEEDS_HUMAN),
-            "labeled needs-human at creation (not a separate add_pr_label): {:?}",
-            pr.labels
-        );
-        assert_eq!(pr.head, "meguri/209-draft-test");
-        assert_eq!(pr.base, "main");
-        assert!(pr.body.contains("Refs #209"), "links without closing");
-        assert!(
-            pr.body.contains("証拠物件"),
-            "body flags it as unconverged evidence: {}",
-            pr.body
-        );
-
-        let kinds: Vec<String> = deps
-            .store
-            .events_for_run(&run_id, 50)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert!(
-            kinds.iter().any(|k| k == "self_review.escalated_draft"),
-            "{kinds:?}"
-        );
-        assert!(
-            !kinds.iter().any(|k| k == "pr.created"),
-            "an evidence draft must not count as a delivered PR: {kinds:?}"
-        );
-    }
-
-    /// Resume-safety: a second escalation of the same run (a crash after create,
-    /// or the same NeedsHuman path re-running on resume from STEP_SELF_REVIEW)
-    /// must NOT open a duplicate draft — it adopts the existing one.
-    #[tokio::test]
-    async fn escalate_is_idempotent_across_reruns() {
-        let (deps, forge, run_id, wt, _tmp) = draft_env(true, true).await;
-        let run = deps.store.get_run(&run_id).unwrap().unwrap();
-        let cp = Checkpoint {
-            issue_title: "Add caching".into(),
-            ..Default::default()
-        };
-
-        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
-        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
-
-        assert_eq!(
-            forge.prs().len(),
-            1,
-            "second run must not duplicate the draft"
-        );
-        let kinds: Vec<String> = deps
-            .store
-            .events_for_run(&run_id, 50)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert_eq!(
-            kinds
-                .iter()
-                .filter(|k| *k == "self_review.escalated_draft")
-                .count(),
-            1,
-            "only the first run creates: {kinds:?}"
-        );
-        assert!(
-            kinds
-                .iter()
-                .any(|k| k == "self_review.escalated_draft_exists"),
-            "the re-run adopts the existing draft: {kinds:?}"
-        );
-    }
-
-    /// No commits ahead → nothing to show → comment-only (no PR).
-    #[tokio::test]
-    async fn escalate_stays_comment_only_when_not_ahead() {
-        let (deps, forge, run_id, wt, _tmp) = draft_env(false, true).await;
-        let run = deps.store.get_run(&run_id).unwrap().unwrap();
-        let cp = Checkpoint {
-            issue_title: "Add caching".into(),
-            ..Default::default()
-        };
-        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
-        assert!(forge.prs().is_empty(), "nothing committed → no draft");
-    }
-
-    /// A failed push falls back to comment-only (best-effort): no PR, and the
-    /// failure is recorded rather than silently swallowed.
-    #[tokio::test]
-    async fn escalate_falls_back_to_comment_only_on_push_failure() {
-        // No origin remote wired → `git push origin` fails.
-        let (deps, forge, run_id, wt, _tmp) = draft_env(true, false).await;
-        let run = deps.store.get_run(&run_id).unwrap().unwrap();
-        let cp = Checkpoint {
-            issue_title: "Add caching".into(),
-            ..Default::default()
-        };
-        publish_needs_human_draft(&deps, &run, &cp, &wt, &DraftFlavor).await;
-        assert!(forge.prs().is_empty(), "push failed → no draft");
-        let kinds: Vec<String> = deps
-            .store
-            .events_for_run(&run_id, 50)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert!(
-            kinds.iter().any(|k| k == "self_review.draft_push_failed"),
-            "{kinds:?}"
-        );
     }
 }

@@ -24,7 +24,6 @@ fn project() -> ProjectConfig {
         check_command: None,
         worktree_root: None,
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),
@@ -247,10 +246,7 @@ async fn observe_cost_is_constant_and_recorded() {
     for n in 1..=3 {
         seed_armable(&forge, n, "sha");
     }
-    let one = forge
-        .observe_open_prs(meguri::engine::pr_reviewer::PR_REVIEW_STATUS)
-        .await
-        .unwrap();
+    let one = forge.observe_open_prs().await.unwrap();
     assert_eq!(one.prs.len(), 3);
     assert_eq!(one.cost.requests, 1, "one bulk read for three PRs");
 

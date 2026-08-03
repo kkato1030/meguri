@@ -14,7 +14,7 @@ use crate::engine::{self, Deps};
 use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
-use crate::store::{DesiredState, LANE_AUTHOR, LANE_PR_REVIEW, RunRecord, RunStatus, Store};
+use crate::store::{DesiredState, LANE_AUTHOR, RunRecord, RunStatus, Store};
 use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
@@ -1362,7 +1362,6 @@ pub async fn cmd_attach(
     pr: Option<i64>,
     run_id: Option<&str>,
     task: Option<i64>,
-    review: bool,
 ) -> Result<()> {
     let cfg = Config::load()?;
     let store = open_store()?;
@@ -1393,7 +1392,7 @@ pub async fn cmd_attach(
     } else {
         bail!("pass an issue/run id, or one of --issue / --pr / --run-id / --task");
     };
-    let (kind, pane) = resolve_attach_pane(&store, &needle, review)?;
+    let (kind, pane) = resolve_attach_pane(&store, &needle)?;
     // Attach addresses an existing pane by id; the tmux attach command resolves
     // the pane's own session, so no project-scoped label is needed here.
     let mux = mux::from_kind(&kind, &cfg.mux.session, None)?;
@@ -1407,14 +1406,12 @@ pub async fn cmd_attach(
     bail!("exec failed: {err}");
 }
 
-/// Resolve what `meguri attach <needle> [--review]` should attach to. Panes
-/// belong to the issue's lanes (author + pr-review, kept until the issue
-/// closes), so the issue's persistent lane pane wins over whatever pane id
-/// a run once recorded — and a bare issue number keeps working after its
-/// runs finished. A run id derives its lane from the run's loop kind;
-/// `--review` picks the pr-review lane for issue numbers.
-fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(String, String)> {
-    let wanted_lane = if review { LANE_PR_REVIEW } else { LANE_AUTHOR };
+/// Resolve what `meguri attach <needle>` should attach to. Panes belong to
+/// the issue's author lane (kept until the issue closes), so the issue's
+/// persistent lane pane wins over whatever pane id a run once recorded — and
+/// a bare issue number keeps working after its runs finished.
+fn resolve_attach_pane(store: &Store, needle: &str) -> Result<(String, String)> {
+    let wanted_lane = LANE_AUTHOR;
     if let Some(run) = store.find_run(needle)? {
         // Derive the run's lane from its loop kind: a pr-review-lane run
         // resolves its pr-review pane, everything else the author pane —
@@ -1437,11 +1434,7 @@ fn resolve_attach_pane(store: &Store, needle: &str, review: bool) -> Result<(Str
             .filter(|p| p.lane == wanted_lane)
             .collect();
         match panes.as_slice() {
-            [] => {
-                if review {
-                    bail!("issue #{issue} has no live review pane");
-                }
-            }
+            [] => {}
             [p] => {
                 if let (Some(kind), Some(id)) = (&p.mux_kind, &p.mux_pane_id) {
                     return Ok((kind.clone(), id.clone()));

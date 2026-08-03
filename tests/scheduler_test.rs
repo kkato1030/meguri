@@ -44,7 +44,6 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
     let mut config = Config::default();
     config.limits.idle_grace_secs = 3600;
     config.limits.result_grace_secs = 1;
-    config.review.enabled = false; // self-review not under test in the scheduler suite
     let project = ProjectConfig {
         id: "proj".into(),
         repo_path: Some(clone),
@@ -56,7 +55,6 @@ async fn setup(root: &Path, forge: Arc<FakeForge>) -> Deps {
         check_command: None,
         worktree_root: Some(root.join("worktrees")),
         pr: None,
-        review: None,
         worktree_setup: Default::default(),
         autonomy: None,
         prompts: Default::default(),
