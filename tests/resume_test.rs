@@ -86,7 +86,7 @@ async fn setup() -> TestEnv {
         prompts: Default::default(),
     };
 
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
         forge,

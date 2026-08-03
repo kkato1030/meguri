@@ -91,7 +91,7 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> TestEnv {
         prompts: Default::default(),
     };
 
-    let deps = Deps::with_label_source(
+    let deps = Deps::with_github_source(
         Store::open_in_memory().unwrap(),
         mux.clone(),
         forge.clone(),

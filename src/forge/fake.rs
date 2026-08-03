@@ -335,18 +335,6 @@ impl Forge for FakeForge {
             .collect())
     }
 
-    async fn list_open_issues(&self) -> Result<Vec<Issue>> {
-        let closed = self.closed.lock().unwrap();
-        Ok(self
-            .issues
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|i| !closed.contains_key(&i.number))
-            .cloned()
-            .collect())
-    }
-
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>> {
         if self.blocked_by_errors.lock().unwrap().contains(&issue) {
             bail!("blocked_by of issue #{issue} is unreadable");
@@ -435,16 +423,6 @@ impl Forge for FakeForge {
         };
         rec.labels.retain(|l| l != label);
         Ok(())
-    }
-
-    async fn get_pr(&self, number: i64) -> Result<PullRequest> {
-        self.prs
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|p| p.number == number)
-            .map(Self::pr_to_public)
-            .ok_or_else(|| anyhow::anyhow!("PR #{number} not found"))
     }
 
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {

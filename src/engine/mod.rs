@@ -42,7 +42,7 @@ pub struct Deps {
     pub project: ProjectConfig,
     /// Whether launch-time pre-flight priming is active (issue #235). Production
     /// (`app::build_deps`) sets it `true`; the test constructor
-    /// [`Deps::with_label_source`] leaves it `false`, so integration tests —
+    /// [`Deps::with_github_source`] leaves it `false`, so integration tests —
     /// which pair a `FakeMux` (never executes the agent command) with the
     /// default `claude` command — never fire a *real* `claude` prime subprocess.
     pub preflight_enabled: bool,
@@ -54,14 +54,14 @@ impl Deps {
     /// it. This is the shape `app::build_coordination` produces for github
     /// projects; tests use it so their FakeForge flows through the same
     /// `TaskSource` seam production does (issue #54 acceptance criterion 6).
-    pub fn with_label_source(
+    pub fn with_github_source(
         store: Store,
         mux: Arc<dyn Multiplexer>,
         forge: Arc<dyn Forge>,
         config: Config,
         project: ProjectConfig,
     ) -> Self {
-        let task_source = Arc::new(crate::tasks::LabelTaskSource::new(
+        let task_source = Arc::new(crate::tasks::GithubTaskSource::new(
             forge.clone(),
             store.clone(),
             project.id.clone(),
@@ -81,7 +81,7 @@ impl Deps {
 
     /// Swap in a custom [`ForgeFactory`] (cross-repo decomposition tests inject
     /// fakes for workspace siblings). Builder-style so the common
-    /// `with_label_source` path stays a single call.
+    /// `with_github_source` path stays a single call.
     pub fn with_forge_factory(mut self, factory: Arc<dyn crate::forge::ForgeFactory>) -> Self {
         self.forge_factory = factory;
         self
@@ -530,7 +530,7 @@ mod tests {
             worktree_setup: Default::default(),
             prompts: Default::default(),
         };
-        Deps::with_label_source(
+        Deps::with_github_source(
             Store::open_in_memory().unwrap(),
             Arc::new(FakeMux::new(false)),
             Arc::new(crate::forge::fake::FakeForge::default()),

@@ -15,7 +15,7 @@ use crate::forge::Forge;
 use crate::forge::gh::GhForge;
 use crate::mux;
 use crate::store::{DesiredState, LANE_AUTHOR, RunRecord, RunStatus, Store};
-use crate::tasks::{LabelTaskSource, LocalTaskSource, TaskKind, TaskSource};
+use crate::tasks::{GithubTaskSource, LocalTaskSource, TaskKind, TaskSource};
 
 pub fn open_store() -> Result<Store> {
     Store::open(&config::db_path())
@@ -39,7 +39,7 @@ fn build_coordination(
                 "github-mode project has no repo_slug (config validation should have caught this)",
             )?;
             let forge: Arc<dyn Forge> = Arc::new(GhForge::new(&slug));
-            let ts: Arc<dyn TaskSource> = Arc::new(LabelTaskSource::new(
+            let ts: Arc<dyn TaskSource> = Arc::new(GithubTaskSource::new(
                 forge.clone(),
                 store.clone(),
                 project.id.clone(),
@@ -165,13 +165,26 @@ async fn add_github(cfg: &Config, project: &ProjectConfig, text: &str, ready: bo
         labels.push(crate::forge::LABEL_READY);
     }
 
-    let _ = cfg;
     let params = AddParams {
         text,
         labels: &labels,
         repo_slug,
     };
-    add_core(&forge, params).await?;
+    let number = add_core(&forge, params).await?;
+    // 権威反転: import the task row immediately (the intake would pick it up
+    // within its cadence anyway; this removes the wait for `--ready` adds).
+    if ready {
+        let _ = cfg;
+        let store = open_store()?;
+        let title = text.lines().next().unwrap_or(text);
+        store.create_task(
+            &project.id,
+            TaskKind::Work.as_str(),
+            title,
+            text,
+            &crate::tasks::github_origin(number),
+        )?;
+    }
     Ok(())
 }
 
@@ -710,86 +723,55 @@ pub async fn cmd_run(
     }
 }
 
-/// Issue-side manual run (`Mode::ManualRun`): the decider's arm with the
-/// discovery throttles bypassed and the safety gates kept.
+/// Issue-side manual run: create (or resume) the worker run directly. The
+/// safety gates live at claim time (hold / trigger-label re-verification +
+/// the held row) — a manual run bypasses only the intake cadence.
 async fn run_issue_side(deps: &engine::Deps, issue: i64) -> Result<()> {
-    use crate::engine::issue_reconciler::{self, IssueStep, Mode};
     let gh_issue = deps.forge().get_issue(issue).await?;
-    let open_prs = engine::reaper::open_meguri_pr_issues(deps).await;
-    let snap = issue_reconciler::build_issue_snapshot(deps, &gh_issue, &open_prs).await?;
-    match issue_reconciler::next_step_issue(&snap, Mode::ManualRun) {
-        IssueStep::Agent(arm) => {
-            let run = match deps.store.create_run_for_loop(
-                &deps.project.id,
-                arm.loop_kind(),
-                issue,
-                &gh_issue.title,
-            ) {
-                Ok(run) => run,
-                Err(_) => resume_existing(deps, issue)?,
-            };
-            println!(
-                "run {} — issue #{issue} {:?} → {} — watch with: meguri attach {}",
-                run.id,
-                gh_issue.title,
-                arm.loop_kind(),
-                run.id
-            );
-            let outcome = engine::run_recipe(deps, &run.id, &run.loop_kind).await?;
-            print_run_outcome(outcome)
-        }
-        other => {
-            println!("nothing to launch for issue #{issue}: {other:?}");
-            Ok(())
-        }
-    }
+    let run = match deps.store.create_run_for_loop(
+        &deps.project.id,
+        engine::worker::KIND,
+        issue,
+        &gh_issue.title,
+    ) {
+        Ok(run) => run,
+        Err(_) => resume_existing(deps, issue)?,
+    };
+    println!(
+        "run {} — issue #{issue} {:?} → worker — watch with: meguri attach {}",
+        run.id, gh_issue.title, run.id
+    );
+    let outcome = engine::run_recipe(deps, &run.id, &run.loop_kind).await?;
+    print_run_outcome(outcome)
 }
 
-/// Local-task manual run (`next_step_local`, ADR 0016): local mode's input
-/// path — no more bail for local projects.
+/// Local-task manual run (ADR 0016): local mode's input path.
 async fn run_local_task(deps: &engine::Deps, task_id: i64) -> Result<()> {
-    use crate::engine::issue_reconciler::{
-        LocalArm, LocalSnapshot, LocalStep, Mode, next_step_local,
-    };
     let task = deps
         .store
         .get_task(task_id)?
         .with_context(|| format!("no local task {task_id}"))?;
-    let snap = LocalSnapshot {
-        human_stop: false,
-        issue_busy: false,
-        already_shipped: false,
-        deps_unmet: false,
+    let run = match deps.store.create_run_for_task(
+        &deps.project.id,
+        engine::worker::KIND,
+        task_id,
+        &task.title,
+    ) {
+        Ok(run) => run,
+        Err(_) => {
+            let existing = deps
+                .store
+                .list_runs(true)?
+                .into_iter()
+                .find(|r| r.project_id == deps.project.id && r.task_id == Some(task_id))
+                .context("an active run exists but could not be loaded")?;
+            println!("resuming run {} (step {})", existing.id, existing.step);
+            existing
+        }
     };
-    match next_step_local(&snap, Mode::ManualRun) {
-        LocalStep::Agent(LocalArm::Worker) => {
-            let run = match deps.store.create_run_for_task(
-                &deps.project.id,
-                engine::worker::KIND,
-                task_id,
-                &task.title,
-            ) {
-                Ok(run) => run,
-                Err(_) => {
-                    let existing = deps
-                        .store
-                        .list_runs(true)?
-                        .into_iter()
-                        .find(|r| r.project_id == deps.project.id && r.task_id == Some(task_id))
-                        .context("an active run exists but could not be loaded")?;
-                    println!("resuming run {} (step {})", existing.id, existing.step);
-                    existing
-                }
-            };
-            println!("run {} — task {task_id} {:?}", run.id, task.title);
-            let outcome = engine::run_recipe(deps, &run.id, engine::worker::KIND).await?;
-            print_run_outcome(outcome)
-        }
-        other => {
-            println!("nothing to launch for task {task_id}: {other:?}");
-            Ok(())
-        }
-    }
+    println!("run {} — task {task_id} {:?}", run.id, task.title);
+    let outcome = engine::run_recipe(deps, &run.id, engine::worker::KIND).await?;
+    print_run_outcome(outcome)
 }
 
 /// Resume the active run of `issue` when creation hit the unique index.
@@ -925,10 +907,7 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
     for project in projects {
         let deps = build_deps(&cfg, project, None)?;
         let mut states = reaper::IssueStates::default();
-        // Manual prune honors the same open-PR ownership boundary as the
-        // automatic Finalize pass (finding 4b).
-        let open_pr_issues = reaper::open_meguri_pr_issues(&deps).await;
-        let pane_candidates = reaper::plan_panes(&deps, &mut states, &open_pr_issues).await?;
+        let pane_candidates = reaper::plan_panes(&deps, &mut states).await?;
 
         // Panes go first so their worktrees become reclaimable in this same
         // pass (a closed issue's live pane no longer protects its worktree).
@@ -955,7 +934,7 @@ pub async fn cmd_prune(project: Option<&str>, dry_run: bool, force: bool) -> Res
             }
         }
 
-        let candidates = reaper::plan_with(&deps, &mut states, &open_pr_issues).await?;
+        let candidates = reaper::plan_with(&deps, &mut states).await?;
         if candidates.is_empty() {
             if pane_candidates.is_empty() {
                 println!("{}: no meguri panes or worktrees", project.id);
@@ -1087,13 +1066,8 @@ fn first_heading(markdown: &str) -> Option<String> {
 pub async fn cmd_tasks(project: Option<&str>, all: bool) -> Result<()> {
     let cfg = Config::load()?;
     let project = pick_project(&cfg, project)?;
-    match project.mode {
-        ProjectMode::Local => cmd_tasks_local(project, all),
-        ProjectMode::Github => {
-            let _ = cfg;
-            bail!("`meguri tasks` lists local tasks; github mode uses issue labels")
-        }
-    }
+    let _ = cfg;
+    cmd_tasks_local(project, all)
 }
 
 /// Local-mode listing: the sqlite `tasks`, with a not-before annotation on any

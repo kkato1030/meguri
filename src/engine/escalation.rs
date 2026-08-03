@@ -198,6 +198,13 @@ pub async fn escalate_infra(deps: &Deps, run: &RunRecord, reason: &str, detail: 
         // respects). A human resumes by removing the hold / clearing the gate.
         match key {
             TaskKey::Issue(n) => {
+                // Authority first: park the row; the hold label is projection.
+                if let Ok(Some(row)) = deps
+                    .store
+                    .task_by_origin(&deps.project.id, &crate::tasks::github_origin(n))
+                {
+                    let _ = deps.store.park_task_until(row.id, INFRA_PARKED_UNTIL);
+                }
                 if deps.forge.is_some() {
                     let _ = deps.forge().add_label(n, forge::LABEL_HOLD).await;
                 }
@@ -303,7 +310,7 @@ mod tests {
             worktree_setup: Default::default(),
             prompts: Default::default(),
         };
-        Deps::with_label_source(
+        Deps::with_github_source(
             Store::open_in_memory().unwrap(),
             Arc::new(FakeMux::new(false)),
             forge,
