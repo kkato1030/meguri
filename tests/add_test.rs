@@ -8,7 +8,7 @@ use meguri::app::{
 };
 use meguri::config::Config;
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_PLAN};
+use meguri::forge::{Forge, LABEL_READY};
 
 fn params<'a>(text: &'a str, labels: &'a [&'a str]) -> AddParams<'a> {
     AddParams {
@@ -21,11 +21,11 @@ fn params<'a>(text: &'a str, labels: &'a [&'a str]) -> AddParams<'a> {
 #[tokio::test]
 async fn flags_apply_labels_at_capture() {
     let forge = Arc::new(FakeForge::default());
-    let n = add_core(&*forge, params("plan me", &[LABEL_PLAN]))
+    let n = add_core(&*forge, params("do me", &[LABEL_READY]))
         .await
         .unwrap();
     let issue = forge.get_issue(n).await.unwrap();
-    assert!(issue.has_label(LABEL_PLAN)); // 基準 4
+    assert!(issue.has_label(LABEL_READY)); // 基準 4
 }
 
 #[tokio::test]
@@ -123,31 +123,13 @@ mode = "local"
 }
 
 #[test]
-fn local_mode_plan_flag_is_rejected() {
-    // Local mode has no planner (issue #54): PlannerLoop::discover returns
-    // nothing without a forge, so a plan task would stay queued forever.
-    // `meguri add --plan` on a local project must fail up front.
-    let cfg = two_mode_config();
-    let local = &cfg.projects[1];
-    let err = check_add_flags(local, true, false, false)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("no planner"), "{err}");
-    assert!(err.contains("#54"), "{err}");
-    // Without --plan the same local capture is fine (work task).
-    check_add_flags(local, false, false, true).unwrap();
-}
-
-#[test]
 fn add_flags_are_checked_against_the_mode() {
     let cfg = two_mode_config();
     let (gh, local) = (&cfg.projects[0], &cfg.projects[1]);
-    // github mode: --plan is exactly what the planner intake wants...
-    check_add_flags(gh, true, false, false).unwrap();
-    // ...but --plan + --ready contradict each other,
-    assert!(check_add_flags(gh, true, true, false).is_err());
-    // and --file is a local-mode option.
-    assert!(check_add_flags(gh, false, false, true).is_err());
-    // local mode: --ready is a github-mode option.
-    assert!(check_add_flags(local, false, true, false).is_err());
+    check_add_flags(gh, true, false).unwrap();
+    // --file is a local-mode option.
+    assert!(check_add_flags(gh, false, true).is_err());
+    // local mode: --ready is a github-mode option; --file is fine.
+    assert!(check_add_flags(local, true, false).is_err());
+    check_add_flags(local, false, true).unwrap();
 }

@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, ReviewThread};
 use crate::store::RunRecord;
 use serde_json::json;
@@ -103,7 +103,7 @@ impl Flavor for FixerFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
+        if let Some(reason) = pr_is_touchable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
         let threads: Vec<ReviewThread> = deps
@@ -349,7 +349,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,

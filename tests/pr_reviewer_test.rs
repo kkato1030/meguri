@@ -11,16 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meguri::config::{AgentProfile, Config, LaunchMode, PlanDelivery, ProjectConfig};
+use meguri::config::{AgentProfile, Config, LaunchMode, ProjectConfig};
 use meguri::engine::issue_reconciler;
-use meguri::engine::pr_reviewer::{
-    self, DIFF_FILE, PR_REVIEW_STATUS, REVIEW_FILE, run_pr_reviewer,
-};
-use meguri::engine::{Deps, WorkerOutcome, reaper};
+use meguri::engine::pr_reviewer::{self, PR_REVIEW_STATUS, REVIEW_FILE, run_pr_reviewer};
+use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    CommitStatusState, Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY,
-    LABEL_SPEC_REVIEWING, LABEL_WORKING,
+    CommitStatusState, Forge, LABEL_HOLD, LABEL_IMPLEMENTING, LABEL_NEEDS_HUMAN, LABEL_WORKING,
 };
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
@@ -134,7 +131,6 @@ async fn setup_with(
         check_command: None,
         worktree_root: Some(worktree_root.clone()),
         pr: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,
@@ -266,145 +262,6 @@ async fn reconciled_runs(env: &TestEnv, kind: &str) -> Vec<meguri::store::RunRec
         .collect()
 }
 
-/// pr-reviewer(Plan) clean: spec-reviewing → spec-ready, a success pr-review
-/// status, a folded body `<details>`, and NO inline threads or comments —
-/// the fixer never reacts (criterion 3, 3a).
-#[tokio::test(flavor = "multi_thread")]
-async fn plan_review_clean_flips_to_spec_ready_via_status_and_body() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_pr_reviewer_run(&env);
-
-    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
-        write_review(wt, "clean", "LGTM — spec covers the issue.");
-        write_result(wt, turn_id, "success");
-    });
-
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
-            .await
-            .expect("pr-review timed out")
-            .unwrap();
-    agent.abort();
-    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
-
-    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
-    assert_eq!(record.status, RunStatus::Succeeded);
-    assert_eq!(record.step, pr_reviewer::STEP_SETTLE);
-    assert_eq!(record.loop_kind, pr_reviewer::KIND);
-
-    // Plan review drives the label state machine: spec-reviewing → spec-ready.
-    let labels = env.forge.pr_labels_of(PR);
-    assert!(labels.contains(&LABEL_SPEC_READY.to_string()), "{labels:?}");
-    assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
-    assert!(!labels.contains(&LABEL_WORKING.to_string()));
-
-    // A success pr-review commit status on the reviewed head.
-    assert_eq!(
-        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
-        Some(CommitStatusState::Success)
-    );
-
-    // The verdict folds into the PR body — not a conversation comment, and
-    // never an inline thread (the fixer stays inert, criterion 3).
-    let pr = env
-        .forge
-        .prs()
-        .into_iter()
-        .find(|p| p.number == PR)
-        .unwrap();
-    assert!(pr.body.contains("<details>"), "body: {}", pr.body);
-    assert!(pr.body.contains("pr review (plan) — clean"));
-    assert!(
-        env.forge.pr_comments_of(PR).is_empty(),
-        "pr-reviewer posts no conversation comment"
-    );
-    assert!(
-        env.forge.threads_of(PR).is_empty(),
-        "pr-reviewer posts no inline review thread"
-    );
-
-    // The agent reviewed the PR head in a `pr-reviewer-<issue>` detached checkout.
-    let wt = find_worktree(&env.worktree_root).unwrap();
-    assert!(
-        wt.ends_with(format!("pr-reviewer-{ISSUE}")),
-        "{}",
-        wt.display()
-    );
-    assert_eq!(
-        run_git(&wt, &["rev-parse", "HEAD"]).await.unwrap(),
-        env.head_sha
-    );
-    assert!(wt.join(DIFF_FILE).exists());
-}
-
-/// pr-reviewer(Plan) findings do NOT escalate (issue #192, ADR 0013): a
-/// failure status, the summary in the body, spec-reviewing kept, working
-/// released, and no needs-human — `spec_fixer` owns the plan-side fix loop
-/// and its discover must be able to pick the PR up on the very next poll.
-/// Escalating here would starve spec_fixer's discover (which skips
-/// needs-human PRs) before it ever ran (the #176/#188 integration bug this
-/// issue fixes).
-#[tokio::test(flavor = "multi_thread")]
-async fn plan_review_findings_defer_to_spec_fixer_without_escalating() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_pr_reviewer_run(&env);
-
-    let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
-        write_review(wt, "findings", "- The spec lacks acceptance criteria.");
-        write_result(wt, turn_id, "success");
-    });
-
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(60), run_pr_reviewer(&env.deps, &run.id))
-            .await
-            .expect("pr-review timed out")
-            .unwrap();
-    agent.abort();
-    assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
-
-    let labels = env.forge.pr_labels_of(PR);
-    assert!(
-        labels.contains(&LABEL_SPEC_REVIEWING.to_string()),
-        "{labels:?}"
-    );
-    assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
-    assert!(
-        !labels.contains(&LABEL_NEEDS_HUMAN.to_string()),
-        "plan findings must not escalate — spec_fixer owns the fix loop: {labels:?}"
-    );
-    assert!(!labels.contains(&LABEL_WORKING.to_string()));
-    assert!(
-        env.forge.comments_of(PR).is_empty(),
-        "no escalation comment for plan findings"
-    );
-    assert_eq!(
-        env.forge.commit_status_of(&env.head_sha, PR_REVIEW_STATUS),
-        Some(CommitStatusState::Failure)
-    );
-    let pr = env
-        .forge
-        .prs()
-        .into_iter()
-        .find(|p| p.number == PR)
-        .unwrap();
-    assert!(pr.body.contains("acceptance criteria"), "body: {}", pr.body);
-
-    // pr_reviewer itself does not re-review a head it already settled...
-    assert!(
-        reconciled_runs(&env, pr_reviewer::KIND).await.is_empty(),
-        "an already-reviewed head is not re-reviewed"
-    );
-    // ...but the spec-fixer arm fires on the very next resync (issue #192,
-    // acceptance criterion 1): no needs-human means it is free to pick up
-    // the PR whose head pr-review status it just saw settle to Failure.
-    let runs = reconciled_runs(&env, meguri::engine::spec_fixer::KIND).await;
-    assert_eq!(
-        runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
-        vec![ISSUE],
-        "spec_fixer must be enqueued now that the PR is not escalated"
-    );
-}
-
 /// pr-reviewer(Impl): reviews an implementation PR, writes the pr-review
 /// status + body summary, escalates a blocking safety finding to needs-human
 /// (issue #176 / ADR 0025), and NEVER touches spec-* labels (criterion 3a). No
@@ -444,8 +301,6 @@ async fn impl_review_reviews_without_touching_spec_labels() {
         labels.contains(&LABEL_IMPLEMENTING.to_string()),
         "{labels:?}"
     );
-    assert!(!labels.contains(&LABEL_SPEC_READY.to_string()));
-    assert!(!labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
     // Findings escalate: the impl PR is parked on needs-human (issue #176).
     assert!(
@@ -522,31 +377,24 @@ async fn impl_review_off_discovers_nothing() {
     );
 }
 
-/// Discovery filters: held / claimed / already-reviewed heads are skipped; a
-/// plan PR whose plan review is off is skipped too.
+/// Discovery filters: held / claimed / already-reviewed heads are skipped.
 #[tokio::test(flavor = "multi_thread")]
 async fn discovery_filters_hold_claimed_and_reviewed_heads() {
-    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
 
-    env.forge.add_pr(
-        13,
-        "held",
-        "",
-        &[LABEL_SPEC_REVIEWING, LABEL_HOLD],
-        "b13",
-        "sha13",
-    );
+    env.forge
+        .add_pr(13, "held", "", &[LABEL_HOLD], "meguri/13-held", "sha13");
     env.forge.add_pr(
         14,
         "claimed",
         "",
-        &[LABEL_SPEC_REVIEWING, LABEL_WORKING],
-        "b14",
+        &[LABEL_WORKING],
+        "meguri/14-claimed",
         "sha14",
     );
     // Already reviewed at its head.
     env.forge
-        .add_pr(15, "reviewed", "", &[LABEL_SPEC_REVIEWING], "b15", "sha15");
+        .add_pr(15, "reviewed", "", &[], "meguri/15-reviewed", "sha15");
     env.forge
         .set_commit_status_direct("sha15", PR_REVIEW_STATUS, CommitStatusState::Failure);
 
@@ -555,25 +403,14 @@ async fn discovery_filters_hold_claimed_and_reviewed_heads() {
         runs.iter().map(|r| r.issue_number).collect::<Vec<_>>(),
         vec![ISSUE]
     );
-    env.deps
-        .store
-        .update_run_status(&runs[0].id, RunStatus::Skipped, None)
-        .unwrap();
-
-    // Plan review off → the spec PR is not discovered either.
-    env.deps.config.review.guard.plan = false;
-    assert!(reconciled_runs(&env, pr_reviewer::KIND).await.is_empty());
 }
 
-/// A benign race (label removed after discovery) skips quietly.
+/// A benign race (PR claimed after discovery) skips quietly.
 #[tokio::test(flavor = "multi_thread")]
 async fn skips_quietly_when_label_removed_after_discovery() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
     let run = create_pr_reviewer_run(&env);
-    env.forge
-        .remove_pr_label(PR, LABEL_SPEC_REVIEWING)
-        .await
-        .unwrap();
+    env.forge.add_pr_label(PR, LABEL_WORKING).await.unwrap();
 
     let outcome =
         tokio::time::timeout(Duration::from_secs(30), run_pr_reviewer(&env.deps, &run.id))
@@ -585,8 +422,9 @@ async fn skips_quietly_when_label_removed_after_discovery() {
         env.deps.store.get_run(&run.id).unwrap().unwrap().status,
         RunStatus::Skipped
     );
+    // The claim we raced against is not ours to release.
     assert!(
-        !env.forge
+        env.forge
             .pr_labels_of(PR)
             .contains(&LABEL_WORKING.to_string())
     );
@@ -595,7 +433,7 @@ async fn skips_quietly_when_label_removed_after_discovery() {
 /// needs_human on the review turn escalates on the PR.
 #[tokio::test(flavor = "multi_thread")]
 async fn needs_human_escalates_on_the_pr() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
     let run = create_pr_reviewer_run(&env);
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
@@ -613,7 +451,6 @@ async fn needs_human_escalates_on_the_pr() {
         "{labels:?}"
     );
     assert!(!labels.contains(&LABEL_WORKING.to_string()));
-    assert!(labels.contains(&LABEL_SPEC_REVIEWING.to_string()));
     let comments = env.forge.comments_of(PR);
     assert_eq!(comments.len(), 1);
     assert!(comments[0].contains("needs a human"));
@@ -624,11 +461,11 @@ async fn needs_human_escalates_on_the_pr() {
 /// both.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_round_reuses_pane_and_worktree() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
+    let env = setup(&[LABEL_IMPLEMENTING], true).await;
     let clone = env.deps.project.repo_path.clone().unwrap();
 
     let agent = spawn_scripted_agent(env.worktree_root.clone(), |_, wt, turn_id| {
-        write_review(wt, "findings", "- still missing acceptance criteria");
+        write_review(wt, "advisory", "- consider a smaller cache key");
         write_result(wt, turn_id, "success");
     });
 
@@ -728,7 +565,7 @@ printf '{"turn_id":"%s","status":"needs_human","summary":"scripted direct review
 /// `claude`), and every pr-review turn runs as a plain subprocess.
 async fn setup_direct(script_dir: &Path) -> TestEnv {
     let agent = fake_headless_agent(script_dir);
-    setup_with(&[LABEL_SPEC_REVIEWING], false, move |cfg| {
+    setup_with(&[LABEL_IMPLEMENTING], true, move |cfg| {
         cfg.launch
             .roles
             .insert("pr-reviewer".into(), LaunchMode::Direct);
@@ -847,12 +684,6 @@ fn emitted_park_event(env: &TestEnv, run_id: &str) -> bool {
         .any(|e| e.kind == "review.awaiting_human")
 }
 
-/// Drive one review round to completion with the given verdict and (for an
-/// impl blocking verdict) categories.
-async fn run_review(env: &TestEnv, verdict: &'static str, run_id: &str) {
-    run_review_cats(env, verdict, &[], run_id).await
-}
-
 async fn run_review_cats(
     env: &TestEnv,
     verdict: &'static str,
@@ -870,62 +701,6 @@ async fn run_review_cats(
         .unwrap();
     agent.abort();
     assert!(matches!(outcome, WorkerOutcome::Succeeded { .. }));
-}
-
-/// Plan clean under `plan_delivery=separate` (the default) parks: the human
-/// must merge the spec PR — nothing else picks this up (spec_fixer drives only
-/// findings). The run ends Succeeded but carries AwaitingHuman, emits
-/// `review.awaiting_human`, shows in the parked-review query, and pages the PR
-/// once. The `spec-reviewing → spec-ready` transition still happens
-/// (criteria 1, 2, 4, 5, 7).
-#[tokio::test(flavor = "multi_thread")]
-async fn plan_clean_parks_under_separate_delivery() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    assert_eq!(env.deps.project.plan_delivery, PlanDelivery::Separate);
-    let run = create_pr_reviewer_run(&env);
-
-    run_review(&env, "clean", &run.id).await;
-
-    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
-    assert_eq!(record.status, RunStatus::Succeeded);
-    assert_eq!(
-        record.interaction_state,
-        Some(InteractionState::AwaitingHuman)
-    );
-    assert!(emitted_park_event(&env, &run.id));
-
-    let parked = env.deps.store.list_parked_reviews().unwrap();
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].id, run.id);
-
-    // The label transition is unchanged.
-    let labels = env.forge.pr_labels_of(PR);
-    assert!(labels.contains(&LABEL_SPEC_READY.to_string()), "{labels:?}");
-}
-
-/// Plan clean under `plan_delivery=combined` does NOT park: the spec worker
-/// picks up `spec-ready` and continues automatically (criterion 7).
-#[tokio::test(flavor = "multi_thread")]
-async fn plan_clean_does_not_park_under_combined_delivery() {
-    let mut env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    env.deps.project.plan_delivery = PlanDelivery::Combined;
-    let run = create_pr_reviewer_run(&env);
-
-    run_review(&env, "clean", &run.id).await;
-
-    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
-    assert_ne!(
-        record.interaction_state,
-        Some(InteractionState::AwaitingHuman),
-        "combined clean is not a park"
-    );
-    assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
-    // But the handoff label still lands.
-    assert!(
-        env.forge
-            .pr_labels_of(PR)
-            .contains(&LABEL_SPEC_READY.to_string())
-    );
 }
 
 /// The impl review never raises the parked-review signal: an impl blocking
@@ -946,30 +721,4 @@ async fn impl_blocking_does_not_park() {
     );
     assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
     assert!(!emitted_park_event(&env, &run.id));
-}
-
-/// Closing the issue clears its park via the reaper sweep (criterion 6b): the
-/// clean-park-then-merge path where no next head ever arrives.
-#[tokio::test(flavor = "multi_thread")]
-async fn issue_close_clears_the_park_via_reaper_sweep() {
-    let env = setup(&[LABEL_SPEC_REVIEWING], false).await;
-    let run = create_pr_reviewer_run(&env);
-    run_review(&env, "clean", &run.id).await;
-    assert_eq!(env.deps.store.list_parked_reviews().unwrap().len(), 1);
-
-    env.forge.close_issue(ISSUE);
-    reaper::finalize(&env.deps, &Default::default())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        env.deps
-            .store
-            .get_run(&run.id)
-            .unwrap()
-            .unwrap()
-            .interaction_state,
-        None
-    );
-    assert!(env.deps.store.list_parked_reviews().unwrap().is_empty());
 }

@@ -50,8 +50,6 @@ use crate::turn::{TurnOutcome, TurnStatus};
 /// with the flavors whose `self_reviews()` returns true.
 pub fn self_reviews_loop_kind(loop_kind: &str) -> bool {
     loop_kind == crate::engine::worker::KIND
-        || loop_kind == crate::engine::planner::KIND
-        || loop_kind == crate::engine::spec_worker::KIND
 }
 
 /// How many parallel round-1 reviewers this run fans out (issue #214, ADR 0023),
@@ -325,7 +323,8 @@ async fn self_review_inner(
     // Parallel round-1 reviewers (issue #214, ADR 0023). Empty → the historical
     // single-reviewer path, byte-for-byte.
     let reviewers = review_cfg.reviewers.clone();
-    let kind = flavor.kind();
+    let kind = Kind::Impl;
+    let _ = flavor;
     let base = deps.project.default_branch.clone();
     let language = deps.config.language_for(&deps.project);
 
@@ -861,9 +860,7 @@ async fn review_turn(
                 ))
                 .into());
             }
-            // needs_plan/decompose make no sense on a review turn once work is
-            // committed — a human looks.
-            TurnStatus::NeedsHuman | TurnStatus::NeedsPlan | TurnStatus::Decompose => {
+            TurnStatus::NeedsHuman => {
                 return Err(NeedsHuman(format!(
                     "agent needs a human self-reviewing issue #{}: {}",
                     run.issue_number, result.summary
@@ -1356,15 +1353,6 @@ async fn fix_turn(
                 ))
                 .into());
             }
-            // needs_plan/decompose are meaningless once the work is committed
-            // and merely being polished — a human looks.
-            TurnStatus::NeedsPlan | TurnStatus::Decompose => {
-                return Err(NeedsHuman(format!(
-                    "agent asked to re-plan while fixing its self-review on issue #{}: {}",
-                    run.issue_number, result.summary
-                ))
-                .into());
-            }
         }
 
         // Two invariants: the tree is clean (nothing uncommitted to push) and
@@ -1428,12 +1416,6 @@ fn lens_instruction(kind: Kind, lenses: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     match kind {
-        Kind::Plan => format!(
-            "- Review through each of these lenses, adapted to a design document: {list} \
-             (e.g. `correctness` = are the decisions sound and internally consistent; \
-             `tests` = is the plan verifiable / are acceptance criteria present; \
-             `simplicity` = is the scope minimal; `security` = are risks acknowledged).\n"
-        ),
         Kind::Impl => format!("- Review through each of these lenses: {list}.\n"),
     }
 }
@@ -1458,7 +1440,6 @@ fn parallel_review_prompt(
     review_file: &str,
 ) -> String {
     let subject = match kind {
-        Kind::Plan => "spec/ADR",
         Kind::Impl => "implementation",
     };
     format!(
@@ -1513,7 +1494,6 @@ fn anchor_confirm_prompt(
     concerns: &[String],
 ) -> String {
     let subject = match kind {
-        Kind::Plan => "spec/ADR",
         Kind::Impl => "implementation",
     };
     format!(
@@ -1559,7 +1539,6 @@ fn review_prompt(
 ) -> String {
     let round = cp.self_review_rounds + 1;
     let subject = match kind {
-        Kind::Plan => "spec/ADR",
         Kind::Impl => "implementation",
     };
     if round == 1 {
@@ -1850,7 +1829,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -2557,7 +2535,6 @@ mod tests {
         // Two reviewers on a self-reviewing loop → 2.
         cfg.review.reviewers = vec![ReviewerConfig::default(), ReviewerConfig::default()];
         assert_eq!(parallel_reviewer_count(&cfg, project, "worker"), 2);
-        assert_eq!(parallel_reviewer_count(&cfg, project, "planner"), 2);
         // A loop that never self-reviews contributes 0 even with reviewers set.
         assert_eq!(parallel_reviewer_count(&cfg, project, "fixer"), 0);
         // Review disabled → 0.

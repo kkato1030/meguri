@@ -10,8 +10,8 @@ use meguri::engine::issue_reconciler::{ARMED_MARKER_PREFIX, armed_marker, sweep}
 use meguri::engine::pr_reviewer::PR_REVIEW_STATUS;
 use meguri::forge::fake::FakeForge;
 use meguri::forge::{
-    CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_REVIEWING,
-    MergePolicy, MergeStrategy, MergeableState,
+    CommitStatusState, Forge, LABEL_AUTOMERGE, LABEL_HOLD, LABEL_NEEDS_HUMAN, MergePolicy,
+    MergeStrategy, MergeableState,
 };
 
 /// A Deps over the given forge with auto-merge enabled (label opt-in, squash).
@@ -31,7 +31,6 @@ fn deps_with(forge: Arc<FakeForge>) -> Deps {
         check_command: None,
         worktree_root: None,
         pr: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,
@@ -236,15 +235,6 @@ async fn does_not_arm_when_disabled() {
 async fn spec_hold_thread_and_non_opt_in_are_not_armed() {
     let forge = Arc::new(FakeForge::default());
 
-    // spec-reviewing: mid-spec, never arm.
-    forge.add_pr(
-        1,
-        "Spec",
-        "Closes #1.\n",
-        &[LABEL_AUTOMERGE, LABEL_SPEC_REVIEWING],
-        "meguri/1-x",
-        "s1",
-    );
     // on hold.
     forge.add_pr(
         2,

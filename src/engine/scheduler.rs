@@ -323,7 +323,6 @@ mod tests {
             check_command: None,
             worktree_root: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             prompts: Default::default(),

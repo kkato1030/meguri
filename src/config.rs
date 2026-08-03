@@ -232,8 +232,6 @@ pub struct Config {
     #[serde(default)]
     pub autonomy: Autonomy,
     #[serde(default)]
-    pub decompose: DecomposeConfig,
-    #[serde(default)]
     pub reconciler: ReconcilerConfig,
     /// Top-level role→preamble map (`[prompts]`, issue #149): role name (or
     /// the shared `all` key) → repo-relative path to a file whose contents are
@@ -337,48 +335,11 @@ fn default_review_lenses() -> Vec<String> {
 /// defaults on (it is today's mandatory `spec_reviewer`), impl guard defaults
 /// off (opt-in; external-bot compatible). Its output is a `meguri/pr-review`
 /// commit status + a folded PR-body `<details>` — never inline threads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GuardConfig {
-    /// Guard the plan (spec/ADR) PR — the reviewed-spec gate (default on).
-    #[serde(default = "default_true")]
-    pub plan: bool,
     /// Guard the implementation PR (default off).
     #[serde(default, rename = "impl")]
     pub impl_enabled: bool,
-}
-
-impl Default for GuardConfig {
-    fn default() -> Self {
-        Self {
-            plan: default_true(),
-            impl_enabled: false,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// `[decompose]` — the reviewed-decomposition materializer (issue #134). The
-/// planner writes a decomposition proposal spec; once its PR is approved a
-/// lightweight sweep files the child issues + dependencies.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct DecomposeConfig {
-    /// Kill switch (default on): false makes the materialization sweep inert,
-    /// so an approved proposal is not materialized — it stays `spec-ready`
-    /// awaiting a human. The operational lever for rolling back the
-    /// irreversible child-creation step (ADR 0016).
-    #[serde(default = "default_true")]
-    pub materialize_enabled: bool,
-}
-
-impl Default for DecomposeConfig {
-    fn default() -> Self {
-        Self {
-            materialize_enabled: default_true(),
-        }
-    }
 }
 
 /// How autonomous meguri is allowed to be for a project (issue #176, ADR 0012).
@@ -424,23 +385,13 @@ pub struct StepPolicyConfig {
     #[serde(default = "default_true")]
     pub fixer: bool,
     // ADR 0012 S4 (決定10): the uniform kill switch extends to every
-    // reconciler arm. Config *semantics* (triage mode, guard toggles, …) stay
-    // on their own keys as snapshot trigger conditions — these bools only gate
-    // the Agent step (`Wait(PolicyDisabled)`), they do not replace them.
+    // reconciler arm. Config *semantics* (guard toggles, …) stay on their own
+    // keys as snapshot trigger conditions — these bools only gate the Agent
+    // step (`Wait(PolicyDisabled)`), they do not replace them.
     #[serde(default = "default_true")]
     pub pr_reviewer: bool,
     #[serde(default = "default_true")]
-    pub spec_fixer: bool,
-    #[serde(default = "default_true")]
-    pub spec_worker: bool,
-    #[serde(default = "default_true")]
-    pub planner: bool,
-    #[serde(default = "default_true")]
     pub worker: bool,
-    #[serde(default = "default_true")]
-    pub cleaner: bool,
-    #[serde(default = "default_true")]
-    pub triage: bool,
 }
 
 impl Default for StepPolicyConfig {
@@ -450,14 +401,13 @@ impl Default for StepPolicyConfig {
             ci_fixer: true,
             fixer: true,
             pr_reviewer: true,
-            spec_fixer: true,
-            spec_worker: true,
-            planner: true,
             worker: true,
-            cleaner: true,
-            triage: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// How far the triage loop is allowed to act (issue #85). The series stages
@@ -1024,30 +974,6 @@ impl ProjectMode {
     }
 }
 
-/// How a plan-first issue is delivered (ADR 0008). Deliberately a separate
-/// key from [`ProjectMode`] (github/local): the two are orthogonal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum PlanDelivery {
-    /// Two PRs: the spec/ADR PR is reviewed and merged on its own, then the
-    /// issue flips `speccing → ready` and the worker implements in a separate
-    /// PR. The spec PR uses a non-closing `Refs #N` reference (default).
-    #[default]
-    Separate,
-    /// One PR: the spec-worker takes over the spec PR's branch and stacks the
-    /// implementation on it (the #98 morph shape); spec and impl merge once.
-    Combined,
-}
-
-impl PlanDelivery {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Separate => "separate",
-            Self::Combined => "combined",
-        }
-    }
-}
-
 /// The shape of a run's deliverable. `patch` (issue #54 Phase 2) is accepted
 /// by the config but not yet implemented by the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1126,10 +1052,6 @@ pub struct ProjectConfig {
     /// github, `branch` for local — resolved via [`Config::deliver_for`].
     #[serde(default)]
     pub deliver: Option<Deliver>,
-    /// How plan-first issues are delivered (see [`PlanDelivery`], ADR 0008);
-    /// defaults to `separate` (two PRs).
-    #[serde(default)]
-    pub plan_delivery: PlanDelivery,
     /// Per-project self-review / guard settings; overrides the global
     /// `[review]` section wholesale (like `pr` / `clean`).
     #[serde(default)]

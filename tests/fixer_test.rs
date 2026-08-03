@@ -13,7 +13,7 @@ use meguri::config::{Config, ProjectConfig};
 use meguri::engine::fixer::{self, FIXER_REPLY_MARKER, run_fixer};
 use meguri::engine::{Deps, WorkerOutcome};
 use meguri::forge::fake::FakeForge;
-use meguri::forge::{Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY, LABEL_WORKING};
+use meguri::forge::{Forge, LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_WORKING};
 use meguri::gitops::run_git;
 use meguri::mux::fake::FakeMux;
 use meguri::store::{RunStatus, Store};
@@ -93,11 +93,6 @@ async fn setup(check_command: Option<&str>) -> TestEnv {
         worktree_root: Some(worktree_root.clone()),
         language: None,
         pr: None,
-        // These tests assert the combined-delivery invariant that a
-        // spec-ready PR belongs to the spec worker, so the fixer keeps off
-        // it (ADR 0008). Separate-mode fixing of spec-ready PRs is covered
-        // by the fixer unit test.
-        plan_delivery: meguri::config::PlanDelivery::Combined,
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,
@@ -395,14 +390,6 @@ async fn fixer_reviewer_ping_pong_converges() {
 async fn fixer_discovery_skips_spec_ready_merged_held_needs_human_and_foreign_prs() {
     let env = setup(None).await;
 
-    // PR #2: spec approved — the worker owns the branch now.
-    let pr = env.forge.push_pr(
-        "meguri/12-spec-def456",
-        "Spec: thing (#12)",
-        &[LABEL_SPEC_READY],
-    );
-    env.forge
-        .add_review_thread(pr, "t-spec", "docs/spec.md", "reviewer", "nit");
     // PR #3: merged — history is immutable.
     let pr = env.forge.push_pr("meguri/13-old-abc999", "Old (#13)", &[]);
     env.forge
@@ -452,33 +439,6 @@ async fn fixer_discovery_skips_spec_ready_merged_held_needs_human_and_foreign_pr
         "only the open, unclaimed, unescalated meguri PR with an awaiting thread \
          and no active family run is actionable"
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn fixer_skips_quietly_when_pr_flips_spec_ready_after_discovery() {
-    let env = setup(None).await;
-    let run = create_fixer_run(&env);
-
-    // The benign race: the spec was approved between discovery and claim.
-    env.forge.add_pr_label(1, LABEL_SPEC_READY).await.unwrap();
-
-    let outcome = tokio::time::timeout(Duration::from_secs(30), run_fixer(&env.deps, &run.id))
-        .await
-        .expect("fixer timed out")
-        .unwrap();
-
-    assert!(
-        matches!(outcome, WorkerOutcome::Skipped(_)),
-        "expected skip, got {outcome:?}"
-    );
-    let record = env.deps.store.get_run(&run.id).unwrap().unwrap();
-    assert_eq!(record.status, RunStatus::Skipped);
-
-    // Quiet skip: no claim, no escalation, no comment, branch untouched.
-    let labels = env.forge.pr_labels(1);
-    assert!(!labels.contains(&LABEL_WORKING.to_string()));
-    assert!(!labels.contains(&LABEL_NEEDS_HUMAN.to_string()));
-    assert!(env.forge.comments_of(1).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

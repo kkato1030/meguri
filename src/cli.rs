@@ -35,10 +35,6 @@ pub enum Command {
         /// sole configured project)
         #[arg(long)]
         project: Option<String>,
-        /// github mode: queue it for the planner (`meguri:plan`) instead of
-        /// the worker (local mode has no planner yet — issue #54)
-        #[arg(long)]
-        plan: bool,
         /// github mode: also queue it for the worker loop (`meguri:ready`)
         #[arg(long)]
         ready: bool,

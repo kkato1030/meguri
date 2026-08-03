@@ -41,7 +41,6 @@ fn deps_with_store(forge: Arc<FakeForge>, store: meguri::store::Store) -> Deps {
         check_command: None,
         worktree_root: None,
         pr: None,
-        plan_delivery: Default::default(),
         review: None,
         worktree_setup: Default::default(),
         autonomy: None,

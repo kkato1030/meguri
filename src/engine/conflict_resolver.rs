@@ -38,7 +38,7 @@ use async_trait::async_trait;
 
 pub use super::WorkerOutcome;
 use super::flow::{self, Checkpoint, Flavor, PreparedWork};
-use super::{Deps, MEGURI_BRANCH_PREFIX, is_combined, open_pr_for_issue, pr_is_touchable};
+use super::{Deps, MEGURI_BRANCH_PREFIX, open_pr_for_issue, pr_is_touchable};
 use crate::forge::{self, MergeableState};
 use crate::gitops;
 use crate::store::RunRecord;
@@ -82,7 +82,7 @@ impl Flavor for ConflictResolverFlavor {
                 run.issue_number
             )));
         };
-        if let Some(reason) = pr_is_touchable(&pr, is_combined(deps)) {
+        if let Some(reason) = pr_is_touchable(&pr) {
             return Ok(PreparedWork::Skip(reason));
         }
         if deps.forge().pr_mergeable(pr.number).await? != MergeableState::Conflicting {
@@ -418,7 +418,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,

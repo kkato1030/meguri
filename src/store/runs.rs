@@ -17,12 +17,6 @@ pub enum RunStatus {
     /// The run turned out to have nothing to do (e.g. the issue was
     /// de-labeled between discovery and claim) — terminal, no escalation.
     Skipped,
-    /// The agent found a design decision must precede implementation and the
-    /// issue was routed to the planner (issue #22) — terminal, not a failure.
-    NeedsPlan,
-    /// The planner split the issue into sub-issues instead of writing a spec
-    /// (issue #24) — terminal, the second normal planner ending.
-    Decomposed,
 }
 
 impl RunStatus {
@@ -35,8 +29,6 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
-            Self::NeedsPlan => "needs_plan",
-            Self::Decomposed => "decomposed",
         }
     }
 
@@ -49,8 +41,6 @@ impl RunStatus {
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
             "skipped" => Some(Self::Skipped),
-            "needs_plan" => Some(Self::NeedsPlan),
-            "decomposed" => Some(Self::Decomposed),
             _ => None,
         }
     }
@@ -395,30 +385,6 @@ impl Store {
         })
     }
 
-    /// Whether the issue has already retreated to planning once before, via
-    /// an earlier `needs_plan` run of the given loop — the "same issue twice"
-    /// leg of the worker's vibration guard (issue #135). A spec-file check
-    /// alone misses issues that were re-labeled `ready` without a spec ever
-    /// landing on disk (e.g. planning resolved the ambiguity some other way);
-    /// this catches that case so a second retreat escalates to a human
-    /// instead of bouncing `ready` ⇄ `plan` forever.
-    pub fn issue_has_needs_plan_run(
-        &self,
-        project_id: &str,
-        loop_kind: &str,
-        issue_number: i64,
-    ) -> Result<bool> {
-        self.with_conn(|c| {
-            let exists = c
-                .prepare(
-                    "SELECT 1 FROM runs WHERE project_id = ?1 AND loop_kind = ?2
-                       AND issue_number = ?3 AND status = 'needs_plan' LIMIT 1",
-                )?
-                .exists(params![project_id, loop_kind, issue_number])?;
-            Ok(exists)
-        })
-    }
-
     /// Runs that own a worktree, matched by branch name or recorded path
     /// (newest first). Both keys are tried because the reaper resolves
     /// worktrees from `git worktree list`, whose paths may be canonicalized
@@ -470,9 +436,7 @@ impl Store {
                 RunStatus::Succeeded
                 | RunStatus::Failed
                 | RunStatus::Cancelled
-                | RunStatus::Skipped
-                | RunStatus::NeedsPlan
-                | RunStatus::Decomposed => (None, Some(now())),
+                | RunStatus::Skipped => (None, Some(now())),
                 _ => (None, None),
             };
             c.execute(

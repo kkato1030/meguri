@@ -134,17 +134,13 @@ fn label_scheme(label: &str) -> (&'static str, &'static str) {
     use super::*;
     match label {
         // Axis 1 — phase.
-        LABEL_PLAN => ("1D76DB", "meguri phase: awaiting spec planning"),
         LABEL_READY => ("1D76DB", "meguri phase: awaiting implementation"),
-        LABEL_SPECCING => ("6F42C1", "meguri phase: spec PR open"),
         LABEL_IMPLEMENTING => ("0E8A16", "meguri phase: implementation PR open"),
         // Axis 2 — ball / who holds it.
         LABEL_WORKING => ("FBCA04", "meguri: an agent is working on it"),
         LABEL_NEEDS_HUMAN => ("B60205", "meguri: a human needs to look (see comment)"),
         LABEL_HOLD => ("CFD3D7", "meguri: intentionally paused by a human"),
         // PR-side spec review labels.
-        LABEL_SPEC_REVIEWING => ("6F42C1", "meguri: spec PR awaiting review"),
-        LABEL_SPEC_READY => ("0E8A16", "meguri: spec approved; implementation continues"),
         // Bookkeeping.
         LABEL_CLEAN_REPORT => (DEFAULT_LABEL_COLOR, "meguri: cleaner report issue"),
         _ => (DEFAULT_LABEL_COLOR, "managed by meguri"),
@@ -2212,10 +2208,8 @@ mod tests {
     #[test]
     fn phase_labels_carry_their_scheme_colors() {
         // The color encodes the two-axis meaning (ADR 0005), so lock it here.
-        assert_eq!(label_scheme(super::super::LABEL_SPECCING).0, "6F42C1");
         assert_eq!(label_scheme(super::super::LABEL_IMPLEMENTING).0, "0E8A16");
         assert_eq!(label_scheme(super::super::LABEL_READY).0, "1D76DB");
-        assert_eq!(label_scheme(super::super::LABEL_PLAN).0, "1D76DB");
         assert_eq!(label_scheme(super::super::LABEL_WORKING).0, "FBCA04");
         assert_eq!(label_scheme(super::super::LABEL_NEEDS_HUMAN).0, "B60205");
         assert_eq!(label_scheme(super::super::LABEL_HOLD).0, "CFD3D7");

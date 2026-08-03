@@ -25,7 +25,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::pr_reviewer::PR_REVIEW_STATUS;
-use super::{Deps, canonical_key, is_combined};
+use super::{Deps, canonical_key};
 use crate::config::{AutoMergeConfig, AutoMergeMode, AutoMergeOptIn, Autonomy};
 use crate::forge::{
     self, ArmOutcome, CheckRollup, CheckState, CommitStatusState, MergePolicy, MergeState,
@@ -39,14 +39,9 @@ use crate::store::parse_ts;
 pub const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
 /// Labels that block *arming* a not-yet-armed PR beyond the human-stop pair:
-/// `working` means a run owns the PR, and the two spec-phase labels mean the PR
-/// is still a spec under review. `hold` / `needs-human` are handled one level
-/// up (they stop both regimes), so they are not repeated here.
-const ARM_BLOCKING_LABELS: &[&str] = &[
-    forge::LABEL_WORKING,
-    forge::LABEL_SPEC_REVIEWING,
-    forge::LABEL_SPEC_READY,
-];
+/// `working` means a run owns the PR. `hold` / `needs-human` are handled one
+/// level up (they stop both regimes), so they are not repeated here.
+const ARM_BLOCKING_LABELS: &[&str] = &[forge::LABEL_WORKING];
 
 /// How long an armed PR may sit Blocked-but-readable before the Stuck backstop
 /// escalates it (unchanged from the old merge-watch; ADR 0007's generosity).
@@ -151,9 +146,6 @@ pub enum Op {
     MergePr,
     /// Park the PR on `needs-human` (pr-review failed, or a Stuck backstop).
     Escalate,
-    /// The spec-fix budget is spent while the plan review is still red (ADR
-    /// 0012 S4 決定2): park the spec PR with the spec-fixer's own comment.
-    EscalateSpecFixBudget,
 }
 
 /// A fixer-family arm: a heavy agent recipe the reconciler launches (ADR 0012
@@ -168,13 +160,9 @@ pub enum Arm {
     CiFixer,
     /// An open review thread awaiting meguri — address the comments.
     Fixer,
-    /// An unreviewed head (plan: `spec-reviewing`; impl: green meguri PR) —
-    /// run the guard review in the independent `pr-review` lane (決定2).
+    /// An unreviewed head (a green meguri PR) — run the guard review in the
+    /// independent `pr-review` lane (決定2).
     PrReviewer,
-    /// A `spec-reviewing` PR whose head review failed — push a revision (決定2).
-    SpecFixer,
-    /// A combined-delivery `spec-ready` PR — the branch-takeover morph (決定2).
-    SpecWorker,
 }
 
 impl Arm {
@@ -185,15 +173,12 @@ impl Arm {
             Arm::CiFixer => super::ci_fixer::KIND,
             Arm::Fixer => super::fixer::KIND,
             Arm::PrReviewer => super::pr_reviewer::KIND,
-            Arm::SpecFixer => super::spec_fixer::KIND,
-            Arm::SpecWorker => super::spec_worker::KIND,
         }
     }
 
     /// Whether this arm rides the fixer-family claim-marker / backoff
-    /// machinery (§4.5 / ADR 0027). The spec-stage arms predate it and keep
-    /// their own gates (head-status dedup, budget, labels), so their enqueue
-    /// is the plain unique-index path.
+    /// machinery (§4.5 / ADR 0027). The review arm keeps its own gates
+    /// (head-status dedup), so its enqueue is the plain unique-index path.
     fn fixer_family(self) -> bool {
         matches!(self, Arm::ConflictResolver | Arm::CiFixer | Arm::Fixer)
     }
@@ -242,9 +227,6 @@ pub struct Snapshot {
     pub stale: bool,
     /// A required check failed (splits a Blocked PR: ci-fixer vs Stuck).
     pub rollup_failure: bool,
-    /// The spec worker owns this branch (combined delivery + `spec-ready`); no
-    /// fixer-family arm may touch it (`pr_is_touchable`'s spec-ready gate).
-    pub spec_worker_owns: bool,
     /// A live author-lane run already owns this issue (any branch-editing loop,
     /// including a fixer-family recipe in flight). The reconciler stays off the
     /// PR while one runs. This is keyed on **run liveness, not the
@@ -276,33 +258,18 @@ pub struct Snapshot {
     pub policy_ok: bool,
     /// native (arm) vs orchestrator (direct merge).
     pub mode: AutoMergeMode,
-    // --- spec-stage fields (ADR 0012 S4 決定2) -----------------------------
-    /// The PR carries `spec-reviewing` (a spec under plan review).
-    pub spec_reviewing: bool,
-    /// The PR carries `spec-ready` (raw label; `spec_worker_owns` folds in
-    /// the delivery mode).
-    pub spec_ready: bool,
     /// The PR carries `working` (a run's claim label).
     pub pr_working: bool,
-    /// The PR body is a reviewed decomposition proposal (the materializer's,
-    /// never the spec worker's or the handoff's).
-    pub is_decompose_proposal: bool,
     /// The head's `meguri/pr-review` commit status, raw (`None` = this head
     /// was never reviewed — the PrReviewer arm's trigger).
     pub review_head_status: Option<CommitStatusState>,
-    /// The plan / impl guard toggles (`[projects.review.guard]`).
-    pub plan_guard_enabled: bool,
+    /// The impl guard toggle (`[projects.review.guard]`).
     pub impl_guard_enabled: bool,
     /// The real CI rollup (meguri's own advisory statuses stripped) is green.
     pub ci_green: bool,
     /// An active pr-reviewer run already covers this issue (its own lane —
     /// `issue_busy` deliberately excludes it).
     pub reviewer_busy: bool,
-    /// The spec-fix budget is spent (still-red review → escalate).
-    pub spec_fix_exhausted: bool,
-    /// A succeeded spec-worker takeover already covers the issue at its
-    /// current body (the body-digest suppression).
-    pub spec_worker_shipped: bool,
 }
 
 impl Snapshot {
@@ -321,15 +288,9 @@ fn pr_review_arm(s: &Snapshot) -> Option<Step> {
     if s.pr_working {
         return None; // a claim label parks reviews too (historical gate)
     }
-    if s.spec_reviewing {
-        if !s.plan_guard_enabled {
-            return None;
-        }
-    } else {
-        // Impl review: meguri branch, no spec-phase label, settled-green CI.
-        if !s.impl_guard_enabled || !s.is_meguri_branch || s.spec_ready || !s.ci_green {
-            return None;
-        }
+    // Impl review: meguri branch, settled-green CI.
+    if !s.impl_guard_enabled || !s.is_meguri_branch || !s.ci_green {
+        return None;
     }
     if s.review_head_status.is_some() {
         return None; // this head is already reviewed (or under review)
@@ -352,64 +313,21 @@ pub fn next_step(s: &Snapshot) -> Step {
     }
     // A human stop is final for every arm, and the durable "already escalated"
     // brake that makes a Stuck / review-failed / budget escalation fire once.
-    // Decided before the meguri-branch gate: a human-authored spec PR under
-    // `spec-reviewing` is reviewable (決定2), so its stop must win first.
     if s.human_stop {
         return Step::Skip("human stop (hold/needs-human)");
     }
     // The pr-reviewer arm (決定2): its `pr-review` lane runs parallel to the
-    // author lane, so it is decided before the busy / branch gates. A plan
-    // candidate is any `spec-reviewing` PR (human-authored specs included);
-    // an impl candidate is a green, spec-label-free meguri PR. The head's
-    // review status is the dedup key.
+    // author lane, so it is decided before the busy / branch gates. A
+    // candidate is a green meguri PR; the head's review status is the dedup
+    // key.
     if let Some(step) = pr_review_arm(s) {
         return step;
     }
     if !s.is_meguri_branch {
         return Step::Skip("not a meguri branch");
     }
-    // The spec-fixer arm (決定2): a `spec-reviewing` PR whose current head's
-    // review failed gets a revision round; a spent budget parks it. Absent /
-    // pending review statuses wait (the reviewer owns the head).
-    if s.spec_reviewing {
-        if s.pr_working {
-            return Step::Skip("claimed (working)");
-        }
-        if s.issue_busy {
-            return Step::Skip("a live run owns the issue");
-        }
-        return match s.review_head_status {
-            Some(CommitStatusState::Failure) => {
-                if s.spec_fix_exhausted {
-                    Step::Op(Op::EscalateSpecFixBudget)
-                } else {
-                    Step::Agent(Arm::SpecFixer)
-                }
-            }
-            _ => Step::Wait("spec review in progress"),
-        };
-    }
-    // Under combined delivery a `spec-ready` PR's branch is the spec worker's
-    // (ADR 0008 §6) — now a real takeover arm (決定2). A reviewed decompose
-    // proposal is the materializer's; the body-digest suppression and the
-    // author-lane exclusion keep the takeover single-shot.
-    if s.spec_worker_owns {
-        if s.is_decompose_proposal {
-            return Step::Skip("decompose proposal (the materializer owns it)");
-        }
-        if s.pr_working {
-            return Step::Skip("claimed (working)");
-        }
-        if s.issue_busy {
-            return Step::Skip("a live run owns the issue");
-        }
-        if s.spec_worker_shipped {
-            return Step::Skip("takeover already shipped, body unchanged");
-        }
-        return Step::Agent(Arm::SpecWorker);
-    }
     // A live author-lane run already owns this issue (a fixer-family recipe in
-    // flight, or an external loop like spec_fixer). Stay off it — they share the
+    // flight). Stay off it — they share the
     // author pane / worktree. Run-liveness, not the `meguri:working` label, so a
     // stale label from a crashed run cannot deadlock recovery (f3): this gate
     // also fronts the budget escalation and stuck backstop below, so those only
@@ -530,25 +448,20 @@ fn arm_allowed(arm: Arm, p: &crate::config::StepPolicyConfig) -> bool {
         Arm::CiFixer => p.ci_fixer,
         Arm::Fixer => p.fixer,
         Arm::PrReviewer => p.pr_reviewer,
-        Arm::SpecFixer => p.spec_fixer,
-        Arm::SpecWorker => p.spec_worker,
     }
 }
 
-/// The spec/status-axis signal carrier seam (ADR 0026 signal binding, partial
-/// introduction). How the reconciler reads the spec-axis signals it must NOT
-/// reconstruct from observation (human stop) and the spec-worker ownership. This
-/// slice ships only the [`Labels`] binding — today's behaviour moved behind the
-/// seam; a `Markers` binding is future work (the seam is the deliverable).
+/// The status-axis signal carrier seam (ADR 0026 signal binding, partial
+/// introduction). How the reconciler reads the signals it must NOT
+/// reconstruct from observation (human stop). This slice ships only the
+/// [`Labels`] binding; a `Markers` binding is future work.
 pub trait SignalCarrier {
-    /// A human parked/paused the PR (spec-axis: `hold` / `needs-human`). A
-    /// clipped label window reads conservatively as stopped (never miss a stop).
+    /// A human parked/paused the PR (`hold` / `needs-human`). A clipped label
+    /// window reads conservatively as stopped (never miss a stop).
     fn human_stop(&self, pr: &PullRequest, labels_complete: bool) -> bool;
-    /// The spec worker owns this branch (combined delivery + `spec-ready`).
-    fn spec_worker_owns(&self, pr: &PullRequest, combined: bool) -> bool;
 }
 
-/// The default carrier: spec/status signals live on forge labels (ADR 0005).
+/// The default carrier: status signals live on forge labels (ADR 0005).
 pub struct Labels;
 
 impl SignalCarrier for Labels {
@@ -556,9 +469,6 @@ impl SignalCarrier for Labels {
         pr.has_label(forge::LABEL_HOLD)
             || pr.has_label(forge::LABEL_NEEDS_HUMAN)
             || !labels_complete
-    }
-    fn spec_worker_owns(&self, pr: &PullRequest, combined: bool) -> bool {
-        combined && pr.has_label(forge::LABEL_SPEC_READY)
     }
 }
 
@@ -646,7 +556,6 @@ async fn build_snapshot(
             .any(super::fixer::thread_awaits_fixer);
     // A `spec-ready` PR under combined delivery is the spec worker's branch — no
     // fixer-family arm touches it (`pr_is_touchable`'s spec-ready gate).
-    let spec_worker_owns = Labels.spec_worker_owns(pr, is_combined(deps));
     let issue = canonical_key(pr);
     let issue_busy = deps
         .store
@@ -676,27 +585,12 @@ async fn build_snapshot(
     }
     .state()
         == CheckState::Failure;
-    // --- spec-stage reductions (決定2) -------------------------------------
     let review = deps.config.review_for(&deps.project);
-    let spec_reviewing = pr.has_label(forge::LABEL_SPEC_REVIEWING);
-    let spec_ready = pr.has_label(forge::LABEL_SPEC_READY);
     let pr_working = pr.has_label(forge::LABEL_WORKING);
-    let is_decompose_proposal = super::planner::is_decompose_proposal(&pr.body);
     let ci_green = real_rollup(obs).state() == CheckState::Success;
     let reviewer_busy =
         deps.store
             .issue_has_active_loop_run(&deps.project.id, super::pr_reviewer::KIND, issue)?;
-    let spec_fix_exhausted =
-        deps.store
-            .succeeded_run_count(&deps.project.id, super::spec_fixer::KIND, issue)?
-            >= super::spec_fixer::MAX_SPEC_FIX_RUNS;
-    // The takeover's body-digest suppression (issue #142): only read the issue
-    // (one API call) when the takeover would otherwise be the arm.
-    let spec_worker_shipped = if spec_worker_owns && !is_decompose_proposal && !pr_working {
-        spec_worker_already_shipped(deps, pr).await?
-    } else {
-        false
-    };
     Ok(Snapshot {
         open: pr.state == "open",
         is_meguri_branch: pr.head_branch.starts_with(MEGURI_BRANCH_PREFIX),
@@ -705,7 +599,6 @@ async fn build_snapshot(
         merge: obs.merge.clone(),
         stale,
         rollup_failure,
-        spec_worker_owns,
         issue_busy,
         awaits_fixer_thread,
         conflict_exhausted,
@@ -717,33 +610,12 @@ async fn build_snapshot(
         auto_merge_config_enabled: am.enabled,
         policy_ok,
         mode: am.mode,
-        spec_reviewing,
-        spec_ready,
         pr_working,
-        is_decompose_proposal,
         review_head_status: obs.pr_review,
-        plan_guard_enabled: review.guard.plan,
         impl_guard_enabled: review.guard.impl_enabled,
         ci_green,
         reviewer_busy,
-        spec_fix_exhausted,
-        spec_worker_shipped,
     })
-}
-
-/// The spec worker's body-digest suppression (issue #142, half A), verbatim
-/// from the old `SpecWorkerLoop::discover`: a succeeded takeover suppresses
-/// re-takeover only while the issue body is unchanged; an edit lifts it and
-/// signals once. `body_edits = false` degrades to permanent suppression. A PR
-/// with no issue-encoding branch is not meguri's to take over (reads as
-/// "shipped" so the arm never fires).
-async fn spec_worker_already_shipped(deps: &Deps, pr: &PullRequest) -> Result<bool> {
-    let kind = super::spec_worker::KIND;
-    let Some(issue) = crate::gitops::issue_from_branch(&pr.head_branch) else {
-        return Ok(true); // human-made head: not a takeover target
-    };
-    deps.store
-        .issue_has_succeeded_run(&deps.project.id, kind, issue)
 }
 
 /// Watch-poll sweep: observe every open PR once (informer cache), then drive
@@ -821,12 +693,6 @@ pub async fn sweep(deps: &Deps) -> Result<()> {
     // plan_handoff sweep, now the merged-spec branch of the decider).
     if let Err(e) = reconcile_issues(deps, &open_pr_issues).await {
         tracing::warn!("issue-side reconcile failed for {}: {e:#}", deps.project.id);
-    }
-    // Approved decomposition proposals → child issues + dependencies (ADR 0012
-    // §決定4, decompose_materializer → PR-side act). Forge-only, like the merge
-    // tail; folded out of the tick's standalone sweep.
-    if let Err(e) = super::decompose_materializer::sweep(deps).await {
-        tracing::warn!("decompose reconcile failed for {}: {e:#}", deps.project.id);
     }
     Ok(())
 }
@@ -1220,12 +1086,6 @@ async fn act(
         Op::UpdateBranch => update_branch(deps, &obs.pr).await,
         Op::ArmAutoMerge => arm(deps, am, &obs.pr).await,
         Op::MergePr => merge_directly(deps, am, &obs.pr).await,
-        Op::EscalateSpecFixBudget => {
-            // The spec-fixer's own budget escalation (決定2): its comment,
-            // page and event moved with it from the old discover.
-            super::spec_fixer::escalate_budget_exhausted(deps, &obs.pr).await;
-            Ok(())
-        }
         Op::Escalate => {
             // Distinguish the escalation cause from the Snapshot: a spent fixer
             // budget while the symptom persists (conflict / red CI), else the
@@ -1271,9 +1131,8 @@ async fn escalate_budget_exhausted(deps: &Deps, pr: &PullRequest, arm: Arm) {
             "its checks are still failing",
         ),
         Arm::Fixer => (0, "addressed this PR's review comments", "they persist"),
-        // Spec-stage arms never route here: the spec-fixer budget has its own
-        // Op (EscalateSpecFixBudget), the others have no budget escalation.
-        Arm::PrReviewer | Arm::SpecFixer | Arm::SpecWorker => {
+        // The review arm never routes here: it has no budget escalation.
+        Arm::PrReviewer => {
             debug_assert!(false, "no budget escalation for {arm:?}");
             return;
         }
@@ -1509,7 +1368,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -1598,7 +1456,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -1687,7 +1544,6 @@ mod tests {
             worktree_root: None,
             language: None,
             pr: None,
-            plan_delivery: Default::default(),
             review: None,
             worktree_setup: Default::default(),
             autonomy: None,
@@ -1808,7 +1664,6 @@ mod tests {
             )),
             stale: false,
             rollup_failure: false,
-            spec_worker_owns: false,
             issue_busy: false,
             awaits_fixer_thread: false,
             conflict_exhausted: false,
@@ -1820,20 +1675,13 @@ mod tests {
             auto_merge_config_enabled: true,
             policy_ok: true,
             mode: AutoMergeMode::Native,
-            // Spec-stage fields (決定2), inert for the merge-tail baselines:
-            // an already-reviewed head with both guards off keeps the
-            // pr-reviewer / spec arms quiet.
-            spec_reviewing: false,
-            spec_ready: false,
+            // An already-reviewed head with the guard off keeps the
+            // pr-reviewer arm quiet for the merge-tail baselines.
             pr_working: false,
-            is_decompose_proposal: false,
             review_head_status: Some(CommitStatusState::Success),
-            plan_guard_enabled: false,
             impl_guard_enabled: false,
             ci_green: true,
             reviewer_busy: false,
-            spec_fix_exhausted: false,
-            spec_worker_shipped: false,
         }
     }
 
@@ -2034,115 +1882,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_worker_owned_branch_is_the_takeover_arm() {
-        // 決定2: the ownership boundary still keeps every fixer arm off the
-        // branch — but the owner is now a real arm, so an unclaimed,
-        // unshipped spec-ready PR launches the takeover instead of idling.
-        assert_eq!(
-            next_step(&Snapshot {
-                spec_worker_owns: true,
-                awaits_fixer_thread: true,
-                ..armed_snapshot()
-            }),
-            Step::Agent(Arm::SpecWorker)
-        );
-        assert_eq!(Arm::SpecWorker.loop_kind(), super::super::spec_worker::KIND);
-        // A live author-lane run, a claim label, a shipped takeover, or a
-        // decompose proposal each park the arm without falling through to the
-        // fixer family (the boundary is preserved).
-        for (tweak, expect) in [
-            (
-                Snapshot {
-                    spec_worker_owns: true,
-                    issue_busy: true,
-                    awaits_fixer_thread: true,
-                    ..armed_snapshot()
-                },
-                Step::Skip("a live run owns the issue"),
-            ),
-            (
-                Snapshot {
-                    spec_worker_owns: true,
-                    pr_working: true,
-                    ..armed_snapshot()
-                },
-                Step::Skip("claimed (working)"),
-            ),
-            (
-                Snapshot {
-                    spec_worker_owns: true,
-                    spec_worker_shipped: true,
-                    ..armed_snapshot()
-                },
-                Step::Skip("takeover already shipped, body unchanged"),
-            ),
-            (
-                Snapshot {
-                    spec_worker_owns: true,
-                    is_decompose_proposal: true,
-                    ..armed_snapshot()
-                },
-                Step::Skip("decompose proposal (the materializer owns it)"),
-            ),
-        ] {
-            assert_eq!(next_step(&tweak), expect);
-        }
-    }
-
-    #[test]
-    fn spec_reviewing_pr_routes_review_fix_and_budget() {
-        // 決定2: an unreviewed spec-reviewing head is the pr-reviewer's; a
-        // failed head is the spec-fixer's; a spent budget escalates; pending
-        // waits. The reviewer arm works on non-meguri branches too (a human
-        // spec PR under review).
-        let spec = |status: Option<CommitStatusState>| Snapshot {
-            spec_reviewing: true,
-            plan_guard_enabled: true,
-            review_head_status: status,
-            ..armed_snapshot()
-        };
-        assert_eq!(next_step(&spec(None)), Step::Agent(Arm::PrReviewer));
-        assert_eq!(
-            next_step(&Snapshot {
-                is_meguri_branch: false,
-                ..spec(None)
-            }),
-            Step::Agent(Arm::PrReviewer),
-            "plan review covers human-authored spec PRs"
-        );
-        assert_eq!(
-            next_step(&spec(Some(CommitStatusState::Failure))),
-            Step::Agent(Arm::SpecFixer)
-        );
-        assert_eq!(
-            next_step(&Snapshot {
-                spec_fix_exhausted: true,
-                ..spec(Some(CommitStatusState::Failure))
-            }),
-            Step::Op(Op::EscalateSpecFixBudget)
-        );
-        assert_eq!(
-            next_step(&spec(Some(CommitStatusState::Pending))),
-            Step::Wait("spec review in progress")
-        );
-        // An active reviewer run dedups the arm; a disabled plan guard skips it.
-        assert_eq!(
-            next_step(&Snapshot {
-                reviewer_busy: true,
-                ..spec(None)
-            }),
-            Step::Wait("spec review in progress")
-        );
-        assert_eq!(
-            next_step(&Snapshot {
-                plan_guard_enabled: false,
-                ..spec(None)
-            }),
-            Step::Wait("spec review in progress")
-        );
-    }
-
-    #[test]
     fn impl_review_arm_requires_green_unlabeled_meguri_head() {
         // 決定2: the impl-review candidacy — guard on, meguri branch, no
         // spec-phase label, settled-green CI, unreviewed head.
@@ -2165,13 +1904,6 @@ mod tests {
                 "ci not green",
                 Snapshot {
                     ci_green: false,
-                    ..candidate.clone()
-                },
-            ),
-            (
-                "spec-ready label",
-                Snapshot {
-                    spec_ready: true,
                     ..candidate.clone()
                 },
             ),
@@ -2440,25 +2172,19 @@ mod tests {
     fn labels_carrier_reproduces_the_direct_reading() {
         // The signal-binding seam is behaviour-preserving for the Labels
         // binding: for every label combination, the carrier's human_stop /
-        // spec_worker_owns equal the direct label reading (the baseline).
-        use crate::forge::{LABEL_HOLD, LABEL_NEEDS_HUMAN, LABEL_SPEC_READY};
+        // the direct label reading (the baseline).
+        use crate::forge::{LABEL_HOLD, LABEL_NEEDS_HUMAN};
         let label_sets: &[Vec<String>] = &[
             vec![],
             vec![LABEL_HOLD.into()],
             vec![LABEL_NEEDS_HUMAN.into()],
-            vec![LABEL_SPEC_READY.into()],
-            vec![LABEL_HOLD.into(), LABEL_SPEC_READY.into()],
         ];
         for labels in label_sets {
             let mut pr = pr_with_labels(labels.clone());
             for &complete in &[true, false] {
-                for &combined in &[true, false] {
-                    let baseline_stop =
-                        pr.has_label(LABEL_HOLD) || pr.has_label(LABEL_NEEDS_HUMAN) || !complete;
-                    assert_eq!(Labels.human_stop(&pr, complete), baseline_stop);
-                    let baseline_owns = combined && pr.has_label(LABEL_SPEC_READY);
-                    assert_eq!(Labels.spec_worker_owns(&pr, combined), baseline_owns);
-                }
+                let baseline_stop =
+                    pr.has_label(LABEL_HOLD) || pr.has_label(LABEL_NEEDS_HUMAN) || !complete;
+                assert_eq!(Labels.human_stop(&pr, complete), baseline_stop);
             }
             pr.labels.clear();
         }
@@ -2615,12 +2341,6 @@ async fn process_issue_identity(
                 )?;
             }
         }
-        IssueStep::Op(IssueOp::Handoff) => {
-            // The act re-verifies (merged spec PR, not a decompose proposal)
-            // before flipping speccing → ready — defense in depth against a
-            // drifted observation.
-            super::plan_handoff::handoff_issue(deps, issue.number, &issue.labels).await?;
-        }
         IssueStep::Wait(reason) | IssueStep::Skip(reason) => {
             tracing::debug!("issue #{}: reconciler — {reason}", issue.number);
         }
@@ -2646,72 +2366,28 @@ pub async fn build_issue_snapshot(
             || deps
                 .store
                 .issue_has_active_author_run(&deps.project.id, issue.number)?,
-        has_plan: has(forge::LABEL_PLAN),
         has_ready: has(forge::LABEL_READY),
-        has_speccing: has(forge::LABEL_SPECCING),
         has_implementing: has(forge::LABEL_IMPLEMENTING),
-        spec_pr_state: None,
         already_shipped: false,
         deps_unmet: false,
     };
     // The discovery gates cost API calls (dependencies), so they are only
     // evaluated when the decider would otherwise reach a new-work arm — the
     // same laziness the old per-label discover had.
-    let reaches_new_work = !snap.human_stop
-        && !snap.has_open_meguri_pr
-        && !snap.issue_busy
-        && (snap.has_plan || snap.has_ready);
+    let reaches_new_work =
+        !snap.human_stop && !snap.has_open_meguri_pr && !snap.issue_busy && snap.has_ready;
     if reaches_new_work {
-        let loop_kind = if snap.has_plan {
-            super::planner::KIND
-        } else {
-            super::worker::KIND
-        };
-        match deps.task_source.evaluate_issue(loop_kind, issue).await? {
+        match deps
+            .task_source
+            .evaluate_issue(super::worker::KIND, issue)
+            .await?
+        {
             crate::tasks::GateVerdict::Pass => {}
             crate::tasks::GateVerdict::Shipped => snap.already_shipped = true,
             crate::tasks::GateVerdict::Blocked => snap.deps_unmet = true,
         }
     }
-    // A `speccing` issue with no open PR needs its spec PR's terminal state
-    // for the handoff branch (決定5 / f3): a targeted per-issue read, like the
-    // old plan_handoff sweep. Separate delivery only — combined hands off via
-    // the spec worker on the PR side.
-    if snap.has_speccing
-        && !snap.human_stop
-        && !snap.has_open_meguri_pr
-        && !snap.issue_busy
-        && !snap.has_plan
-        && !snap.has_ready
-        && deps.project.plan_delivery == crate::config::PlanDelivery::Separate
-    {
-        snap.spec_pr_state = observe_spec_pr_state(deps, issue.number).await?;
-    }
     Ok(snap)
-}
-
-/// The terminal state of a `speccing` issue's recorded spec PR (決定5 / f3):
-/// the branch the planner recorded, resolved to its PR's state. `None` when no
-/// spec PR was recorded or it cannot be read (waits for the next resync), and
-/// for a decompose proposal (the materializer owns it, never the handoff).
-async fn observe_spec_pr_state(deps: &Deps, issue: i64) -> Result<Option<SpecPrState>> {
-    let Some(branch) =
-        deps.store
-            .branch_for_issue(&deps.project.id, super::planner::KIND, issue)?
-    else {
-        return Ok(None);
-    };
-    let Some(pr) = deps.forge().pr_for_branch(&branch).await? else {
-        return Ok(None);
-    };
-    if super::planner::is_decompose_proposal(&pr.body) {
-        return Ok(None);
-    }
-    Ok(Some(match pr.state.as_str() {
-        "open" => SpecPrState::Open,
-        "merged" => SpecPrState::Merged,
-        _ => SpecPrState::ClosedUnmerged,
-    }))
 }
 
 /// The local-mode reconcile (決定1 / f1, third decider): the local task
@@ -2779,21 +2455,9 @@ pub enum Mode {
     ManualRun,
 }
 
-/// The terminal state of a `speccing` issue's spec PR, read per-issue for the
-/// handoff decision (決定5 / f3). Only meaningful for a `speccing` issue that
-/// has **no open** meguri PR (an open one is owned by the PR side).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpecPrState {
-    Open,
-    Merged,
-    ClosedUnmerged,
-}
-
 /// A pre-PR / non-open-PR issue arm (ADR 0012 §4, `Agent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueArm {
-    /// `meguri:plan` → write a spec (planner recipe).
-    Planner,
     /// `meguri:ready` → implement (worker recipe).
     Worker,
 }
@@ -2802,25 +2466,15 @@ impl IssueArm {
     /// The `runs.loop_kind` this arm dispatches to (the recipe's `KIND`).
     pub fn loop_kind(self) -> &'static str {
         match self {
-            IssueArm::Planner => super::planner::KIND,
             IssueArm::Worker => super::worker::KIND,
         }
     }
-}
-
-/// A pre-PR / non-open-PR issue Op (ADR 0012 §4, `Op`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IssueOp {
-    /// separate delivery: a merged spec PR advances its `speccing` issue to
-    /// `ready` (決定5; the old `plan_handoff` sweep, label-only).
-    Handoff,
 }
 
 /// The decision [`next_step_issue`] returns for one issue identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueStep {
     Agent(IssueArm),
-    Op(IssueOp),
     Wait(&'static str),
     Skip(&'static str),
 }
@@ -2839,15 +2493,11 @@ pub struct IssueSnapshot {
     pub has_open_meguri_pr: bool,
     /// A live author-lane run already owns the issue (`issue_has_active_author_run`).
     pub issue_busy: bool,
-    /// Phase labels present. Priority `plan` > `ready` > `speccing` >
-    /// `implementing`; multiple set (manual drift) still resolves to one arm.
-    pub has_plan: bool,
+    /// Phase labels present. Priority `ready` > `implementing`; multiple set
+    /// (manual drift) still resolves to one arm.
     pub has_ready: bool,
-    pub has_speccing: bool,
     pub has_implementing: bool,
-    /// For a `speccing` issue with no open PR: its spec PR's terminal state.
-    pub spec_pr_state: Option<SpecPrState>,
-    /// Discovery gates for the chosen planner/worker arm (現 `LabelTaskSource`
+    /// Discovery gates for the chosen worker arm (現 `LabelTaskSource`
     /// と同じ判定関数の結果を畳んだ純入力):
     /// already shipped (a succeeded run covers this issue).
     pub already_shipped: bool,
@@ -2874,22 +2524,9 @@ pub fn next_step_issue(s: &IssueSnapshot, mode: Mode) -> IssueStep {
         return IssueStep::Skip("a live run owns the issue");
     }
     // Phase priority: exactly one arm. `hold`/`needs-human` was folded into
-    // `human_stop` above, so the ladder is plan > ready > speccing > implementing.
-    if s.has_plan {
-        return gated_new_work(IssueArm::Planner, s, mode);
-    }
+    // `human_stop` above, so the ladder is ready > implementing.
     if s.has_ready {
         return gated_new_work(IssueArm::Worker, s, mode);
-    }
-    if s.has_speccing {
-        return match s.spec_pr_state {
-            Some(SpecPrState::Merged) => IssueStep::Op(IssueOp::Handoff),
-            Some(SpecPrState::ClosedUnmerged) => IssueStep::Skip("spec PR closed unmerged"),
-            // Open is owned by the PR side (caught by has_open_meguri_pr above);
-            // kept total defensively.
-            Some(SpecPrState::Open) => IssueStep::Skip("owned by its open PR"),
-            None => IssueStep::Skip("speccing: no spec PR yet"),
-        };
     }
     if s.has_implementing {
         return IssueStep::Skip("implementing (in progress)");
@@ -2897,9 +2534,9 @@ pub fn next_step_issue(s: &IssueSnapshot, mode: Mode) -> IssueStep {
     IssueStep::Skip("no actionable phase label")
 }
 
-/// Apply the discovery gates to a chosen planner/worker arm. The dependency
-/// gate holds under both modes (fail-closed); `already_shipped` is the
-/// discovery throttle a manual run bypasses.
+/// Apply the discovery gates to the chosen worker arm. The dependency gate
+/// holds under both modes (fail-closed); `already_shipped` is the discovery
+/// throttle a manual run bypasses.
 fn gated_new_work(arm: IssueArm, s: &IssueSnapshot, mode: Mode) -> IssueStep {
     if s.deps_unmet {
         return IssueStep::Wait("blocked by an open dependency");
@@ -2963,11 +2600,8 @@ mod issue_side_tests {
             human_stop: false,
             has_open_meguri_pr: false,
             issue_busy: false,
-            has_plan: false,
             has_ready: true,
-            has_speccing: false,
             has_implementing: false,
-            spec_pr_state: None,
             already_shipped: false,
             deps_unmet: false,
         }
@@ -2975,30 +2609,19 @@ mod issue_side_tests {
 
     #[test]
     fn phase_priority_picks_exactly_one_arm() {
-        // plan wins over ready (manual drift resolves to the highest phase).
-        let both = IssueSnapshot {
-            has_plan: true,
-            ..ready_snapshot()
-        };
-        assert_eq!(
-            next_step_issue(&both, Mode::Reconcile),
-            IssueStep::Agent(IssueArm::Planner)
-        );
-        // ready alone → worker.
+        // ready → worker.
         assert_eq!(
             next_step_issue(&ready_snapshot(), Mode::Reconcile),
             IssueStep::Agent(IssueArm::Worker)
         );
-        assert_eq!(IssueArm::Planner.loop_kind(), super::super::planner::KIND);
         assert_eq!(IssueArm::Worker.loop_kind(), super::super::worker::KIND);
     }
 
     #[test]
     fn ownership_and_serialization_gates_come_first() {
-        // Human stop wins even with a plan label and even under ManualRun.
+        // Human stop wins even under ManualRun.
         let stopped = IssueSnapshot {
             human_stop: true,
-            has_plan: true,
             ..ready_snapshot()
         };
         assert_eq!(
@@ -3022,43 +2645,6 @@ mod issue_side_tests {
         assert_eq!(
             next_step_issue(&busy, Mode::Reconcile),
             IssueStep::Skip("a live run owns the issue")
-        );
-    }
-
-    #[test]
-    fn speccing_handoff_matches_the_ownership_rule() {
-        // f3: open spec PR → PR side (Skip); merged → Handoff; closed → Skip.
-        let base = IssueSnapshot {
-            has_ready: false,
-            has_speccing: true,
-            ..ready_snapshot()
-        };
-        // An open spec PR sets has_open_meguri_pr, so the boundary catches it
-        // before the speccing branch — the issue side never waits on it.
-        let open = IssueSnapshot {
-            has_open_meguri_pr: true,
-            spec_pr_state: Some(SpecPrState::Open),
-            ..base
-        };
-        assert_eq!(
-            next_step_issue(&open, Mode::Reconcile),
-            IssueStep::Skip("owned by its open PR")
-        );
-        let merged = IssueSnapshot {
-            spec_pr_state: Some(SpecPrState::Merged),
-            ..base
-        };
-        assert_eq!(
-            next_step_issue(&merged, Mode::Reconcile),
-            IssueStep::Op(IssueOp::Handoff)
-        );
-        let closed = IssueSnapshot {
-            spec_pr_state: Some(SpecPrState::ClosedUnmerged),
-            ..base
-        };
-        assert_eq!(
-            next_step_issue(&closed, Mode::Reconcile),
-            IssueStep::Skip("spec PR closed unmerged")
         );
     }
 
@@ -3138,39 +2724,25 @@ mod issue_side_tests {
         for &human_stop in &[true, false] {
             for &has_open_pr in &[true, false] {
                 for &busy in &[true, false] {
-                    for &plan in &[true, false] {
-                        for &ready in &[true, false] {
-                            for &speccing in &[true, false] {
-                                for &implementing in &[true, false] {
-                                    for spec_pr in [
-                                        None,
-                                        Some(SpecPrState::Open),
-                                        Some(SpecPrState::Merged),
-                                        Some(SpecPrState::ClosedUnmerged),
-                                    ] {
-                                        for &shipped in &[true, false] {
-                                            for &deps in &[true, false] {
-                                                for mode in [Mode::Reconcile, Mode::ManualRun] {
-                                                    let s = IssueSnapshot {
-                                                        human_stop,
-                                                        has_open_meguri_pr: has_open_pr,
-                                                        issue_busy: busy,
-                                                        has_plan: plan,
-                                                        has_ready: ready,
-                                                        has_speccing: speccing,
-                                                        has_implementing: implementing,
-                                                        spec_pr_state: spec_pr,
-                                                        already_shipped: shipped,
-                                                        deps_unmet: deps,
-                                                    };
-                                                    assert_eq!(
-                                                        next_step_issue(&s, mode),
-                                                        expected(&s, mode),
-                                                        "{s:?} {mode:?}"
-                                                    );
-                                                }
-                                            }
-                                        }
+                    for &ready in &[true, false] {
+                        for &implementing in &[true, false] {
+                            for &shipped in &[true, false] {
+                                for &deps in &[true, false] {
+                                    for mode in [Mode::Reconcile, Mode::ManualRun] {
+                                        let s = IssueSnapshot {
+                                            human_stop,
+                                            has_open_meguri_pr: has_open_pr,
+                                            issue_busy: busy,
+                                            has_ready: ready,
+                                            has_implementing: implementing,
+                                            already_shipped: shipped,
+                                            deps_unmet: deps,
+                                        };
+                                        assert_eq!(
+                                            next_step_issue(&s, mode),
+                                            expected(&s, mode),
+                                            "{s:?} {mode:?}"
+                                        );
                                     }
                                 }
                             }
@@ -3202,17 +2774,8 @@ mod issue_side_tests {
                 IssueStep::Agent(arm)
             }
         };
-        if s.has_plan {
-            gated(IssueArm::Planner)
-        } else if s.has_ready {
+        if s.has_ready {
             gated(IssueArm::Worker)
-        } else if s.has_speccing {
-            match s.spec_pr_state {
-                Some(SpecPrState::Merged) => IssueStep::Op(IssueOp::Handoff),
-                Some(SpecPrState::ClosedUnmerged) => IssueStep::Skip("spec PR closed unmerged"),
-                Some(SpecPrState::Open) => IssueStep::Skip("owned by its open PR"),
-                None => IssueStep::Skip("speccing: no spec PR yet"),
-            }
         } else if s.has_implementing {
             IssueStep::Skip("implementing (in progress)")
         } else {

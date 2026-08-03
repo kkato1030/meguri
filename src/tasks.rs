@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::engine::{planner, worker};
+use crate::engine::worker;
 use crate::forge::{self, Forge};
 use crate::store::Store;
 
@@ -30,27 +30,23 @@ use crate::store::Store;
 /// machine (Phase 1–3); Phase 4's remote DB gives each host its own.
 pub const LOCAL_HOST: &str = "local";
 
-/// What a task is queued for. Maps to the worker (`work`) and planner
-/// (`plan`) loops, and to the `meguri:ready`/`meguri:plan` labels in
-/// [`LabelTaskSource`].
+/// What a task is queued for. Maps to the worker (`work`) loop and to the
+/// `meguri:ready` label in [`LabelTaskSource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Work,
-    Plan,
 }
 
 impl TaskKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Work => "work",
-            Self::Plan => "plan",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "work" => Some(Self::Work),
-            "plan" => Some(Self::Plan),
             _ => None,
         }
     }
@@ -61,7 +57,6 @@ impl TaskKind {
     fn label_and_loop(self) -> (&'static str, &'static str) {
         match self {
             Self::Work => (forge::LABEL_READY, worker::KIND),
-            Self::Plan => (forge::LABEL_PLAN, planner::KIND),
         }
     }
 }
@@ -288,7 +283,7 @@ impl TaskSource for LabelTaskSource {
         if issue.has_label(forge::LABEL_HOLD) {
             return Ok(None);
         }
-        if !(issue.has_label(forge::LABEL_READY) || issue.has_label(forge::LABEL_PLAN)) {
+        if !issue.has_label(forge::LABEL_READY) {
             return Ok(None);
         }
         self.forge.add_label(n, forge::LABEL_WORKING).await?;
@@ -296,14 +291,9 @@ impl TaskSource for LabelTaskSource {
         // no longer needed while this run is in flight (a new failure re-adds
         // the label). Best-effort, like the escalation side.
         let _ = self.forge.remove_label(n, forge::LABEL_NEEDS_HUMAN).await;
-        let kind = if issue.has_label(forge::LABEL_PLAN) {
-            TaskKind::Plan
-        } else {
-            TaskKind::Work
-        };
         Ok(Some(Task {
             key: *key,
-            kind,
+            kind: TaskKind::Work,
             automerge: issue.has_label(forge::LABEL_AUTOMERGE),
             title: issue.title,
             body: issue.body,
@@ -432,10 +422,6 @@ mod tests {
         assert_eq!(
             TaskKind::Work.label_and_loop(),
             (forge::LABEL_READY, worker::KIND)
-        );
-        assert_eq!(
-            TaskKind::Plan.label_and_loop(),
-            (forge::LABEL_PLAN, planner::KIND)
         );
     }
 

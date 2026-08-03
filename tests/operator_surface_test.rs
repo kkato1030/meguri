@@ -39,11 +39,8 @@ fn manual_run_bypasses_throttles_but_keeps_safety_gates() {
         human_stop: false,
         has_open_meguri_pr: false,
         issue_busy: false,
-        has_plan: false,
         has_ready: true,
-        has_speccing: false,
         has_implementing: false,
-        spec_pr_state: None,
         already_shipped: false,
         deps_unmet: false,
     };
