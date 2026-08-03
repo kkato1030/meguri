@@ -25,37 +25,6 @@ pub async fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
-/// Blocking sibling of [`run_git`] for the synchronous verification hooks
-/// (`Flavor::verify_work` runs outside an executor-friendly context).
-pub fn run_git_sync(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .context("spawning git")?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
-    } else {
-        bail!(
-            "git {} (in {}) failed: {}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-}
-
-/// Resolve the toplevel of the Git work tree containing `dir` (blocking, via
-/// `git rev-parse --show-toplevel`). Errors when `dir` is not inside a Git
-/// work tree — callers that want a fallback must handle it explicitly rather
-/// than silently getting `dir` back.
-pub fn repo_toplevel_sync(dir: &Path) -> Result<PathBuf> {
-    let top = run_git_sync(dir, &["rev-parse", "--show-toplevel"])
-        .with_context(|| format!("{} is not inside a Git repository", dir.display()))?;
-    Ok(PathBuf::from(top))
-}
-
 pub fn slugify(title: &str) -> String {
     let mut slug: String = title
         .to_lowercase()
@@ -93,18 +62,6 @@ pub fn task_branch_name(task_id: i64, title: &str, run_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = hex::encode(&Sha256::digest(run_id.as_bytes())[..3]);
     format!("meguri/t{task_id}-{slug}-{hash}", slug = slugify(title))
-}
-
-/// The task id a [`task_branch_name`]-style branch encodes
-/// (`meguri/t<id>-<slug>-<runhash>`); `None` for anything else, including
-/// issue branches (`meguri/<issue>-…`).
-pub fn task_from_branch(branch: &str) -> Option<i64> {
-    branch
-        .strip_prefix("meguri/t")?
-        .split('-')
-        .next()?
-        .parse()
-        .ok()
 }
 
 mod hex {
@@ -270,7 +227,7 @@ pub async fn attach_worktree(
 
 /// Create (or re-point) a review worktree detached at `head_sha` (a PR
 /// head). Detached HEAD avoids colliding with whichever worktree still has
-/// the PR branch checked out (e.g. the planner's on the same host). The
+/// the PR branch checked out (e.g. another worktree on the same host). The
 /// worktree is issue-scoped and survives review rounds (issue #92): when it
 /// already exists — resuming an interrupted run, or reviewing the next push
 /// — it is reset hard onto the new head instead of being recreated, so the
@@ -446,47 +403,6 @@ pub async fn default_branch_head(repo_path: &Path, default_branch: &str) -> Resu
     run_git(repo_path, &["rev-parse", default_branch]).await
 }
 
-/// A branch on origin as the cleaner's stale-branch check sees it.
-#[derive(Debug, Clone)]
-pub struct RemoteBranch {
-    /// Branch name without the `origin/` prefix.
-    pub name: String,
-    /// Committer time (unix epoch seconds) of the branch tip.
-    pub committer_unix: i64,
-}
-
-/// Branches on origin with their tip committer times. Fetches with `--prune`
-/// first (best-effort) so deleted branches drop out of the listing.
-pub async fn list_remote_branches(repo_path: &Path) -> Result<Vec<RemoteBranch>> {
-    let _ = run_git(repo_path, &["fetch", "--prune", "origin"]).await;
-    let out = run_git(
-        repo_path,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(committerdate:unix)",
-            "refs/remotes/origin",
-        ],
-    )
-    .await?;
-    let mut branches = Vec::new();
-    for line in out.lines() {
-        let Some((refname, date)) = line.rsplit_once(' ') else {
-            continue;
-        };
-        let Some(name) = refname.strip_prefix("refs/remotes/origin/") else {
-            continue;
-        };
-        if name == "HEAD" {
-            continue; // symbolic ref, not a branch
-        }
-        branches.push(RemoteBranch {
-            name: name.to_string(),
-            committer_unix: date.parse().unwrap_or(0),
-        });
-    }
-    Ok(branches)
-}
-
 /// True when nothing is uncommitted (untracked counts as dirty).
 pub async fn status_clean(worktree: &Path) -> Result<bool> {
     Ok(run_git(worktree, &["status", "--porcelain"])
@@ -511,205 +427,9 @@ pub async fn commits_ahead(worktree: &Path, default_branch: &str) -> Result<u64>
     Ok(count.parse().unwrap_or(0))
 }
 
-/// The unified diff of HEAD against the base ref — three-dot, i.e. the
-/// changes introduced on HEAD since it diverged from base (the same shape a
-/// PR shows). Mirrors [`commits_ahead`]'s `origin/<base>` vs `<base>`
-/// resolution so the self-review reads exactly the PR's own diff, locally,
-/// without any forge call (ADR 0006).
-pub async fn diff_against_base(worktree: &Path, default_branch: &str) -> Result<String> {
-    let base = if run_git(
-        worktree,
-        &["rev-parse", "--verify", &format!("origin/{default_branch}")],
-    )
-    .await
-    .is_ok()
-    {
-        format!("origin/{default_branch}")
-    } else {
-        default_branch.to_string()
-    };
-    run_git(worktree, &["diff", &format!("{base}...HEAD")]).await
-}
-
-/// Diff between two commits in a worktree (issue #212): the incremental diff the
-/// self-review passes on round 2+, from the HEAD it reviewed last time (`from`)
-/// to the current one (`to`, usually `HEAD`). `from..to` shows exactly what the
-/// fix turns added since the previous review.
-pub async fn diff_between(worktree: &Path, from: &str, to: &str) -> Result<String> {
-    run_git(worktree, &["diff", &format!("{from}..{to}")]).await
-}
-
 pub async fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
     run_git(worktree, &["push", "-u", "origin", branch]).await?;
     Ok(())
-}
-
-/// Fetch the base branch and return its tip commit (`origin/<base>` when a
-/// remote exists, the local branch otherwise). The conflict resolver pins
-/// this sha at claim time so the merge target stays fixed even if the base
-/// moves mid-run.
-pub async fn fetch_base_tip(repo_path: &Path, base_branch: &str) -> Result<String> {
-    // Best-effort freshness; offline or remote-less repos still work.
-    let _ = run_git(repo_path, &["fetch", "origin", base_branch]).await;
-    if let Ok(sha) = run_git(
-        repo_path,
-        &["rev-parse", "--verify", &format!("origin/{base_branch}")],
-    )
-    .await
-    {
-        return Ok(sha);
-    }
-    run_git(
-        repo_path,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("refs/heads/{base_branch}"),
-        ],
-    )
-    .await
-    .with_context(|| format!("base branch {base_branch} exists neither on origin nor locally"))
-}
-
-/// How long the schedule resolver's freshness fetch may run before it counts
-/// as a failure. `run_git` has no timeout, so a stuck credential helper / SSH
-/// would otherwise block the serial scheduler indefinitely (issue #222 f4).
-const SCHEDULE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Bounded refresh of `origin/<default_branch>` for the schedule resolver
-/// (issue #222 f1/f4). Unlike [`fetch_base_tip`] the outcome is reported so the
-/// caller can abstain (ADR 0026):
-/// - no `origin` remote → `Ok(())` (nothing to fetch; the local branch is the
-///   only authority — no staleness is possible).
-/// - fetch succeeded within [`SCHEDULE_FETCH_TIMEOUT`] → `Ok(())`.
-/// - fetch failed, or timed out → `Err` (the caller skips the repo-schedule
-///   layer this tick; host schedules are unaffected).
-///
-/// The child is killed on drop, so a timed-out fetch does not linger.
-pub async fn fetch_default_branch(repo_path: &Path, default_branch: &str) -> Result<()> {
-    fetch_default_branch_within(repo_path, default_branch, SCHEDULE_FETCH_TIMEOUT).await
-}
-
-/// The timeout-injectable core of [`fetch_default_branch`] (the public wrapper
-/// pins [`SCHEDULE_FETCH_TIMEOUT`]); tests drive it with a short bound to prove
-/// a hanging fetch times out rather than stalling.
-async fn fetch_default_branch_within(
-    repo_path: &Path,
-    default_branch: &str,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    if run_git(repo_path, &["remote", "get-url", "origin"])
-        .await
-        .is_err()
-    {
-        return Ok(()); // no remote: local branch is authoritative
-    }
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .args(["fetch", "origin", default_branch])
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .with_context(|| {
-            format!(
-                "git fetch origin {default_branch} timed out after {}s",
-                timeout.as_secs()
-            )
-        })?
-        .context("spawning git fetch")?;
-    if !out.status.success() {
-        bail!(
-            "git fetch origin {default_branch} (in {}) failed: {}",
-            repo_path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Fetch a PR head branch from origin and return its freshly-fetched tip sha
-/// (`origin/<branch>`). The decompose materializer pins this against the PR's
-/// approved head_sha to notice a head that moved mid-sweep (issue #134).
-///
-/// The fetch is **not** best-effort here (unlike [`fetch_base_tip`]): this gates
-/// an irreversible issue-creation, so a failed fetch — network down, or the
-/// branch deleted on the remote (`git fetch origin <gone>` errors) — must surface
-/// as an error, never fall through to a stale local remote-tracking ref that
-/// could still match the approved sha. The sweep then skips and retries next tick.
-pub async fn fetch_branch_tip(repo_path: &Path, branch: &str) -> Result<String> {
-    run_git(repo_path, &["fetch", "origin", branch])
-        .await
-        .with_context(|| format!("fetching branch {branch} from origin"))?;
-    run_git(
-        repo_path,
-        &["rev-parse", "--verify", &format!("origin/{branch}")],
-    )
-    .await
-    .with_context(|| format!("branch {branch} not found on origin"))
-}
-
-/// Read a file's contents at a git ref (`git show <ref>:<path>`); the ref may be
-/// a branch or a sha. The decompose materializer reads the proposal spec from
-/// the exact approved head sha, not the working tree (issue #134).
-pub async fn show_file_at_ref(repo_path: &Path, git_ref: &str, path: &str) -> Result<String> {
-    run_git(repo_path, &["show", &format!("{git_ref}:{path}")])
-        .await
-        .with_context(|| format!("reading {path} at {git_ref}"))
-}
-
-/// Whether `ancestor` is reachable from `descendant` — how the conflict
-/// resolver proves the base tip was actually merged, not cherry-picked
-/// around. Synchronous: called from `Flavor::verify_work`.
-pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .output()
-        .context("spawning git")?;
-    match out.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!(
-            "git merge-base --is-ancestor {ancestor} {descendant} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-    }
-}
-
-/// A line git would have written as a conflict marker. `=======` alone is
-/// deliberately not matched (legitimate as e.g. a setext heading underline);
-/// a leftover separator without its bracketing markers cannot occur.
-fn is_conflict_marker_line(line: &str) -> bool {
-    ["<<<<<<<", ">>>>>>>", "|||||||"].iter().any(|marker| {
-        line.strip_prefix(marker)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-    })
-}
-
-/// Files changed between `from_ref` and HEAD that still contain conflict
-/// markers — the conflict resolver's proof that a "resolved" merge did not
-/// commit the markers themselves. Synchronous: called from
-/// `Flavor::verify_work`. Unreadable (deleted, binary) files are skipped.
-pub fn conflict_marker_files(worktree: &Path, from_ref: &str) -> Result<Vec<String>> {
-    let changed = run_git_sync(
-        worktree,
-        &["diff", "--name-only", &format!("{from_ref}..HEAD")],
-    )?;
-    let mut hits = Vec::new();
-    for file in changed.lines().filter(|l| !l.is_empty()) {
-        let Ok(content) = std::fs::read_to_string(worktree.join(file)) else {
-            continue;
-        };
-        if content.lines().any(is_conflict_marker_line) {
-            hits.push(file.to_string());
-        }
-    }
-    Ok(hits)
 }
 
 #[cfg(test)]
@@ -745,17 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn task_branches_carry_the_t_prefix_and_stay_out_of_issue_space() {
-        let b = task_branch_name(5, "Local task", "run-1");
-        assert!(b.starts_with("meguri/t5-local-task-"));
-        assert_eq!(task_from_branch(&b), Some(5));
-        // Task branches never parse as issue branches, and vice versa.
-        assert_eq!(issue_from_branch(&b), None);
-        assert_eq!(task_from_branch("meguri/7-fix-bug-abc"), None);
-        assert_eq!(task_from_branch("main"), None);
-    }
-
-    #[test]
     fn branch_name_is_stable_and_scoped() {
         let a = branch_name(7, "Fix bug", "run-1");
         let b = branch_name(7, "Fix bug", "run-2");
@@ -773,28 +482,6 @@ mod tests {
         ] {
             run_git(dir, &args).await.unwrap();
         }
-    }
-
-    #[test]
-    fn repo_toplevel_sync_walks_up_from_subdir_and_rejects_non_repos() {
-        let repo = tempfile::tempdir().unwrap();
-        run_git_sync(repo.path(), &["init", "-b", "main"]).unwrap();
-        let sub = repo.path().join("docs").join("adr");
-        std::fs::create_dir_all(&sub).unwrap();
-        // Canonicalize both sides: on macOS the tempdir sits behind the
-        // /var -> /private/var symlink and git reports the resolved path.
-        assert_eq!(
-            repo_toplevel_sync(&sub).unwrap().canonicalize().unwrap(),
-            repo.path().canonicalize().unwrap()
-        );
-
-        // Outside any work tree: a hard error, never a silent fallback.
-        let plain = tempfile::tempdir().unwrap();
-        let err = repo_toplevel_sync(plain.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("not inside a Git repository"),
-            "unexpected error: {err:#}"
-        );
     }
 
     #[tokio::test]
@@ -942,7 +629,7 @@ mod tests {
             .unwrap();
         let tip = run_git(&old_wt, &["rev-parse", "HEAD"]).await.unwrap();
 
-        // The fixer attaches the same branch at a different path: the old
+        // Attaching the same branch at a different path: the old
         // worktree gets detached, the new one sits on the branch tip.
         let new_root = tempfile::tempdir().unwrap();
         let new_wt = worktree_path(new_root.path(), "proj", branch);
@@ -1045,148 +732,6 @@ mod tests {
             run_git(repo.path(), &["rev-parse", "--verify", &branch])
                 .await
                 .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_base_tip_prefers_origin_and_pins_a_sha() {
-        // Remote-less repo: falls back to the local branch tip.
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path()).await;
-        let local_tip = run_git(repo.path(), &["rev-parse", "main"]).await.unwrap();
-        assert_eq!(
-            fetch_base_tip(repo.path(), "main").await.unwrap(),
-            local_tip
-        );
-        assert!(fetch_base_tip(repo.path(), "nope").await.is_err());
-
-        // With a remote: the origin tip wins even when the local branch lags.
-        let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare", "-b", "main"])
-            .await
-            .unwrap();
-        run_git(
-            repo.path(),
-            &["remote", "add", "origin", origin.path().to_str().unwrap()],
-        )
-        .await
-        .unwrap();
-        run_git(repo.path(), &["push", "origin", "main"])
-            .await
-            .unwrap();
-        run_git(repo.path(), &["commit", "--allow-empty", "-m", "ahead"])
-            .await
-            .unwrap();
-        let pushed = run_git(repo.path(), &["rev-parse", "origin/main"])
-            .await
-            .unwrap();
-        assert_eq!(fetch_base_tip(repo.path(), "main").await.unwrap(), pushed);
-    }
-
-    #[tokio::test]
-    async fn fetch_default_branch_reports_failure_without_hanging() {
-        // issue #222 f1/f4: no-remote is a benign success; a broken remote is a
-        // reported failure (the caller then abstains) — never a hang.
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path()).await;
-        // No `origin` remote → nothing to fetch, treated as success.
-        assert!(fetch_default_branch(repo.path(), "main").await.is_ok());
-        // A broken origin → the fetch fails fast (bounded), surfaced as an error.
-        run_git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "/nonexistent/definitely-not-a-repo.git",
-            ],
-        )
-        .await
-        .unwrap();
-        assert!(fetch_default_branch(repo.path(), "main").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_default_branch_times_out_instead_of_hanging() {
-        // issue #222 f4: a fetch that never returns (a stuck credential helper)
-        // must be bounded, not stall the serial scheduler. A `git` remote via the
-        // `ext::` transport running `sleep` hangs deterministically; the bounded
-        // fetch returns an error well before the sleep would end.
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path()).await;
-        run_git(repo.path(), &["config", "protocol.ext.allow", "always"])
-            .await
-            .unwrap();
-        run_git(
-            repo.path(),
-            &["remote", "add", "origin", "ext::sh -c \"sleep 30\""],
-        )
-        .await
-        .unwrap();
-
-        let start = std::time::Instant::now();
-        let r =
-            fetch_default_branch_within(repo.path(), "main", std::time::Duration::from_millis(300))
-                .await;
-        let elapsed = start.elapsed();
-        assert!(r.is_err(), "a hanging fetch must fail, not hang");
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "bounded by the 300ms timeout, not the 30s sleep (took {elapsed:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn ancestry_and_marker_scan_verify_a_merge() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path()).await;
-        std::fs::write(repo.path().join("f.txt"), "base\n").unwrap();
-        run_git(repo.path(), &["add", "."]).await.unwrap();
-        run_git(repo.path(), &["commit", "-m", "base"])
-            .await
-            .unwrap();
-        let base = run_git(repo.path(), &["rev-parse", "HEAD"]).await.unwrap();
-
-        run_git(repo.path(), &["checkout", "-b", "topic"])
-            .await
-            .unwrap();
-        std::fs::write(repo.path().join("f.txt"), "topic\n").unwrap();
-        run_git(repo.path(), &["commit", "-am", "topic"])
-            .await
-            .unwrap();
-
-        assert!(is_ancestor(repo.path(), &base, "HEAD").unwrap());
-        assert!(!is_ancestor(repo.path(), "HEAD", &base).unwrap());
-        assert!(is_ancestor(repo.path(), "no-such-ref", "HEAD").is_err());
-
-        // Committed conflict markers are found; mid-line lookalikes are not.
-        std::fs::write(
-            repo.path().join("f.txt"),
-            "<<<<<<< HEAD\ntopic\n=======\nbase\n>>>>>>> main\n",
-        )
-        .unwrap();
-        std::fs::write(
-            repo.path().join("clean.md"),
-            "Heading\n=======\na <<<<<<< b\n",
-        )
-        .unwrap();
-        run_git(repo.path(), &["add", "."]).await.unwrap();
-        run_git(repo.path(), &["commit", "-m", "markers"])
-            .await
-            .unwrap();
-        assert_eq!(
-            conflict_marker_files(repo.path(), &base).unwrap(),
-            vec!["f.txt".to_string()]
-        );
-
-        std::fs::write(repo.path().join("f.txt"), "resolved\n").unwrap();
-        run_git(repo.path(), &["commit", "-am", "resolve"])
-            .await
-            .unwrap();
-        assert!(
-            conflict_marker_files(repo.path(), &base)
-                .unwrap()
-                .is_empty()
         );
     }
 

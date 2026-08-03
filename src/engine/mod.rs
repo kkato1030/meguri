@@ -24,9 +24,8 @@ pub struct Deps {
     pub store: Store,
     pub mux: Arc<dyn Multiplexer>,
     /// The GitHub forge — issue reading, PR/label/review operations. `None`
-    /// in local mode; the forge-dependent loops (fixer, pr-reviewer,
-    /// spec-worker, conflict-resolver, ci-fixer, cleaner) then discover
-    /// nothing. Task coordination goes through [`Deps::task_source`], not here.
+    /// in local mode, where the forge-dependent paths never run. Task
+    /// coordination goes through [`Deps::task_source`], not here.
     pub forge: Option<Arc<dyn Forge>>,
     /// The task coordination layer (discover / claim / release / escalate /
     /// complete) — `LabelTaskSource` in github mode, `LocalTaskSource` in
@@ -77,9 +76,9 @@ impl Deps {
         self.project.repo_path.clone()
     }
 
-    /// The forge for github-mode loops. Panics if absent — only the
-    /// forge-dependent loops run without a forge, and they short-circuit their
-    /// discovery before ever reaching here.
+    /// The forge for github-mode paths. Panics if absent — callers are
+    /// github-mode only and check (or are gated on) forge presence before
+    /// reaching here.
     pub fn forge(&self) -> &Arc<dyn Forge> {
         self.forge
             .as_ref()
@@ -87,19 +86,12 @@ impl Deps {
     }
 }
 
-/// Head-branch prefix identifying meguri's own PRs — the fixer-family loops
-/// (fixer / ci_fixer / conflict_resolver) only ever touch work meguri opened.
+/// Head-branch prefix identifying meguri's own PRs.
 pub(crate) const MEGURI_BRANCH_PREFIX: &str = "meguri/";
 
-/// Whether a fixer-family loop (fixer / ci_fixer / conflict_resolver) may
-/// touch `pr` at all, independent of the loop's own symptom (review threads /
-/// red CI / conflicts). The three loops used to carry near-identical copies
-/// of this guard, which let them drift apart silently: conflict_resolver's
-/// copy never gained the `spec-ready` gate the other two got under ADR 0008
-/// (issue #170) — a resolver could merge the base into a branch the spec
-/// worker still owned. Lifted here so the shared gates cannot drift again;
-/// only each loop's own symptom check stays outside.
-///
+/// Whether meguri may touch `pr` at all: it must be open, on a
+/// meguri-opened head branch, and carry none of the hold / working /
+/// needs-human labels. Returns `Some(reason)` when it must be left alone.
 pub fn pr_is_touchable(pr: &PullRequest) -> Option<String> {
     if pr.state != "open" {
         return Some(format!("PR #{} is {} (not open)", pr.number, pr.state));
@@ -310,7 +302,6 @@ mod tests {
             head_branch: head_branch.into(),
             head_sha: String::new(),
             state: "open".into(),
-            is_draft: false,
             labels: vec![],
         }
     }
@@ -351,7 +342,9 @@ mod tests {
 
     #[test]
     fn every_loop_lives_in_the_author_lane() {
-        for kind in ["worker", "fixer", "ci-fixer", "conflict-resolver"] {
+        // Any kind string maps to the author lane — the worker is the only
+        // loop, and a future loop starts there unless it opts out.
+        for kind in ["worker", "some-future-loop"] {
             assert_eq!(lane_for_loop(kind), LANE_AUTHOR, "loop: {kind}");
         }
     }

@@ -7,10 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
-use super::{
-    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
-    PaneId, PaneSpec, Split,
-};
+use super::{AgentState, Multiplexer, MuxError, MuxKind, MuxResult, PaneId, PaneSpec};
 
 #[derive(Debug)]
 pub struct FakePane {
@@ -39,10 +36,6 @@ pub struct FakeMux {
     /// returns an error and no pane is created (emulates the mux itself
     /// refusing the spawn, e.g. tmux gone mid-run).
     error_spawn_matching: Mutex<Option<String>>,
-    /// Panes tiled into a dashboard, in tile order (for `meguri top` tests).
-    tiled: Mutex<Vec<(PaneId, DashboardId, Split)>>,
-    /// Dashboards created so far, keyed by label (idempotency for `top`).
-    dashboards: Mutex<HashMap<String, DashboardId>>,
     /// Commands launched via `run_in_pane`, in call order.
     ran_in_pane: Mutex<Vec<(PaneId, Vec<String>)>>,
     /// Set by [`Self::stop`] (issue #250): emulates the mux daemon itself
@@ -63,8 +56,6 @@ impl FakeMux {
             spawn_log: Mutex::new(Vec::new()),
             dead_spawn_matching: Mutex::new(None),
             error_spawn_matching: Mutex::new(None),
-            tiled: Mutex::new(Vec::new()),
-            dashboards: Mutex::new(HashMap::new()),
             ran_in_pane: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             default_agent_present: Mutex::new(None),
@@ -156,11 +147,6 @@ impl FakeMux {
         self.spawn_log.lock().unwrap().clone()
     }
 
-    /// Panes that were tiled into a dashboard, in tile order.
-    pub fn tiled_panes(&self) -> Vec<(PaneId, DashboardId, Split)> {
-        self.tiled.lock().unwrap().clone()
-    }
-
     /// Commands launched into a pane via `run_in_pane`, in call order.
     pub fn ran_in_pane(&self) -> Vec<(PaneId, Vec<String>)> {
         self.ran_in_pane.lock().unwrap().clone()
@@ -191,12 +177,6 @@ impl FakeMux {
 impl Multiplexer for FakeMux {
     fn kind(&self) -> MuxKind {
         MuxKind::Tmux
-    }
-
-    fn capabilities(&self) -> MuxCapabilities {
-        MuxCapabilities {
-            native_agent_state: self.native_agent_state,
-        }
     }
 
     async fn ensure_session(&self) -> MuxResult<()> {
@@ -315,58 +295,6 @@ impl Multiplexer for FakeMux {
 
     fn attach_command(&self, pane: &PaneId) -> String {
         format!("echo fake pane {pane}")
-    }
-
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
-        let tile = {
-            let mut dashboards = self.dashboards.lock().unwrap();
-            if let Some(tile) = dashboards.get(label) {
-                return Ok(Dashboard {
-                    tile: tile.clone(),
-                    status_pane: None,
-                    fresh: false,
-                });
-            }
-            let tile = DashboardId(format!("fake-dash:{label}"));
-            dashboards.insert(label.to_string(), tile.clone());
-            tile
-        };
-        let status = self.register_live_pane(&format!("fake-status:{label}"));
-        Ok(Dashboard {
-            tile,
-            status_pane: Some(status),
-            fresh: true,
-        })
-    }
-
-    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
-        self.ran_in_pane
-            .lock()
-            .unwrap()
-            .push((pane.clone(), argv.to_vec()));
-        Ok(())
-    }
-
-    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
-        if !self
-            .panes
-            .lock()
-            .unwrap()
-            .get(pane)
-            .map(|p| p.alive)
-            .unwrap_or(false)
-        {
-            return Err(MuxError::PaneNotFound(pane.clone()));
-        }
-        self.tiled
-            .lock()
-            .unwrap()
-            .push((pane.clone(), into.clone(), dir));
-        Ok(())
-    }
-
-    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
-        format!("echo fake dashboard {dashboard}")
     }
 }
 

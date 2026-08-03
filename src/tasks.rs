@@ -92,8 +92,8 @@ pub trait TaskSource: Send + Sync {
 
     /// Hand the task to a human; `reason` is stored durably
     /// (`status='needs_human'` + `reason`, plus the label + comment
-    /// projection in github mode). `hint` is the launch-mode-aware "how to
-    /// look at this" sentence (issue #169) folded into the github comment.
+    /// projection in github mode). `hint` is the "how to look at this"
+    /// attach sentence folded into the github comment.
     async fn escalate(&self, key: &TaskKey, reason: &str, hint: &str) -> Result<()>;
 
     /// The task shipped a deliverable (`status='done'`; github mode also

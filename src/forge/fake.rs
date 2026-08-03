@@ -24,9 +24,9 @@ pub struct RecordedPr {
 
 #[derive(Default)]
 pub struct FakeForge {
-    /// This fake's own repo slug, if it stands in for a specific repo (issue
-    /// #154 cross-repo tests). `None` = the single-repo default: every
-    /// `add_blocked_by_in` is treated as same-repo.
+    /// This fake's own repo slug, if it stands in for a specific repo.
+    /// `None` = the single-repo default: every `add_blocked_by_in` is
+    /// treated as same-repo.
     pub slug: Option<String>,
     pub issues: Mutex<Vec<Issue>>,
     /// Closed issues: number → state_reason ("completed", "not_planned", ...).
@@ -39,7 +39,7 @@ pub struct FakeForge {
     pub prs: Mutex<Vec<RecordedPr>>,
     /// Branches whose pr_for_branch lookup fails (forge-outage scenarios).
     pub pr_for_branch_errors: Mutex<HashSet<String>>,
-    /// Issues whose `comment` fails (forge-hiccup scenarios, e.g. triage
+    /// Issues whose `comment` fails (forge-hiccup scenarios
     /// auto-promote rolling a label back when the reason comment can't post).
     pub comment_errors: Mutex<HashSet<i64>>,
     /// GitHub's cross-reference ("Development") linkage: issue → PR numbers
@@ -68,10 +68,10 @@ impl FakeForge {
         });
     }
 
-    /// A fake standing in for a specific repo slug (issue #154 cross-repo
-    /// decomposition tests): `add_blocked_by_in` then distinguishes
-    /// same-repo blockers (existence-checked) from cross-repo ones (recorded
-    /// as-is, since the blocker lives in another fake's store).
+    /// A fake standing in for a specific repo slug: `add_blocked_by_in` then
+    /// distinguishes same-repo blockers (existence-checked) from cross-repo
+    /// ones (recorded as-is, since the blocker lives in another fake's
+    /// store).
     pub fn with_slug(slug: &str) -> Self {
         Self {
             slug: Some(slug.to_string()),
@@ -122,7 +122,7 @@ impl FakeForge {
     }
 
     /// Seed a pull request as if it already existed on the forge (reviewer
-    /// tests; `create_pr` records worker/planner-created ones).
+    /// tests; `create_pr` records worker-created ones).
     pub fn add_pr(
         &self,
         number: i64,
@@ -164,14 +164,6 @@ impl FakeForge {
         let mut prs = self.prs.lock().unwrap();
         if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
             pr.head_sha = head_sha.into();
-        }
-    }
-
-    /// Toggle a seeded PR's draft flag (auto-merge draft-readying tests).
-    pub fn set_pr_draft(&self, number: i64, draft: bool) {
-        let mut prs = self.prs.lock().unwrap();
-        if let Some(pr) = prs.iter_mut().find(|p| p.number == number) {
-            pr.draft = draft;
         }
     }
 
@@ -254,17 +246,6 @@ impl FakeForge {
         self.pr_labels_of(pr)
     }
 
-    /// Whether a PR is currently a draft.
-    pub fn is_draft(&self, pr: i64) -> bool {
-        self.prs
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|p| p.number == pr)
-            .map(|p| p.draft)
-            .unwrap_or(false)
-    }
-
     fn pr_to_public(pr: &RecordedPr) -> PullRequest {
         PullRequest {
             number: pr.number,
@@ -274,7 +255,6 @@ impl FakeForge {
             head_branch: pr.head.clone(),
             head_sha: pr.head_sha.clone(),
             state: pr.state.clone(),
-            is_draft: pr.draft,
             labels: pr.labels.clone(),
         }
     }
@@ -340,8 +320,6 @@ impl Forge for FakeForge {
             bail!("blocked_by of issue #{issue} is unreadable");
         }
         let closed = self.closed.lock().unwrap();
-        let issues = self.issues.lock().unwrap();
-        let own_repo = self.slug.clone().unwrap_or_default();
         Ok(self
             .blocked_by
             .lock()
@@ -350,23 +328,15 @@ impl Forge for FakeForge {
             .map(|blockers| {
                 blockers
                     .iter()
-                    .map(|n| {
-                        let (repo, body) = match issues.iter().find(|i| i.number == *n) {
-                            Some(i) => (own_repo.clone(), i.body.clone()),
-                            None => Default::default(),
-                        };
-                        Blocker {
-                            number: *n,
-                            state: if closed.contains_key(n) {
-                                "closed"
-                            } else {
-                                "open"
-                            }
-                            .into(),
-                            state_reason: closed.get(n).cloned(),
-                            body,
-                            repo,
+                    .map(|n| Blocker {
+                        number: *n,
+                        state: if closed.contains_key(n) {
+                            "closed"
+                        } else {
+                            "open"
                         }
+                        .into(),
+                        state_reason: closed.get(n).cloned(),
                     })
                     .collect()
             })
@@ -402,17 +372,6 @@ impl Forge for FakeForge {
             bail!("issue #{issue} not found");
         };
         i.labels.retain(|l| l != label);
-        Ok(())
-    }
-
-    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()> {
-        let mut prs = self.prs.lock().unwrap();
-        let Some(rec) = prs.iter_mut().find(|p| p.number == pr) else {
-            bail!("PR #{pr} not found");
-        };
-        if !rec.labels.iter().any(|l| l == label) {
-            rec.labels.push(label.to_string());
-        }
         Ok(())
     }
 

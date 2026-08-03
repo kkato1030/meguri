@@ -13,9 +13,9 @@ applyTo: "src/**/*.rs"
   `src/mux/mod.rs` の `Mux`/`AgentState` を通じて抽象化する。具体的な実装
   （`src/forge/gh.rs` / `src/forge/fake.rs`、`src/mux/tmux.rs` / `src/mux/herdr.rs` /
   `src/mux/fake.rs`）を呼び出し側から直接 match しない。新しい振る舞いはまずトレイトに足す。
-- issue ラベル（`meguri:*`）は「フェーズ」と「ボールの所在」の2軸モデル
-  （`docs/adr/0005-issue-labels-two-axis-phase-and-ball.md`）に従う。ラベル定数は
-  `src/forge/mod.rs` の `LABEL_*` にまとまっている。
-- ループ実装は `src/engine/` にループ1つ = ファイル1つで置く（`worker.rs` / `planner.rs` /
-  `fixer.rs` など）。完了コントラクトのプロンプト生成・result.json の読み書きは
-  `src/turn/` が担当し、各ループはそこを通す。
+- issue ラベル（`meguri:*`）は権威反転後のモデルに従う: `ready`/`hold` は人間の
+  エッジ入力（intake が読む）、`working`/`implementing`/`needs-human` は sqlite の
+  task 状態の best-effort 投影。ラベル定数は `src/forge/mod.rs` の `LABEL_*` にまとまっている。
+- ループ実装は `src/engine/` にループ1つ = ファイル1つで置く（現在の核は `worker.rs` のみ）。
+  完了コントラクトのプロンプト生成・result.json の読み書きは `src/turn/` が担当し、
+  各ループはそこを通す。

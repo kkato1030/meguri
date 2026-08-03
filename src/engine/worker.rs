@@ -4,10 +4,9 @@
 //! worker-specific label, prompt, and PR shape.
 //!
 //! Lifetime (issue #92): keyed by the issue, new branch and worktree, pane
-//! in the issue's author lane — kept after success and shared with every
-//! later loop on the same branch (fixer, ci-fixer, conflict resolver), so
-//! the implementation context continues; the reaper reclaims it when the
-//! issue closes.
+//! in the issue's author lane — kept after success so the implementation
+//! context survives for a human follow-up or a re-run on the same branch;
+//! the reaper reclaims it when the issue closes.
 
 use std::path::Path;
 
@@ -107,16 +106,18 @@ impl Flavor for WorkerFlavor {
 
     /// Phase transition (ADR 0005) + claim release. In github mode the issue's
     /// `meguri:ready` becomes `meguri:implementing` — the implementation PR is
-    /// now open. The `implementing` add is load-bearing (it backs the
-    /// "unlabeled = untriaged" invariant), so it runs *before* the claim is
-    /// released (which drops `working`+`ready`), keeping the issue always
-    /// labeled; failing the add fails the run. The coordination layer's
-    /// `complete` then releases the claim: github drops `working`+`ready`
-    /// best-effort, local flips the task to `done`. No-op forge in local mode.
+    /// now open. The `implementing` add runs *before* the claim is released
+    /// (which drops `working`+`ready`), keeping the issue labeled throughout;
+    /// failing the add fails the run. The coordination layer's `complete`
+    /// then releases the claim: github drops `working`+`ready` best-effort,
+    /// local flips the task to `done`. No-op forge in local mode.
     async fn settle_labels(&self, deps: &Deps, run: &RunRecord, _cp: &Checkpoint) -> Result<()> {
-        if let Some(f) = &deps.forge {
-            f.add_label(run.issue_number, forge::LABEL_IMPLEMENTING)
-                .await?;
+        // Only an issue-keyed run has an issue to label: a local task row in a
+        // github project (TaskKey::Local) must not label "issue #0".
+        if let Some(f) = &deps.forge
+            && let crate::tasks::TaskKey::Issue(issue) = run.task_key()
+        {
+            f.add_label(issue, forge::LABEL_IMPLEMENTING).await?;
         }
         deps.task_source.complete(&run.task_key()).await
     }

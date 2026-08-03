@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::{
-    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
-    PaneId, PaneSpec, Split, tail_looks_blocked,
+    AgentState, Multiplexer, MuxError, MuxKind, MuxResult, PaneId, PaneSpec, tail_looks_blocked,
 };
 
 /// How long the screen must stay unchanged before we call the agent Idle/Blocked.
@@ -79,12 +78,6 @@ fn hash_str(s: &str) -> u64 {
 impl Multiplexer for TmuxMux {
     fn kind(&self) -> MuxKind {
         MuxKind::Tmux
-    }
-
-    fn capabilities(&self) -> MuxCapabilities {
-        MuxCapabilities {
-            native_agent_state: false,
-        }
     }
 
     async fn ensure_session(&self) -> MuxResult<()> {
@@ -269,84 +262,4 @@ impl Multiplexer for TmuxMux {
             pane = pane.0,
         )
     }
-
-    /// Reuse the dedicated dashboard session if it already exists, else create
-    /// it detached. Its initial pane is the status pane; agent panes are later
-    /// tiled into its window via `join-pane` + `select-layout tiled`.
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
-        let sess = dashboard_session(label);
-        if self
-            .tmux(&["has-session", "-t", &format!("={sess}")])
-            .await
-            .is_ok()
-        {
-            return Ok(Dashboard {
-                tile: DashboardId(sess),
-                status_pane: None,
-                fresh: false,
-            });
-        }
-        // -x/-y: sane size for the tiled dashboard (default 80x24 truncates).
-        let pane_id = self
-            .tmux(&[
-                "new-session",
-                "-d",
-                "-s",
-                &sess,
-                "-x",
-                "220",
-                "-y",
-                "50",
-                "-P",
-                "-F",
-                "#{pane_id}",
-            ])
-            .await?;
-        Ok(Dashboard {
-            tile: DashboardId(sess),
-            status_pane: Some(PaneId(pane_id)),
-            fresh: true,
-        })
-    }
-
-    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
-        // -k restarts the pane's command in place (the fresh session's shell).
-        let mut args: Vec<String> = vec![
-            "respawn-pane".into(),
-            "-k".into(),
-            "-t".into(),
-            pane.0.clone(),
-            "--".into(),
-        ];
-        args.extend(argv.iter().cloned());
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.tmux(&argv).await.map(|_| ())
-    }
-
-    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
-        // -h/-v pick the initial split; `select-layout tiled` then reflows all
-        // panes uniformly, so repeated joins stay readable. The target is the
-        // dashboard session, so panes land in its active window.
-        let flag = match dir {
-            Split::Right => "-h",
-            Split::Down => "-v",
-        };
-        self.tmux(&["join-pane", flag, "-s", &pane.0, "-t", &into.0])
-            .await?;
-        let _ = self.tmux(&["select-layout", "-t", &into.0, "tiled"]).await;
-        Ok(())
-    }
-
-    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
-        // The dashboard is a dedicated session and `dashboard.0` is that
-        // session's name (created by `dashboard_session`), so it names the
-        // right target directly — no window→session resolution needed.
-        format!("tmux attach -t {}", dashboard.0)
-    }
-}
-
-/// tmux session name for a dashboard label. Session names can't carry ':'
-/// (tmux target syntax), so `meguri:top` becomes `meguri-top`.
-fn dashboard_session(label: &str) -> String {
-    label.replace(':', "-")
 }

@@ -93,14 +93,6 @@ impl Scheduler {
                 }
             }
 
-            // Materialize any declared-but-missing managed clones BEFORE anything
-            // touches `repo_path` (ADR 0018). Must precede redispatch, discover,
-            // AND the sweeps: redispatch runs before discover, discover is
-            // skipped when slots are full, and the sweeps touch `repo_path`
-            // outside discover — so a hook placed in any one of them would leave
-            // a window where an un-cloned project is processed. A project whose
-            // clone can't be materialized is excluded from this whole tick and
-            // retried next tick.
             let ready = self.ensure_projects_ready().await;
 
             // Re-dispatch interrupted/queued runs before discovering new
@@ -115,12 +107,10 @@ impl Scheduler {
             }
 
             // Ride the poll: reclaim panes and worktrees whose issue closed
-            // (the issue is the unit of lifetime — one author pane plus one
-            // review pane per issue, kept until it closes; #13, #92).
-            // Runs on the first tick too, i.e. as startup recovery.
+            // (the issue is the unit of lifetime — the author pane is kept
+            // until it closes; #13, #92). Runs on the first tick too, i.e. as
+            // startup recovery.
             for deps in &self.projects {
-                // Skip a project whose managed clone isn't ready this tick (the
-                // sweeps below touch `repo_path`); it retries next tick.
                 if !ready.contains(&deps.project.id) {
                     continue;
                 }
@@ -163,8 +153,8 @@ impl Scheduler {
     /// The set of project ids to process this tick — every configured
     /// project (`repo_path` is required and points at an existing clone).
     async fn ensure_projects_ready(&self) -> HashSet<String> {
-        // Every project pins an explicit `repo_path` (managed clones are
-        // dormant, docs/adr/STATUS.md), so all projects are always ready.
+        // Every project pins an explicit `repo_path`, so all projects are
+        // always ready; the set shape survives for a future readiness gate.
         self.projects.iter().map(|d| d.project.id.clone()).collect()
     }
 
@@ -175,11 +165,11 @@ impl Scheduler {
         running: &mut JoinSet<String>,
         active: &mut HashMap<String, usize>,
     ) -> Result<()> {
-        // The workqueue's activeQ order (ADR 0012 §5): dispatch `queued` runs by
-        // merge-proximity `dispatch_rank` (then issue number, FIFO) rather than
-        // by creation order, so the reconciler's fixer-family runs — created in
-        // the sweep, outside discovery — get their priority. Head-of-line
-        // admission (the `break` below) then applies to the highest-priority run.
+        // The workqueue's activeQ order (ADR 0012 §5): dispatch `queued` runs
+        // by `dispatch_rank` (then issue number, FIFO). With the worker as the
+        // only loop the rank is flat today; the ordering hook survives for a
+        // future second loop. Head-of-line admission (the `break` below)
+        // applies to the highest-priority run.
         let mut runs = store.list_runs(true)?;
         runs.sort_by_key(|r| (super::dispatch_rank(&r.loop_kind), r.issue_number));
         for run in runs {
@@ -189,7 +179,6 @@ impl Scheduler {
             if active.contains_key(&run.id) {
                 continue;
             }
-            // Don't resume a run whose managed clone isn't ready this tick.
             if !ready.contains(&run.project_id) {
                 continue;
             }
@@ -218,10 +207,10 @@ impl Scheduler {
 
     /// Whether a run of `weight` can start now without over-spending the slot
     /// budget (issue #111). One escape: a run always starts on an idle
-    /// scheduler, so a weight-2 collab-advisor run is not deadlocked at
+    /// scheduler, so a future heavy (multi-slot) run is not deadlocked at
     /// `max_concurrent = 1` (criterion 8). Otherwise the budget is hard
     /// (`active + weight <= max`) — never the "+1 slack" that would let an
-    /// advisor run over-subscribe a busy scheduler.
+    /// heavy run over-subscribe a busy scheduler.
     fn admits(&self, active: &HashMap<String, usize>, weight: usize) -> bool {
         let current = active_weight(active);
         current == 0 || current + weight <= self.max_concurrent
@@ -332,11 +321,11 @@ mod tests {
     #[test]
     fn admits_enforces_the_weighted_budget() {
         // This is the gate discover/redispatch use before every dispatch, so a
-        // weight-2 collab-advisor run cannot over-subscribe the slot budget.
+        // weight-2 (hypothetical heavy) run cannot over-subscribe the budget.
         let s = empty_scheduler(2);
-        // Idle scheduler: a weight-2 advisor run fits exactly.
+        // Idle scheduler: a weight-2 run fits exactly.
         assert!(s.admits(&active_map(&[]), 2));
-        // One normal run active (weight 1): a weight-2 advisor run would push
+        // One normal run active (weight 1): a weight-2 run would push
         // the total to 3 — rejected (the over-subscription the review caught).
         assert!(!s.admits(&active_map(&[("a", 1)]), 2));
         // …but a weight-1 run still fits (1 + 1 = 2).

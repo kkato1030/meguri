@@ -1,8 +1,7 @@
 //! Launch-time pre-flight prime (issue #235).
 //!
-//! An interactive agent pane (worker / planner / fixer / pr-reviewer — ADR
-//! 0012 `Pane` mode) stalls on the CLI's first-run *folder-trust* prompt for a
-//! fresh worktree: meguri never reads the screen, so nobody answers it. This
+//! An interactive agent pane stalls on the CLI's first-run *folder-trust*
+//! prompt for a fresh worktree: meguri never reads the screen, so nobody answers it. This
 //! module runs the CLI's own headless one-shot in the worktree cwd *just
 //! before* the pane spawns, so the CLI records folder trust for that path and
 //! the real pane starts clean.
@@ -19,7 +18,7 @@
 //!   config-dir cannot re-enable tools.
 //!
 //! The argv (including the deny file and the model carried over from the
-//! pane's profile) is resolved by [`crate::routing::effective_preflight_args`];
+//! pane's profile) is resolved by [`crate::profile::effective_preflight_args`];
 //! this module owns *running* it once per (identity, path), serialized and
 //! claim-once, plus writing the deny file.
 
@@ -34,7 +33,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{self, AgentProfile};
-use crate::profile as routing;
+use crate::profile;
 
 /// How long to wait for a killed prime child to be reapable before giving up
 /// and leaking it as a zombie — an unbounded `wait()` would hang the launch.
@@ -198,7 +197,7 @@ fn skip_reason(profile: &AgentProfile, version: Option<(u64, u64, u64)>) -> &'st
 
 /// Ensure the folder-trust prime has run once for `(profile identity, cwd)`.
 ///
-/// Resolves the prime argv ([`routing::effective_preflight_args`]); an empty
+/// Resolves the prime argv ([`crate::profile::effective_preflight_args`]); an empty
 /// argv is a safe skip. Otherwise serializes on the identity lock, checks the
 /// persistent marker (claim-once — a prior `success` *or* `failed` means "do
 /// not run again"), writes the deny settings file, runs the prime under
@@ -223,7 +222,7 @@ pub async fn ensure_preflight(
         None
     };
     let deny_path = deny_settings_path();
-    let argv = routing::effective_preflight_args(profile, version, &deny_path);
+    let argv = profile::effective_preflight_args(profile, version, &deny_path);
     if argv.is_empty() {
         return PreflightOutcome::Skipped {
             reason: skip_reason(profile, version),
@@ -328,13 +327,13 @@ async fn detect_version_with(command: &str, timeout: Duration) -> Option<(u64, u
     if !out.status.success() {
         return None;
     }
-    routing::parse_version_triple(&String::from_utf8_lossy(&out.stdout))
+    profile::parse_version_triple(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Run one prime as a plain async subprocess (no PTY — `-p` exits on its own).
 /// Spawned in its own process group so a timeout can `killpg` the whole tree,
 /// including any MCP/tool descendants, without blocking the Tokio runtime
-/// (issue #235 f4). Mirrors `src/refine.rs`'s async pattern.
+/// (issue #235 f4).
 pub async fn run_preflight(
     command: &str,
     argv: &[String],

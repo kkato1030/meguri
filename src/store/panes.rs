@@ -1,9 +1,8 @@
 //! The pane registry: the issue is the unit of lifetime (#13, #92). A pane
-//! belongs to `(project, issue, lane)` and outlives individual runs — one
-//! `author` pane shared by every branch-editing loop of the issue, plus one
-//! independent `pr-review` pane for the pr-reviewer — and the reaper reclaims
-//! them when the issue closes on the forge. `agent_session_id` (the agent's
-//! native session, `claude --resume <id>`) is kept per lane and survives
+//! belongs to `(project, issue, lane)` and outlives individual runs — the
+//! kernel uses one `author` pane per issue — and the reaper reclaims it when
+//! the issue closes on the forge. `agent_session_id` (the agent's native
+//! session, `claude --resume <id>`) is kept per lane and survives
 //! reclamation, so closing a pane stays reversible.
 
 use anyhow::Result;
@@ -11,15 +10,8 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::{Store, now};
 
-/// The lane every branch-editing loop shares (planner, worker, spec worker,
-/// fixer, ci-fixer, conflict resolver — and the cleaner's standalone report
-/// pane, which no other loop ever touches).
+/// The worker's lane — the issue's single implementation context.
 pub const LANE_AUTHOR: &str = "author";
-/// The collab advisor lane (issue #111, ADR 0006 collab-advisor): the
-/// plan-author advisor pane a worker consults over agmsg. Ephemeral — spawned
-/// at worker execute, reaped at run end regardless of `keep_pane`, never
-/// adopted/resumed, and never carries a saved `agent_session_id`.
-pub const LANE_ADVISOR: &str = "advisor";
 
 #[derive(Debug, Clone)]
 pub struct PaneRecord {
@@ -100,9 +92,9 @@ impl Store {
         })
     }
 
-    /// Register (or re-point) a lane's resumable session without a live pane
-    /// (direct launch mode, issue #169): creates the row if the lane has
-    /// never had one, or updates its worktree/session id if it has. Unlike
+    /// Register (or re-point) a lane's resumable session without a live
+    /// pane: creates the row if the lane has never had one, or updates its
+    /// worktree/session id if it has. Unlike
     /// [`Store::upsert_pane`], `mux_kind`/`mux_session`/`mux_pane_id` are left
     /// untouched (absent on a fresh row) — "lane" now means "issue-scoped
     /// resumable context", pane being merely optional.
@@ -273,7 +265,8 @@ impl Store {
         self.with_conn(|c| {
             let exists = c
                 .prepare(
-                    "SELECT 1 FROM runs WHERE project_id = ?1 AND issue_number = ?2
+                    "SELECT 1 FROM runs WHERE project_id = ?1
+                       AND IFNULL(issue_number, 0) = ?2
                        AND status IN ('queued','running','interrupted') LIMIT 1",
                 )?
                 .exists(params![project_id, issue_number])?;

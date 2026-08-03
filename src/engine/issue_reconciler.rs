@@ -117,7 +117,29 @@ pub async fn intake(deps: &Deps) -> Result<()> {
         }
     }
 
-    // 3. needs_human → queued once the human cleared the label (and the issue
+    // 3. Retraction: a queued github row whose issue no longer carries
+    //    `meguri:ready` was cancelled by the human — cancel the row, or the
+    //    decider would re-file a run every tick that dies at the claim's
+    //    label re-verification, forever. (A held row waits on its hold label;
+    //    a claimed row is in flight and is the CLI's to stop.)
+    let ready_set: std::collections::HashSet<i64> = ready.iter().map(|i| i.number).collect();
+    for row in deps.store.queued_tasks_any(&deps.project.id)? {
+        let Some(issue) = origin_issue(&row.origin) else {
+            continue; // a locally seeded row has no label to sync
+        };
+        if !ready_set.contains(&issue)
+            && !held_set.contains(&issue)
+            && deps.store.cancel_task(row.id)?
+        {
+            deps.store.emit(
+                None,
+                "task.retracted",
+                json!({ "task": row.id, "issue": issue }),
+            )?;
+        }
+    }
+
+    // 4. needs_human → queued once the human cleared the label (and the issue
     //    still carries `meguri:ready`). The ready listing is the signal: an
     //    escalated task's issue keeps its ready label (only `complete` drops
     //    it), so it appears in `ready` above.
@@ -314,6 +336,36 @@ mod tests {
 
         // The ready label is still on (complete never ran); the needs-human
         // label was cleared by the human → the row re-queues.
+        intake(&deps).await.unwrap();
+        let row = deps
+            .store
+            .task_by_origin("proj", "github:7")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "queued");
+    }
+
+    #[tokio::test]
+    async fn intake_retracts_a_queued_row_when_ready_is_removed() {
+        use crate::forge::Forge;
+        let forge = Arc::new(FakeForge::with_issue(7, "T", "B", &[LABEL_READY]));
+        let deps = deps_with(forge.clone());
+        intake(&deps).await.unwrap();
+
+        forge.remove_label(7, LABEL_READY).await.unwrap();
+        intake(&deps).await.unwrap();
+        let row = deps
+            .store
+            .task_by_origin("proj", "github:7")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "cancelled", "removing ready retracts the row");
+        // No run is ever filed for it.
+        reconcile_tasks(&deps).await.unwrap();
+        assert!(deps.store.list_runs(true).unwrap().is_empty());
+
+        // Re-adding the label imports a fresh row (a cancelled row is not live).
+        forge.add_label(7, LABEL_READY).await.unwrap();
         intake(&deps).await.unwrap();
         let row = deps
             .store

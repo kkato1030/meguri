@@ -171,8 +171,6 @@ async fn cmd_doctor() -> Result<()> {
                     " — add one to config.toml before running"
                 },
             );
-            // Auto-merge preconditions (ADR 0003): only for projects that
-            // enabled it — the same gate `meguri watch` fail-fasts on.
         }
         Err(e) => {
             ok = check("config", false, format!("{e:#}"));

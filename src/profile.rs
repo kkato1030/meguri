@@ -48,40 +48,6 @@ pub fn validate(cfg: &Config) -> Result<()> {
 /// steer a role back to it with `<role> = "default"`; it is never detected.
 pub const DEFAULT_PROFILE: &str = "default";
 
-/// Known CLIs that support a headless one-shot mode, and the argv that enters
-/// it, keyed by the profile `command`'s base name. Used to fill in
-/// [`effective_headless_args`] when a profile leaves `headless_args` unset, so
-/// a zero-config `meguri init` (whose `default` command is `claude`) still
-/// refines. Kept deliberately tiny: only exact base-name matches, never a
-/// guess at an unknown CLI's flags.
-fn known_headless_args(command: &str) -> Option<Vec<String>> {
-    let base = std::path::Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command);
-    match base {
-        "claude" => Some(vec!["-p".to_string()]),
-        _ => None,
-    }
-}
-
-/// The argv that actually launches a profile's headless one-shot refine, or
-/// `None` when the profile has no headless mode (refine is then skipped with a
-/// one-line warning — never a silent fallback). Resolution, in order:
-///
-/// 1. explicit non-empty `headless_args` → used verbatim (a complete argv);
-/// 2. explicit empty `[]` → `None`: the opt-out sentinel (TOML can't write
-///    `None`, and an empty argv is a valid-looking-but-broken launch);
-/// 3. unset + a known headless CLI `command` → that CLI's default argv;
-/// 4. unset + an unknown `command` → `None` (unsupported).
-pub fn effective_headless_args(profile: &AgentProfile) -> Option<Vec<String>> {
-    match &profile.headless_args {
-        Some(args) if !args.is_empty() => Some(args.clone()),
-        Some(_) => None,
-        None => known_headless_args(&profile.command),
-    }
-}
-
 /// The no-op prompt handed to the pre-flight prime (issue #235): a headless
 /// one-shot whose only intended effect is that the CLI enters the worktree
 /// directory once (recording folder trust). The prompt asks for no work; the
@@ -227,8 +193,7 @@ pub fn warn_unsafe_preflight_overrides(cfg: &Config) {
     }
 }
 
-/// The built-in profiles baked in alongside the recommendation table, so
-/// `[routing] mode = "auto"` works with no other config. A user
+/// The built-in profiles, resolvable by name with no other config. A user
 /// `[agents.profiles.<same-name>]` overrides the builtin.
 pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
     let mut m = HashMap::new();
@@ -242,9 +207,6 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "opus".into(),
             ],
             resume_args: vec!["--resume".into()],
-            // Headless refine keeps the model but never yolo (read-only).
-            headless_args: Some(vec!["-p".into(), "--model".into(), "opus".into()]),
-            direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
@@ -261,8 +223,6 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
                 "sonnet".into(),
             ],
             resume_args: vec!["--resume".into()],
-            headless_args: Some(vec!["-p".into(), "--model".into(), "sonnet".into()]),
-            direct_args: vec!["-p".into()],
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,
@@ -275,10 +235,8 @@ pub fn builtin_profiles() -> HashMap<String, AgentProfile> {
             command: "codex".into(),
             args: vec!["--yolo".into()],
             resume_args: vec!["resume".into()],
-            headless_args: None,
             // codex's non-interactive one-shot form is the `exec` subcommand
             // (mirrors `resume_args` also being a bare subcommand).
-            direct_args: vec!["exec".into()],
             herdr_agent_hint: None,
             session_dir: None,
             preflight: None,

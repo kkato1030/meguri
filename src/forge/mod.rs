@@ -9,51 +9,22 @@ use async_trait::async_trait;
 pub mod fake;
 pub mod gh;
 
-// Issue labels form two axes (ADR 0005). Axis 1 — the phase: a meguri-engaged
-// open issue always carries exactly one of `plan` / `speccing` / `ready` /
-// `implementing`, so an unlabeled issue means "untriaged". Axis 2 — the ball
-// (who holds it): `working` / `needs-human` / `hold` layer on top of the phase
-// without removing it.
+// Issue labels since the 権威反転: `ready` / `hold` are the human's edge
+// inputs (read by the intake pass), `working` / `implementing` / `needs-human`
+// are meguri's best-effort projections of the sqlite task state.
 
-/// Phase (axis 1): issue is queued for the worker loop (applied by a human).
+/// Input: queue this issue for the worker loop (applied by a human).
 pub const LABEL_READY: &str = "meguri:ready";
-/// Phase (axis 1): the issue's implementation PR is open (CI fixing, review,
-/// awaiting merge all included). The worker/spec-worker apply it at PR
-/// creation/takeover and it stays until the issue closes. Load-bearing: it
-/// backs the "unlabeled = untriaged" invariant.
+/// Projection: the issue's implementation PR is open.
 pub const LABEL_IMPLEMENTING: &str = "meguri:implementing";
-/// meguri claimed the issue (dedup across restarts and hosts).
+/// Projection: meguri claimed the issue (an agent is working on it).
 pub const LABEL_WORKING: &str = "meguri:working";
-/// Discovery must skip this issue.
+/// Input: dispatch must skip this issue's task (the phone-operable emergency
+/// stop; in-flight runs are not interrupted).
 pub const LABEL_HOLD: &str = "meguri:hold";
-/// meguri gave up and a human needs to look (a comment explains why).
+/// Projection: meguri gave up and a human needs to look (a comment explains
+/// why). Clearing it while `ready` is still on re-queues the task.
 pub const LABEL_NEEDS_HUMAN: &str = "meguri:needs-human";
-/// The cleaner loop's per-project report issue (one per project; its body is
-/// a snapshot of the current divergence, rewritten on every sweep).
-pub const LABEL_CLEAN_REPORT: &str = "meguri:clean-report";
-/// The triage loop's per-project report issue (issue #85). Read-only, like
-/// the cleaner's: its body is a snapshot of the current triage
-/// recommendations for untriaged open issues, rewritten on every sweep.
-pub const LABEL_TRIAGE_REPORT: &str = "meguri:triage-report";
-/// Triage v1 advise (issue #87): proposes `meguri:ready` on the issue itself.
-/// A human promotes it verbatim; meguri never applies the real label.
-pub const LABEL_TRIAGE_READY: &str = "meguri:triage-ready";
-/// Triage v1 advise (issue #87): proposes `meguri:plan`, same rules as
-/// [`LABEL_TRIAGE_READY`].
-pub const LABEL_TRIAGE_PLAN: &str = "meguri:triage-plan";
-/// Triage v1 advise (issue #87): proposes `meguri:needs-human`, same rules as
-/// [`LABEL_TRIAGE_READY`].
-pub const LABEL_TRIAGE_NEEDS_HUMAN: &str = "meguri:triage-needs-human";
-/// All three triage-advise proposal labels. They carry the `meguri:` prefix
-/// (so worker/planner discovery — keyed on the exact real labels, never a
-/// prefix scan — cannot mistake one for a go-ahead) but are deliberately
-/// excluded from the two-axis phase/ball vocabulary: a proposal is not yet a
-/// decision, so it must not read as "engaged" to triage's own re-triage gate.
-pub const TRIAGE_PROPOSAL_LABELS: [&str; 3] = [
-    LABEL_TRIAGE_READY,
-    LABEL_TRIAGE_PLAN,
-    LABEL_TRIAGE_NEEDS_HUMAN,
-];
 
 /// Open/closed lifecycle of an issue on the forge — the authority that
 /// decides when local resources tied to the issue (worktrees, panes) may be
@@ -82,17 +53,6 @@ pub struct Blocker {
     pub state: String,
     /// Why it closed ("completed", "not_planned", "duplicate"), if closed.
     pub state_reason: Option<String>,
-    /// The blocker issue's body, as GitHub's dependency endpoint returns it
-    /// (the whole issue object). The decompose materializer matches its
-    /// per-child marker here to recognize an already-created child as the
-    /// strongly-consistent authority (issue #134); empty when the forge did
-    /// not supply one. The dependency gate ignores it.
-    pub body: String,
-    /// The blocker issue's home repo slug (`owner/repo`) — a cross-repo
-    /// decomposition child lives in a workspace sibling, so identifying it
-    /// needs the repo, not just the number (issue #134 / #154). Empty when the
-    /// forge did not supply one.
-    pub repo: String,
 }
 
 impl Blocker {
@@ -130,9 +90,6 @@ pub struct PullRequest {
     pub head_sha: String,
     /// Lowercase state: "open", "merged" or "closed".
     pub state: String,
-    /// Whether the PR is still a draft (`isDraft`). The auto-merger readies a
-    /// draft before arming; the worker opens automerge PRs non-draft.
-    pub is_draft: bool,
     pub labels: Vec<String>,
 }
 
@@ -152,14 +109,10 @@ pub trait Forge: Send + Sync {
     /// Issues blocking `issue` via the forge-native dependency graph
     /// (GitHub's `blocked_by`); discovery gates on them (see [`Blocker`]).
     async fn blocked_by(&self, issue: i64) -> Result<Vec<Blocker>>;
-    /// File a new issue; returns its number (planner decomposition,
-    /// issue #24; the cleaner's report issue, issue #44).
+    /// File a new issue; returns its number (`meguri add` capture).
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<i64>;
     async fn add_label(&self, issue: i64, label: &str) -> Result<()>;
     async fn remove_label(&self, issue: i64, label: &str) -> Result<()>;
-    /// Add a label to a pull request (issues and PRs share GitHub's number
-    /// space but need different edit commands).
-    async fn add_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn remove_pr_label(&self, pr: i64, label: &str) -> Result<()>;
     async fn comment(&self, issue: i64, body: &str) -> Result<()>;
     /// Open a pull request. `labels` are applied as part of creation (a single
@@ -182,8 +135,7 @@ pub trait Forge: Send + Sync {
     async fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>>;
     /// Open PRs the forge already cross-references to `issue` (GitHub's own
     /// "Development"/timeline linkage — not a meguri label or comment). The
-    /// worker/planner check this immediately before opening a new PR (issue
-    /// #249, docs/design/needs-human-friction-and-delivery-speed.md §3-D/§P5)
+    /// worker checks this immediately before opening a new PR (issue #249)
     /// so a rail-external PR that already covers the issue is never
     /// duplicated.
     async fn linked_open_prs(&self, issue: i64) -> Result<Vec<PullRequest>>;
@@ -200,8 +152,6 @@ mod tests {
             number: 1,
             state: state.into(),
             state_reason: state_reason.map(str::to_string),
-            body: String::new(),
-            repo: String::new(),
         }
     }
 

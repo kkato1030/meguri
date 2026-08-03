@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::{
-    AgentState, Dashboard, DashboardId, Multiplexer, MuxCapabilities, MuxError, MuxKind, MuxResult,
-    PaneId, PaneSpec, Split,
+    AgentState, Multiplexer, MuxError, MuxKind, MuxResult, PaneId, PaneSpec,
     herdr_socket::{self, EventStream},
 };
 
@@ -427,12 +426,6 @@ impl Multiplexer for HerdrMux {
         MuxKind::Herdr
     }
 
-    fn capabilities(&self) -> MuxCapabilities {
-        MuxCapabilities {
-            native_agent_state: true,
-        }
-    }
-
     async fn ensure_session(&self) -> MuxResult<()> {
         self.workspace_id().await.map(|_| ())
     }
@@ -668,96 +661,6 @@ impl Multiplexer for HerdrMux {
     fn attach_command(&self, pane: &PaneId) -> String {
         let ws = pane.0.split(':').next().unwrap_or("").to_string();
         format!("herdr workspace focus {ws} >/dev/null 2>&1; herdr")
-    }
-
-    /// Construct (or reuse) the dedicated dashboard workspace labeled `label`,
-    /// separate from the agent workspace. Its single tab's root pane is the
-    /// status pane that renders the header; agent panes are later tiled into
-    /// that same tab. Reuse is detected by the tab's label so the status loop
-    /// is started exactly once.
-    async fn ensure_dashboard(&self, label: &str) -> MuxResult<Dashboard> {
-        let ws = self.workspace_id_labeled(label).await?;
-        let tabs = self
-            .herdr_json(&["tab", "list", "--workspace", &ws])
-            .await?;
-        if let Some(arr) = tabs.get("tabs").and_then(Value::as_array) {
-            for tab in arr {
-                if tab.get("label").and_then(Value::as_str) == Some(label)
-                    && let Some(id) = tab.get("tab_id").and_then(Value::as_str)
-                {
-                    return Ok(Dashboard {
-                        tile: DashboardId(id.to_string()),
-                        status_pane: None,
-                        fresh: false,
-                    });
-                }
-            }
-        }
-        let result = self
-            .herdr_json(&[
-                "tab",
-                "create",
-                "--workspace",
-                &ws,
-                "--label",
-                label,
-                "--no-focus",
-            ])
-            .await?;
-        let tab_id = result
-            .pointer("/tab/tab_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| MuxError::CommandFailed {
-                kind: "herdr",
-                detail: format!("tab create returned no tab id: {result}"),
-            })?
-            .to_string();
-        let status_pane = result
-            .pointer("/root_pane/pane_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| MuxError::CommandFailed {
-                kind: "herdr",
-                detail: format!("tab create returned no root pane: {result}"),
-            })?
-            .to_string();
-        Ok(Dashboard {
-            tile: DashboardId(tab_id),
-            status_pane: Some(PaneId(status_pane)),
-            fresh: true,
-        })
-    }
-
-    async fn run_in_pane(&self, pane: &PaneId, argv: &[String]) -> MuxResult<()> {
-        let command_line = shell_join(argv);
-        self.herdr_ok(&["pane", "run", &pane.0, &command_line])
-            .await
-    }
-
-    async fn tile_pane(&self, pane: &PaneId, into: &DashboardId, dir: Split) -> MuxResult<()> {
-        let split = match dir {
-            Split::Right => "right",
-            Split::Down => "down",
-        };
-        self.herdr_ok(&[
-            "pane",
-            "move",
-            &pane.0,
-            "--tab",
-            &into.0,
-            "--split",
-            split,
-            "--no-focus",
-        ])
-        .await
-    }
-
-    fn dashboard_attach_command(&self, dashboard: &DashboardId) -> String {
-        let ws = dashboard.0.split(':').next().unwrap_or("");
-        format!(
-            "herdr workspace focus {ws} >/dev/null 2>&1; \
-             herdr tab focus {tab} >/dev/null 2>&1; herdr",
-            tab = dashboard.0
-        )
     }
 }
 

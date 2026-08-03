@@ -4,13 +4,9 @@ applyTo: "docs/**"
 ---
 
 - `docs/adr/NNNN-slug.md` は恒久的な設計判断の記録である。一度書いたら削除・改訂ではなく、
-  判断が変わったら新しい ADR を積む。番号は次の空き番号を使う。
-- `docs/specs/issue-<N>.md` は使い捨ての足場である。planner が spec-first フロー
-  （`meguri:plan`）で作成し、reviewer のレビューを収束させたら spec-worker が実装完了時に
-  削除する。デフォルトブランチ上には残らない
-  （`docs/adr/0001-specs-are-disposable-scaffolding.md`）。
-- spec に書いた内容のうち長期的に価値があるもの（設計判断の理由・ドメイン規則）は、消える前に
-  ADR か既存の永続ドメイン文書へ振り分ける。
-- issue ラベルは「フェーズ」（`plan` → `speccing` → `ready` → `implementing`）と
-  「ボールの所在」（`working` / `needs-human` / `hold`）の2軸モデルであり、独自のラベル運用を
-  文書に追加する前に `docs/adr/0005-issue-labels-two-axis-phase-and-ball.md` を参照する。
+  判断が変わったら新しい ADR を積む。番号は次の空き番号を使う。刈り込みで休眠した機構の
+  ADR は `docs/adr/STATUS.md` の台帳で dormant として管理する（ファイル自体は残す）。
+- 長期的に価値がある内容（設計判断の理由・ドメイン規則）は ADR か既存の永続ドメイン文書へ
+  振り分ける。
+- issue ラベルは権威反転後のモデルに従う: `ready`/`hold` は人間のエッジ入力（intake が読む）、
+  `working`/`implementing`/`needs-human` は sqlite の task 状態の best-effort 投影。

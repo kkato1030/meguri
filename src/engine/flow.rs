@@ -34,8 +34,7 @@ pub const STEP_OPEN_PR: &str = "open-pr";
 /// What makes a loop's flow different from another's; everything else
 /// (claiming, checkpointing, turns, validation, escalation) is shared.
 /// The default method bodies implement the issue-triggered "new branch, new
-/// PR" shape the worker and planner share; PR-targeted loops (the fixer, the
-/// spec worker) override the claim, worktree, and escalation hooks.
+/// PR" shape of the worker — today's only loop.
 #[async_trait]
 pub trait Flavor: Send + Sync {
     /// Label that queues an issue for this loop; re-checked at claim time by
@@ -44,9 +43,7 @@ pub trait Flavor: Send + Sync {
 
     /// Whether this loop's PR should auto-close its issue on merge (`Closes #N`
     /// vs the non-closing `Refs #N`). Default: yes — an implementation PR
-    /// closes its issue. The planner overrides it in separate delivery: the
-    /// spec/ADR PR merges on its own and must NOT close the issue (the handoff
-    /// then flips it to `ready`, ADR 0008 §6).
+    /// closes its issue.
     fn pr_closes_issue(&self, deps: &Deps) -> bool {
         let _ = deps;
         true
@@ -90,20 +87,15 @@ pub trait Flavor: Send + Sync {
     ) -> std::result::Result<(), String>;
 
     /// Base ref the execute step counts commits against. Default: the
-    /// project's default branch (new-branch loops); the fixer counts against
-    /// the PR branch's pushed tip instead.
+    /// project's default branch.
     fn verify_base(&self, deps: &Deps, run: &RunRecord) -> String {
         let _ = run;
         deps.project.default_branch.clone()
     }
 
     /// Whether this loop's execute turn may (re)establish `cp.subject`
-    /// (issue #136). Implementation-shaping turns — the worker, the
-    /// planner, the spec worker's takeover — do; fix-family turns whose job
-    /// is to amend without changing the nature of the change (the fixer,
-    /// the ci-fixer, the conflict resolver) must not, so the PR title stays
-    /// fixed to whatever turn established it instead of flapping with every
-    /// fix's wording. Default: yes.
+    /// (issue #136); `pr_title()` prefers the subject when present.
+    /// Default: yes.
     fn sets_subject(&self) -> bool {
         true
     }
@@ -116,10 +108,8 @@ pub trait Flavor: Send + Sync {
 
     /// Settle the PR's presentation (title/body) once it exists. Default:
     /// no-op — new-PR loops set both at create time (via [`Flavor::pr_title`]
-    /// and [`compose_pr_body`]), so there is nothing to transition. Branch
-    /// takeovers whose PR was authored by another loop (the spec worker)
-    /// override this to move the PR from that loop's presentation to their
-    /// own. Re-run on resume, so keep it idempotent.
+    /// and [`compose_pr_body`]), so there is nothing to transition. Re-run on
+    /// resume, so keep it idempotent.
     async fn settle_presentation(
         &self,
         deps: &Deps,
@@ -139,7 +129,7 @@ pub trait Flavor: Send + Sync {
     /// Failure escalation ("Authority": the durable record of why the run
     /// stopped lives with the task). Default: the coordination layer's
     /// escalate (needs-human label + comment / `status='needs_human'` +
-    /// reason), with a launch-mode-aware attach hint (issue #169).
+    /// reason).
     async fn escalate(&self, deps: &Deps, run: &RunRecord, reason: &str) {
         super::escalation::escalate_task(deps, run, reason).await;
     }
@@ -169,15 +159,16 @@ pub struct Checkpoint {
     /// Agent-authored PR description (Markdown) from the verified execute turn.
     #[serde(default)]
     pub pr_body: Option<String>,
-    /// Existing PR head branch to attach to (fixer runs).
+    /// Legacy field from the pruned PR-targeted loops; no live writer or
+    /// reader. Kept so old persisted checkpoints still deserialize.
     #[serde(default)]
     pub head_branch: Option<String>,
-    /// Base-branch tip pinned at claim time (conflict-resolver runs); the
-    /// merge target the agent must bring in and verify_work checks for.
+    /// Legacy field from the pruned PR-targeted loops; no live writer or
+    /// reader. Kept so old persisted checkpoints still deserialize.
     #[serde(default)]
     pub base_sha: Option<String>,
-    /// Review threads the run set out to address (fixer runs); replied to
-    /// after the push.
+    /// Legacy field from the pruned PR-targeted loops; no live writer or
+    /// reader. Kept so old persisted checkpoints still deserialize.
     #[serde(default)]
     pub thread_ids: Vec<String>,
 }
@@ -348,13 +339,11 @@ pub(crate) fn claimed_pr(deps: &Deps, run_id: &str) -> Option<i64> {
         .and_then(|cp| cp.pr_number)
 }
 
-/// Loop kinds whose `Flavor` claims a PR by adding `meguri:working` to it
-/// (mirrors the `Flavor::release_claim` overrides in each of these modules).
-/// `worker`/`planner` also stamp `Checkpoint::pr_number` once their PR opens,
-/// but that PR is claimed through the *issue's* label, never the PR's — so
-/// they must NOT be treated as PR claimers here (issue #252 review finding
-/// f1): an interrupted worker run stopped after some other loop later
-/// claimed its PR would otherwise strip that unrelated run's live claim.
+/// Loop kinds whose `Flavor` claims a PR by adding `meguri:working` to it —
+/// none today (the PR-claiming loops were pruned). The worker stamps
+/// `Checkpoint::pr_number` once its PR opens, but that PR is claimed through
+/// the *issue's* label, never the PR's — so it must NOT be treated as a PR
+/// claimer here (issue #252 review finding f1).
 fn claims_pr_by_label(_loop_kind: &str) -> bool {
     false
 }
@@ -489,13 +478,11 @@ async fn create_branch_worktree(deps: &Deps, run: &RunRecord, cp: &Checkpoint) -
 }
 
 /// Env vars passed to `worktree_setup` commands: the run's role (its loop
-/// kind — `worker`, `fixer`, `spec-reviewer`, …), the launch profile that
-/// role resolves to, and the target issue/task number. Lets a user script
-/// specialize per role (e.g. skip a heavy step for `cleaner`). `MEGURI_PROFILE`
-/// goes through [`resolve_run_profile`] — the same pin-aware resolution the
-/// run's pane spawn uses — rather than re-resolving routing from scratch, so
-/// it can't drift from the profile the agent actually launches under (e.g.
-/// if routing config or CLI detection changes between the two).
+/// kind — `worker`), the launch profile it runs under, and the target
+/// issue/task number. `MEGURI_PROFILE` goes through [`resolve_run_profile`] —
+/// the same pin-aware resolution the run's pane spawn uses — so it can't
+/// drift from the profile the agent actually launches under (e.g. if profile
+/// config or CLI detection changes between the two).
 fn worktree_setup_env(deps: &Deps, run: &RunRecord) -> Result<[(&'static str, String); 3]> {
     let (profile_name, _) = resolve_run_profile(deps, run)?;
     Ok([
@@ -611,10 +598,9 @@ struct EnsuredPane {
 
 /// Get the lane's pane, spawning it (with the trigger as the agent's
 /// initial prompt argument) if it doesn't exist or died. The pane is keyed
-/// by `(project, issue, lane)` and outlives runs (issue #92): every
-/// branch-editing loop of the issue (planner, worker, fixer, …) shares the
-/// author lane's live session, while the pr-reviewer keeps its own pr-review
-/// lane. When the lane has a native agent session id on record, a fresh
+/// by `(project, issue, lane)` and outlives runs (issue #92): successive
+/// worker runs on the same issue share the author lane's live session.
+/// When the lane has a native agent session id on record, a fresh
 /// spawn resumes it (`claude --resume <id> <trigger>`) so the agent keeps
 /// its conversation context; a resume that dies on the spot falls back to
 /// the plain full-prompt spawn.
@@ -732,7 +718,7 @@ async fn ensure_pane(
 /// Run the launch-time pre-flight prime for a pane and emit its outcome as an
 /// event (issue #235). Best-effort: a failure or skip is recorded but never
 /// fatal — the pane launches regardless (spec D5). `cwd` is the directory whose
-/// folder trust the prime establishes (a worktree, or an advisor dir).
+/// folder trust the prime establishes (the run's worktree).
 async fn preflight_and_emit(
     deps: &Deps,
     run: &RunRecord,
@@ -987,25 +973,17 @@ async fn resumed_pane_survives(deps: &Deps, pane: &PaneId) -> bool {
     }
 }
 
-/// Which lane a turn runs in, the launch profile it uses, and how it is
-/// launched (issue #169). Threading this explicitly lets the worker's
-/// self-review run its review turn in a separate lane under a different
-/// profile — and potentially a different launch mode — than the fix turns
-/// (ADR 0006). "Lane" now means "issue-scoped resumable context"; a pane is
-/// optional (`mode == Direct` never has one).
+/// Which lane a turn runs in and the launch profile it uses. A lane is an
+/// issue-scoped resumable context backed by a pane.
 pub(crate) struct Lane {
-    /// The pane-registry lane key `(project, issue, lane)`. Owned (issue #214):
-    /// most lanes are the historical `&'static str` constants, but a parallel
-    /// round-1 reviewer uses a per-reviewer key like `self-review#0` so its
-    /// pane/session never collides with a sibling reviewer's.
+    /// The pane-registry lane key `(project, issue, lane)`.
     lane: String,
     profile_name: String,
     profile: crate::config::AgentProfile,
 }
 
 /// The run's own lane: its loop's pane lane, under the profile pinned on the
-/// run (resolved and pinned lazily on first spawn), and the launch mode its
-/// routing role resolves to.
+/// run (resolved and pinned lazily on first spawn).
 fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
     let lane = lane_for_loop(&run.loop_kind);
     let (profile_name, profile) = resolve_run_profile(deps, run)?;
@@ -1017,7 +995,7 @@ fn author_lane(deps: &Deps, run: &RunRecord) -> Result<Lane> {
 }
 
 /// Resolve this run's role preamble(s) into the standing-discipline block that
-/// gets prepended to the turn prompt (issue #149, ADR 0012). Reads each
+/// gets prepended to the turn prompt. Reads each
 /// configured file from the worktree behind the containment gate
 /// ([`crate::config::resolve_preamble_within`]): a missing path or one that
 /// escapes the worktree (via a symlink) is skipped with a warning and a
@@ -1246,12 +1224,12 @@ async fn handle_agent_quiet(
 
 /// Keep the lane's resumable session id in sync with what the turn taught
 /// us. The truth lives on the pane row (`panes.agent_session_id`, issue
-/// lifetime) — the resume path reads only that, whether or not the lane has
-/// a live pane (issue #169 broadens "lane" from "pane" to "pane optional").
+/// lifetime) — the resume path reads only that.
 /// After every completed turn the primary source is a file scan of the
 /// worktree's transcripts (`agent_session::latest_session_id`, reliable and
 /// independent of agent self-reporting); the result file's self-report and
-/// (pane mode only) the mux (herdr carries it on `pane get`) are fallbacks.
+/// (when a pane is present) the mux (herdr carries it on `pane get`) are
+/// fallbacks.
 /// `runs.agent_session_id` is still written for observability. A resumed
 /// executor dying without a result means the stored id no longer restores a
 /// working session, so drop it rather than resume-loop on it forever.
@@ -1428,8 +1406,7 @@ async fn execute(
 }
 
 /// validate: the orchestrator itself runs the project's check command and
-/// feeds failures back to the agent, never trusting agent claims. Shared by
-/// the `validate` step and the self-review phase's post-fix re-validation;
+/// feeds failures back to the agent, never trusting agent claims.
 /// `persist_step` is the step written while the fix-turn counter advances, so
 /// a crash resumes into the right phase.
 pub(crate) async fn validate(
@@ -1563,14 +1540,14 @@ async fn deliver(
 }
 
 /// Duplicate-delivery guard (issue #249, design doc §3-D/§P5): right before
-/// the worker/planner open a *new* PR for an issue, check whether the forge
+/// the worker opens a *new* PR for an issue, check whether the forge
 /// already cross-references an open PR on a non-meguri branch. If one
 /// exists, a human already has (or is running) a rail-external delivery for
 /// this issue — opening a second one risks shipping the same change twice
 /// under different file names, as #236/#237/#238 did. Only meguri's own
-/// branches (`meguri/...`) are exempt: a resumed run's own PR, or a sibling
-/// meguri loop's, must never trip this. Local tasks (no github issue) are
-/// exempt — there is nothing on a forge to cross-reference.
+/// branches (`meguri/...`) are exempt: a resumed run's own PR must never
+/// trip this. Local tasks (no github issue) are exempt — there is nothing
+/// on a forge to cross-reference.
 async fn reject_rail_external_duplicate(deps: &Deps, run: &RunRecord) -> Result<()> {
     let TaskKey::Issue(issue) = run.task_key() else {
         return Ok(());
@@ -1603,11 +1580,6 @@ async fn open_pr(
     let branch = run.branch.clone().context("run has no branch")?;
     gitops::push_branch(worktree, &branch).await?;
 
-    // Inspection history (ADR 0008): once the reviewed head is pushed, stamp
-    // the self-review verdict as a `meguri/self-review` commit status. The
-    // internal loop ran pre-open in the worktree; the status makes its outcome
-    // visible on the PR head without touching the conversation. Best-effort:
-    // a status failure must not fail an otherwise-good PR.
     let close = flavor.pr_closes_issue(deps);
     let pr_url = if let Some(url) = &cp.pr_url {
         url.clone() // resumed after PR creation
@@ -1654,10 +1626,7 @@ pub(crate) fn default_pr_title(run: &RunRecord, cp: &Checkpoint) -> String {
 
 /// The PR body meguri wraps around the agent's description: an issue-link
 /// header, the agent-authored description (its `pr_body`, or the execute
-/// turn's summary as a fallback), the self-review `<details>` (ADR 0008), and
-/// the meguri footer. Shared by new-PR creation and the spec worker's
-/// spec→implementation body transition so the two paths render an identical
-/// shape (issue #98). `lenses` names the perspectives the self-review applied.
+/// turn's summary as a fallback), and the meguri footer.
 pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint, close: bool) -> String {
     let description = cp
         .pr_body
@@ -1675,9 +1644,8 @@ pub(crate) fn compose_pr_body(run: &RunRecord, cp: &Checkpoint, close: bool) -> 
 }
 
 /// The header line linking a PR to its issue. `Closes #N` (auto-closes on
-/// merge) for a combined delivery / normal PR; `Refs #N` (non-closing) when
-/// the caller sets `close = false` — the separate spec PR must not close the
-/// issue when it merges (ADR 0008 §6).
+/// merge) for a normal PR; `Refs #N` (non-closing) when the caller sets
+/// `close = false`.
 pub(crate) fn issue_reference(issue: i64, close: bool) -> String {
     if close {
         format!("Closes #{issue}")
@@ -1981,8 +1949,8 @@ mod tests {
         // A run's launch profile can be pinned (runs.agent_profile) before
         // prepare-worktree ever runs — e.g. a resumed/retried run, or a
         // concurrent spawn. MEGURI_PROFILE must reuse that pin instead of
-        // re-resolving routing from scratch, or the hook and the pane it's
-        // preparing for could end up generating for different profiles.
+        // re-resolving the profile from scratch, or the hook and the pane
+        // it's preparing for could end up generating for different profiles.
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;
         let worktree_root = tempfile::tempdir().unwrap();
@@ -1995,9 +1963,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        // No [routing] configured, so a fresh `routing::resolve` call would
-        // return "default" — pin something else first and confirm the hook
-        // picks that up instead.
+        // The project pins no profile, so a fresh resolution would return
+        // "default" — pin something else first and confirm the hook picks
+        // that up instead.
         deps.store
             .update_run_agent_profile(&run.id, "codex")
             .unwrap();
