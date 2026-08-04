@@ -1,0 +1,3 @@
+# CI は `cargo nextest run --profile ci` で走る(.github/workflows/ci.yml)。
+# いまは既定値と同じで良いので中身は空 — プロファイルの存在だけが必要。
+[profile.ci]
