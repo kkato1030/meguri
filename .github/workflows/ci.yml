@@ -70,9 +70,6 @@ jobs:
       - name: cargo nextest
         run: cargo nextest run --profile ci
 
-      # nextest は doctest を実行しないため別途カバーする(現状 0 件、ほぼ即時)
-      - name: cargo test --doc
-        run: cargo test --doc
 
   # 獲得スキル配布物のドリフト検知(issue #151 / ADR 0012 §4): 未導入ユーザー向けの
   # `apm install kkato1030/meguri/skills/meguri#<tag>` チャネルが、apm のバージョン更新で黙って
