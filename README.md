@@ -15,7 +15,7 @@ v1 が蓄積した失敗の知識(ブロックダイアログ、虚偽申告、s
 
 ## v0(現在)
 
-**local task 1 本 → tmux pane のエージェント → 検証済みブランチ。** 約 800 行・依存 5 crate。
+**local task 1 本 → herdr / tmux pane のエージェント → 検証済みブランチ。** 約 1,000 行・依存 5 crate。
 
 ```bash
 cargo install --path .
@@ -27,17 +27,17 @@ check_command = "cargo test"
 EOF
 
 meguri run "READMEのtypoを直す"
-# → worktree を切り、tmux pane で claude が走り、
+# → worktree を切り、herdr(なければ tmux)の pane で claude が走り、
 #   result.json の申告を独立検証して、検証済みブランチを残す
 ```
 
-途中で介入したければ `tmux attach -t meguri-myproj`。失敗・needs_human・検証落ちのときも pane は残るので、attach して続きを人間が引き取れる。
+途中で介入したければ herdr の workspace「meguri:myproj」(tmux なら `tmux attach -t meguri-myproj`)へ。失敗・needs_human・検証落ちのときも pane は残るので、人間が続きを引き取れる。
 
 ### アーキテクチャ
 
 現時点の正確な地図(コンポーネント・1 run の流れ・契約・割り切り)は
 [docs/architecture.md](docs/architecture.md)。コードはその地図と 1:1 の 5 ファイル
-(main / config / turn / mux / gitops、約 800 行)。
+(main / config / turn / mux / gitops、約 1,000 行)。
 
 ## ロードマップ
 

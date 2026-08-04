@@ -17,7 +17,26 @@ pub struct Config {
     #[serde(default)]
     pub agent: Agent,
     #[serde(default)]
+    pub mux: MuxConfig,
+    #[serde(default)]
     pub limits: Limits,
+}
+
+/// multiplexer の選択。`auto` は herdr の socket が生きていれば herdr、
+/// いなければ tmux([`crate::mux::detect`])。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuxConfig {
+    #[serde(default = "default_mux_kind")]
+    pub kind: String,
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_mux_kind(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +134,9 @@ fn home_dir() -> PathBuf {
 
 fn default_branch() -> String {
     "main".into()
+}
+fn default_mux_kind() -> String {
+    "auto".into()
 }
 fn default_agent_command() -> String {
     "claude".into()

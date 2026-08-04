@@ -10,10 +10,10 @@
 //!    読まない([`turn`])。
 //! 2. **trust-but-verify** — `success` の申告は独立に検証する: git tree が
 //!    clean、base より commit が進んでいる、`check_command` が通る([`gitops`])。
-//! 3. **生きた pane** — エージェントは headless ではなく tmux pane の対話
+//! 3. **生きた pane** — エージェントは headless ではなく herdr / tmux の対話
 //!    セッションで動き、人間はいつでも attach して介入できる([`mux`])。
 //!
-//! 読む順番: main.rs(この流れ)→ config.rs → turn.rs → mux.rs → gitops.rs。
+//! 読む順番: main.rs(この流れ)→ config.rs → turn.rs → mux/ → gitops.rs。
 
 mod config;
 mod gitops;
@@ -73,15 +73,16 @@ fn run(task: &str, project: Option<&str>) -> Result<()> {
     let prompt_path =
         turn::write_prompt(&worktree, &turn_id, task, project.check_command.as_deref())
             .context("prompt の書き出し")?;
-    let pane = mux::spawn_agent(&project.id, &branch, &worktree, &cfg.agent)
+    let mux = mux::detect(&cfg.mux.kind, &project.id)?;
+    let mut command = vec![cfg.agent.command.clone()];
+    command.extend(cfg.agent.args.iter().cloned());
+    let pane = mux
+        .spawn_agent(&branch, &worktree, &command)
         .context("エージェント pane の起動")?;
-    println!(
-        "pane: {} (attach: tmux attach -t {})",
-        pane.id, pane.session
-    );
+    println!("pane: {} ({})", pane.id, pane.attach_hint);
     // エージェントの起動を少し待ってから、prompt を読むよう 1 行だけ打ち込む。
     std::thread::sleep(Duration::from_secs(cfg.limits.spawn_grace_secs));
-    mux::send_line(
+    mux.send_line(
         &pane,
         &format!(
             "{} を読んで、その内容を完遂してください。",
@@ -90,19 +91,25 @@ fn run(task: &str, project: Option<&str>) -> Result<()> {
     )?;
 
     // --- 3. 申告を待つ(画面は読まない) -----------------------------------
-    let result = wait_for_result(&worktree, &turn_id, &pane, cfg.limits.max_turn_runtime_secs)?;
+    let result = wait_for_result(
+        &worktree,
+        &turn_id,
+        &*mux,
+        &pane,
+        cfg.limits.max_turn_runtime_secs,
+    )?;
     println!("agent: {} — {}", result.status, result.summary);
 
     // --- 4. trust-but-verify: success の申告を独立に検証する ---------------
     match result.status.as_str() {
         "success" => {}
         "needs_human" => bail!(
-            "エージェントが人間の判断を求めています。pane に attach して続きを: tmux attach -t {}",
-            pane.session
+            "エージェントが人間の判断を求めています。続きは: {}",
+            pane.attach_hint
         ),
         _ => bail!(
-            "エージェントが失敗を申告しました。pane で経緯を確認してください: tmux attach -t {}",
-            pane.session
+            "エージェントが失敗を申告しました。経緯は: {}",
+            pane.attach_hint
         ),
     }
     gitops::verify(&worktree, &base_sha, project.check_command.as_deref())
@@ -121,6 +128,7 @@ fn run(task: &str, project: Option<&str>) -> Result<()> {
 fn wait_for_result(
     worktree: &Path,
     turn_id: &str,
+    mux: &dyn mux::Mux,
     pane: &mux::Pane,
     max_secs: u64,
 ) -> Result<turn::TurnResult> {
@@ -129,13 +137,13 @@ fn wait_for_result(
         if let Some(result) = turn::read_result(worktree, turn_id)? {
             return Ok(result);
         }
-        if !mux::pane_alive(pane)? {
+        if !mux.pane_alive(pane)? {
             bail!("エージェントの pane が終了しました(result.json は未提出)");
         }
         if Instant::now() > deadline {
             bail!(
-                "{max_secs} 秒待っても result.json が現れませんでした。pane は生きています: tmux attach -t {}",
-                pane.session
+                "{max_secs} 秒待っても result.json が現れませんでした。pane は生きています: {}",
+                pane.attach_hint
             );
         }
         std::thread::sleep(Duration::from_secs(2));
