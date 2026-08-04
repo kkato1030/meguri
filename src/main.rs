@@ -18,6 +18,7 @@
 mod config;
 mod gitops;
 mod mux;
+mod preflight;
 mod turn;
 
 use std::path::Path;
@@ -52,6 +53,9 @@ fn main() -> Result<()> {
 
 /// v0 の全体フロー。上から下へ、1 run の一生がそのまま並んでいる。
 fn run(task: &str, project: Option<&str>) -> Result<()> {
+    if task.trim().is_empty() {
+        bail!("タスクが空です — 1 行のメモで良いので内容を渡してください");
+    }
     let cfg = config::load()?;
     let project = cfg.project(project)?;
 
@@ -73,6 +77,8 @@ fn run(task: &str, project: Option<&str>) -> Result<()> {
     let prompt_path =
         turn::write_prompt(&worktree, &turn_id, task, project.check_command.as_deref())
             .context("prompt の書き出し")?;
+    // claude の folder-trust ダイアログを pane 起動前に潰す(失敗しても続行)。
+    preflight::prime(&worktree, &cfg.agent);
     let mux = mux::detect(&cfg.mux.kind, &project.id)?;
     let mut command = vec![cfg.agent.command.clone()];
     command.extend(cfg.agent.args.iter().cloned());

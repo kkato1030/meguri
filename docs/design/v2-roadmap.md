@@ -26,13 +26,14 @@ v1 の刈り込み(kernel-pruning-plan、〜PR #272)で概念は核まで絞れ�
 |---|---|---|---|
 | v0 | 単発 run(済) | worktree → pane → result.json → 検証 → ブランチ | 完了コントラクト、trust-but-verify、`.meguri/` exclude |
 | v0.0.1 | herdr 対応(済) | mux trait 化 + herdr backend(spawn/send/alive)。オーナーの常用環境を優先して前倒し | v1 herdr.rs のコマンド面(tab create / pane run / send-text)、pane run = shell 内起動で画面が残る |
+| v0.0.2 | preflight prime(済) | claude の folder-trust ダイアログで run が始まらない失敗が v2 で再観測(初回 run で実測)→ v1 の preflight を最小移植 | preflight prime(deny-all settings + strict-mcp-config、ADR 0027 D1、issue #235) |
 | v0.1 | 検証フィードバック | 検証落ちを fix turn としてエージェントに差し戻す(上限付き) | 虚偽申告の訂正(validate_turns、ADR 0002 系) |
 | v0.2 | ブロック検知と nudge | 沈黙の nudge(上限付き)、pane の Blocked 判定は「破綻」とだけ区別 | idle_grace / nudge_limit、「ブロック ≠ 失敗」 |
 | v0.3 | resume | run の checkpoint 永続化(sqlite 導入)+ agent session id 保存 → クラッシュ後再開 | crash recovery、ADR 0029(会話可能な session だけ resume) |
 | v1.0 | watch ループ | task キュー(sqlite が権威)+ 直列/並列ディスパッチ + 排他 lock | 権威反転、claim no-steal(ADR 0027) |
 | v1.1 | GitHub 入出力 | intake(ready/hold ラベル、低頻度)+ 投影(working/needs-human)+ PR 作成 | 権威反転の read 予算(intake 2 req/周期)、ラベルは投影 |
 | v1.2 | 運用面 | ps / logs / attach / stop / prune | 介入面 = 耐久シグナルだけで駆動 |
-| — | escalation の infra 分類、session health、preflight、herdr socket(状態検出) | 必要になった時点で | ADR 0028 / 0029 / preflight prime |
+| — | escalation の infra 分類、session health、herdr socket(状態検出) | 必要になった時点で | ADR 0028 / 0029 |
 
 v1 の未解決 issue のうち v2 設計に直接効くもの: #273(pane の識別を issue 番号に
 依存させない — v2 は最初から run/task キーで設計する)、#274(投影の成否に権威の

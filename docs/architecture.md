@@ -5,7 +5,7 @@
 > 未来の計画は書かない — それは [design/v2-roadmap.md](design/v2-roadmap.md) の
 > 仕事。ここに書いてよいのは、いまの main(v2)で実際に動くものだけ。
 
-最終更新: v0 + herdr 対応時点。
+最終更新: v0 + herdr 対応 + preflight prime 時点。
 
 ## いまできること
 
@@ -23,12 +23,13 @@
 | `config.rs` | `~/.meguri/config.toml` の読み込み。書いた項目だけ上書き、未知キーは loud に拒否 |
 | `turn.rs` | 完了コントラクト: prompt の書き出しと result.json の読み取り |
 | `mux/` | mux に求める 3 操作(pane を作る・1 行打つ・生死を見る)の trait と herdr / tmux の 2 実装 |
+| `preflight.rs` | claude の folder-trust prime: pane 起動前に deny-all の headless 1 発で trust を記録(best-effort) |
 | `gitops.rs` | git 操作の集約: worktree 作成と trust-but-verify。他所から git を直接叩かない |
 
 ## 1 run の流れ
 
 ```
-meguri run "タスク" [--project <id>]
+meguri run "タスク" [--project <id>]     ※空タスクは即エラー
    │
    ▼
 [config]  config.toml を読む。--project 省略は「1 件だけ設定済み」のときのみ可
@@ -46,6 +47,14 @@ meguri run "タスク" [--project <id>]
           「完了の作法」(result.json の形式・.meguri/ はコミット禁止・
           check_command があることの予告)を prompt 自身に埋め込む —
           エージェント側の事前設定を要求しない
+   │
+   ▼
+[preflight] agent が claude なら、pane 起動前にその worktree で headless の
+          claude を 1 回走らせ folder trust を記録する(fresh worktree の
+          「このフォルダを信頼するか?」ダイアログで run が始まらない問題の
+          対策)。この 1 回は yolo なし + meguri 所有の deny-all --settings +
+          --strict-mcp-config で走り、ツールを一切実行できない。失敗しても
+          警告して pane 起動に進む(その場合はダイアログに人間が答える)
    │
    ▼
 [mux]     mux.kind(既定 auto: herdr socket が生きていれば herdr、いなければ
@@ -114,6 +123,7 @@ max_turn_runtime_secs = 2700       # result.json を待つ上限(pane は殺さ�
 ```
 ~/.meguri/config.toml                        設定
 ~/.meguri/worktrees/<project>/<run_id>/      run ごとの worktree(掃除は手動)
+~/.meguri/preflight/deny-settings.json       preflight 用 deny-all(0600、meguri 所有)
 <repo_path> のブランチ meguri/<slug>-<id>    成果物
 ```
 
