@@ -1,0 +1,12 @@
+[package]
+name = "meguri"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# v0.1 p1: データモデル + 永続化 + CLI。
+# 依存は最小に保つ(§20)。新しい crate はそれが解く問題が現れた増分で足す。
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }  # bundled = システム sqlite 不要
+anyhow = "1"

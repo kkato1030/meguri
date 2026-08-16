@@ -745,7 +745,7 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 分割increments:
 
 * **p0: ACP spike(済)** — Claude/Gemini/Codex/Cursor で ACP 往復を実測。結論: ACP は動くが未成熟で、**pane + 構造化ファイル契約の方が筋が良い**と判断(§7 / §23 Q5)。捨てコードは main に入れず `archive/p0-acp-spike` ブランチに退避(PR は不採用で close)
-* **p1: データモデル + 永続化 + CLI** — Intent / Outcome(statement/predicate=verify/requires)/ Work の CRUD、sqlite、ready・satisfied 導出、Mermaid 出力
+* **p1: データモデル + 永続化 + CLI(済)** — Intent / Outcome(statement/verify/requires)/ Work の CRUD、sqlite、satisfied・ready・blocked 導出、Mermaid 出力。実装は `src/`(architecture.md 参照)
 * **p2: Planning 対話** — pane で生の Claude/Codex と対話 → エージェントが `proposal.json` を書く → meguri が読んで Graph Diff 表示 → Human approval で確定
 
 ### 完了条件
