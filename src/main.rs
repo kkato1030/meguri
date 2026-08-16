@@ -64,10 +64,22 @@ enum Cmd {
     /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
     Plan(PlanCmd),
-    /// Run a ready Outcome: spawn a Work and cut its isolated worktree
+    /// Run a ready Outcome: spawn a Work, launch an agent in its worktree, wait for the result
     Run {
         /// The Outcome to work on (must be ready; e.g. o13)
         outcome: String,
+        /// Override the agent command (default: config `agent`)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Launch + inject, then return immediately (state stays 'running'; check the pane yourself)
+        #[arg(long)]
+        detach: bool,
+        /// Seconds to wait after launching the agent before injecting the prompt
+        #[arg(long, default_value_t = 8)]
+        grace_secs: u64,
+        /// Seconds to wait for .meguri/result.json to appear (ignored with --detach)
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
     },
 }
 
@@ -285,13 +297,30 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
-        Cmd::Run { outcome } => run_cmd(&conn, &outcome)?,
+        Cmd::Run { outcome, agent, detach, grace_secs, timeout_secs } => run_cmd(
+            &conn,
+            &outcome,
+            &RunOpts {
+                agent,
+                detach,
+                grace: Duration::from_secs(grace_secs),
+                timeout: Duration::from_secs(timeout_secs),
+            },
+        )?,
     }
     Ok(())
 }
 
+/// `meguri run` の実行オプション(o15 の起動・o16 の待機を制御)。
+struct RunOpts {
+    agent: Option<String>,
+    detach: bool,
+    grace: Duration,
+    timeout: Duration,
+}
+
 /// o14: ready な Outcome を Work にし、その repo の bare から隔離 worktree を切る。
-fn run_cmd(conn: &rusqlite::Connection, outcome: &str) -> Result<()> {
+fn run_cmd(conn: &rusqlite::Connection, outcome: &str, opts: &RunOpts) -> Result<()> {
     let oid = parse_id(outcome, 'o')?;
     let o = store::get_outcome(conn, oid)?;
     if o.verify == Verify::Rollup {
@@ -341,20 +370,28 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str) -> Result<()> {
     println!("  branch:   {} (base {short})", wt.branch);
 
     // o15: worktree の pane でエージェントを起動し、実装プロンプトを注入する。
-    launch_work(conn, wid, &o, &wt.path)?;
+    // o16: --detach でなければ result.json の出現を待って完了を判定する。
+    launch_work(conn, wid, &o, &wt.path, opts)?;
     Ok(())
 }
 
-/// o15: Work の worktree で pane を開き、実装プロンプトを書いてエージェントに注入する。
-/// pane は残す(§3.5)。完了検知(result.json のポーリング)は o16。
-fn launch_work(conn: &rusqlite::Connection, wid: i64, o: &store::Outcome, worktree: &std::path::Path) -> Result<()> {
+/// o15/o16: Work の worktree で pane を開き、実装プロンプトを注入してエージェントを起こし、
+/// (--detach でなければ)耐久 result ファイルの出現を待って完了を判定する。pane は残す(§3.5)。
+fn launch_work(
+    conn: &rusqlite::Connection,
+    wid: i64,
+    o: &store::Outcome,
+    worktree: &std::path::Path,
+    opts: &RunOpts,
+) -> Result<()> {
     let cfg = config::load()?;
+    let agent_cmd = opts.agent.clone().unwrap_or(cfg.agent);
     let scratch = worktree.join(".meguri");
     std::fs::create_dir_all(&scratch)
         .with_context(|| format!("cannot create {}", scratch.display()))?;
     let result_path = scratch.join("result.json");
     let prompt_path = scratch.join("prompt.md");
-    let _ = std::fs::remove_file(&result_path); // 古い残骸を消す
+    let _ = std::fs::remove_file(&result_path); // 古い残骸を消す(消さないと前回の result を即検知してしまう)
 
     let prompt = exec::impl_prompt(o, worktree, &result_path, &cfg.lang);
     std::fs::write(&prompt_path, &prompt)
@@ -364,13 +401,57 @@ fn launch_work(conn: &rusqlite::Connection, wid: i64, o: &store::Outcome, worktr
     let pane = mux.open_pane("meguri", &format!("w{wid}"), Some(worktree))?;
     // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(p2.2b の学び)。
     std::thread::sleep(Duration::from_millis(800));
-    mux.send_line(&pane, &cfg.agent)?;
-    std::thread::sleep(Duration::from_secs(8)); // spawn_grace: CLI 起動待ち
+    mux.send_line(&pane, &agent_cmd)?;
+    std::thread::sleep(opts.grace); // spawn_grace: CLI 起動待ち
     mux.send_line(&pane, "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).")?;
 
     store::set_work_state(conn, wid, "running")?;
     println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
+
+    if opts.detach {
+        println!("  detached — state stays 'running'. attach to the pane to watch, then re-run to harvest.");
+        return Ok(());
+    }
+
+    // o16: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
+    match wait_result(mux.as_ref(), &pane, &result_path, opts.timeout) {
+        Some(r) => {
+            let state = exec::state_for(&r.status);
+            store::set_work_state(conn, wid, state)?;
+            println!("  agent reported [{}]: {}", r.status, r.summary);
+            println!("  w{wid} is now [{state}]");
+        }
+        None => {
+            // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
+            // ここでは pane を残し、state は 'running' のまま人間に委ねる(§3.5)。
+            println!("  no durable result detected (pane died or timed out). state stays 'running'; attach to the pane to check.");
+        }
+    }
     Ok(())
+}
+
+/// o16: 耐久 result ファイル(`.meguri/result.json`)の出現をポーリングで待つ。**画面は読まない**(§8)。
+/// 返り値: `Some(result)`=検知 / `None`=pane 死亡 or timeout(どちらも pane は残す)。
+fn wait_result(
+    mux: &dyn mux::Mux,
+    pane: &mux::PaneId,
+    result_path: &std::path::Path,
+    timeout: Duration,
+) -> Option<exec::WorkResult> {
+    let start = std::time::Instant::now();
+    loop {
+        // Ok(Some)=完了 / Ok(None)=まだ / Err=書き込み途中の部分 JSON → まだ完成していない扱いで待つ。
+        if let Ok(Some(r)) = exec::read_result(result_path) {
+            return Some(r);
+        }
+        if !mux.is_alive(pane).unwrap_or(false) {
+            return None; // pane が死んだ(詳細な扱いは o25)
+        }
+        if start.elapsed() >= timeout {
+            return None; // timeout(詳細な扱いは o24。pane は残す)
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
