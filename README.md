@@ -27,8 +27,25 @@ $BIN graph --mermaid     # Outcome Graph を表示(状態は導出)
 ```
 
 手動で回す場合は `plan prompt`(プロンプト出力)→ エージェントが `proposal.json` を
-書く →`plan diff` →`plan apply`。設定は `~/.meguri/config.toml`(`lang` / `agent`)。
-詳細は [`docs/architecture.md`](docs/architecture.md)。
+書く →`plan diff` →`plan apply`。詳細は [`docs/architecture.md`](docs/architecture.md)。
+
+## 設定(`~/.meguri/config.toml`)
+
+すべて任意で、ファイルやキーが無ければ既定値が使われる。
+
+```toml
+# Outcome の statement を書く言語(自然言語名)。既定 "English"。
+# planning プロンプトにそのまま渡すだけなので、"日本語" / "Japanese" など自由。
+# 翻訳はしない(切替は以後書かれる内容に効く)。
+lang = "English"
+
+# `plan run` が pane で起動するエージェント CLI(そのまま shell に打ち込む 1 行)。
+# 既定はこれ。planning ではファイルを書くだけなので権限確認を省いている。
+# 1 回だけ変えたいときは `meguri plan run --agent "<cmd>"` で上書きできる。
+agent = "claude --dangerously-skip-permissions"
+```
+
+保存先は `MEGURI_HOME`(既定 `~/.meguri`)を変えれば移動できる。
 
 ---
 
