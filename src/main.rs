@@ -43,12 +43,18 @@ enum Cmd {
         /// Limit to this Intent (e.g. i1 / 1)
         #[arg(long)]
         intent: Option<String>,
-        /// Output as Mermaid
+        /// Output as Mermaid (to stdout)
         #[arg(long)]
         mermaid: bool,
-        /// Output a self-contained clickable HTML graph (open it in a browser)
+        /// Write a self-contained clickable HTML graph and open it in a browser
         #[arg(long)]
         html: bool,
+        /// Where to write the HTML (default: MEGURI_HOME/graph.html)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Don't open the HTML in a browser (with --html)
+        #[arg(long)]
+        no_open: bool,
     },
     /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
@@ -179,11 +185,20 @@ fn main() -> Result<()> {
         Cmd::Intent(c) => intent(&conn, c)?,
         Cmd::Outcome(c) => outcome(&conn, c)?,
         Cmd::Work(c) => work(&conn, c)?,
-        Cmd::Graph { intent, mermaid, html } => {
+        Cmd::Graph { intent, mermaid, html, out, no_open } => {
             let iid = intent.map(|s| parse_id(&s, 'i')).transpose()?;
             let outcomes = store::list_outcomes(&conn, iid)?;
             if html {
-                print!("{}", render::html(&outcomes));
+                let path = match out {
+                    Some(p) => p,
+                    None => db::meguri_home()?.join("graph.html"),
+                };
+                std::fs::write(&path, render::html(&outcomes))
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+                println!("wrote {}", path.display());
+                if !no_open {
+                    open_in_browser(&path);
+                }
             } else if mermaid {
                 print!("{}", render::mermaid(&outcomes));
             } else {
@@ -277,6 +292,12 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// ファイルをブラウザで開く(best-effort。失敗しても黙る)。
+fn open_in_browser(path: &std::path::Path) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener).arg(path).spawn();
 }
 
 /// 標準入力で y/N を尋ねる。
