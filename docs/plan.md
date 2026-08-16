@@ -771,6 +771,10 @@ Outcome Graph を実際の AI coding に接続する。
 * [x] Work instruction injection(完了コントラクト込み)(o15: `src/exec.rs` の impl_prompt を注入、state=running)
 * [x] result 待機(耐久シグナルのみ)(o16: `.meguri/result.json` をポーリング、部分書き込みは未完了扱い、pane 死亡/timeout で打ち切り。報告 status → state=reported/failed/needs_human。`run --detach` で待たない)
 * [ ] meguri 側の独立検証 + fix turn 差し戻し(上限付き)
+  * [x] 検証①: working tree が clean か(o17: `verify::clean_tree`、reported 時に実行・表示。gate は o20)
+  * [ ] 検証②: base より commit が進んでいるか(o18)
+  * [ ] 検証③: check_command が exit 0 か(o19)
+  * [ ] 検証 rollup で verified の関門にする(o20)/ fix turn 差し戻し(o22)
 * [ ] 沈黙 nudge / タイムアウト / pane 死亡の失敗経路
 * [ ] Artifact registration
 * [ ] `meguri accept` / `meguri rework`(ローカル Human Gate)

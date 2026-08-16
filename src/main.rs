@@ -12,6 +12,7 @@ mod mux;
 mod plan;
 mod render;
 mod store;
+mod verify;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -420,6 +421,12 @@ fn launch_work(
             store::set_work_state(conn, wid, state)?;
             println!("  agent reported [{}]: {}", r.status, r.summary);
             println!("  w{wid} is now [{state}]");
+
+            // o17: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
+            // まだ gate はしない(verified 化する rollup は o20)。検証子は o18/o19 で増える。
+            if state == "reported" {
+                print_check(verify::clean_tree(worktree)?);
+            }
         }
         None => {
             // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
@@ -428,6 +435,12 @@ fn launch_work(
         }
     }
     Ok(())
+}
+
+/// 検証子(o17-)の結果を 1 行で表示する。
+fn print_check(c: verify::Check) {
+    let mark = if c.pass { "PASS" } else { "FAIL" };
+    println!("  verify {}: {mark} — {}", c.name, c.detail);
 }
 
 /// o16: 耐久 result ファイル(`.meguri/result.json`)の出現をポーリングで待つ。**画面は読まない**(§8)。
