@@ -52,6 +52,23 @@ pub fn clean_tree(worktree: &Path) -> Result<Check> {
     }
 }
 
+/// o18: ブランチが base(worktree を切った時点の SHA)より commit が進んでいるか。
+///
+/// clean_tree(o17)は「ゴミが残っていない」を見るだけで、**何も作らず commit も無い**
+/// 空の worktree でも通ってしまう。実際に成果 commit が積まれたかは base からの距離で見る。
+pub fn commits_ahead(worktree: &Path, base_sha: &str) -> Result<Check> {
+    let (ok, out, err) = git_out(worktree, &["rev-list", "--count", &format!("{base_sha}..HEAD")])?;
+    if !ok {
+        return Ok(Check { name: "commits_ahead", pass: false, detail: format!("git rev-list failed: {err}") });
+    }
+    let n: u32 = out.trim().parse().unwrap_or(0);
+    if n > 0 {
+        Ok(Check { name: "commits_ahead", pass: true, detail: format!("{n} commit(s) ahead of base") })
+    } else {
+        Ok(Check { name: "commits_ahead", pass: false, detail: "no commits ahead of base".into() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +112,26 @@ mod tests {
         std::fs::write(repo.join(".meguri").join("result.json"), "{}").unwrap();
         let c = clean_tree(&repo).unwrap();
         assert!(c.pass, "expected .meguri/ ignored, got: {}", c.detail);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn commits_ahead_pass_and_fail() {
+        let repo = temp_repo();
+        let (_, base, _) = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        // base=HEAD のまま = 進んでいない。
+        let c = commits_ahead(&repo, &base).unwrap();
+        assert!(!c.pass, "expected not-ahead, got: {}", c.detail);
+
+        // commit を 1 つ積むと base より進む。
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work"]);
+        let c = commits_ahead(&repo, &base).unwrap();
+        assert!(c.pass);
+        assert!(c.detail.contains("1 commit"));
 
         let _ = std::fs::remove_dir_all(&repo);
     }

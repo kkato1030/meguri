@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.2 o17(meguri 側の独立検証①: working tree が clean か)** 時点。
+最終更新: **v0.2 o18(meguri 側の独立検証②: base より commit が進んでいるか)** 時点。
 
 ## いまできること
 
@@ -20,8 +20,8 @@
 まだ無いもの: Work の実行(v0.2 着手中 — repo 管理(bare)+ **`meguri run` で spawn +
 隔離 worktree(o14)+ worktree の pane にエージェント起動・実装プロンプト注入(o15)+
 `.meguri/result.json` の出現をポーリングして完了検知(o16、画面は読まない)+
-success 報告時に **meguri 側の独立検証①: working tree が clean か(o17)** を実行・表示まで**。
-検証②③(commit 進行 / check_command=o18-o19)・検証 rollup で verified 化(o20)・
+success 報告時に **meguri 側の独立検証①② (working tree clean=o17 / base より commit 進行=o18)** を実行・表示まで**。
+検証③(check_command=o19)・検証 rollup で verified 化(o20)・
 Artifact(o21)/ 失敗経路の詳細(o22-o25)は未)/ GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
@@ -37,7 +37,7 @@ Artifact(o21)/ 失敗経路の詳細(o22-o25)は未)/ GitHub 連携 / watch・re
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
-| `src/verify.rs` | meguri 側の**独立検証**(§9.3、trust-but-verify): 各検証子は `Check{name,pass,detail}` を返す。o17 = `clean_tree`(worktree に未コミット/追跡外が残っていないか。`.meguri/` は exclude 済みで無視)。o18/o19 で検証子が増え、o20 が rollup。実 git の単体テストあり |
+| `src/verify.rs` | meguri 側の**独立検証**(§9.3、trust-but-verify): 各検証子は `Check{name,pass,detail}` を返す。o17 = `clean_tree`(worktree に未コミット/追跡外が残っていないか。`.meguri/` は exclude 済みで無視)、o18 = `commits_ahead`(spawn 時に記録した base SHA より commit が進んでいるか=何も作らず report した空 worktree を弾く)。o19 で検証子が増え、o20 が rollup。実 git の単体テストあり |
 | `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示(verify 種別ごとに DoD を出し分け)。加えて **result.json の読み取り**(`WorkResult{status,summary}`、部分書き込みは未完了扱い)と status→Work state の対応(o16)。画面は読まず result.json で完了を判定する契約。単体テストあり |
 
 ## ドメインモデル(§4/§5)
@@ -46,7 +46,7 @@ Artifact(o21)/ 失敗経路の詳細(o22-o25)は未)/ GitHub 連携 / watch・re
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。
-  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)で `reported`(success=報告あり・meguri 未検証)/ `failed`(failure)/ `needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o22-o25)。`reported`(success)のときは meguri 側の独立検証(`verify.rs`、o17: clean_tree)を走らせて結果を表示する(まだ gate しない=state は変えない。verified 化する rollup は o20)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)で `reported`(success=報告あり・meguri 未検証)/ `failed`(failure)/ `needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o22-o25)。`reported`(success)のときは meguri 側の独立検証(`verify.rs`、o17: clean_tree / o18: commits_ahead)を走らせて結果を表示する(まだ gate しない=state は変えない。verified 化する rollup は o20)。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。

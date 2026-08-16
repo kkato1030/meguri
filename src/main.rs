@@ -372,7 +372,7 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str, opts: &RunOpts) -> Result
 
     // o15: worktree の pane でエージェントを起動し、実装プロンプトを注入する。
     // o16: --detach でなければ result.json の出現を待って完了を判定する。
-    launch_work(conn, wid, &o, &wt.path, opts)?;
+    launch_work(conn, wid, &o, &wt.path, &wt.base_sha, opts)?;
     Ok(())
 }
 
@@ -383,6 +383,7 @@ fn launch_work(
     wid: i64,
     o: &store::Outcome,
     worktree: &std::path::Path,
+    base_sha: &str,
     opts: &RunOpts,
 ) -> Result<()> {
     let cfg = config::load()?;
@@ -422,10 +423,11 @@ fn launch_work(
             println!("  agent reported [{}]: {}", r.status, r.summary);
             println!("  w{wid} is now [{state}]");
 
-            // o17: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
-            // まだ gate はしない(verified 化する rollup は o20)。検証子は o18/o19 で増える。
+            // o17/o18: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
+            // まだ gate はしない(verified 化する rollup は o20)。検証子は o19 で増える。
             if state == "reported" {
                 print_check(verify::clean_tree(worktree)?);
+                print_check(verify::commits_ahead(worktree, base_sha)?);
             }
         }
         None => {
