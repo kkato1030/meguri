@@ -372,7 +372,7 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str, opts: &RunOpts) -> Result
 
     // o15: worktree の pane でエージェントを起動し、実装プロンプトを注入する。
     // o16: --detach でなければ result.json の出現を待って完了を判定する。
-    launch_work(conn, wid, &o, &wt.path, &wt.base_sha, opts)?;
+    launch_work(conn, wid, &o, &wt.path, &wt.base_sha, &wt.branch, opts)?;
     Ok(())
 }
 
@@ -384,6 +384,7 @@ fn launch_work(
     o: &store::Outcome,
     worktree: &std::path::Path,
     base_sha: &str,
+    branch: &str,
     opts: &RunOpts,
 ) -> Result<()> {
     let cfg = config::load()?;
@@ -429,7 +430,12 @@ fn launch_work(
                 let state = if verify::all_pass(&checks) { "verified" } else { "rework" };
                 store::set_work_state(conn, wid, state)?;
                 if state == "verified" {
+                    // o21: 検証済みの commit を Artifact として記録する(Work の耐久成果物)。
+                    let sha = gitops::head_sha(worktree)?;
+                    store::set_work_artifact(conn, wid, &sha)?;
+                    let short = sha.chars().take(7).collect::<String>();
                     println!("  w{wid} passed verification → [verified]");
+                    println!("  artifact: {branch} @ {short}");
                 } else {
                     let n = checks.iter().filter(|c| !c.pass).count();
                     println!("  w{wid} failed verification ({n} check(s)) → [rework] (fix turn is o22)");
@@ -779,6 +785,10 @@ fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
                 println!("w{}  for o{}  [{}/{}]  {}", w.id, w.serves_id, w.executor, w.state, w.objective);
                 if let Some(p) = &w.worktree_path {
                     println!("     worktree: {p}");
+                }
+                if let (Some(b), Some(sha)) = (&w.branch, &w.artifact_sha) {
+                    let short = sha.chars().take(7).collect::<String>();
+                    println!("     artifact: {b} @ {short}");
                 }
             }
         }

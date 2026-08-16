@@ -777,7 +777,7 @@ Outcome Graph を実際の AI coding に接続する。
   * [x] 検証 rollup で verified の関門にする(o20: `run_all`+`all_pass`。全 pass=`verified` / 一つでも落ち=`rework`)
   * [ ] fix turn 差し戻し(o22)
 * [ ] 沈黙 nudge / タイムアウト / pane 死亡の失敗経路
-* [ ] Artifact registration
+* [x] Artifact registration(o21: verified な commit を Work の `artifact_sha` に記録。`branch @ sha` が耐久成果物、`work ls` に表示)
 * [ ] `meguri accept` / `meguri rework`(ローカル Human Gate)
 
 ### 完了条件

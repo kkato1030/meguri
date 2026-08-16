@@ -85,10 +85,11 @@ pub struct Work {
     pub state: String,
     /// spawn 時に埋まる worktree 情報(§9 の作業場)。
     pub worktree_path: Option<String>,
-    #[allow(dead_code)]
     pub branch: Option<String>,
     #[allow(dead_code)]
     pub base_sha: Option<String>,
+    /// verified に達したとき記録する commit(o21 の Artifact)。
+    pub artifact_sha: Option<String>,
 }
 
 // ---- Repo ----
@@ -430,9 +431,10 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
             worktree_path: r.get(5)?,
             branch: r.get(6)?,
             base_sha: r.get(7)?,
+            artifact_sha: r.get(8)?,
         })
     };
-    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha";
+    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha";
     let rows: Vec<Work> = match serves_id {
         Some(sid) => {
             let mut stmt = conn
@@ -464,17 +466,24 @@ pub fn set_work_worktree(conn: &Connection, id: i64, path: &str, branch: &str, b
     Ok(())
 }
 
+/// o21: verified に達した Work の Artifact(検証済み commit)を記録する。
+pub fn set_work_artifact(conn: &Connection, id: i64, sha: &str) -> Result<()> {
+    conn.execute("UPDATE works SET artifact_sha = ?2 WHERE id = ?1", params![id, sha])?;
+    Ok(())
+}
+
 fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM works WHERE id = ?1", [id], |_| Ok(())).is_ok())
 }
 
 pub fn get_work(conn: &Connection, id: i64) -> Result<Work> {
     conn.query_row(
-        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha FROM works WHERE id = ?1",
+        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha FROM works WHERE id = ?1",
         [id],
         |r| Ok(Work {
             id: r.get(0)?, serves_id: r.get(1)?, objective: r.get(2)?, executor: r.get(3)?,
             state: r.get(4)?, worktree_path: r.get(5)?, branch: r.get(6)?, base_sha: r.get(7)?,
+            artifact_sha: r.get(8)?,
         }),
     )
     .with_context(|| format!("no work w{id}"))

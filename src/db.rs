@@ -56,6 +56,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "worktree_path", "TEXT")?;
     add_column_if_missing(conn, "works", "branch", "TEXT")?;
     add_column_if_missing(conn, "works", "base_sha", "TEXT")?;
+    add_column_if_missing(conn, "works", "artifact_sha", "TEXT")?; // o21: verified な commit
     Ok(())
 }
 
@@ -116,6 +117,7 @@ pub(crate) const SCHEMA: &str = r#"
             state         TEXT NOT NULL DEFAULT 'planned',
             worktree_path TEXT,                          -- spawn 時に埋まる
             branch        TEXT,
-            base_sha      TEXT
+            base_sha      TEXT,
+            artifact_sha  TEXT                            -- verified な commit(o21)
         );
         "#;
