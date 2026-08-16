@@ -26,6 +26,17 @@ fn db_path() -> Result<PathBuf> {
     Ok(meguri_home()?.join("meguri.db"))
 }
 
+/// 管理 repo の bare clone を置くディレクトリ(`MEGURI_HOME/repos`)。
+pub fn repos_dir() -> Result<PathBuf> {
+    Ok(meguri_home()?.join("repos"))
+}
+
+/// worktree を置くディレクトリ(`MEGURI_HOME/worktrees`)。o14(spawn)で使う。
+#[allow(dead_code)]
+pub fn worktrees_dir() -> Result<PathBuf> {
+    Ok(meguri_home()?.join("worktrees"))
+}
+
 /// DB を開き、スキーマを用意して返す。
 pub fn open() -> Result<Connection> {
     let path = db_path()?;
@@ -59,6 +70,14 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
 
 /// スキーマ SQL。テストの in-memory DB でも使う。
 pub(crate) const SCHEMA: &str = r#"
+        -- meguri が管理する repo(bare clone は MEGURI_HOME/repos/<name>.git)。
+        CREATE TABLE IF NOT EXISTS repos (
+            id             INTEGER PRIMARY KEY,
+            name           TEXT NOT NULL UNIQUE,
+            origin         TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+
         CREATE TABLE IF NOT EXISTS intents (
             id          INTEGER PRIMARY KEY,
             title       TEXT NOT NULL,

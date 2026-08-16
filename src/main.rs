@@ -31,6 +31,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Repo (a managed bare clone that Works run against)
+    #[command(subcommand)]
+    Repo(RepoCmd),
     /// Intent (what you want; the root of a graph)
     #[command(subcommand)]
     Intent(IntentCmd),
@@ -112,6 +115,26 @@ enum PlanCmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Register a repo and create its managed bare clone
+    Add {
+        /// A short name (used for paths and to bind Intents)
+        name: String,
+        /// Clone source (a git URL or a local path)
+        #[arg(long)]
+        from: String,
+        /// Default branch to cut worktrees from
+        #[arg(long, default_value = "main")]
+        branch: String,
+    },
+    Ls,
+    /// Update the bare clone from origin
+    Fetch { name: String },
+    /// Remove the repo and its bare clone
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +249,7 @@ fn main() -> Result<()> {
     let conn = db::open()?;
 
     match cli.cmd {
+        Cmd::Repo(c) => repo(&conn, c)?,
         Cmd::Intent(c) => intent(&conn, c)?,
         Cmd::Outcome(c) => outcome(&conn, c)?,
         Cmd::Work(c) => work(&conn, c)?,
@@ -351,6 +375,44 @@ fn confirm(msg: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+/// 管理 repo の bare clone のパス(`MEGURI_HOME/repos/<name>.git`)。
+fn bare_path(name: &str) -> Result<PathBuf> {
+    Ok(db::repos_dir()?.join(format!("{name}.git")))
+}
+
+fn repo(conn: &rusqlite::Connection, c: RepoCmd) -> Result<()> {
+    match c {
+        RepoCmd::Add { name, from, branch } => {
+            // 先に登録(名前の一意性チェック)→ clone。clone 失敗なら登録を戻す。
+            store::add_repo(conn, &name, &from, &branch)?;
+            let bare = bare_path(&name)?;
+            if let Err(e) = gitops::bare_clone(&from, &bare) {
+                let _ = store::remove_repo(conn, &name);
+                return Err(e);
+            }
+            println!("added repo {name} (bare: {})", bare.display());
+        }
+        RepoCmd::Ls => {
+            for r in store::list_repos(conn)? {
+                println!("{}  [{}]  {}", r.name, r.default_branch, r.origin);
+            }
+        }
+        RepoCmd::Fetch { name } => {
+            store::get_repo_by_name(conn, &name)?;
+            gitops::fetch(&bare_path(&name)?)?;
+            println!("fetched {name}");
+        }
+        RepoCmd::Rm { name } => {
+            store::get_repo_by_name(conn, &name)?;
+            store::remove_repo(conn, &name)?;
+            let bare = bare_path(&name)?;
+            let _ = std::fs::remove_dir_all(&bare);
+            println!("removed repo {name}");
+        }
+    }
+    Ok(())
 }
 
 fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {

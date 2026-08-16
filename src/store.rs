@@ -7,6 +7,16 @@ use rusqlite::{params, Connection};
 // ---- 型 ----
 
 #[derive(Debug, Clone)]
+pub struct Repo {
+    /// o14(Intent↔repo 紐付け)で使う。
+    #[allow(dead_code)]
+    pub id: i64,
+    pub name: String,
+    pub origin: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Intent {
     pub id: i64,
     pub title: String,
@@ -71,6 +81,46 @@ pub struct Work {
     pub objective: String,
     pub executor: String, // 'ai' | 'human'
     pub state: String,
+}
+
+// ---- Repo ----
+
+pub fn add_repo(conn: &Connection, name: &str, origin: &str, default_branch: &str) -> Result<i64> {
+    if name.trim().is_empty() {
+        bail!("repo name cannot be empty");
+    }
+    conn.execute(
+        "INSERT INTO repos (name, origin, default_branch) VALUES (?1, ?2, ?3)",
+        params![name, origin, default_branch],
+    )
+    .with_context(|| format!("cannot add repo {name:?} (name already used?)"))?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_repos(conn: &Connection) -> Result<Vec<Repo>> {
+    let mut stmt = conn.prepare("SELECT id, name, origin, default_branch FROM repos ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Repo { id: r.get(0)?, name: r.get(1)?, origin: r.get(2)?, default_branch: r.get(3)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_repo_by_name(conn: &Connection, name: &str) -> Result<Repo> {
+    conn.query_row(
+        "SELECT id, name, origin, default_branch FROM repos WHERE name = ?1",
+        [name],
+        |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, origin: r.get(2)?, default_branch: r.get(3)? }),
+    )
+    .with_context(|| format!("no repo named {name:?}"))
+}
+
+pub fn remove_repo(conn: &Connection, name: &str) -> Result<()> {
+    if conn.execute("DELETE FROM repos WHERE name = ?1", [name])? == 0 {
+        bail!("no repo named {name:?}");
+    }
+    Ok(())
 }
 
 // ---- Intent ----

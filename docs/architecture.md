@@ -31,7 +31,7 @@ spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconci
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
-| `src/gitops.rs` | **v0.2 execution の土台(o13)**: base から隔離 worktree + ブランチを切り base SHA を記録。`.meguri/` を共有 exclude へ。まだ CLI 未配線(o14 spawn で使う)。実 git の単体テストあり |
+| `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` から使う。両 backend の実機単体テストあり |
 
 ## ドメインモデル(§4/§5)
@@ -55,6 +55,8 @@ spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconci
 主内容(タイトル / 宣言 / 目的)は**位置引数**。修飾は平易なフラグ。
 
 ```
+meguri repo    add <name> --from <url|path> [--branch <b>]  # bare clone を作って登録
+meguri repo    ls | fetch <name> | rm <name>
 meguri intent  add "<title>" [--description <d>]
 meguri intent  ls
 meguri intent  edit <i> [--title <t>] [--description <d>]
@@ -111,6 +113,8 @@ meguri plan run    [--intent <i>] [--agent <cmd>] [--detach] [--grace-secs N] [-
 ```
 ~/.meguri/meguri.db          sqlite(MEGURI_HOME で移動可)
 ~/.meguri/config.toml        設定(lang / agent、無ければ既定)
+~/.meguri/repos/<name>.git   管理 repo の bare clone(repo add で作る)
+~/.meguri/worktrees/         Work の隔離 worktree(o14 で使う)
 ~/.meguri/proposal.json      手動 planning の作業ファイル(既定パス)
 ~/.meguri/proposals/i<N>.json  `plan run` の Intent 別 proposal(並行 Intent が衝突しない)
 ~/.meguri/plan-prompt-i<N>.md  `plan run` がエージェントに読ませるプロンプト

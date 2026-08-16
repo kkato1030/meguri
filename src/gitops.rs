@@ -34,6 +34,39 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `-C` を付けない git(clone のように repo の外で走らせるもの)。
+fn git_top(args: &[&str]) -> Result<String> {
+    let out = Command::new("git").args(args).output().context("failed to run git")?;
+    if !out.status.success() {
+        bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `origin`(url または path)から `dest` に **bare clone** を作る。
+/// `--mirror` は使わない(refspec が暴れる、v1 の学び)。fetch refspec を
+/// remote-tracking(`refs/remotes/origin/*`)に張り、以降 `fetch` で更新できるようにする。
+pub fn bare_clone(origin: &str, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        bail!("bare clone already exists: {}", dest.display());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let dest_str = dest.to_str().context("non-utf8 dest")?;
+    git_top(&["clone", "--bare", origin, dest_str])?;
+    // bare clone は refs/heads を直接持つので、remote-tracking を張り直して fetch を通す。
+    git(dest, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"])?;
+    git(dest, &["fetch", "--quiet", "origin"])?;
+    Ok(())
+}
+
+/// bare clone を origin から更新する。
+pub fn fetch(bare: &Path) -> Result<()> {
+    git(bare, &["fetch", "--quiet", "origin"])?;
+    Ok(())
+}
+
 /// `repo` の `base` 先端から、`worktrees_dir/<key>` に隔離 worktree を作り、
 /// 専用ブランチ `meguri/<key>` を切る。base SHA を記録して返す。
 pub fn create_worktree(repo: &Path, base: &str, worktrees_dir: &Path, key: &str) -> Result<Worktree> {
@@ -135,6 +168,32 @@ mod tests {
         remove_worktree(&repo, &wt).unwrap();
         assert!(!wt.path.exists());
         let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wtdir);
+    }
+
+    #[test]
+    fn worktree_off_bare_clone() {
+        // main ブランチを持つ元 repo を作る。
+        let src = std::env::temp_dir().join(format!("meguri-src-{}-{}", std::process::id(), rand_key()));
+        std::fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("README.md"), "hi").unwrap();
+        sh(&src, &["add", "."]);
+        sh(&src, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"]);
+
+        // bare clone を作り、そこから worktree を切る(= o14 の経路)。
+        let bare = std::env::temp_dir().join(format!("meguri-bare-{}-{}.git", std::process::id(), rand_key()));
+        bare_clone(src.to_str().unwrap(), &bare).unwrap();
+        fetch(&bare).unwrap();
+
+        let wtdir = std::env::temp_dir().join(format!("meguri-wtb-{}-{}", std::process::id(), rand_key()));
+        let key = format!("w{}", rand_key());
+        let wt = create_worktree(&bare, "main", &wtdir, &key).unwrap();
+        assert!(wt.path.join("README.md").exists());
+
+        remove_worktree(&bare, &wt).unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&wtdir);
     }
 }
