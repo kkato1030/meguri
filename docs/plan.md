@@ -177,29 +177,51 @@ intent:
 
 ## Outcome(グラフのノード)
 
-到達したい状態。真か偽かで評価できる条件として書く。Intent の **Desired State はトップレベルの Outcome 群**であり、粗い Outcome(マイルストーン)は子 Outcome の充足の合成として表す。
+到達したい状態。Intent の **Desired State はトップレベルの Outcome 群**であり、粗い Outcome(マイルストーン)は子 Outcome の充足の合成として表す。
 
 Outcome は以下を持つ。
 
 * **statement**: 到達状態の宣言(「〜されている」)
-* **predicate**: 充足判定の手段(test / check / 人間判断)。機械判定できない Outcome は人間判断にフォールバック(§14)
 * **requires**: 前提となる他 Outcome(辺)
-* **satisfied**: 充足しているか(**保存しない — predicate から毎回導出**)
+* **verify**: この状態を満たせたかの確かめ方(下記)。省略した Outcome は **まとめ節点(マイルストーン)**
+
+### verify(確かめ方)と satisfied(達成)を分ける
+
+同じ Outcome について、時間軸の違う 2 つを別に持つ。
+
+* **verify** — ある作業ブランチが狙った状態を満たしているか。**Work の完了時**に評価する(§9.1)。Human Gate に上げてよいかの門番。
+* **satisfied** — Outcome が今ほんとうに達成されているか。**保存しない・導出値**。
+
+verify の種類は 3 つ(**v0.1 はこの 3 つに絞る**):
+
+| verify | 確かめ方 | satisfied(達成)の定義 |
+|---|---|---|
+| `command` | シェルコマンドが exit 0(テスト・ビルド・検査) | 担当 Work が verify を通り、かつ**マージされた** |
+| `human` | 人が「達成」と表明 | 人が表明したら達成。**計画やり直しまで維持(sticky)** |
+| (省略=まとめ節点) | 自分では確かめない | **子(requires)が全て satisfied** になったら達成 |
+
+`command` は権威 tree のコミットでキャッシュし、**コードが変われば自動で再評価**(先祖返りで達成が自動的に外れる)。`human` は sticky。どの Outcome も verify を必ず持つ(既定 `human`)— 計画対話で「達成をどう確かめる?」を毎回問わせ、受け入れ基準を鋭くするため。
+
+**v0.1 では作らない(が塞がない)確かめ方**: 「本番で実際に動いている(URL が応答する等の runtime 観測)」「外部ステータス(CI 緑等)」。これらは**コードが変わらなくても状態が変わる**ので、コミットでのキャッシュに乗らず別の観測サイクルが要る。delivery を名乗る以上ロードマップには残す(§23 Q4)。
 
 例:
 
 ```yaml
 outcome:
   id: outcome-042
-  statement: "OAuth callback で不正な state が拒否される"
-  predicate:
-    kind: check          # test | check | human
-    detail: "integration test: state 検証スイートが通る"
+  statement: "OAuth callback で不正な state が弾かれる"
+  verify:
+    kind: command          # command | human | (省略=まとめ節点)
+    command: "cargo test state_validation"
   requires:
-    - outcome-018           # "OAuth プロバイダ設定が存在する"
+    - outcome-018          # "OAuth プロバイダ設定が存在する"
+# satisfied は導出:
+#   command → 担当 Work が verify 通過 + マージ済み。tree のコミット変化で自動再評価
+#   human   → 人の達成表明が有効な間(計画やり直しまで sticky)
+#   まとめ  → requires が全て satisfied
 ```
 
-Outcome は AI が自動決定するのではなく、Human + AI の対話によって合意する(§7)。充足判定は MVP では機械化を強制しない — predicate が `human` の Outcome は **手動 trigger + 人間判断**でよい(§14)。
+Outcome は AI が自動決定するのではなく、Human + AI の対話によって合意する(§7)。
 
 ## Work(Outcome を満たす手段)
 
@@ -262,7 +284,9 @@ Blocked(導出: 前提が未充足)
   O5 ← O2
 ```
 
-「ready な Outcome に Work を起こす」が実行の入口(§9)。「Outcome が satisfied か」の判定が完了の基準(§9.1)。
+「ready な Outcome に Work を起こす」が実行の入口(§9)。「Outcome が satisfied か」が完了の基準(§9.1)。
+
+**依存の解禁は satisfied(= マージ済み)基準【案A】**: 下流の着手は上流がマージされるまで待つ。単純・安全だが、鎖状の依存は「人間のマージ待ち」で直列化する。効くのは長い鎖のみ(横に広い形は上流マージで一斉に ready)なので、当面は**計画対話で鎖を短く・横に広く保つ**ことで緩和する。throughput が実測で問題になったら、上流が verify を通った時点で下流を解禁する【案B(stacked)】を将来レバーとして入れる(§23 Q4)。なお進みの本当の律速は人間レビューのゲートであり、案B は実装の並行化にしか効かない。
 
 ---
 
@@ -435,23 +459,26 @@ meguri 側の独立検証
 Agent に渡す Context には最低限以下を含める。
 
 * Intent
-* Desired State
-* 対象 Work
-* Acceptance Criteria
-* 関連 Work
+* serving Outcome(statement = 達成すべき状態、verify = 達成の確かめ方)
+* 対象 Work(objective)
+* 関連する前提 Outcome(requires)とその状態
 * Repository context
 * Coding / project instructions
-* 完了の作法(result ファイル形式・コミット作法・検証があることの予告)
+* 完了の作法(result ファイル形式・コミット作法・verify があることの予告)
 
-## 9.1 独立検証(trust-but-verify)
+## 9.1 独立検証(trust-but-verify)= Outcome の verify
 
-Agent が success を申告したときだけ、meguri が独立に検証する:
+Agent が success を申告したときだけ、meguri が独立に検証する。これは **serving Outcome の `verify` を、その Work のブランチで評価すること**に等しい(§4):
 
 1. working tree が clean(未 commit の変更なし)
 2. base から commit が進んでいる(何もせず success を弾く)
-3. check_command が通る(設定時。meguri 自身が実行)
+3. **Outcome の `verify` が通る**:
+   - `verify.kind = command` → そのコマンドをブランチで実行し exit 0
+   - `verify.kind = human` → 機械検証は無い。そのまま Human Gate(§13)の人間判断が verify を兼ねる
 
 検証落ちは fix turn として Agent に差し戻す(回数上限付き)。上限超過は `failed`。
+
+**verify を通っただけでは Outcome は satisfied ではない**。satisfied になるのは、この後 Human Gate を経て **マージされた**とき(§4 の satisfied 定義)。verify(ブランチが良さそう)と satisfied(実際に届いた)は別の事実。
 
 ## 9.2 失敗経路
 
@@ -559,7 +586,7 @@ meguri の中核。**level-triggered** で動く: **Outcome の identity だけ�
 reconcile(outcome):
   Observe(この Outcome と前提の状態を読み直す)
      ↓
-  satisfied?(predicate で判定)── Yes → Done(下流 Outcome の ready 導出が変わる)
+  satisfied?(§4 の種類ごとの定義で判定)── Yes → Done(下流 Outcome の ready 導出が変わる)
      │ No
      ↓
   requires が全て satisfied?(導出)── No → Wait(blocked。何もしない)
@@ -1004,3 +1031,17 @@ accepted       採用判断   → 人間
 - **defer**: レビュー phase の actor 可変化(`human` | `ai-reviewer`、異種モデル相互レビュー = 旧 6-role routing)は後回し。v0.x は人間レビュー固定(§13)。
 
 Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす手段(Work)の内訳」として phase/executor を持つ。方針は固まっており、残るは v0.1 p1 でのスキーマと実行フローの詳細確定。
+
+## Q4. 達成の確かめ方と依存の解禁 【一部決定 / 一部将来レバー・2026-08-16】
+
+**決定(本文 §4/§5/§9.1 に反映済み)**:
+- **verify(検証)と satisfied(達成)を分ける**。verify = 作業ブランチが狙い通りか(Work 完了時に評価)、satisfied = 実際に達成(導出値)。
+- **verify は v0.1 で 3 種類**: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ 省略=まとめ節点(子が全部 satisfied)。既定 `human`。
+- **satisfied の定義**: command → 担当 Work が verify 通過 + マージ済み(コミット変化で自動再評価)/ human → 人の表明が有効な間 / まとめ → requires 充足。
+- **依存の解禁は satisfied 基準【案A】**(下流は上流マージ後に着手)。
+
+**将来レバー(v0.1 では作らないが塞がない)**:
+- **案B(stacked 実行)**: 上流が verify を通った時点で下流を解禁(上流ブランチ基点で積む)。鎖状依存の直列化を緩めるが、上流がレビューで覆ると下流は作り直し。旧 meguri は「土台が動く」痛みを実測済み。throughput が実測で問題化したら投入。実装は worktree を上流ブランチ基点にする仕組みが v0.2 に増える。
+- **runtime / 外部ステータス確認**: 「本番で実際に動いている(URL 応答等)」「CI 緑等の外部状態」を satisfied の確かめ方に追加。コードが変わらなくても状態が変わるので、コミットキャッシュでなく別の観測サイクルが要る。**delivery を名乗る以上ロードマップに残す**(候補: v0.4 前後)。
+
+**より深い律速の所在**: 進みの本当のボトルネックは依存の張り方ではなく**人間レビューのゲート**。案B は実装の並行化にしか効かない。レビューの捌き方(pr-reviewer の役割・自動化の範囲)は v0.4 以降の独立論点(Q3 の defer とも接続、旧 review-convergence 診断を参照)。
