@@ -52,6 +52,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     // 既存 DB 向けの列追加(新規 DB は SCHEMA に含むので二重にならないよう存在確認)。
     add_column_if_missing(conn, "outcomes", "description", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "intents", "repo_id", "INTEGER")?;
+    add_column_if_missing(conn, "works", "worktree_path", "TEXT")?;
+    add_column_if_missing(conn, "works", "branch", "TEXT")?;
+    add_column_if_missing(conn, "works", "base_sha", "TEXT")?;
     Ok(())
 }
 
@@ -81,7 +85,8 @@ pub(crate) const SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS intents (
             id          INTEGER PRIMARY KEY,
             title       TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT ''
+            description TEXT NOT NULL DEFAULT '',
+            repo_id     INTEGER REFERENCES repos(id)   -- どの repo で実行するか(任意)
         );
 
         CREATE TABLE IF NOT EXISTS outcomes (
@@ -104,10 +109,13 @@ pub(crate) const SCHEMA: &str = r#"
         );
 
         CREATE TABLE IF NOT EXISTS works (
-            id        INTEGER PRIMARY KEY,
-            serves_id INTEGER NOT NULL REFERENCES outcomes(id),
-            objective TEXT NOT NULL,
-            executor  TEXT NOT NULL DEFAULT 'ai',       -- 'ai' | 'human'
-            state     TEXT NOT NULL DEFAULT 'planned'
+            id            INTEGER PRIMARY KEY,
+            serves_id     INTEGER NOT NULL REFERENCES outcomes(id),
+            objective     TEXT NOT NULL,
+            executor      TEXT NOT NULL DEFAULT 'ai',   -- 'ai' | 'human'
+            state         TEXT NOT NULL DEFAULT 'planned',
+            worktree_path TEXT,                          -- spawn 時に埋まる
+            branch        TEXT,
+            base_sha      TEXT
         );
         "#;

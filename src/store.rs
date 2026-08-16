@@ -21,6 +21,8 @@ pub struct Intent {
     pub id: i64,
     pub title: String,
     pub description: String,
+    /// どの repo で実行するか(o14 で紐付け。未紐付けは None)。
+    pub repo_id: Option<i64>,
 }
 
 /// verify の種類(§4)。command/human/rollup の 3 つ。
@@ -81,6 +83,12 @@ pub struct Work {
     pub objective: String,
     pub executor: String, // 'ai' | 'human'
     pub state: String,
+    /// spawn 時に埋まる worktree 情報(§9 の作業場)。
+    pub worktree_path: Option<String>,
+    #[allow(dead_code)]
+    pub branch: Option<String>,
+    #[allow(dead_code)]
+    pub base_sha: Option<String>,
 }
 
 // ---- Repo ----
@@ -134,13 +142,40 @@ pub fn add_intent(conn: &Connection, title: &str, description: &str) -> Result<i
 }
 
 pub fn list_intents(conn: &Connection) -> Result<Vec<Intent>> {
-    let mut stmt = conn.prepare("SELECT id, title, description FROM intents ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id, title, description, repo_id FROM intents ORDER BY id")?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(Intent { id: r.get(0)?, title: r.get(1)?, description: r.get(2)? })
+            Ok(Intent { id: r.get(0)?, title: r.get(1)?, description: r.get(2)?, repo_id: r.get(3)? })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+pub fn get_intent(conn: &Connection, id: i64) -> Result<Intent> {
+    conn.query_row(
+        "SELECT id, title, description, repo_id FROM intents WHERE id = ?1",
+        [id],
+        |r| Ok(Intent { id: r.get(0)?, title: r.get(1)?, description: r.get(2)?, repo_id: r.get(3)? }),
+    )
+    .with_context(|| format!("no intent i{id}"))
+}
+
+/// Intent に repo を紐付ける(o14)。
+pub fn set_intent_repo(conn: &Connection, intent_id: i64, repo_id: i64) -> Result<()> {
+    if !intent_exists(conn, intent_id)? {
+        bail!("intent i{intent_id} does not exist");
+    }
+    conn.execute("UPDATE intents SET repo_id = ?2 WHERE id = ?1", params![intent_id, repo_id])?;
+    Ok(())
+}
+
+pub fn get_repo(conn: &Connection, id: i64) -> Result<Repo> {
+    conn.query_row(
+        "SELECT id, name, origin, default_branch FROM repos WHERE id = ?1",
+        [id],
+        |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, origin: r.get(2)?, default_branch: r.get(3)? }),
+    )
+    .with_context(|| format!("no repo with id {id}"))
 }
 
 pub fn intent_exists(conn: &Connection, id: i64) -> Result<bool> {
@@ -392,24 +427,35 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
             objective: r.get(2)?,
             executor: r.get(3)?,
             state: r.get(4)?,
+            worktree_path: r.get(5)?,
+            branch: r.get(6)?,
+            base_sha: r.get(7)?,
         })
     };
+    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha";
     let rows: Vec<Work> = match serves_id {
         Some(sid) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, serves_id, objective, executor, state FROM works WHERE serves_id = ?1 ORDER BY id",
-            )?;
+            let mut stmt = conn
+                .prepare(&format!("SELECT {COLS} FROM works WHERE serves_id = ?1 ORDER BY id"))?;
             let rows = stmt.query_map([sid], map)?.collect::<rusqlite::Result<Vec<Work>>>()?;
             rows
         }
         None => {
-            let mut stmt = conn
-                .prepare("SELECT id, serves_id, objective, executor, state FROM works ORDER BY id")?;
+            let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM works ORDER BY id"))?;
             let rows = stmt.query_map([], map)?.collect::<rusqlite::Result<Vec<Work>>>()?;
             rows
         }
     };
     Ok(rows)
+}
+
+/// spawn 時に worktree 情報を Work に書き込む(§9 の作業場)。
+pub fn set_work_worktree(conn: &Connection, id: i64, path: &str, branch: &str, base_sha: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE works SET worktree_path = ?2, branch = ?3, base_sha = ?4 WHERE id = ?1",
+        params![id, path, branch, base_sha],
+    )?;
+    Ok(())
 }
 
 fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
