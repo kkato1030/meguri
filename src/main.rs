@@ -3,6 +3,7 @@
 //! ここで扱うのは「グラフを作る・見る」まで。planning 対話(pane + proposal.json)や
 //! 実行系(pane で Work を回す)は後続の増分(p2 以降)。
 
+mod config;
 mod db;
 mod derive;
 mod plan;
@@ -18,7 +19,7 @@ use clap::{Parser, Subcommand};
 use store::Verify;
 
 #[derive(Parser)]
-#[command(name = "meguri", version, about = "Intent を Outcome Graph に変換し実行・判断を管理する")]
+#[command(name = "meguri", version, about = "Turn intent into an outcome graph and coordinate execution and judgment")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -26,49 +27,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Intent(実現したいこと。グラフの根)
+    /// Intent (what you want; the root of a graph)
     #[command(subcommand)]
     Intent(IntentCmd),
-    /// Outcome(到達したい状態。グラフのノード)
+    /// Outcome (a desired state; a node in the graph)
     #[command(subcommand)]
     Outcome(OutcomeCmd),
-    /// Work(Outcome を満たす手段)
+    /// Work (a means to satisfy an Outcome)
     #[command(subcommand)]
     Work(WorkCmd),
-    /// Outcome Graph を表示(状態は導出)
+    /// Show the Outcome Graph (state is derived)
     Graph {
-        /// この Intent に絞る(例: i1 / 1)
+        /// Limit to this Intent (e.g. i1 / 1)
         #[arg(long)]
         intent: Option<String>,
-        /// Mermaid で出力
+        /// Output as Mermaid
         #[arg(long)]
         mermaid: bool,
     },
-    /// Planning 対話(pane で提案 → proposal.json → 承認で反映)
+    /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
     Plan(PlanCmd),
 }
 
 #[derive(Subcommand)]
 enum PlanCmd {
-    /// エージェントに渡す planning プロンプトを出力
+    /// Print the planning prompt to hand to an agent
     Prompt {
         #[arg(long)]
         intent: Option<String>,
-        /// proposal.json の書き出し先(既定: MEGURI_HOME/proposal.json)
+        /// Where the agent should write proposal.json (default: MEGURI_HOME/proposal.json)
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// proposal.json を検証し、追加される Outcome を表示
+    /// Validate proposal.json and show the outcomes it would add
     Diff {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// proposal.json を承認して反映(additive)
+    /// Approve proposal.json and apply it (additive)
     Apply {
         #[arg(long)]
         file: Option<PathBuf>,
-        /// 確認プロンプトを飛ばす
+        /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
     },
@@ -76,9 +77,9 @@ enum PlanCmd {
 
 #[derive(Subcommand)]
 enum IntentCmd {
-    /// 例: meguri intent add "認証を production-ready にする"
+    /// e.g. meguri intent add "Make auth production-ready"
     Add {
-        /// タイトル
+        /// Title
         title: String,
         #[arg(long, default_value = "")]
         description: String,
@@ -88,20 +89,20 @@ enum IntentCmd {
 
 #[derive(Subcommand)]
 enum OutcomeCmd {
-    /// 例: meguri outcome add "不正な state が弾かれる" --check "cargo test" --needs o1
+    /// e.g. meguri outcome add "Invalid state is rejected" --check "cargo test" --needs o1
     Add {
-        /// 到達状態の宣言(「〜されている」)
+        /// The desired state ("... is in place")
         statement: String,
-        /// 所属 Intent(省略時: Intent が 1 件ならそれ。例: i1 / 1)
+        /// Owning Intent (default: the only Intent if there is one; e.g. i1 / 1)
         #[arg(long)]
         intent: Option<String>,
-        /// verify=command: 達成を確かめるコマンド(exit 0 で達成)
+        /// verify=command: command that confirms achievement (exit 0)
         #[arg(long)]
         check: Option<String>,
-        /// verify=rollup: まとめ節点(子が全て満たされたら達成)。--check と排他
+        /// verify=rollup: milestone (achieved when all children are). Conflicts with --check
         #[arg(long)]
         milestone: bool,
-        /// 前提 Outcome(カンマ区切り。例: o1,o2)
+        /// Prerequisite Outcomes (comma-separated, e.g. o1,o2)
         #[arg(long)]
         needs: Option<String>,
     },
@@ -109,22 +110,22 @@ enum OutcomeCmd {
         #[arg(long)]
         intent: Option<String>,
     },
-    /// 達成を表明する(verify=human のみ)
+    /// Mark as achieved (verify=human only)
     Done { id: String },
-    /// 達成表明を外す
+    /// Clear the achieved mark
     Undone { id: String },
 }
 
 #[derive(Subcommand)]
 enum WorkCmd {
-    /// 例: meguri work add "state 検証を実装" --for o2
+    /// e.g. meguri work add "Implement state validation" --for o2
     Add {
-        /// 何をするか
+        /// What to do
         objective: String,
-        /// 満たそうとする Outcome(例: o2 / 2)
+        /// The Outcome this serves (e.g. o2 / 2)
         #[arg(long)]
         r#for: String,
-        /// 実装フェーズの担当(ai | human)
+        /// Who does the implementation phase (ai | human)
         #[arg(long, default_value = "ai")]
         by: String,
     },
@@ -166,7 +167,8 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
     match c {
         PlanCmd::Prompt { intent, file } => {
             let out = path(file)?;
-            let text = plan::prompt(conn, intent.as_deref(), &out)?;
+            let lang = config::load()?.lang;
+            let text = plan::prompt(conn, intent.as_deref(), &out, &lang)?;
             print!("{text}");
         }
         PlanCmd::Diff { file } => {
@@ -178,13 +180,13 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
             let p = path(file)?;
             let plan = plan::resolve(conn, &plan::load(&p)?)?;
             print!("{}", plan::diff_text(&plan));
-            if !yes && !confirm("反映しますか?")? {
-                println!("中止");
+            if !yes && !confirm("Apply?")? {
+                println!("cancelled");
                 return Ok(());
             }
             let ids = plan::apply(conn, &plan)?;
             let list: Vec<String> = ids.iter().map(|i| format!("o{i}")).collect();
-            println!("反映: {} を追加", list.join(", "));
+            println!("applied: added {}", list.join(", "));
         }
     }
     Ok(())
@@ -203,7 +205,7 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
     match c {
         IntentCmd::Add { title, description } => {
             let id = store::add_intent(conn, &title, &description)?;
-            println!("i{id} を作成");
+            println!("created i{id}");
         }
         IntentCmd::Ls => {
             for it in store::list_intents(conn)? {
@@ -222,14 +224,14 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
         OutcomeCmd::Add { statement, intent, check, milestone, needs } => {
             let iid = resolve_intent(conn, intent.as_deref())?;
             let verify = match (check, milestone) {
-                (Some(_), true) => bail!("--check と --milestone は同時指定できない"),
+                (Some(_), true) => bail!("--check and --milestone cannot be combined"),
                 (Some(cmd), false) => Verify::Command(cmd),
                 (None, true) => Verify::Rollup,
                 (None, false) => Verify::Human, // 既定
             };
             let reqs = parse_id_list(needs.as_deref(), 'o')?;
             let id = store::add_outcome(conn, iid, &statement, &verify, &reqs)?;
-            println!("o{id} を作成([{}] {})", verify.kind_str(), statement);
+            println!("created o{id} ([{}] {})", verify.kind_str(), statement);
         }
         OutcomeCmd::Ls { intent } => {
             let iid = intent.map(|s| parse_id(&s, 'i')).transpose()?;
@@ -246,12 +248,12 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
         OutcomeCmd::Done { id } => {
             let oid = parse_id(&id, 'o')?;
             store::set_human_satisfied(conn, oid, true)?;
-            println!("o{oid} を達成に(human 表明)");
+            println!("marked o{oid} done (human)");
         }
         OutcomeCmd::Undone { id } => {
             let oid = parse_id(&id, 'o')?;
             store::set_human_satisfied(conn, oid, false)?;
-            println!("o{oid} の達成表明を外した");
+            println!("cleared o{oid} done mark");
         }
     }
     Ok(())
@@ -262,7 +264,7 @@ fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
         WorkCmd::Add { objective, r#for, by } => {
             let sid = parse_id(&r#for, 'o')?;
             let id = store::add_work(conn, sid, &objective, &by)?;
-            println!("w{id} を作成(for o{sid}, by {by})");
+            println!("created w{id} (for o{sid}, by {by})");
         }
         WorkCmd::Ls { r#for } => {
             let sid = r#for.map(|s| parse_id(&s, 'o')).transpose()?;
@@ -281,17 +283,17 @@ fn resolve_intent(conn: &rusqlite::Connection, opt: Option<&str>) -> Result<i64>
     if let Some(s) = opt {
         let id = parse_id(s, 'i')?;
         if !store::intent_exists(conn, id)? {
-            bail!("intent i{id} が存在しない");
+            bail!("intent i{id} does not exist");
         }
         return Ok(id);
     }
     let intents = store::list_intents(conn)?;
     match intents.as_slice() {
-        [] => bail!("Intent がまだ無い(先に `meguri intent add \"...\"`)"),
+        [] => bail!("no intents yet (run `meguri intent add \"...\"` first)"),
         [only] => Ok(only.id),
         many => {
             let ids: Vec<String> = many.iter().map(|i| format!("i{}", i.id)).collect();
-            bail!("Intent が複数あるので --intent で指定を({})", ids.join(", "))
+            bail!("multiple intents exist; pass --intent ({})", ids.join(", "))
         }
     }
 }
@@ -302,7 +304,7 @@ fn parse_id(s: &str, prefix: char) -> Result<i64> {
     let digits = t.strip_prefix(prefix).unwrap_or(t);
     digits
         .parse::<i64>()
-        .with_context(|| format!("id として解釈できない: {s:?}(例: {prefix}1 か 1)"))
+        .with_context(|| format!("not a valid id: {s:?} (e.g. {prefix}1 or 1)"))
 }
 
 /// "o1,o2" → [1, 2]。None/空なら空。

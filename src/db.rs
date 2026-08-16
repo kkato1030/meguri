@@ -12,12 +12,12 @@ pub fn meguri_home() -> Result<PathBuf> {
     let home = match std::env::var_os("MEGURI_HOME") {
         Some(h) => PathBuf::from(h),
         None => {
-            let h = std::env::var_os("HOME").context("HOME が未設定")?;
+            let h = std::env::var_os("HOME").context("HOME is not set")?;
             PathBuf::from(h).join(".meguri")
         }
     };
     std::fs::create_dir_all(&home)
-        .with_context(|| format!("meguri home を作れない: {}", home.display()))?;
+        .with_context(|| format!("cannot create meguri home: {}", home.display()))?;
     Ok(home)
 }
 
@@ -30,7 +30,7 @@ fn db_path() -> Result<PathBuf> {
 pub fn open() -> Result<Connection> {
     let path = db_path()?;
     let conn = Connection::open(&path)
-        .with_context(|| format!("DB を開けない: {}", path.display()))?;
+        .with_context(|| format!("cannot open DB: {}", path.display()))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     migrate(&conn)?;
     Ok(conn)

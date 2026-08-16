@@ -87,27 +87,28 @@ pub struct Plan {
 
 // ---- prompt(1) ----
 
-/// エージェントに渡す planning プロンプトを組み立てる。
-pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path) -> Result<String> {
+/// エージェントに渡す planning プロンプトを組み立てる。`lang` は statement を書く言語
+/// (自然言語名。config の lang)。
+pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path, lang: &str) -> Result<String> {
     let intent_id = resolve_intent(conn, intent_opt)?;
     let it = store::list_intents(conn)?
         .into_iter()
         .find(|i| i.id == intent_id)
-        .context("intent が消えた")?;
+        .context("intent disappeared")?;
     let existing = store::list_outcomes(conn, Some(intent_id))?;
 
     let mut s = String::new();
-    s.push_str("あなたは meguri の Planning を手伝う。以下の Intent を、到達したい状態\n");
-    s.push_str("(Outcome)の DAG に分解し、提案を JSON で書き出してほしい。\n\n");
+    s.push_str("You are helping plan work in meguri. Break the Intent below into a DAG of\n");
+    s.push_str("desired states (Outcomes) and write a JSON proposal.\n\n");
     s.push_str(&format!("# Intent (i{})\n{}\n", it.id, it.title));
     if !it.description.is_empty() {
         s.push_str(&format!("{}\n", it.description));
     }
     s.push('\n');
 
-    s.push_str("# 既存の Outcome(重複を避け、前提にする時は下の o<id> で参照)\n");
+    s.push_str("# Existing Outcomes (avoid duplicates; reference one as a prerequisite by its o<id>)\n");
     if existing.is_empty() {
-        s.push_str("(まだ無い)\n");
+        s.push_str("(none yet)\n");
     } else {
         for o in &existing {
             s.push_str(&format!("- o{} [{}] {}\n", o.id, o.verify.kind_str(), o.statement));
@@ -115,53 +116,58 @@ pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path) -> R
     }
     s.push('\n');
 
+    s.push_str("# Instructions\n");
+    s.push_str("- Decompose the Intent into Outcomes phrased as desired *states* (\"... is in place\"), not tasks.\n");
+    s.push_str(&format!("- Write each statement in {lang}.\n"));
     s.push_str(
-        r#"# 依頼
-- Intent を「〜されている」という到達状態(Outcome)に分解する。作業(タスク)ではなく状態を書く。
-- 各 Outcome には verify(達成をどう確かめるか)を付ける:
-    - {"kind":"command","command":"<テスト/検査コマンド>"}  … コマンドが通れば達成
-    - {"kind":"human"}                                       … 人が判断(既定)
-    - {"kind":"rollup"}                                      … 自分では確かめず、needs が全て達成なら達成(マイルストーン)
-- 依存は needs に、proposal 内の ref 名か既存の "o<id>" を並べる。
-- 追加のみ(既存の削除・変更はしない)。
-
-# 出力(必ずこの JSON をファイルに書く)
+        r#"- Give each Outcome a `verify` (how we confirm it is achieved):
+    - {"kind":"command","command":"<test/check command>"}  - achieved when the command exits 0
+    - {"kind":"human"}                                       - a human judges it (default)
+    - {"kind":"rollup"}                                      - no check of its own; achieved when all `needs` are (a milestone)
+- List prerequisites in `needs`, using a proposal-local `ref` or an existing "o<id>".
+- Additive only: do not remove or modify existing Outcomes.
 "#,
     );
-    s.push_str(&format!("書き出し先: {}\n\n", out_path.display()));
-    s.push_str(SCHEMA_EXAMPLE);
+    s.push_str(&format!("- Set the proposal's \"intent\" to \"i{}\" (this Intent).\n\n", it.id));
+    s.push_str(&format!("Write the JSON to: {}\n\n", out_path.display()));
+    s.push_str(&schema_example(it.id));
     s.push('\n');
     Ok(s)
 }
 
-const SCHEMA_EXAMPLE: &str = r#"```json
-{
-  "intent": "i1",
+/// スキーマ例。`"intent"` は今の Intent の id を埋める(別 Intent に書かせないため)。
+fn schema_example(intent_id: i64) -> String {
+    format!(
+        r#"```json
+{{
+  "intent": "i{intent_id}",
   "outcomes": [
-    { "ref": "provider", "statement": "OAuth プロバイダ設定が存在する",
-      "verify": {"kind": "human"} },
-    { "ref": "state", "statement": "不正な state が弾かれる",
-      "verify": {"kind": "command", "command": "cargo test state_validation"},
-      "needs": ["provider"] },
-    { "ref": "e2e", "statement": "認証が E2E で検証されている",
-      "verify": {"kind": "rollup"}, "needs": ["state", "provider"] }
+    {{ "ref": "provider", "statement": "OAuth provider is configured",
+      "verify": {{"kind": "human"}} }},
+    {{ "ref": "state", "statement": "Invalid state is rejected",
+      "verify": {{"kind": "command", "command": "cargo test state_validation"}},
+      "needs": ["provider"] }},
+    {{ "ref": "e2e", "statement": "Auth is verified end-to-end",
+      "verify": {{"kind": "rollup"}}, "needs": ["state", "provider"] }}
   ]
+}}
+```"#
+    )
 }
-```"#;
 
 // ---- load + resolve(検証) ----
 
 pub fn load(path: &Path) -> Result<String> {
     std::fs::read_to_string(path)
-        .with_context(|| format!("proposal を読めない: {}(先に `meguri plan prompt`)", path.display()))
+        .with_context(|| format!("cannot read proposal: {} (run `meguri plan prompt` first)", path.display()))
 }
 
 /// proposal を検証し、追加計画に解決する。
 pub fn resolve(conn: &Connection, json: &str) -> Result<Plan> {
     let proposal: Proposal =
-        serde_json::from_str(json).context("proposal.json の JSON が壊れている")?;
+        serde_json::from_str(json).context("proposal.json is not valid JSON")?;
     if proposal.outcomes.is_empty() {
-        bail!("proposal に outcomes が無い");
+        bail!("proposal has no outcomes");
     }
     let intent_id = resolve_intent(conn, proposal.intent.as_deref())?;
 
@@ -169,13 +175,13 @@ pub fn resolve(conn: &Connection, json: &str) -> Result<Plan> {
     let mut refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for po in &proposal.outcomes {
         if po.r#ref.trim().is_empty() {
-            bail!("ref が空の Outcome がある");
+            bail!("an outcome has an empty ref");
         }
         if !refs.insert(po.r#ref.clone()) {
-            bail!("ref が重複している: {:?}", po.r#ref);
+            bail!("duplicate ref: {:?}", po.r#ref);
         }
         if po.statement.trim().is_empty() {
-            bail!("statement が空(ref {:?})", po.r#ref);
+            bail!("empty statement (ref {:?})", po.r#ref);
         }
     }
 
@@ -189,11 +195,11 @@ pub fn resolve(conn: &Connection, json: &str) -> Result<Plan> {
                 needs.push(NeedRef::Local(n.to_string()));
             } else {
                 let id = parse_o(n).with_context(|| {
-                    format!("needs {:?}(ref {:?})は proposal 内の ref でも既存 o<id> でもない", n, po.r#ref)
+                    format!("needs {:?} (ref {:?}) is neither a proposal ref nor an existing o<id>", n, po.r#ref)
                 })?;
                 let ok = store::get_outcome(conn, id).map(|o| o.intent_id == intent_id).unwrap_or(false);
                 if !ok {
-                    bail!("needs の o{id}(ref {:?})が存在しないか別 Intent", po.r#ref);
+                    bail!("needs o{id} (ref {:?}) does not exist or belongs to another intent", po.r#ref);
                 }
                 needs.push(NeedRef::Existing(id));
             }
@@ -211,7 +217,7 @@ pub fn resolve(conn: &Connection, json: &str) -> Result<Plan> {
 // ---- diff(3) ----
 
 pub fn diff_text(plan: &Plan) -> String {
-    let mut s = format!("i{} に {} 個の Outcome を追加:\n", plan.intent_id, plan.items.len());
+    let mut s = format!("Add {} outcome(s) to i{}:\n", plan.items.len(), plan.intent_id);
     for it in &plan.items {
         let needs = if it.needs.is_empty() {
             String::new()
@@ -224,7 +230,7 @@ pub fn diff_text(plan: &Plan) -> String {
                     NeedRef::Existing(id) => format!("o{id}"),
                 })
                 .collect();
-            format!("  ← {}", list.join(", "))
+            format!("  <- {}", list.join(", "))
         };
         s.push_str(&format!("  + [{}] {} (@{}){}\n", it.verify.kind_str(), it.statement, it.r#ref, needs));
     }
@@ -262,26 +268,26 @@ pub fn apply(conn: &Connection, plan: &Plan) -> Result<Vec<i64>> {
 
 fn parse_o(s: &str) -> Result<i64> {
     let t = s.trim();
-    t.strip_prefix('o').unwrap_or(t).parse::<i64>().with_context(|| format!("o<id> として解釈できない: {s:?}"))
+    t.strip_prefix('o').unwrap_or(t).parse::<i64>().with_context(|| format!("not a valid o<id>: {s:?}"))
 }
 
 /// outcome add と同じ Intent 解決(1 件なら省略可、複数なら要指定)。
 fn resolve_intent(conn: &Connection, opt: Option<&str>) -> Result<i64> {
     if let Some(s) = opt {
         let id = s.trim().strip_prefix('i').unwrap_or(s.trim()).parse::<i64>()
-            .with_context(|| format!("intent id として解釈できない: {s:?}"))?;
+            .with_context(|| format!("not a valid intent id: {s:?}"))?;
         if !store::intent_exists(conn, id)? {
-            bail!("intent i{id} が存在しない");
+            bail!("intent i{id} does not exist");
         }
         return Ok(id);
     }
     let intents = store::list_intents(conn)?;
     match intents.as_slice() {
-        [] => bail!("Intent がまだ無い(先に `meguri intent add \"...\"`)"),
+        [] => bail!("no intents yet (run `meguri intent add \"...\"` first)"),
         [only] => Ok(only.id),
         many => {
             let ids: Vec<String> = many.iter().map(|i| format!("i{}", i.id)).collect();
-            bail!("Intent が複数あるので proposal の \"intent\" か --intent で指定を({})", ids.join(", "))
+            bail!("multiple intents exist; set proposal \"intent\" or pass --intent ({})", ids.join(", "))
         }
     }
 }

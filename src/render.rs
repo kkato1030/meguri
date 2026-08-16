@@ -37,9 +37,9 @@ pub fn text(outcomes: &[Outcome]) -> String {
                     .map(|r| format!("o{r}"))
                     .collect();
                 if unmet.is_empty() {
-                    "  (前提: 全て充足)".to_string()
+                    "  (all prerequisites satisfied)".to_string()
                 } else {
-                    format!("  (未充足の前提: {})", unmet.join(", "))
+                    format!("  (unmet prerequisites: {})", unmet.join(", "))
                 }
             };
             out.push_str(&format!(
@@ -52,7 +52,7 @@ pub fn text(outcomes: &[Outcome]) -> String {
         }
     }
     if out.is_empty() {
-        out.push_str("(Outcome がありません)\n");
+        out.push_str("(no outcomes)\n");
     }
     out
 }
