@@ -418,19 +418,26 @@ fn launch_work(
     // o16: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
     match wait_result(mux.as_ref(), &pane, &result_path, opts.timeout) {
         Some(r) => {
-            let state = exec::state_for(&r.status);
-            store::set_work_state(conn, wid, state)?;
             println!("  agent reported [{}]: {}", r.status, r.summary);
-            println!("  w{wid} is now [{state}]");
-
-            // o17-o19: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
-            // まだ gate はしない(verified 化する rollup は o20)。
-            if state == "reported" {
-                print_check(verify::clean_tree(worktree)?);
-                print_check(verify::commits_ahead(worktree, base_sha)?);
-                if let Some(c) = verify::check_command(o, worktree)? {
+            let reported = exec::state_for(&r.status);
+            if reported == "reported" {
+                // success 報告: 申告を信じきらず meguri 側で独立検証して gate する(§3.5、o17-o20)。
+                let checks = verify::run_all(o, worktree, base_sha)?;
+                for c in &checks {
                     print_check(c);
                 }
+                let state = if verify::all_pass(&checks) { "verified" } else { "rework" };
+                store::set_work_state(conn, wid, state)?;
+                if state == "verified" {
+                    println!("  w{wid} passed verification → [verified]");
+                } else {
+                    let n = checks.iter().filter(|c| !c.pass).count();
+                    println!("  w{wid} failed verification ({n} check(s)) → [rework] (fix turn is o22)");
+                }
+            } else {
+                // failure / needs_human はエージェント申告のまま(検証しても意味がない)。
+                store::set_work_state(conn, wid, reported)?;
+                println!("  w{wid} is now [{reported}]");
             }
         }
         None => {
@@ -443,7 +450,7 @@ fn launch_work(
 }
 
 /// 検証子(o17-)の結果を 1 行で表示する。
-fn print_check(c: verify::Check) {
+fn print_check(c: &verify::Check) {
     let mark = if c.pass { "PASS" } else { "FAIL" };
     println!("  verify {}: {mark} — {}", c.name, c.detail);
 }

@@ -102,6 +102,21 @@ pub fn check_command(o: &Outcome, worktree: &Path) -> Result<Option<Check>> {
     Ok(Some(Check { name: "check_command", pass: false, detail }))
 }
 
+/// o20: 適用可能な全検証子を回して結果を集める(rollup の材料)。
+/// 体裁(clean_tree / commits_ahead)は常に。中身(check_command)は verify=command のときだけ。
+pub fn run_all(o: &Outcome, worktree: &Path, base_sha: &str) -> Result<Vec<Check>> {
+    let mut checks = vec![clean_tree(worktree)?, commits_ahead(worktree, base_sha)?];
+    if let Some(c) = check_command(o, worktree)? {
+        checks.push(c);
+    }
+    Ok(checks)
+}
+
+/// o20: 全 Check が pass なら verified の関門を通る。空でも「体裁 2 つ」は必ず含む。
+pub fn all_pass(checks: &[Check]) -> bool {
+    checks.iter().all(|c| c.pass)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +218,31 @@ mod tests {
         // human/rollup は検証対象外 = None。
         assert!(check_command(&outcome(Verify::Human), &repo).unwrap().is_none());
         assert!(check_command(&outcome(Verify::Rollup), &repo).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn run_all_rollup() {
+        let repo = temp_repo();
+        let (_, base, _) = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        // clean だが commit なし → commits_ahead で落ちる。
+        let checks = run_all(&outcome(Verify::Command("true".into())), &repo, &base).unwrap();
+        assert_eq!(checks.len(), 3);
+        assert!(!all_pass(&checks));
+
+        // f.txt を commit すると 3 つとも通る(check は test -f f.txt)。
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work"]);
+        let checks = run_all(&outcome(Verify::Command("test -f f.txt".into())), &repo, &base).unwrap();
+        assert!(all_pass(&checks), "{:?}", checks);
+
+        // human の Outcome は check_command 抜きの体裁 2 つだけ。
+        let checks = run_all(&outcome(Verify::Human), &repo, &base).unwrap();
+        assert_eq!(checks.len(), 2);
+        assert!(all_pass(&checks));
 
         let _ = std::fs::remove_dir_all(&repo);
     }

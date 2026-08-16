@@ -774,7 +774,8 @@ Outcome Graph を実際の AI coding に接続する。
   * [x] 検証①: working tree が clean か(o17: `verify::clean_tree`、reported 時に実行・表示。gate は o20)
   * [x] 検証②: base より commit が進んでいるか(o18: `verify::commits_ahead`、spawn 時の base SHA 基準)
   * [x] 検証③: check_command が exit 0 か(o19: `verify::check_command`、Outcome の verify=command を worktree で実行。human/rollup は対象外)
-  * [ ] 検証 rollup で verified の関門にする(o20)/ fix turn 差し戻し(o22)
+  * [x] 検証 rollup で verified の関門にする(o20: `run_all`+`all_pass`。全 pass=`verified` / 一つでも落ち=`rework`)
+  * [ ] fix turn 差し戻し(o22)
 * [ ] 沈黙 nudge / タイムアウト / pane 死亡の失敗経路
 * [ ] Artifact registration
 * [ ] `meguri accept` / `meguri rework`(ローカル Human Gate)
