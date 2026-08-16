@@ -2,7 +2,7 @@
 
 ## 1. 概要
 
-meguri は、**Intent を実行可能な Work Graph に変換し、人間と AI による実行・判断を通して Goal への到達を管理する Delivery Control Plane** を目指す。
+meguri は、**Intent を実行可能な Outcome Graph に変換し、人間と AI による実行・判断を通して Desired State への到達を管理する Delivery Control Plane** を目指す。
 
 初期は権威・実行・永続化をローカルに置く(local-first)。ただしこれは**現時点の設計の重心であって、恒久的な制約ではない**。実行系は将来リモート runtime へ拡張しうる(§8)し、権威や永続化の所在も要求が現れれば見直しうる。local-first は今の一手であり、meguri の定義ではない。
 
@@ -11,10 +11,10 @@ AI Agent 自体やコード実行環境を独自実装するのではなく、Cl
 meguri が所有するのは、主に以下とする。
 
 * Intent
-* Goal Graph(到達したい状態のグラフ。製品レベルでは "Work Graph" とも呼ぶが、実体はノード = Goal・Work = 手段。§4/§5、§23 Q1)
-* Desired State(= トップレベルの Goal 群)
+* Outcome Graph(到達したい状態(Outcome)のグラフ。ノード = Outcome・Work = それを満たす手段。§4/§5、§23 Q1)
+* Desired State(= トップレベルの Outcome 群)
 * Work の実行状態
-* Goal 間の依存関係
+* Outcome 間の依存関係
 * Human Gate
 * 実行・判断の履歴
 * 「現在どこまで進んでいるか」
@@ -35,7 +35,7 @@ Human + AI による対話
   ↓
 Desired State
   ↓
-Work Graph の提案
+Outcome Graph の提案
   ↓
 Human Approval
   ↓
@@ -96,7 +96,7 @@ meguri Work
     └─ その他 Artifact
 ```
 
-GitHub が存在しなくても Work Graph 自体は成立する。
+GitHub が存在しなくても Outcome Graph 自体は成立する。
 
 ### 3.3 Planning と Execution を分離する
 
@@ -109,7 +109,7 @@ AI Agent
   ↕
 meguri
   ↓
-Intent / Desired State / Work Graph
+Intent / Desired State / Outcome Graph
 
 
 Execution Plane
@@ -158,7 +158,7 @@ git changes
 
 # 4. Domain Model
 
-> **グラフの土台は Goal graph に確定した(§23 Q1、B 案)。** ノードは「到達したい状態(Goal)」であり、辺は Goal 間の requires/enables。**Work はノードではなく、Goal を「未充足 → 充足」に反転させる手段**として Goal にぶら下がる。これにより、旧構造で別々だった **Desired State / Acceptance Criteria / グラフ**が 1 つに畳まれる。ただし機構は dumb に保つ(1 Goal 1 アプローチ、OR 自動探索なし、自動 planner なし)。
+> **グラフの土台は Outcome graph に確定した(§23 Q1、B 案)。** ノードは「到達したい状態(Outcome)」であり、辺は Outcome 間の requires/enables。**Work はノードではなく、Outcome を「未充足 → 充足」に反転させる手段**として Outcome にぶら下がる。これにより、旧構造で別々だった **Desired State / Acceptance Criteria / グラフ**が 1 つに畳まれる。ただし機構は dumb に保つ(1 Outcome 1 アプローチ、OR 自動探索なし、自動 planner なし)。
 
 ## Intent
 
@@ -175,51 +175,51 @@ intent:
     本番利用可能な状態にする。
 ```
 
-## Goal(グラフのノード)
+## Outcome(グラフのノード)
 
-到達したい状態。真か偽かで評価できる条件として書く。Intent の **Desired State はトップレベルの Goal 群**であり、粗い Goal(マイルストーン)は子 Goal の充足の合成として表す。
+到達したい状態。真か偽かで評価できる条件として書く。Intent の **Desired State はトップレベルの Outcome 群**であり、粗い Outcome(マイルストーン)は子 Outcome の充足の合成として表す。
 
-Goal は以下を持つ。
+Outcome は以下を持つ。
 
 * **statement**: 到達状態の宣言(「〜されている」)
-* **predicate**: 充足判定の手段(test / check / 人間判断)。機械判定できない Goal は人間判断にフォールバック(§14)
-* **requires**: 前提となる他 Goal(辺)
+* **predicate**: 充足判定の手段(test / check / 人間判断)。機械判定できない Outcome は人間判断にフォールバック(§14)
+* **requires**: 前提となる他 Outcome(辺)
 * **satisfied**: 充足しているか(**保存しない — predicate から毎回導出**)
 
 例:
 
 ```yaml
-goal:
-  id: goal-042
+outcome:
+  id: outcome-042
   statement: "OAuth callback で不正な state が拒否される"
   predicate:
     kind: check          # test | check | human
     detail: "integration test: state 検証スイートが通る"
   requires:
-    - goal-018           # "OAuth プロバイダ設定が存在する"
+    - outcome-018           # "OAuth プロバイダ設定が存在する"
 ```
 
-Goal は AI が自動決定するのではなく、Human + AI の対話によって合意する(§7)。充足判定は MVP では機械化を強制しない — predicate が `human` の Goal は **手動 trigger + 人間判断**でよい(§14)。
+Outcome は AI が自動決定するのではなく、Human + AI の対話によって合意する(§7)。充足判定は MVP では機械化を強制しない — predicate が `human` の Outcome は **手動 trigger + 人間判断**でよい(§14)。
 
-## Work(Goal を満たす手段)
+## Work(Outcome を満たす手段)
 
-自律実行可能な bounded work unit。**Goal に紐づき、その Goal を充足させるために起こす**。Work はノードではなく手段なので、1 つの Goal に対して(失敗時など)複数の Work を付け替えられる — Goal の identity は試みをまたいで安定する。
+自律実行可能な bounded work unit。**Outcome に紐づき、その Outcome を充足させるために起こす**。Work はノードではなく手段なので、1 つの Outcome に対して(失敗時など)複数の Work を付け替えられる — Outcome の identity は試みをまたいで安定する。
 
 Work は以下を持つ。
 
-* **serves**: 満たそうとしている Goal(1 つ)
+* **serves**: 満たそうとしている Outcome(1 つ)
 * **objective**: 何をするか
 * **executor**: 実装フェーズを誰がやるか(`ai` 既定 | `human`。§23 Q2)
 * **state**: 実行状態(§6 の Work Lifecycle)
 
-Acceptance Criteria は Work ではなく **Goal の predicate** が担う(完了の基準は「Goal が充足したか」であって「Work が終わったと申告したか」ではない — trust-but-verify)。
+Acceptance Criteria は Work ではなく **Outcome の predicate** が担う(完了の基準は「Outcome が充足したか」であって「Work が終わったと申告したか」ではない — trust-but-verify)。
 
 例:
 
 ```yaml
 work:
   id: work-311
-  serves: goal-042
+  serves: outcome-042
   objective: |
     OAuth callback 時に state parameter を検証する処理を実装する。
   executor: ai
@@ -228,19 +228,19 @@ work:
 
 ---
 
-# 5. Goal Graph
+# 5. Outcome Graph
 
-Goal を DAG として管理する(ノード = Goal、辺 = requires)。Work はノードではなくノードにぶら下がる手段。
+Outcome を DAG として管理する(ノード = Outcome、辺 = requires)。Work はノードではなくノードにぶら下がる手段。
 
 ```text
-             ┌── G2 ── G5
-Intent → G1 ─┤
-             └── G3 ── G4
+             ┌── O2 ── O5
+Intent → O1 ─┤
+             └── O3 ── O4
 ```
 
-DAG と各 Goal の充足状態から機械的に以下を導出する(いずれも**保存しない**)。
+DAG と各 Outcome の充足状態から機械的に以下を導出する(いずれも**保存しない**)。
 
-* satisfied / unsatisfied(Goal ごと、predicate で判定)
+* satisfied / unsatisfied(Outcome ごと、predicate で判定)
 * ready(unsatisfied かつ requires が全て satisfied → Work を起こせる)
 * blocked(unsatisfied かつ未充足の requires がある)
 * critical path / downstream impact
@@ -249,20 +249,20 @@ DAG と各 Goal の充足状態から機械的に以下を導出する(いずれ
 
 ```text
 Satisfied
-  G1
+  O1
 
 Working(Work 実行中)
-  G2
+  O2
 
 Ready(導出: 未充足・前提充足)
-  G3
+  O3
 
 Blocked(導出: 前提が未充足)
-  G4 ← G3
-  G5 ← G2
+  O4 ← O3
+  O5 ← O2
 ```
 
-「ready な Goal に Work を起こす」が実行の入口(§9)。「Goal が satisfied か」の判定が完了の基準(§9.1)。
+「ready な Outcome に Work を起こす」が実行の入口(§9)。「Outcome が satisfied か」の判定が完了の基準(§9.1)。
 
 ---
 
@@ -332,7 +332,7 @@ ACP は主に **Planning Plane** で使用する。
 * Desired State の定義
 * 不明点についての Human-AI 対話
 * Work への分解
-* Work Graph の提案
+* Outcome Graph の提案
 * Graph の再計画
 
 UX イメージ:
@@ -354,7 +354,7 @@ Human:
 「今回は password login は対象外で」
 
 Agent:
-「了解しました。Work Graph を提案します」
+「了解しました。Outcome Graph を提案します」
 ```
 
 AI が直接 state を確定するのではなく、
@@ -553,19 +553,19 @@ merge 検知はポーリングになる。**API read の予算(req/hr)を設定�
 
 # 12. Reconciler
 
-meguri の中核。**level-triggered** で動く: **Goal の identity だけを受け取り**、毎回全状態(Graph・充足判定・実行状態・Artifact・projection)を読み直して次の一手を決める。ループはコード上に存在せず、reconcile + requeue の合成として現れる。Goal graph 化(§23 Q1)により、これは **K8s controller と同型**になる — 「この Goal は満たされているか? 未充足かつ前提が満たされているなら、それを満たす Work が存在/実行中であることを保証する」。
+meguri の中核。**level-triggered** で動く: **Outcome の identity だけを受け取り**、毎回全状態(Graph・充足判定・実行状態・Artifact・projection)を読み直して次の一手を決める。ループはコード上に存在せず、reconcile + requeue の合成として現れる。Outcome graph 化(§23 Q1)により、これは **K8s controller と同型**になる — 「この Outcome は満たされているか? 未充足かつ前提が満たされているなら、それを満たす Work が存在/実行中であることを保証する」。
 
 ```text
-reconcile(goal):
-  Observe(この Goal と前提の状態を読み直す)
+reconcile(outcome):
+  Observe(この Outcome と前提の状態を読み直す)
      ↓
-  satisfied?(predicate で判定)── Yes → Done(下流 Goal の ready 導出が変わる)
+  satisfied?(predicate で判定)── Yes → Done(下流 Outcome の ready 導出が変わる)
      │ No
      ↓
   requires が全て satisfied?(導出)── No → Wait(blocked。何もしない)
      │ Yes
      ↓
-  この Goal を満たす Work がある?
+  この Outcome を満たす Work がある?
      ├─ ない → capacity があれば Work を起こす(§9)
      └─ ある → 実行を観測。Artifact 出たら Human Gate(§13)へ
      ↺
@@ -576,12 +576,12 @@ reconcile(goal):
 まずは、
 
 ```text
-goal.satisfied = false
+outcome.satisfied = false
 AND all requires satisfied = true
-AND その Goal に走行中の Work が無い
+AND その Outcome に走行中の Work が無い
 ```
 
-なら Work を起こす候補とする。「下流を unlock する」処理は存在しない — Goal が satisfied になれば下流の ready 判定が導出で変わるだけ。
+なら Work を起こす候補とする。「下流を unlock する」処理は存在しない — Outcome が satisfied になれば下流の ready 判定が導出で変わるだけ。
 
 ---
 
@@ -627,20 +627,20 @@ Human Judgment は「Acceptance Criteria を満たしたか」だけでなく、
 
 # 14. Graph Reconciliation
 
-Goal が充足するたびに、単純に次の Goal に進むだけではなく、Graph 自体を再評価できるようにする。Goal graph 化により、この再評価は「**どの Goal が今 satisfied か、そしてまだこの Goal 群を欲しいか**」の問い直しになる(目的は安定・手段は使い捨て、なので再計画が明快)。
+Outcome が充足するたびに、単純に次の Outcome に進むだけではなく、Graph 自体を再評価できるようにする。Outcome graph 化により、この再評価は「**どの Outcome が今 satisfied か、そしてまだこの Outcome 群を欲しいか**」の問い直しになる(目的は安定・手段は使い捨て、なので再計画が明快)。
 
 ```text
-Goal Satisfied
+Outcome Satisfied
       ↓
 Current Reality Changed
       ↓
-各 Goal の predicate を再評価 + Goal 群がまだ欲しいか人間が判断(MVP では手動 trigger)
+各 Outcome の predicate を再評価 + Outcome 群がまだ欲しいか人間が判断(MVP では手動 trigger)
       ↓
-Goal Graph still valid?
+Outcome Graph still valid?
   ┌──────┴──────┐
  Yes            No
   ↓              ↓
-Next ready Goal  Re-plan(Goal の追加/削除/requires の張り替え)
+Next ready Outcome  Re-plan(Outcome の追加/削除/requires の張り替え)
                  ↓
              Graph Diff
                  ↓
@@ -656,8 +656,8 @@ Next ready Goal  Re-plan(Goal の追加/削除/requires の張り替え)
 meguri は「実行・判断の履歴」を所有すると言った以上、ストレージを持つ。
 
 * 初期は **sqlite 一択**とする(単一ファイル、トランザクション、ローカル完結)。永続化の所在(ローカル / リモート)は現時点の選択であり、将来リモート runtime やチーム利用の要求が現れれば見直しうる(§1)。
-* 保存するのは事実のみ: Intent / Goal(statement / predicate / requires)/ Work(serves / executor / 実行状態)/ Artifact / 履歴イベント / Agent session id。
-* 導出値(Goal の satisfied / ready / blocked / critical path)は保存しない。
+* 保存するのは事実のみ: Intent / Outcome(statement / predicate / requires)/ Work(serves / executor / 実行状態)/ Artifact / 履歴イベント / Agent session id。
+* 導出値(Outcome の satisfied / ready / blocked / critical path)は保存しない。
 * クラッシュ耐性の契約: 「実行中 turn の途中進捗のみ喪失可」。それ以外はプロセス再起動で復元できること。
 
 ---
@@ -674,7 +674,7 @@ meguri は「実行・判断の履歴」を所有すると言った以上、ス�
 例:
 
 ```text
-Goal: Authentication production-ready
+Intent: Authentication production-ready
 
 Progress
   Done:             4
@@ -704,23 +704,23 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 
 ## v0.1 — Planning
 
-「Intent → Work Graph」に価値があるかを検証する。**server も Web UI も作らない**。
+「Intent → Outcome Graph」に価値があるかを検証する。**server も Web UI も作らない**。
 
 分割increments:
 
 * **p0: ACP spike** — Claude Code / Codex と ACP で対話往復が通ることだけを確認する捨てコード。通らなければ退路(headless + ファイル渡し)へ切り替え、以降の設計を調整
 * **p1: データモデル + 永続化 + CLI** — Intent / Desired State / Work / 依存 DAG の CRUD、sqlite、ready 導出、Mermaid 出力
-* **p2: Planning 対話** — ACP 経由の対話 → Work Graph proposal → Graph Diff 表示 → Human approval で確定
+* **p2: Planning 対話** — ACP 経由の対話 → Outcome Graph proposal → Graph Diff 表示 → Human approval で確定
 
 ### 完了条件
 
-「曖昧な Intent を入力し、AI と対話しながら、納得できる Work Graph を作れる」。
+「曖昧な Intent を入力し、AI と対話しながら、納得できる Outcome Graph を作れる」。
 
 ---
 
 ## v0.2 — Local Execution
 
-Work Graph を実際の AI coding に接続する。
+Outcome Graph を実際の AI coding に接続する。
 
 * [ ] `ready` 導出からの Work 選択
 * [ ] HerdrRuntime(interface 化は 2 実装目まで待つ)
@@ -735,7 +735,7 @@ Work Graph を実際の AI coding に接続する。
 
 ### 完了条件
 
-「ready な Goal に Work を起こすと、AI が独立 workspace で実装し、検証済みの git change が Artifact として登録され、ローカル accept で Goal が satisfied になり次の Goal が ready になる」。
+「ready な Outcome に Work を起こすと、AI が独立 workspace で実装し、検証済みの git change が Artifact として登録され、ローカル accept で Outcome が satisfied になり次の Outcome が ready になる」。
 
 **この時点で 18 ステップ(§19)のローカル版(GitHub 抜き)が一周する。**
 
@@ -757,7 +757,7 @@ Work Graph を実際の AI coding に接続する。
 ```text
 Intent
  ↓
-Work Graph
+Outcome Graph
  ↓
 Ready Work
  ↓
@@ -816,7 +816,7 @@ meguri が、
 Scrum 自体を core domain にはしない。
 
 ```text
-Work Graph
+Outcome Graph
     ↓
 Scrum Projection
 ```
@@ -855,17 +855,17 @@ Scrum Projection
 
 3. ACP で Claude / Codex と対話する
 
-4. Desired State(= トップレベルの Goal 群)を決める
+4. Desired State(= トップレベルの Outcome 群)を決める
 
-5. Goal Graph を生成する
+5. Outcome Graph を生成する
 
 6. Graph を Human が approve する
 
-7. 依存の無い Goal が ready(導出)になる
+7. 依存の無い Outcome が ready(導出)になる
 
 8. meguri が herdr workspace / pane を作る
 
-9. その Goal を満たす Work を起こし、Agent に渡す
+9. その Outcome を満たす Work を起こし、Agent に渡す
 
 10. Agent が
     - 実装
@@ -885,9 +885,9 @@ Scrum Projection
 
 16. meguri が merge を検知する
 
-17. Work を done、Goal を satisfied にする
+17. Work を done、Outcome を satisfied にする
 
-18. 依存していた次の Goal が ready(導出)になり、
+18. 依存していた次の Outcome が ready(導出)になり、
     次の Work execution を開始する
 ```
 
@@ -910,7 +910,7 @@ Scrum Projection
 
 ### Planning
 
-* Intent から納得できる Work Graph まで作れるか
+* Intent から納得できる Outcome Graph まで作れるか
 * Issue 分解に必要な人間時間が減るか
 * Acceptance Criteria が明確になるか
 
@@ -933,13 +933,13 @@ Intent
   ↓
 Human-AI Planning
   ↓
-Work Graph
+Outcome Graph
   ↓
 AI Execution
   ↓
 Human Judgment
   ↓
-Goal
+Desired State
 ```
 
 のサイクル全体について、人間が **作業のオペレーションではなく Intent と Judgment に集中できているか**を評価する。
@@ -948,15 +948,15 @@ Goal
 
 # 22. meguri の定義
 
-> **meguri is a delivery control plane that turns intent into an executable work graph and coordinates humans and AI agents toward the desired state.**
+> **meguri is a delivery control plane that turns intent into an executable outcome graph and coordinates humans and AI agents toward the desired state.**
 
 日本語では、
 
-> **Intent を実行可能な Work Graph に変換し、人間と AI Agent による実行・判断を通じて Desired State への到達を管理する Delivery Control Plane。**
+> **Intent を実行可能な Outcome Graph に変換し、人間と AI Agent による実行・判断を通じて Desired State への到達を管理する Delivery Control Plane。**
 
 とする。
 
-定義の核は「Intent → Work Graph → 実行・判断 → Desired State」のサイクルの管理であって、その実装がローカルかリモートかではない。初期は local-first で始めるが(§1)、それは現時点の重心であり、この定義には含めない。
+定義の核は「Intent → Outcome Graph → 実行・判断 → Desired State」のサイクルの管理であって、その実装がローカルかリモートかではない。初期は local-first で始めるが(§1)、それは現時点の重心であり、この定義には含めない。
 
 ---
 
@@ -964,19 +964,24 @@ Goal
 
 以下のうち Q1 は**確定済み**(本文 §4〜§14 に反映済み)。Q2/Q3 は Q1 の上に乗る形で方針まで固まっており、スキーマ詳細は v0.1 p1 実装時に確定する。扉を閉じないため経緯を記録しておく。
 
-## Q1. グラフの土台 — Work DAG か Goal graph か 【決定: B(Goal graph)/ 2026-08-16】
+## Q1. グラフの土台 — Work DAG か Outcome graph か 【決定: B(Outcome graph)/ 2026-08-16】
 
-**決定**: ノード = Goal(到達したい状態)、辺 = requires/enables、**Work は Goal を「未充足→充足」に反転させる手段**。本文 §4(Domain Model)/ §5(Goal Graph)/ §12(reconciler)/ §14(再計画)に反映済み。
+**決定**: ノード = Outcome(到達したい状態)、辺 = requires/enables、**Work は Outcome を「未充足→充足」に反転させる手段**。本文 §4(Domain Model)/ §5(Outcome Graph)/ §12(reconciler)/ §14(再計画)に反映済み。
 
-決め手だった B の利点: (1) 別々だった「Desired State」「Acceptance Criteria」「グラフ」が 1 構造に畳まれる(ノード = 状態、充足述語 = 旧 Acceptance、Work = 手段)。(2) §12 の reconciler が K8s controller と同型になる。(3) §14 の再計画が「どの Goal が今満たされているか」の再評価になり明快。(4) **Work でない到達点**(マイルストーン・不変条件・能力)が特別扱いなしにノードとして載る。(5) OR(複数手段のどれかで達成)を表現しうる。
+決め手だった B の利点: (1) 別々だった「Desired State」「Acceptance Criteria」「グラフ」が 1 構造に畳まれる(ノード = 状態、充足述語 = 旧 Acceptance、Work = 手段)。(2) §12 の reconciler が K8s controller と同型になる。(3) §14 の再計画が「どの Outcome が今満たされているか」の再評価になり明快。(4) **Work でない到達点**(マイルストーン・不変条件・能力)が特別扱いなしにノードとして載る。(5) OR(複数手段のどれかで達成)を表現しうる。
 
-制約(確定の条件): **機構は dumb に保つ** — 1 Goal 1 アプローチ、OR 自動探索なし、分解は ACP 提案 → 人間承認、自動 planner は作らない(§18 Non-Goal「複雑な AI scheduler」を守る)。B を選んでも day-1 の挙動は Work DAG とほぼ同じで、違いはスキーマ(ノードと Work を分ける)に集約される。
+制約(確定の条件): **機構は dumb に保つ** — 1 Outcome 1 アプローチ、OR 自動探索なし、分解は ACP 提案 → 人間承認、自動 planner は作らない(§18 Non-Goal「複雑な AI scheduler」を守る)。B を選んでも day-1 の挙動は Work DAG とほぼ同じで、違いはスキーマ(ノードと Work を分ける)に集約される。
+
+**ノード名を「Outcome」に確定**(検討中は Goal と仮称、2026-08-16)。Outcome ノードは骨格が旧 meguri の Issue reconciler(statement + acceptance + 依存 + reconcile(id))と同型になった — これは level-triggered な「望む変化の単位」への収束で、良い兆候。ただし旧 Issue が溶かしていた「durable な目的」と「使い捨ての手段」を分離した点が改善であり、**名前はこの分離を保つ**必要がある。ゆえに:
+- **Work にはしない**(「Work」は手段側の呼称。ノードを Work にすると end/means がまた 1 語に溶ける)。
+- **Issue にはしない**(内部ノードを Issue と呼ぶと GitHub の source-of-truth identity を核に引き込む = §3.2 違反。旧 meguri は issue 番号 identity で事故った)。ノードは Issue に**投影される**が Issue **ではない**。
+- **Outcome** を採る: 「outcome ⇄ output」の対比が Work(= output を生む)と綺麗に対になり、end/means の分離が名前に埋め込まれる。粒度にも中立。
 
 先行研究: GORE(KAOS / i*)、Impact Mapping、OKR ツリー、HTN / AND-OR グラフ、K8s desired-state。
 
 ## Q2. 人間が実行する Work(executor)
 
-Work は Goal を満たす手段(§4)で、実行系(§9)は AI 前提になっている。しかし本番 DNS 切替・デザイン決定・API キー発行など、**AI に委譲できない手段**が存在する。§4 に `executor` フィールドは記載済み(既定 `ai`)で、ここは実行フローの詳細が未確定。
+Work は Outcome を満たす手段(§4)で、実行系(§9)は AI 前提になっている。しかし本番 DNS 切替・デザイン決定・API キー発行など、**AI に委譲できない手段**が存在する。§4 に `executor` フィールドは記載済み(既定 `ai`)で、ここは実行フローの詳細が未確定。
 
 - **案**: 実装フェーズに `executor`(既定 `ai` | `human`)を持たせる。`human` のとき §9 の実行フローは「人間に提示 → 完了報告(`meguri accept` 相当)を待つ」だけに退化する。DAG・ready 導出・critical path は executor を問わず同じに効き、**人間 Work → AI Work の依存が1本の graph に乗る**。
 - **効用**: §21 の「今どこで詰まっているか」が人間タスクまで含めて説明できる(meguri の価値提案の中核)。
@@ -998,4 +1003,4 @@ accepted       採用判断   → 人間
 - **制約(失敗カタログ由来)**: レビューを独立した graph ノードに割らない。レビューは bounded outcome ではなく phase。旧 meguri はレビューを分離可能な escalation 単位として扱い、**ping-pong 型 escalation が throughput の主因**になった(archive の review-convergence 診断)。旧実装の最終形も「レビューは reconciler 内の role/step(pr-reviewer)、別 issue ではない」。
 - **defer**: レビュー phase の actor 可変化(`human` | `ai-reviewer`、異種モデル相互レビュー = 旧 6-role routing)は後回し。v0.x は人間レビュー固定(§13)。
 
-Q2/Q3 は確定した Q1(Goal graph)の上に乗る = 「Goal を満たす手段(Work)の内訳」として phase/executor を持つ。方針は固まっており、残るは v0.1 p1 でのスキーマと実行フローの詳細確定。
+Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす手段(Work)の内訳」として phase/executor を持つ。方針は固まっており、残るは v0.1 p1 でのスキーマと実行フローの詳細確定。
