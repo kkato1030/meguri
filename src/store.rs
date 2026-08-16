@@ -222,6 +222,104 @@ pub fn set_human_satisfied(conn: &Connection, id: i64, value: bool) -> Result<()
     Ok(())
 }
 
+/// statement / description / verify を書き換える(指定したものだけ)。needs は set_needs で。
+pub fn edit_outcome(
+    conn: &Connection,
+    id: i64,
+    statement: Option<&str>,
+    description: Option<&str>,
+    verify: Option<&Verify>,
+) -> Result<()> {
+    get_outcome(conn, id)?; // 存在確認
+    if let Some(s) = statement {
+        if s.trim().is_empty() {
+            bail!("statement cannot be empty");
+        }
+        conn.execute("UPDATE outcomes SET statement = ?2 WHERE id = ?1", params![id, s])?;
+    }
+    if let Some(d) = description {
+        conn.execute("UPDATE outcomes SET description = ?2 WHERE id = ?1", params![id, d])?;
+    }
+    if let Some(v) = verify {
+        conn.execute(
+            "UPDATE outcomes SET verify_kind = ?2, verify_command = ?3 WHERE id = ?1",
+            params![id, v.kind_str(), v.command_str()],
+        )?;
+    }
+    Ok(())
+}
+
+/// requires(前提の辺)を丸ごと置き換える。存在・同一 intent・サイクルを検証する。
+pub fn set_needs(conn: &Connection, id: i64, needs: &[i64]) -> Result<()> {
+    let o = get_outcome(conn, id)?;
+    for &req in needs {
+        let ok: bool = conn
+            .query_row("SELECT intent_id = ?2 FROM outcomes WHERE id = ?1", params![req, o.intent_id], |r| r.get(0))
+            .optional_bool()?;
+        if !ok {
+            bail!("required o{req} does not exist or belongs to another intent");
+        }
+    }
+    conn.execute("DELETE FROM outcome_requires WHERE outcome_id = ?1", params![id])?;
+    for &req in needs {
+        add_requires(conn, id, req)?; // 自己参照・サイクルはここで弾く
+    }
+    Ok(())
+}
+
+/// Outcome を削除する。両方向の requires 辺と、それを serves する Work も消す。
+/// (id, 消した辺数, 消した Work 数, 前提を失った依存側の数)を返す。
+pub fn remove_outcome(conn: &Connection, id: i64) -> Result<(usize, usize)> {
+    get_outcome(conn, id)?; // 存在確認
+    let dependents: usize = conn
+        .query_row("SELECT COUNT(*) FROM outcome_requires WHERE requires_id = ?1", params![id], |r| r.get::<_, i64>(0))
+        .map(|n| n as usize)?;
+    let works = conn.execute("DELETE FROM works WHERE serves_id = ?1", params![id])?;
+    // FK があるので、参照している辺(両方向)を先に消す。
+    conn.execute("DELETE FROM outcome_requires WHERE outcome_id = ?1 OR requires_id = ?1", params![id])?;
+    conn.execute("DELETE FROM outcomes WHERE id = ?1", params![id])?;
+    Ok((works, dependents))
+}
+
+// ---- Intent の edit / remove ----
+
+pub fn edit_intent(conn: &Connection, id: i64, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    if !intent_exists(conn, id)? {
+        bail!("intent i{id} does not exist");
+    }
+    if let Some(t) = title {
+        if t.trim().is_empty() {
+            bail!("title cannot be empty");
+        }
+        conn.execute("UPDATE intents SET title = ?2 WHERE id = ?1", params![id, t])?;
+    }
+    if let Some(d) = description {
+        conn.execute("UPDATE intents SET description = ?2 WHERE id = ?1", params![id, d])?;
+    }
+    Ok(())
+}
+
+/// Intent とその配下(Outcome / requires 辺 / Work)を丸ごと削除する。
+/// requires は同一 intent 内なので、部分グラフとして自己完結に消える。
+/// (消した Outcome 数, Work 数)を返す。
+pub fn remove_intent(conn: &Connection, id: i64) -> Result<(usize, usize)> {
+    if !intent_exists(conn, id)? {
+        bail!("intent i{id} does not exist");
+    }
+    // FK 順に: works → requires 辺 → outcomes → intent。
+    let works = conn.execute(
+        "DELETE FROM works WHERE serves_id IN (SELECT id FROM outcomes WHERE intent_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM outcome_requires WHERE outcome_id IN (SELECT id FROM outcomes WHERE intent_id = ?1)",
+        params![id],
+    )?;
+    let outs = conn.execute("DELETE FROM outcomes WHERE intent_id = ?1", params![id])?;
+    conn.execute("DELETE FROM intents WHERE id = ?1", params![id])?;
+    Ok((outs, works))
+}
+
 // ---- Work ----
 
 pub fn add_work(conn: &Connection, serves_id: i64, objective: &str, executor: &str) -> Result<i64> {
@@ -262,6 +360,34 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
         }
     };
     Ok(rows)
+}
+
+fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM works WHERE id = ?1", [id], |_| Ok(())).is_ok())
+}
+
+pub fn edit_work(conn: &Connection, id: i64, objective: Option<&str>, executor: Option<&str>) -> Result<()> {
+    if !work_exists(conn, id)? {
+        bail!("work w{id} does not exist");
+    }
+    if let Some(o) = objective {
+        conn.execute("UPDATE works SET objective = ?2 WHERE id = ?1", params![id, o])?;
+    }
+    if let Some(e) = executor {
+        if e != "ai" && e != "human" {
+            bail!("executor must be ai or human (got: {e})");
+        }
+        conn.execute("UPDATE works SET executor = ?2 WHERE id = ?1", params![id, e])?;
+    }
+    Ok(())
+}
+
+/// Work を削除する(何からも参照されないので単純に消える)。
+pub fn remove_work(conn: &Connection, id: i64) -> Result<()> {
+    if conn.execute("DELETE FROM works WHERE id = ?1", params![id])? == 0 {
+        bail!("work w{id} does not exist");
+    }
+    Ok(())
 }
 
 // ---- 小さなヘルパ ----
