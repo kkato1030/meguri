@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.2 o15(run で worktree の pane にエージェントを起動・実装プロンプト注入)** 時点。
+最終更新: **v0.2 o16(run が result.json の出現を待って完了を検知)** 時点。
 
 ## いまできること
 
@@ -18,8 +18,9 @@
     pane は残す(§3.5)。
 
 まだ無いもの: Work の実行(v0.2 着手中 — repo 管理(bare)+ **`meguri run` で spawn +
-隔離 worktree(o14)+ その worktree の pane にエージェント起動・実装プロンプト注入(o15)まで**。
-完了検知(result.json のポーリング=o16)/ 検証 / Artifact / 失敗経路は未)/
+隔離 worktree(o14)+ worktree の pane にエージェント起動・実装プロンプト注入(o15)+
+`.meguri/result.json` の出現をポーリングして完了検知(o16、画面は読まない)まで**。
+meguri 側の独立検証(o17-o20)/ Artifact(o21)/ 失敗経路の詳細(o22-o25)は未)/
 GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
@@ -35,14 +36,15 @@ GitHub 連携 / watch・reconciler。
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
-| `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示。verify 種別ごとに DoD を出し分ける。画面は読まず result.json で完了を判定する契約 |
+| `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示(verify 種別ごとに DoD を出し分け)。加えて **result.json の読み取り**(`WorkResult{status,summary}`、部分書き込みは未完了扱い)と status→Work state の対応(o16)。画面は読まず result.json で完了を判定する契約。単体テストあり |
 
 ## ドメインモデル(§4/§5)
 
 * **Intent** — 実現したいこと。グラフの根。
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
-* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、続けてその worktree の pane にエージェントを起動して実装プロンプトを注入し、state を `running` にする(o15)。完了検知(result.json)・検証は未実装。
+* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)で `reported`(success=報告あり・meguri 未検証)/ `failed`(failure)/ `needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o22-o25)。meguri 側の独立検証(o17-o20)で `reported`→verified 化するのは後の増分。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。
@@ -76,8 +78,10 @@ meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
 meguri work    rm   <w>              # DB 行 + spawn 済みなら git worktree/ブランチも掃除
-meguri run <o>                       # o14/o15: ready Outcome → Work を起こし bare から隔離 worktree を切り、
-                                     #   その worktree の pane にエージェントを起動して実装プロンプトを注入(state=running)
+meguri run <o> [--agent <cmd>] [--detach] [--grace-secs N] [--timeout-secs N]
+                              # o14-o16: ready Outcome → Work を起こし bare から隔離 worktree を切り、
+                              #   その worktree の pane でエージェントを起動して実装プロンプトを注入(state=running)、
+                              #   .meguri/result.json の出現を待って報告 status を state に反映(--detach で待たず即返る)
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
