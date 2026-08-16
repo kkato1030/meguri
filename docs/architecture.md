@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.2 o20(3 検証を rollup して verified / rework を gate する)** 時点。
+最終更新: **v0.2 o21(verified な commit を Work の Artifact として記録)** 時点。
 
 ## いまできること
 
@@ -21,8 +21,9 @@
 隔離 worktree(o14)+ worktree の pane にエージェント起動・実装プロンプト注入(o15)+
 `.meguri/result.json` の出現をポーリングして完了検知(o16、画面は読まない)+
 success 報告時に **meguri 側の独立検証①②③ (clean tree=o17 / commit 進行=o18 / check_command=o19)** を rollup し、
-**全部 pass なら `verified` / 一つでも落ちれば `rework` に gate する(o20)**まで**。
-Artifact 登録(o21)/ fix turn 差し戻し(o22)/ 沈黙・timeout・pane 死亡(o23-o25)は未)/
+**全部 pass なら `verified` / 一つでも落ちれば `rework` に gate(o20)**、
+**verified の commit を Work の Artifact(branch @ sha)として記録(o21)**まで**。
+fix turn 差し戻し(o22)/ 沈黙・timeout・pane 死亡(o23-o25)/ ローカル accept で Outcome を satisfied 化は未)/
 GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
@@ -47,7 +48,8 @@ GitHub 連携 / watch・reconciler。
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。
-  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified` / 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。
+  * **Artifact**(o21): verified な Work の `artifact_sha`(= worktree HEAD)。ブランチ `meguri/w<id>` は bare clone に残るので `branch @ sha` が耐久成果物になる。`work ls` に表示。GitHub PR 投影(v0.3)の material。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。

@@ -61,6 +61,11 @@ pub fn bare_clone(origin: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// worktree の現在の HEAD SHA(o21: verified な commit を Artifact として記録する用)。
+pub fn head_sha(worktree: &Path) -> Result<String> {
+    git(worktree, &["rev-parse", "HEAD"])
+}
+
 /// bare clone を origin から更新する。
 pub fn fetch(bare: &Path) -> Result<()> {
     git(bare, &["fetch", "--quiet", "origin"])?;
