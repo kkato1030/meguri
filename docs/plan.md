@@ -6,7 +6,7 @@ meguri は、**Intent を実行可能な Outcome Graph に変換し、人間と 
 
 初期は権威・実行・永続化をローカルに置く(local-first)。ただしこれは**現時点の設計の重心であって、恒久的な制約ではない**。実行系は将来リモート runtime へ拡張しうる(§8)し、権威や永続化の所在も要求が現れれば見直しうる。local-first は今の一手であり、meguri の定義ではない。
 
-AI Agent 自体やコード実行環境を独自実装するのではなく、Claude Code / Codex 等の既存 Agent、ACP、herdr / tmux、GitHub 等を組み合わせる。
+AI Agent 自体やコード実行環境を独自実装するのではなく、Claude Code / Codex 等の既存 Agent、herdr / tmux、GitHub 等を組み合わせる(ACP は検討の末いったん不採用 — §7 / §23 Q5)。
 
 meguri が所有するのは、主に以下とする。
 
@@ -103,12 +103,10 @@ GitHub が存在しなくても Outcome Graph 自体は成立する。
 ```text
 Planning Plane
 
-Human
-  ↕ ACP
-AI Agent
-  ↕
-meguri
-  ↓
+Human ↔ AI Agent(pane で直接対話)
+              ↓ proposal.json(構造化契約)
+            meguri
+              ↓
 Intent / Desired State / Outcome Graph
 
 
@@ -346,67 +344,78 @@ rework / retry のセッション意味論: **会話可能な Agent セッショ
 
 ---
 
-# 7. ACP の利用
+# 7. Planning 対話の実現(pane + 構造化契約)
 
-ACP は主に **Planning Plane** で使用する。
+Planning Plane でやること:
 
-主な用途:
-
-* Intent の解釈
-* Desired State の定義
+* Intent の解釈 / Desired State(= トップ Outcome 群)の合意
 * 不明点についての Human-AI 対話
-* Work への分解
-* Outcome Graph の提案
-* Graph の再計画
+* Outcome への分解・Outcome Graph の提案 / 再計画
+
+**実現手段は pane + 構造化ファイル契約を第一とする(§23 Q5、ACP は不採用)**。
+人間が **生の Claude Code / Codex と pane(herdr/tmux)で対話**し、合意した
+グラフをエージェントが `.meguri/proposal.json`(meguri のスキーマ)に書く。
+meguri は **画面を読まず、その proposal ファイルだけを読む** —— 実行系の
+完了契約(result.json)と同じ「耐久チャネルで構造化結果を受け取る」型(§8)。
 
 UX イメージ:
 
 ```text
-Human:
+Human(pane 内で Claude/Codex に直接):
 「認証をちゃんとしたい」
 
 Agent:
 「今回の 'ちゃんと' を以下として定義してよいですか?」
+- OAuth login / session persistence / logout / expiration / E2E
 
-- OAuth login
-- session persistence
-- logout
-- expiration handling
-- E2E testing
+Human:「password login は対象外で」
 
-Human:
-「今回は password login は対象外で」
-
-Agent:
-「了解しました。Outcome Graph を提案します」
+Agent:「了解。Outcome Graph を .meguri/proposal.json に書きます」
+        → meguri がファイルを読み、現行グラフと diff して人間に提示
 ```
 
-AI が直接 state を確定するのではなく、
+AI が直接 state を確定するのではなく、常に:
 
 ```text
-Current Graph
-      ↓
-Agent Proposal
-      ↓
-Graph Diff
-      ↓
-Human Approval
+Current Graph → Agent Proposal(proposal.json)→ Graph Diff → Human Approval
 ```
 
-を基本とする。
+refine は「人間が同じ pane で対話を続ける → エージェントが proposal.json を
+書き直す → meguri が再収穫」。meguri は会話のキーストロークを仲介せず、
+**文脈を投入し・構造化提案を収穫し・diff/承認を持つ**ことだけを担う。
 
-**統合リスクの扱い**: ACP over Claude Code / Codex で planning 対話に必要な往復が実際に通るかは、v0.1 の最初に spike で検証する(§16)。詰まった場合の退路は headless 実行 + ファイル渡し(proposal を構造化ファイルで受け取り、対話は通常のチャットで行う)。
+**なぜ ACP でないか**(p0 の実測を経た判断、§23 Q5): ACP は動くが未成熟
+(アダプタ依存・版 churn・相手ごとにバラつく)で、planning に ACP・execution に
+pane を使うと**エージェント境界が 2 つ**になる。pane + 契約なら planning と
+execution が**同じ 1 つの型**を共有し、一級・最新・全エージェント対応
+(Codex/Cursor もネイティブ headless なら動く)。ACP を再検討するトリガーは、
+meguri が**自前のチャット UI をホストする**か **人間なしで自律 planning を回す**
+必要が出た時、または ACP がベンダー純正・1.0 まで成熟した時。p0 のスパイクは
+`spikes/p0-acp/` に残す。
 
 ---
 
-# 8. Execution Runtime
+# 8. エージェント境界(planning と execution で共有する 1 つの型)
 
-初期実装では **herdr を優先**する。
+meguri とエージェントの接点は **1 つの抽象**に統一する:
+
+> **文脈 + プロンプトを送り、耐久チャネル(ファイル / stdout-JSON)で
+> 構造化結果を受け取る。画面は読まない。**
+
+* planning: 提案を `.meguri/proposal.json` で受け取る(§7)
+* execution: 結果を `.meguri/result.json` で受け取る(§9)
+
+同じ「完了契約」の型なので、pane 起動・完了契約・trust-but-verify の機構が
+両方で使い回せる。エージェント起動レシピの差(program / args / 除去する環境変数)
+だけが相手ごとに変わる(p0 で実測: claude はネイティブ ACP 無しで CLAUDECODE の
+unset が要る等 —— `spikes/p0-acp/` 参照)。
+
+初期実装では pane 供給に **herdr を優先**する。
 
 ```text
 meguri
   ↓
-ExecutionRuntime
+Runtime(pane 供給 + 完了契約)
   ↓
 HerdrRuntime
   ↓
@@ -674,7 +683,7 @@ Next ready Outcome  Re-plan(Outcome の追加/削除/requires の張り替え)
             Human Approval
 ```
 
-初期 MVP では手動 trigger でよい。再計画の提案は Planning Plane(ACP 対話)が担い、確定は常に Human Approval を通す。
+初期 MVP では手動 trigger でよい。再計画の提案は Planning Plane(pane 対話 + proposal.json)が担い、確定は常に Human Approval を通す。
 
 ---
 
@@ -735,9 +744,9 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 
 分割increments:
 
-* **p0: ACP spike** — Claude Code / Codex と ACP で対話往復が通ることだけを確認する捨てコード。通らなければ退路(headless + ファイル渡し)へ切り替え、以降の設計を調整
-* **p1: データモデル + 永続化 + CLI** — Intent / Desired State / Work / 依存 DAG の CRUD、sqlite、ready 導出、Mermaid 出力
-* **p2: Planning 対話** — ACP 経由の対話 → Outcome Graph proposal → Graph Diff 表示 → Human approval で確定
+* **p0: ACP spike(済)** — Claude/Gemini/Codex/Cursor で ACP 往復を実測。結論: ACP は動くが未成熟で、**pane + 構造化ファイル契約の方が筋が良い**と判断(§7 / §23 Q5)。捨てコードは `spikes/p0-acp/`
+* **p1: データモデル + 永続化 + CLI** — Intent / Outcome(statement/predicate=verify/requires)/ Work の CRUD、sqlite、ready・satisfied 導出、Mermaid 出力
+* **p2: Planning 対話** — pane で生の Claude/Codex と対話 → エージェントが `proposal.json` を書く → meguri が読んで Graph Diff 表示 → Human approval で確定
 
 ### 完了条件
 
@@ -880,7 +889,7 @@ Scrum Projection
 
 2. Intent を作る
 
-3. ACP で Claude / Codex と対話する
+3. pane で Claude / Codex と対話する(合意は proposal.json へ)
 
 4. Desired State(= トップレベルの Outcome 群)を決める
 
@@ -997,7 +1006,7 @@ Desired State
 
 決め手だった B の利点: (1) 別々だった「Desired State」「Acceptance Criteria」「グラフ」が 1 構造に畳まれる(ノード = 状態、充足述語 = 旧 Acceptance、Work = 手段)。(2) §12 の reconciler が K8s controller と同型になる。(3) §14 の再計画が「どの Outcome が今満たされているか」の再評価になり明快。(4) **Work でない到達点**(マイルストーン・不変条件・能力)が特別扱いなしにノードとして載る。(5) OR(複数手段のどれかで達成)を表現しうる。
 
-制約(確定の条件): **機構は dumb に保つ** — 1 Outcome 1 アプローチ、OR 自動探索なし、分解は ACP 提案 → 人間承認、自動 planner は作らない(§18 Non-Goal「複雑な AI scheduler」を守る)。B を選んでも day-1 の挙動は Work DAG とほぼ同じで、違いはスキーマ(ノードと Work を分ける)に集約される。
+制約(確定の条件): **機構は dumb に保つ** — 1 Outcome 1 アプローチ、OR 自動探索なし、分解は pane 対話での提案 → 人間承認、自動 planner は作らない(§18 Non-Goal「複雑な AI scheduler」を守る)。B を選んでも day-1 の挙動は Work DAG とほぼ同じで、違いはスキーマ(ノードと Work を分ける)に集約される。
 
 **ノード名を「Outcome」に確定**(検討中は Goal と仮称、2026-08-16)。Outcome ノードは骨格が旧 meguri の Issue reconciler(statement + acceptance + 依存 + reconcile(id))と同型になった — これは level-triggered な「望む変化の単位」への収束で、良い兆候。ただし旧 Issue が溶かしていた「durable な目的」と「使い捨ての手段」を分離した点が改善であり、**名前はこの分離を保つ**必要がある。ゆえに:
 - **Work にはしない**(「Work」は手段側の呼称。ノードを Work にすると end/means がまた 1 語に溶ける)。
@@ -1045,3 +1054,19 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 - **runtime / 外部ステータス確認**: 「本番で実際に動いている(URL 応答等)」「CI 緑等の外部状態」を satisfied の確かめ方に追加。コードが変わらなくても状態が変わるので、コミットキャッシュでなく別の観測サイクルが要る。**delivery を名乗る以上ロードマップに残す**(候補: v0.4 前後)。
 
 **より深い律速の所在**: 進みの本当のボトルネックは依存の張り方ではなく**人間レビューのゲート**。案B は実装の並行化にしか効かない。レビューの捌き方(pr-reviewer の役割・自動化の範囲)は v0.4 以降の独立論点(Q3 の defer とも接続、旧 review-convergence 診断を参照)。
+
+## Q5. エージェント統合 = ACP か 契約ベースか 【決定: 契約ベース / 2026-08-16】
+
+**決定(本文 §7/§8 に反映済み)**: planning の対話も、ACP ではなく **pane + 構造化ファイル契約**で実現する。エージェント境界は「文脈を送る → 耐久チャネル(ファイル/stdout-JSON)で構造化結果を受け取る・画面は読まない」の 1 抽象に統一し、planning(`proposal.json`)と execution(`result.json`)で共有する。
+
+**p0 の実測(#282、`spikes/p0-acp/`)**: ACP は JSON-RPC over stdio で動く。Claude(adapter 経由)・Gemini(ネイティブ)で往復成立。ただし未成熟 —— アダプタは 0.x、プロトコルは v1→v2 の churn、Codex はアダプタ埋め込み core がモデルに追随できず生成不可、Cursor は第三者アダプタが返答を流さない。ベンダー純正 ACP は Gemini のみで、Claude/Codex は Zed のアダプタ頼み。
+
+**契約ベースを採る理由**:
+1. v1/v2 で証明済みの型(生きた pane + 完了契約 + 画面を読まない)の再利用。
+2. **エージェント境界が 1 つに統一**(ACP を planning・pane を execution にすると 2 つになる)。表面積が半分。
+3. 一級・最新・全エージェント対応(素の headless なら Codex の luna も Cursor も動く。アダプタ版 churn を回避)。
+4. planning に必要なのは「多ターン + 構造化提案の収穫」だけで、ACP の richness(meguri がチャット UI をホスト / 人間なし自律ターン)は今は不要。
+
+**ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `spikes/p0-acp/` から再開する。
+
+**手段の段階**(§7): 第一は **pane(B)**(人間が生の pane で対話 → proposal.json 収穫)。人間が pane に attach せず meguri の CLI で完結させたくなったら **headless 仲介(C)**(`claude -p --resume` / `codex exec resume` を叩き proposal.json を受ける)を足す。B/C は同じファイル契約を共有するので B→C は追加であって作り直しではない。
