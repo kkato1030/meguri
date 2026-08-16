@@ -62,7 +62,9 @@ meguri outcome done   <o>      # 達成を表明(verify=human のみ)
 meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
-meguri graph [--intent <i>] [--mermaid | --html]   # --html: クリックで詳細の自己完結グラフ
+meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
+meguri graph [--intent <i>] --html [--out <path>] [--no-open]
+                              # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
 
 meguri plan prompt [--intent <i>] [--file <path>]        # planning プロンプトを出力
 meguri plan diff   [--intent <i>] [--file <path>]        # proposal の追加内容を検証・表示
