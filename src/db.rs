@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-/// DB ファイルの場所。`MEGURI_HOME`(既定 `~/.meguri`)配下の `meguri.db`。
-fn db_path() -> Result<PathBuf> {
+/// meguri のホーム(`MEGURI_HOME`、既定 `~/.meguri`)。無ければ作る。
+pub fn meguri_home() -> Result<PathBuf> {
     let home = match std::env::var_os("MEGURI_HOME") {
         Some(h) => PathBuf::from(h),
         None => {
@@ -18,7 +18,12 @@ fn db_path() -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&home)
         .with_context(|| format!("meguri home を作れない: {}", home.display()))?;
-    Ok(home.join("meguri.db"))
+    Ok(home)
+}
+
+/// DB ファイルの場所。ホーム配下の `meguri.db`。
+fn db_path() -> Result<PathBuf> {
+    Ok(meguri_home()?.join("meguri.db"))
 }
 
 /// DB を開き、スキーマを用意して返す。
@@ -33,8 +38,12 @@ pub fn open() -> Result<Connection> {
 
 /// スキーマ(冪等)。増分で列を足すときはここに追記していく。
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
+    conn.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+/// スキーマ SQL。テストの in-memory DB でも使う。
+pub(crate) const SCHEMA: &str = r#"
         CREATE TABLE IF NOT EXISTS intents (
             id          INTEGER PRIMARY KEY,
             title       TEXT NOT NULL,
@@ -66,7 +75,4 @@ fn migrate(conn: &Connection) -> Result<()> {
             executor  TEXT NOT NULL DEFAULT 'ai',       -- 'ai' | 'human'
             state     TEXT NOT NULL DEFAULT 'planned'
         );
-        "#,
-    )?;
-    Ok(())
-}
+        "#;

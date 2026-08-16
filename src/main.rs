@@ -5,8 +5,12 @@
 
 mod db;
 mod derive;
+mod plan;
 mod render;
 mod store;
+
+use std::io::Write;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -39,6 +43,34 @@ enum Cmd {
         /// Mermaid で出力
         #[arg(long)]
         mermaid: bool,
+    },
+    /// Planning 対話(pane で提案 → proposal.json → 承認で反映)
+    #[command(subcommand)]
+    Plan(PlanCmd),
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// エージェントに渡す planning プロンプトを出力
+    Prompt {
+        #[arg(long)]
+        intent: Option<String>,
+        /// proposal.json の書き出し先(既定: MEGURI_HOME/proposal.json)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// proposal.json を検証し、追加される Outcome を表示
+    Diff {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// proposal.json を承認して反映(additive)
+    Apply {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// 確認プロンプトを飛ばす
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -119,8 +151,52 @@ fn main() -> Result<()> {
                 print!("{}", render::text(&outcomes));
             }
         }
+        Cmd::Plan(c) => plan_cmd(&conn, c)?,
     }
     Ok(())
+}
+
+fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
+    let path = |f: Option<PathBuf>| -> Result<PathBuf> {
+        match f {
+            Some(p) => Ok(p),
+            None => plan::default_proposal_path(),
+        }
+    };
+    match c {
+        PlanCmd::Prompt { intent, file } => {
+            let out = path(file)?;
+            let text = plan::prompt(conn, intent.as_deref(), &out)?;
+            print!("{text}");
+        }
+        PlanCmd::Diff { file } => {
+            let p = path(file)?;
+            let plan = plan::resolve(conn, &plan::load(&p)?)?;
+            print!("{}", plan::diff_text(&plan));
+        }
+        PlanCmd::Apply { file, yes } => {
+            let p = path(file)?;
+            let plan = plan::resolve(conn, &plan::load(&p)?)?;
+            print!("{}", plan::diff_text(&plan));
+            if !yes && !confirm("反映しますか?")? {
+                println!("中止");
+                return Ok(());
+            }
+            let ids = plan::apply(conn, &plan)?;
+            let list: Vec<String> = ids.iter().map(|i| format!("o{i}")).collect();
+            println!("反映: {} を追加", list.join(", "));
+        }
+    }
+    Ok(())
+}
+
+/// 標準入力で y/N を尋ねる。
+fn confirm(msg: &str) -> Result<bool> {
+    print!("{msg} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
 fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
