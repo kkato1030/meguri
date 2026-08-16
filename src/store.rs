@@ -472,6 +472,15 @@ pub fn set_work_artifact(conn: &Connection, id: i64, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// accept された Work が serve する Outcome の id 集合(satisfied 導出の材料、o22 系のローカル Human Gate)。
+pub fn accepted_outcome_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT serves_id FROM works WHERE state = 'accepted'")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?;
+    Ok(ids)
+}
+
 fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM works WHERE id = ?1", [id], |_| Ok(())).is_ok())
 }

@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.2 o21(verified な commit を Work の Artifact として記録)** 時点。
+最終更新: **v0.2 accept(ローカル Human Gate: verified Work → Outcome satisfied → 次が ready)** 時点。
 
 ## いまできること
 
@@ -17,14 +17,19 @@
     猶予後にプロンプトを注入、`proposal.json` の出現を待って diff → 承認・反映まで一気通貫。
     pane は残す(§3.5)。
 
-まだ無いもの: Work の実行(v0.2 着手中 — repo 管理(bare)+ **`meguri run` で spawn +
-隔離 worktree(o14)+ worktree の pane にエージェント起動・実装プロンプト注入(o15)+
-`.meguri/result.json` の出現をポーリングして完了検知(o16、画面は読まない)+
-success 報告時に **meguri 側の独立検証①②③ (clean tree=o17 / commit 進行=o18 / check_command=o19)** を rollup し、
-**全部 pass なら `verified` / 一つでも落ちれば `rework` に gate(o20)**、
-**verified の commit を Work の Artifact(branch @ sha)として記録(o21)**まで**。
-fix turn 差し戻し(o22)/ 沈黙・timeout・pane 死亡(o23-o25)/ ローカル accept で Outcome を satisfied 化は未)/
-GitHub 連携 / watch・reconciler。
+- **Work の実行(本線が一周する)**: `meguri run <o>` が ready Outcome から
+  Work を起こし(o14)、bare から隔離 worktree を切り(o13)、その pane でエージェントを
+  起動して実装プロンプトを注入(o15)、`.meguri/result.json` の出現をポーリングして
+  完了検知(o16、画面は読まない)、success 報告時に **meguri 側の独立検証①②③
+  (clean tree=o17 / commit 進行=o18 / check_command=o19)** を rollup し、
+  **全部 pass なら `verified`(検証済み commit を Artifact=branch @ sha として記録=o21)/
+  一つでも落ちれば `rework` に gate(o20)**。
+- **ローカル accept**(Human Gate): `meguri accept <w>` で verified Work を受理 →
+  serve 先 Outcome が **satisfied**(導出)→ 後続 Outcome が **ready** になる。
+  これで `run → verified → accept → 次が ready` が一周する。
+
+まだ無いもの: fix turn 差し戻し(o22)/ 沈黙・timeout・pane 死亡の失敗経路(o23-o25)/
+accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
 
@@ -34,7 +39,7 @@ GitHub 連携 / watch・reconciler。
 | `src/config.rs` | `~/.meguri/config.toml`(`lang` / `agent`)。無ければ既定 |
 | `src/db.rs` | sqlite 接続とスキーマ(`~/.meguri/meguri.db`、`MEGURI_HOME` で移動可)。**保存は事実のみ** |
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
-| `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
+| `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。command/human は **accept 済み Work を持てば satisfied**(`accepted` id 集合を受け取る)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
@@ -48,18 +53,19 @@ GitHub 連携 / watch・reconciler。
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。
-  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。**`verified` を `meguri accept` で受理すると `accepted`** になり、serve 先 Outcome が satisfied になる(下の導出ルール)。
   * **Artifact**(o21): verified な Work の `artifact_sha`(= worktree HEAD)。ブランチ `meguri/w<id>` は bare clone に残るので `branch @ sha` が耐久成果物になる。`work ls` に表示。GitHub PR 投影(v0.3)の material。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
-**保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。
+**保存する事実**: Intent / Outcome / requires 辺 / Work(state=…/`accepted` 含む)/ human 充足表明。
 **保存しない(導出)**: satisfied / ready / blocked。
 
 ### 導出のルール(`derive.rs`)
 
-* satisfied: `human`=人の表明 / `command`=**p1 では常に未充足**(実行系=マージが無いため。p2/p3 で担当 Work のマージから満たされるようになる)/ `rollup`=子が全て satisfied。
+* satisfied: `human`=人の表明**または** accept 済み Work あり / `command`=**accept 済みの担当 Work があれば満たされる**(verified→`meguri accept`=ローカル Human Gate。GitHub 化は v0.3)/ `rollup`=子が全て satisfied。
 * ready = 未充足 かつ requires が全て satisfied(→ ここに Work を起こせる)。
 * blocked = 未充足 かつ 未充足の requires がある。
+* 導出は `accepted`(accept 済み Work を持つ Outcome の id 集合)を受け取る。事実は Work の `accepted` 状態で、satisfied はそこから毎回導く。
 
 ## CLI
 
@@ -87,6 +93,7 @@ meguri run <o> [--agent <cmd>] [--detach] [--grace-secs N] [--timeout-secs N]
                               # o14-o16: ready Outcome → Work を起こし bare から隔離 worktree を切り、
                               #   その worktree の pane でエージェントを起動して実装プロンプトを注入(state=running)、
                               #   .meguri/result.json の出現を待って報告 status を state に反映(--detach で待たず即返る)
+meguri accept <w>             # ローカル Human Gate: verified Work を受理 → serve 先 Outcome が satisfied → 後続が ready
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
@@ -151,8 +158,9 @@ meguri plan run    [--intent <i>] [--agent <cmd>] [--detach] [--grace-secs N] [-
 `serde` + `serde_json`(proposal.json)/ `toml`(config.toml)。
 最小に保つ(§20)。新しい crate はそれが解く問題が現れた増分で足す。
 
-## 既知の割り切り(p1 の意図的な穴)
+## 既知の割り切り(意図的な穴)
 
-* `command` verify の Outcome は p1 では満たせない(実行系 = p2 待ち)。前提が揃えば ready にはなる。
+* `command` verify の Outcome は **verified な Work を `meguri accept` するまで** satisfied にならない(ローカル Human Gate)。前提が揃えば ready にはなる。
 * サイクル防止は `add_requires` にあるが、現行 CLI(`outcome add --requires` は既存ノードのみ参照)では実際にサイクルを作れないため、防御は休眠状態。
-* Work は登録できるが実行しない。状態は `planned` のまま。
+* accept しても **worktree・pane は残る**(§3.5 で人間が引き取れるように意図的に。後片付けは別増分)。`work rm` で明示的に掃除する。
+* 失敗経路(fix turn=o22 / 沈黙 nudge=o23 / timeout=o24 / pane 死亡=o25)は未実装。`rework`/`failed` になった Work は今は人間が引き取る。

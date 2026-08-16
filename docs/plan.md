@@ -778,7 +778,7 @@ Outcome Graph を実際の AI coding に接続する。
   * [ ] fix turn 差し戻し(o22)
 * [ ] 沈黙 nudge / タイムアウト / pane 死亡の失敗経路
 * [x] Artifact registration(o21: verified な commit を Work の `artifact_sha` に記録。`branch @ sha` が耐久成果物、`work ls` に表示)
-* [ ] `meguri accept` / `meguri rework`(ローカル Human Gate)
+* [x] `meguri accept`(ローカル Human Gate: verified Work→`accepted`→ serve 先 Outcome が satisfied→後続 ready)/ [ ] `meguri rework`
 
 ### 完了条件
 

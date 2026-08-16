@@ -3,7 +3,7 @@
 //! HTML は dagre(層状レイアウトエンジン、min.js を埋め込み = 自己完結)にレイアウトを
 //! 任せる。交差最小化とエッジ配線はエンジン任せで、meguri は node/edge を渡すだけ。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
 
@@ -22,8 +22,8 @@ fn edges(outcomes: &[Outcome]) -> Vec<(i64, i64)> {
 }
 
 /// 人が読むテキスト表示。状態ごとにまとめる。
-pub fn text(outcomes: &[Outcome]) -> String {
-    let st = states(outcomes);
+pub fn text(outcomes: &[Outcome], accepted: &HashSet<i64>) -> String {
+    let st = states(outcomes, accepted);
     let mut out = String::new();
     for group in [State::Satisfied, State::Ready, State::Blocked] {
         let mut any = false;
@@ -63,8 +63,8 @@ pub fn text(outcomes: &[Outcome]) -> String {
 }
 
 /// Mermaid(`graph TD`)。ノードを状態で classDef 着色。
-pub fn mermaid(outcomes: &[Outcome]) -> String {
-    let st: HashMap<i64, State> = states(outcomes);
+pub fn mermaid(outcomes: &[Outcome], accepted: &HashSet<i64>) -> String {
+    let st: HashMap<i64, State> = states(outcomes, accepted);
     let mut out = String::from("graph TD\n");
     for o in outcomes {
         let label = o.statement.replace('"', "'");
@@ -85,8 +85,8 @@ fn esc_html(s: &str) -> String {
 
 /// dagre(min.js)を埋め込んだ自己完結 HTML。レイアウトはブラウザ側で dagre に計算させる。
 /// ノードクリックで関連チェーン(祖先+子孫)だけにフォーカス、ホバーで一時強調、右に詳細。
-pub fn html(outcomes: &[Outcome]) -> String {
-    let st = states(outcomes);
+pub fn html(outcomes: &[Outcome], accepted: &HashSet<i64>) -> String {
+    let st = states(outcomes, accepted);
 
     // ノード(位置は JS が dagre の結果で設定)。
     let mut nodes = String::new();
