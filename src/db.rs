@@ -36,9 +36,24 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
-/// スキーマ(冪等)。増分で列を足すときはここに追記していく。
+/// スキーマ(冪等)。新規 DB は SCHEMA で作り、既存 DB は列追加で追随する。
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    // 既存 DB 向けの列追加(新規 DB は SCHEMA に含むので二重にならないよう存在確認)。
+    add_column_if_missing(conn, "outcomes", "description", "TEXT NOT NULL DEFAULT ''")?;
+    Ok(())
+}
+
+/// テーブルに列が無ければ足す(冪等な最小マイグレーション)。
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|c| c.ok())
+        .any(|c| c == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
     Ok(())
 }
 
@@ -54,6 +69,7 @@ pub(crate) const SCHEMA: &str = r#"
             id              INTEGER PRIMARY KEY,
             intent_id       INTEGER NOT NULL REFERENCES intents(id),
             statement       TEXT NOT NULL,
+            description     TEXT NOT NULL DEFAULT '',
             -- verify.kind: 'command'(コマンド exit 0)| 'human'(人が表明)| 'rollup'(まとめ節点)
             verify_kind     TEXT NOT NULL DEFAULT 'human',
             verify_command  TEXT,          -- kind=command のときのみ

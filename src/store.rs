@@ -55,6 +55,8 @@ pub struct Outcome {
     #[allow(dead_code)]
     pub intent_id: i64,
     pub statement: String,
+    /// 詳しい説明(なぜ / 何を意味するか / 受け入れの詳細)。任意。Intent の description と対称。
+    pub description: String,
     pub verify: Verify,
     /// human 充足表明(sticky)。kind=human の satisfied 判定に使う事実。
     pub human_satisfied: bool,
@@ -101,6 +103,7 @@ pub fn add_outcome(
     conn: &Connection,
     intent_id: i64,
     statement: &str,
+    description: &str,
     verify: &Verify,
     requires: &[i64],
 ) -> Result<i64> {
@@ -117,8 +120,8 @@ pub fn add_outcome(
         }
     }
     conn.execute(
-        "INSERT INTO outcomes (intent_id, statement, verify_kind, verify_command) VALUES (?1, ?2, ?3, ?4)",
-        params![intent_id, statement, verify.kind_str(), verify.command_str()],
+        "INSERT INTO outcomes (intent_id, statement, description, verify_kind, verify_command) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![intent_id, statement, description, verify.kind_str(), verify.command_str()],
     )?;
     let id = conn.last_insert_rowid();
     for &req in requires {
@@ -171,17 +174,18 @@ pub fn requires_of(conn: &Connection, outcome_id: i64) -> Result<Vec<i64>> {
 }
 
 pub fn get_outcome(conn: &Connection, id: i64) -> Result<Outcome> {
-    let (intent_id, statement, kind, command, human): (i64, String, String, Option<String>, bool) = conn
+    let (intent_id, statement, description, kind, command, human): (i64, String, String, String, Option<String>, bool) = conn
         .query_row(
-            "SELECT intent_id, statement, verify_kind, verify_command, human_satisfied FROM outcomes WHERE id = ?1",
+            "SELECT intent_id, statement, description, verify_kind, verify_command, human_satisfied FROM outcomes WHERE id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0)),
         )
         .with_context(|| format!("no outcome o{id}"))?;
     Ok(Outcome {
         id,
         intent_id,
         statement,
+        description,
         verify: Verify::from_row(&kind, command)?,
         human_satisfied: human,
         requires: requires_of(conn, id)?,

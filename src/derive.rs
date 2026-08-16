@@ -84,6 +84,7 @@ mod tests {
             id,
             intent_id: 1,
             statement: format!("o{id}"),
+            description: String::new(),
             verify,
             human_satisfied: human,
             requires: requires.to_vec(),
