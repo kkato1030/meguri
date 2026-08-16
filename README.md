@@ -1,14 +1,34 @@
 # meguri
 
 > **meguri is a delivery control plane that turns intent into an
-> executable work graph and coordinates humans and AI agents toward the
+> executable outcome graph and coordinates humans and AI agents toward the
 > desired state.**
 
-Intent を実行可能な Work Graph に変換し、人間と AI Agent による実行・判断を
-通じて Desired State への到達を管理する Delivery Control Plane。
+Intent を到達したい状態(Outcome)のグラフに変換し、人間と AI Agent による
+実行・判断を通じて Desired State への到達を管理する Delivery Control Plane。
 初期は local-first で始める(現時点の重心であって定義ではない — `docs/plan.md` §1)。
 
-開発計画は `docs/plan.md` を参照。
+- **いま実際に動くもの**: [`docs/architecture.md`](docs/architecture.md)(現状の正確な地図)
+- **これからの計画**: [`docs/plan.md`](docs/plan.md)
+
+## 現状(v0.1: Planning)
+
+Intent を立て、pane でエージェントと対話して Outcome Graph を提案させ、承認すると
+グラフになる、まで動く。Outcome の状態(satisfied / ready / blocked)は保存せず
+毎回**導出**する。Work の実行(v0.2)/ GitHub 連携(v0.3)はこれから。
+
+```sh
+cargo build
+BIN=./target/debug/meguri
+
+$BIN intent add "Make auth production-ready"
+$BIN plan run            # pane でエージェント起動 → 対話で proposal.json → 承認で反映
+$BIN graph --mermaid     # Outcome Graph を表示(状態は導出)
+```
+
+手動で回す場合は `plan prompt`(プロンプト出力)→ エージェントが `proposal.json` を
+書く →`plan diff` →`plan apply`。設定は `~/.meguri/config.toml`(`lang` / `agent`)。
+詳細は [`docs/architecture.md`](docs/architecture.md)。
 
 ---
 
