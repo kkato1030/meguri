@@ -81,6 +81,9 @@ enum Cmd {
         /// Seconds to wait for .meguri/result.json to appear (ignored with --detach)
         #[arg(long, default_value_t = 600)]
         timeout_secs: u64,
+        /// Seconds between re-injections if the agent hasn't produced a result yet (cold-start insurance)
+        #[arg(long, default_value_t = 30)]
+        nudge_secs: u64,
     },
     /// Accept a verified Work (local Human Gate): its Outcome becomes satisfied
     Accept {
@@ -304,7 +307,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
-        Cmd::Run { outcome, agent, detach, grace_secs, timeout_secs } => run_cmd(
+        Cmd::Run { outcome, agent, detach, grace_secs, timeout_secs, nudge_secs } => run_cmd(
             &conn,
             &outcome,
             &RunOpts {
@@ -312,6 +315,7 @@ fn main() -> Result<()> {
                 detach,
                 grace: Duration::from_secs(grace_secs),
                 timeout: Duration::from_secs(timeout_secs),
+                nudge: Duration::from_secs(nudge_secs),
             },
         )?,
         Cmd::Accept { work } => accept_cmd(&conn, &work)?,
@@ -355,6 +359,8 @@ struct RunOpts {
     agent: Option<String>,
     detach: bool,
     grace: Duration,
+    /// 初回注入が落ちた場合の保険。この間隔で上限付き再注入する。
+    nudge: Duration,
     timeout: Duration,
 }
 
@@ -445,18 +451,22 @@ fn launch_work(
     std::thread::sleep(Duration::from_millis(800));
     mux.send_line(&pane, &agent_cmd)?;
     std::thread::sleep(opts.grace); // spawn_grace: CLI 起動待ち
-    mux.send_line(&pane, "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).")?;
+    let instruction = "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).";
+    mux.send_line(&pane, instruction)?; // 初回注入(grace 経過後)
 
     store::set_work_state(conn, wid, "running")?;
     println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
+    // pane は detached な場所で開く。人間が覗けるように案内する(§3.5)。
+    println!("  watch it:  {}", mux.attach_hint("meguri"));
 
     if opts.detach {
-        println!("  detached — state stays 'running'. attach to the pane to watch, then re-run to harvest.");
+        println!("  detached — state stays 'running'. use the command above to watch, then re-run to harvest.");
         return Ok(());
     }
 
     // o16: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
-    match wait_result(mux.as_ref(), &pane, &result_path, opts.timeout) {
+    // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
+    match wait_result(mux.as_ref(), &pane, &result_path, instruction, opts.nudge, opts.timeout) {
         Some(r) => {
             println!("  agent reported [{}]: {}", r.status, r.summary);
             let reported = exec::state_for(&r.status);
@@ -500,15 +510,24 @@ fn print_check(c: &verify::Check) {
     println!("  verify {}: {mark} — {}", c.name, c.detail);
 }
 
+/// 初回注入が落ちても最大この回数まで再注入する(cold-start 保険)。以降は静かに待つ
+/// (作業中のエージェントを叩き続けないため)。本格的な沈黙 nudge は o23。
+const NUDGE_MAX: u32 = 3;
+
 /// o16: 耐久 result ファイル(`.meguri/result.json`)の出現をポーリングで待つ。**画面は読まない**(§8)。
-/// 返り値: `Some(result)`=検知 / `None`=pane 死亡 or timeout(どちらも pane は残す)。
+/// `nudge` 間隔で `instruction` を最大 `NUDGE_MAX` 回だけ再注入する(初回送信が CLI 起動前に
+/// 落ちるケースの保険)。返り値: `Some(result)`=検知 / `None`=pane 死亡 or timeout(pane は残す)。
 fn wait_result(
     mux: &dyn mux::Mux,
     pane: &mux::PaneId,
     result_path: &std::path::Path,
+    instruction: &str,
+    nudge: Duration,
     timeout: Duration,
 ) -> Option<exec::WorkResult> {
     let start = std::time::Instant::now();
+    let mut last_nudge = std::time::Instant::now();
+    let mut nudges: u32 = 0;
     loop {
         // Ok(Some)=完了 / Ok(None)=まだ / Err=書き込み途中の部分 JSON → まだ完成していない扱いで待つ。
         if let Ok(Some(r)) = exec::read_result(result_path) {
@@ -519,6 +538,12 @@ fn wait_result(
         }
         if start.elapsed() >= timeout {
             return None; // timeout(詳細な扱いは o24。pane は残す)
+        }
+        // まだ result が無く、上限内なら再注入(初回が起動前で落ちていた場合の救済)。
+        if nudges < NUDGE_MAX && last_nudge.elapsed() >= nudge {
+            let _ = mux.send_line(pane, instruction);
+            nudges += 1;
+            last_nudge = std::time::Instant::now();
         }
         std::thread::sleep(Duration::from_millis(500));
     }
