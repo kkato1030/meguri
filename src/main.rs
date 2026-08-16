@@ -6,6 +6,8 @@
 mod config;
 mod db;
 mod derive;
+#[allow(dead_code)] // p2.2c(`meguri plan` からの起動)で配線する
+mod mux;
 mod plan;
 mod render;
 mod store;
