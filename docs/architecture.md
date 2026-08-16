@@ -55,13 +55,19 @@
 ```
 meguri intent  add "<title>" [--description <d>]
 meguri intent  ls
+meguri intent  edit <i> [--title <t>] [--description <d>]
+meguri intent  rm   <i>              # 配下の Outcome / 辺 / Work ごと削除
 meguri outcome add "<statement>" [--intent <i>] [--description <d>] [--check "<cmd>" | --milestone] [--needs o1,o2]
 meguri outcome ls   [--intent <i>]
 meguri outcome show <o>              # statement / description / verify / needs をまとめて表示
+meguri outcome edit <o> [--statement <s>] [--description <d>] [--check <cmd>|--milestone|--human] [--needs o1,o2]
+meguri outcome rm   <o>              # 両方向の requires 辺と serving Work も削除
 meguri outcome done   <o>      # 達成を表明(verify=human のみ)
 meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
+meguri work    edit <w> [--objective <s>] [--by ai|human]
+meguri work    rm   <w>
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)

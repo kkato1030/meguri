@@ -122,6 +122,16 @@ enum IntentCmd {
         description: String,
     },
     Ls,
+    /// Edit an Intent's title / description
+    Edit {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove an Intent and everything under it (outcomes, edges, works)
+    Rm { id: String },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +162,28 @@ enum OutcomeCmd {
     },
     /// Show one Outcome's full detail (statement, description, verify, deps, state)
     Show { id: String },
+    /// Edit an Outcome's statement / description / verify / needs
+    Edit {
+        id: String,
+        #[arg(long)]
+        statement: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// Change verify to command
+        #[arg(long)]
+        check: Option<String>,
+        /// Change verify to rollup (milestone)
+        #[arg(long)]
+        milestone: bool,
+        /// Change verify to human
+        #[arg(long)]
+        human: bool,
+        /// Replace the prerequisite set (comma-separated, e.g. o1,o2; empty string clears)
+        #[arg(long)]
+        needs: Option<String>,
+    },
+    /// Remove an Outcome (its requires edges both ways and serving works go too)
+    Rm { id: String },
     /// Mark as achieved (verify=human only)
     Done { id: String },
     /// Clear the achieved mark
@@ -175,6 +207,16 @@ enum WorkCmd {
         #[arg(long)]
         r#for: Option<String>,
     },
+    /// Edit a Work's objective / executor
+    Edit {
+        id: String,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Remove a Work
+    Rm { id: String },
 }
 
 fn main() -> Result<()> {
@@ -323,6 +365,19 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
                 }
             }
         }
+        IntentCmd::Edit { id, title, description } => {
+            let iid = parse_id(&id, 'i')?;
+            if title.is_none() && description.is_none() {
+                bail!("nothing to edit (pass --title and/or --description)");
+            }
+            store::edit_intent(conn, iid, title.as_deref(), description.as_deref())?;
+            println!("edited i{iid}");
+        }
+        IntentCmd::Rm { id } => {
+            let iid = parse_id(&id, 'i')?;
+            let (outs, works) = store::remove_intent(conn, iid)?;
+            println!("removed i{iid} ({outs} outcomes, {works} works)");
+        }
     }
     Ok(())
 }
@@ -368,6 +423,33 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
                 println!("\nneeds: {}", list.join(", "));
             }
         }
+        OutcomeCmd::Edit { id, statement, description, check, milestone, human, needs } => {
+            let oid = parse_id(&id, 'o')?;
+            let verify = match (check, milestone, human) {
+                (None, false, false) => None,
+                (Some(cmd), false, false) => Some(Verify::Command(cmd)),
+                (None, true, false) => Some(Verify::Rollup),
+                (None, false, true) => Some(Verify::Human),
+                _ => bail!("pass at most one of --check / --milestone / --human"),
+            };
+            if statement.is_none() && description.is_none() && verify.is_none() && needs.is_none() {
+                bail!("nothing to edit (pass --statement / --description / --check|--milestone|--human / --needs)");
+            }
+            store::edit_outcome(conn, oid, statement.as_deref(), description.as_deref(), verify.as_ref())?;
+            if let Some(n) = needs {
+                store::set_needs(conn, oid, &parse_id_list(Some(&n), 'o')?)?;
+            }
+            println!("edited o{oid}");
+        }
+        OutcomeCmd::Rm { id } => {
+            let oid = parse_id(&id, 'o')?;
+            let (works, dependents) = store::remove_outcome(conn, oid)?;
+            print!("removed o{oid} ({works} works removed");
+            if dependents > 0 {
+                print!("; {dependents} outcome(s) lost it as a prerequisite");
+            }
+            println!(")");
+        }
         OutcomeCmd::Done { id } => {
             let oid = parse_id(&id, 'o')?;
             store::set_human_satisfied(conn, oid, true)?;
@@ -394,6 +476,19 @@ fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
             for w in store::list_works(conn, sid)? {
                 println!("w{}  for o{}  [{}/{}]  {}", w.id, w.serves_id, w.executor, w.state, w.objective);
             }
+        }
+        WorkCmd::Edit { id, objective, by } => {
+            let wid = parse_id(&id, 'w')?;
+            if objective.is_none() && by.is_none() {
+                bail!("nothing to edit (pass --objective and/or --by)");
+            }
+            store::edit_work(conn, wid, objective.as_deref(), by.as_deref())?;
+            println!("edited w{wid}");
+        }
+        WorkCmd::Rm { id } => {
+            let wid = parse_id(&id, 'w')?;
+            store::remove_work(conn, wid)?;
+            println!("removed w{wid}");
         }
     }
     Ok(())
