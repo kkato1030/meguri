@@ -82,6 +82,11 @@ enum Cmd {
         #[arg(long, default_value_t = 600)]
         timeout_secs: u64,
     },
+    /// Accept a verified Work (local Human Gate): its Outcome becomes satisfied
+    Accept {
+        /// The Work to accept (must be verified; e.g. w3)
+        work: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,21 +285,22 @@ fn main() -> Result<()> {
         Cmd::Graph { intent, mermaid, html, out, no_open } => {
             let iid = intent.map(|s| parse_id(&s, 'i')).transpose()?;
             let outcomes = store::list_outcomes(&conn, iid)?;
+            let accepted = store::accepted_outcome_ids(&conn)?;
             if html {
                 let path = match out {
                     Some(p) => p,
                     None => db::meguri_home()?.join("graph.html"),
                 };
-                std::fs::write(&path, render::html(&outcomes))
+                std::fs::write(&path, render::html(&outcomes, &accepted))
                     .with_context(|| format!("cannot write {}", path.display()))?;
                 println!("wrote {}", path.display());
                 if !no_open {
                     open_in_browser(&path);
                 }
             } else if mermaid {
-                print!("{}", render::mermaid(&outcomes));
+                print!("{}", render::mermaid(&outcomes, &accepted));
             } else {
-                print!("{}", render::text(&outcomes));
+                print!("{}", render::text(&outcomes, &accepted));
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
@@ -308,6 +314,38 @@ fn main() -> Result<()> {
                 timeout: Duration::from_secs(timeout_secs),
             },
         )?,
+        Cmd::Accept { work } => accept_cmd(&conn, &work)?,
+    }
+    Ok(())
+}
+
+/// ローカル Human Gate: verified な Work を accept する。
+/// その serve 先 Outcome が satisfied になり(導出)、後続 Outcome が ready になる。
+fn accept_cmd(conn: &rusqlite::Connection, work: &str) -> Result<()> {
+    let wid = parse_id(work, 'w')?;
+    let w = store::get_work(conn, wid)?;
+    if w.state != "verified" {
+        bail!("w{wid} is [{}], not verified — only verified Work can be accepted", w.state);
+    }
+    store::set_work_state(conn, wid, "accepted")?;
+    println!("accepted w{wid} → o{} is now satisfied", w.serves_id);
+
+    // 後続で新たに ready になった Outcome を案内する(リングが繋がったことの確認)。
+    let o = store::get_outcome(conn, w.serves_id)?;
+    let outcomes = store::list_outcomes(conn, Some(o.intent_id))?;
+    let accepted = store::accepted_outcome_ids(conn)?;
+    let states = derive::states(&outcomes, &accepted);
+    let mut newly_ready: Vec<i64> = outcomes
+        .iter()
+        .filter(|x| x.requires.contains(&w.serves_id) && states.get(&x.id) == Some(&derive::State::Ready))
+        .map(|x| x.id)
+        .collect();
+    newly_ready.sort();
+    if newly_ready.is_empty() {
+        println!("  no newly-ready outcomes (this may complete a branch of the graph)");
+    } else {
+        let list: Vec<String> = newly_ready.iter().map(|id| format!("o{id}")).collect();
+        println!("  now ready: {}  (run one with `meguri run <o>`)", list.join(", "));
     }
     Ok(())
 }
@@ -337,7 +375,8 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str, opts: &RunOpts) -> Result
 
     // ready 判定(その Intent の導出状態)。
     let outcomes = store::list_outcomes(conn, Some(o.intent_id))?;
-    let states = derive::states(&outcomes);
+    let accepted = store::accepted_outcome_ids(conn)?;
+    let states = derive::states(&outcomes, &accepted);
     match states.get(&oid) {
         Some(derive::State::Ready) => {}
         Some(s) => bail!("o{oid} is not ready (currently {})", s.label()),
