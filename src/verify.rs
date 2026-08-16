@@ -12,6 +12,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::store::{Outcome, Verify};
+
 /// 検証子ひとつの結果。o17-o19 が返し、o20 がまとめる。
 #[derive(Debug, Clone)]
 pub struct Check {
@@ -69,9 +71,52 @@ pub fn commits_ahead(worktree: &Path, base_sha: &str) -> Result<Check> {
     }
 }
 
+/// o19: Outcome の `verify=command` を worktree で実行し、exit 0 を要求する。
+///
+/// これが Outcome 固有の「達成の確かめ方」そのもの(§5)。clean_tree/commits_ahead が
+/// 「体裁」の検証なのに対し、これは「中身が要件を満たすか」の検証。
+/// human/rollup の Outcome は meguri が回すコマンドを持たないので `None`(検証対象外)。
+pub fn check_command(o: &Outcome, worktree: &Path) -> Result<Option<Check>> {
+    let cmd = match &o.verify {
+        Verify::Command(c) => c,
+        Verify::Human | Verify::Rollup => return Ok(None),
+    };
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(worktree)
+        .output()
+        .with_context(|| format!("failed to run check_command: {cmd}"))?;
+    if out.status.success() {
+        return Ok(Some(Check { name: "check_command", pass: true, detail: format!("`{cmd}` exited 0") }));
+    }
+    // 落ちたときは診断のため末尾を少しだけ添える(耐久チャネル: exit code + 標準エラー)。
+    let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+    let err = String::from_utf8_lossy(&out.stderr);
+    let tail: String = err.trim().lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    let detail = if tail.is_empty() {
+        format!("`{cmd}` exited {code}")
+    } else {
+        format!("`{cmd}` exited {code}:\n{tail}")
+    };
+    Ok(Some(Check { name: "check_command", pass: false, detail }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(verify: Verify) -> Outcome {
+        Outcome {
+            id: 1,
+            intent_id: 1,
+            statement: "s".into(),
+            description: String::new(),
+            verify,
+            human_satisfied: false,
+            requires: vec![],
+        }
+    }
 
     fn sh(dir: &Path, args: &[&str]) {
         let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
@@ -132,6 +177,32 @@ mod tests {
         let c = commits_ahead(&repo, &base).unwrap();
         assert!(c.pass);
         assert!(c.detail.contains("1 commit"));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn check_command_pass_fail_and_na() {
+        let repo = temp_repo();
+
+        // exit 0 → pass。
+        let c = check_command(&outcome(Verify::Command("true".into())), &repo).unwrap().unwrap();
+        assert!(c.pass, "got: {}", c.detail);
+
+        // exit 非0 → fail(diagnostic 込み)。
+        let c = check_command(&outcome(Verify::Command("echo boom >&2; exit 3".into())), &repo).unwrap().unwrap();
+        assert!(!c.pass);
+        assert!(c.detail.contains("exited 3"));
+        assert!(c.detail.contains("boom"));
+
+        // command は worktree で走る(cwd 検証)。
+        std::fs::write(repo.join("marker"), "x").unwrap();
+        let c = check_command(&outcome(Verify::Command("test -f marker".into())), &repo).unwrap().unwrap();
+        assert!(c.pass);
+
+        // human/rollup は検証対象外 = None。
+        assert!(check_command(&outcome(Verify::Human), &repo).unwrap().is_none());
+        assert!(check_command(&outcome(Verify::Rollup), &repo).unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&repo);
     }

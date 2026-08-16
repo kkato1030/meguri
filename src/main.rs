@@ -423,11 +423,14 @@ fn launch_work(
             println!("  agent reported [{}]: {}", r.status, r.summary);
             println!("  w{wid} is now [{state}]");
 
-            // o17/o18: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
-            // まだ gate はしない(verified 化する rollup は o20)。検証子は o19 で増える。
+            // o17-o19: 報告が success のときだけ meguri 側で独立検証する(trust-but-verify、§3.5)。
+            // まだ gate はしない(verified 化する rollup は o20)。
             if state == "reported" {
                 print_check(verify::clean_tree(worktree)?);
                 print_check(verify::commits_ahead(worktree, base_sha)?);
+                if let Some(c) = verify::check_command(o, worktree)? {
+                    print_check(c);
+                }
             }
         }
         None => {
