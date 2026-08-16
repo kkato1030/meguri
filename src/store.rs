@@ -462,6 +462,18 @@ fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM works WHERE id = ?1", [id], |_| Ok(())).is_ok())
 }
 
+pub fn get_work(conn: &Connection, id: i64) -> Result<Work> {
+    conn.query_row(
+        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha FROM works WHERE id = ?1",
+        [id],
+        |r| Ok(Work {
+            id: r.get(0)?, serves_id: r.get(1)?, objective: r.get(2)?, executor: r.get(3)?,
+            state: r.get(4)?, worktree_path: r.get(5)?, branch: r.get(6)?, base_sha: r.get(7)?,
+        }),
+    )
+    .with_context(|| format!("no work w{id}"))
+}
+
 pub fn edit_work(conn: &Connection, id: i64, objective: Option<&str>, executor: Option<&str>) -> Result<()> {
     if !work_exists(conn, id)? {
         bail!("work w{id} does not exist");

@@ -446,6 +446,29 @@ fn bare_path(name: &str) -> Result<PathBuf> {
     Ok(db::repos_dir()?.join(format!("{name}.git")))
 }
 
+/// Work に紐づく git worktree とブランチを実体ごと消す(best-effort)。
+/// spawn 済みでなければ何もしない。DB 行の削除は呼び出し側で行う。
+fn cleanup_worktree(conn: &rusqlite::Connection, w: &store::Work) {
+    let (Some(path), Some(branch), Some(base_sha)) =
+        (w.worktree_path.clone(), w.branch.clone(), w.base_sha.clone())
+    else {
+        return;
+    };
+    let repo = store::get_outcome(conn, w.serves_id)
+        .and_then(|o| store::get_intent(conn, o.intent_id))
+        .ok()
+        .and_then(|it| it.repo_id)
+        .and_then(|rid| store::get_repo(conn, rid).ok());
+    if let Some(repo) = repo {
+        if let Ok(bare) = bare_path(&repo.name) {
+            let wt = gitops::Worktree { path: path.into(), branch, base_sha };
+            if let Err(e) = gitops::remove_worktree(&bare, &wt) {
+                eprintln!("warning: could not remove worktree {}: {e}", wt.path.display());
+            }
+        }
+    }
+}
+
 fn repo(conn: &rusqlite::Connection, c: RepoCmd) -> Result<()> {
     match c {
         RepoCmd::Add { name, from, branch } => {
@@ -511,6 +534,12 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
         }
         IntentCmd::Rm { id } => {
             let iid = parse_id(&id, 'i')?;
+            // 行の cascade 削除の前に、配下 Work の worktree 実体を掃除する。
+            for o in store::list_outcomes(conn, Some(iid))? {
+                for w in store::list_works(conn, Some(o.id))? {
+                    cleanup_worktree(conn, &w);
+                }
+            }
             let (outs, works) = store::remove_intent(conn, iid)?;
             println!("removed i{iid} ({outs} outcomes, {works} works)");
         }
@@ -626,6 +655,8 @@ fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
         }
         WorkCmd::Rm { id } => {
             let wid = parse_id(&id, 'w')?;
+            let w = store::get_work(conn, wid)?;
+            cleanup_worktree(conn, &w); // 実体の git worktree/ブランチも消す
             store::remove_work(conn, wid)?;
             println!("removed w{wid}");
         }
