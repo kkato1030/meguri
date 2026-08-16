@@ -124,6 +124,9 @@ enum OutcomeCmd {
         /// Owning Intent (default: the only Intent if there is one; e.g. i1 / 1)
         #[arg(long)]
         intent: Option<String>,
+        /// Fuller detail (why / what it means / acceptance)
+        #[arg(long, default_value = "")]
+        description: String,
         /// verify=command: command that confirms achievement (exit 0)
         #[arg(long)]
         check: Option<String>,
@@ -138,6 +141,8 @@ enum OutcomeCmd {
         #[arg(long)]
         intent: Option<String>,
     },
+    /// Show one Outcome's full detail (statement, description, verify, deps, state)
+    Show { id: String },
     /// Mark as achieved (verify=human only)
     Done { id: String },
     /// Clear the achieved mark
@@ -298,7 +303,7 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
 
 fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
     match c {
-        OutcomeCmd::Add { statement, intent, check, milestone, needs } => {
+        OutcomeCmd::Add { statement, intent, description, check, milestone, needs } => {
             let iid = resolve_intent(conn, intent.as_deref())?;
             let verify = match (check, milestone) {
                 (Some(_), true) => bail!("--check and --milestone cannot be combined"),
@@ -307,7 +312,7 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
                 (None, false) => Verify::Human, // 既定
             };
             let reqs = parse_id_list(needs.as_deref(), 'o')?;
-            let id = store::add_outcome(conn, iid, &statement, &verify, &reqs)?;
+            let id = store::add_outcome(conn, iid, &statement, &description, &verify, &reqs)?;
             println!("created o{id} ([{}] {})", verify.kind_str(), statement);
         }
         OutcomeCmd::Ls { intent } => {
@@ -320,6 +325,21 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
                     format!("  ← {}", list.join(", "))
                 };
                 println!("o{}  [{}] {}{}", o.id, o.verify.kind_str(), o.statement, reqs);
+            }
+        }
+        OutcomeCmd::Show { id } => {
+            let oid = parse_id(&id, 'o')?;
+            let o = store::get_outcome(conn, oid)?;
+            println!("o{}  [{}]  {}", o.id, o.verify.kind_str(), o.statement);
+            if !o.description.trim().is_empty() {
+                println!("\n{}", o.description);
+            }
+            if let store::Verify::Command(cmd) = &o.verify {
+                println!("\nverify (command): {cmd}");
+            }
+            if !o.requires.is_empty() {
+                let list: Vec<String> = o.requires.iter().map(|r| format!("o{r}")).collect();
+                println!("\nneeds: {}", list.join(", "));
             }
         }
         OutcomeCmd::Done { id } => {

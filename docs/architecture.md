@@ -35,7 +35,7 @@
 ## ドメインモデル(§4/§5)
 
 * **Intent** — 実現したいこと。グラフの根。
-* **Outcome** — 到達したい状態(グラフのノード)。`statement` / `verify` / `requires`(前提辺)を持つ。
+* **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` を持つ。p1 では登録のみ(実行は未実装)。
 
@@ -55,8 +55,9 @@
 ```
 meguri intent  add "<title>" [--description <d>]
 meguri intent  ls
-meguri outcome add "<statement>" [--intent <i>] [--check "<cmd>" | --milestone] [--needs o1,o2]
+meguri outcome add "<statement>" [--intent <i>] [--description <d>] [--check "<cmd>" | --milestone] [--needs o1,o2]
 meguri outcome ls   [--intent <i>]
+meguri outcome show <o>              # statement / description / verify / needs をまとめて表示
 meguri outcome done   <o>      # 達成を表明(verify=human のみ)
 meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]

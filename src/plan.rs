@@ -129,6 +129,9 @@ struct ProposedOutcome {
     /// proposal 内のローカル名(needs から参照する)。
     r#ref: String,
     statement: String,
+    /// 詳しい説明(なぜ / 何を意味するか / 受け入れの詳細)。任意。
+    #[serde(default)]
+    description: String,
     #[serde(default)]
     verify: ProposedVerify,
     /// 前提。proposal 内の ref か、既存 Outcome の "o3" を書く。
@@ -169,6 +172,7 @@ enum NeedRef {
 struct PlanItem {
     r#ref: String,
     statement: String,
+    description: String,
     verify: Verify,
     needs: Vec<NeedRef>,
 }
@@ -211,7 +215,7 @@ pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path, lang
 
     s.push_str("# Instructions\n");
     s.push_str("- Decompose the Intent into Outcomes phrased as desired *states* (\"... is in place\"), not tasks.\n");
-    s.push_str(&format!("- Write each statement in {lang}.\n"));
+    s.push_str(&format!("- Write each statement (short) and description (fuller: why / what it means / acceptance detail) in {lang}.\n"));
     s.push_str(
         r#"- Give each Outcome a `verify` (how we confirm it is achieved):
     - {"kind":"command","command":"<test/check command>"}  - achieved when the command exits 0
@@ -236,11 +240,14 @@ fn schema_example(intent_id: i64) -> String {
   "intent": "i{intent_id}",
   "outcomes": [
     {{ "ref": "provider", "statement": "OAuth provider is configured",
+      "description": "Client id/secret and redirect URIs are set for the provider; without this nothing else can proceed.",
       "verify": {{"kind": "human"}} }},
     {{ "ref": "state", "statement": "Invalid state is rejected",
+      "description": "The callback compares the state param against the stored one and rejects mismatches (CSRF protection). Acceptance: the state-validation test passes.",
       "verify": {{"kind": "command", "command": "cargo test state_validation"}},
       "needs": ["provider"] }},
     {{ "ref": "e2e", "statement": "Auth is verified end-to-end",
+      "description": "A milestone: login, session, and rejection all hold together.",
       "verify": {{"kind": "rollup"}}, "needs": ["state", "provider"] }}
   ]
 }}
@@ -300,6 +307,7 @@ pub fn resolve(conn: &Connection, json: &str) -> Result<Plan> {
         items.push(PlanItem {
             r#ref: po.r#ref,
             statement: po.statement,
+            description: po.description,
             verify: po.verify.into(),
             needs,
         });
@@ -326,6 +334,9 @@ pub fn diff_text(plan: &Plan) -> String {
             format!("  <- {}", list.join(", "))
         };
         s.push_str(&format!("  + [{}] {} (@{}){}\n", it.verify.kind_str(), it.statement, it.r#ref, needs));
+        if !it.description.trim().is_empty() {
+            s.push_str(&format!("      {}\n", it.description.replace('\n', " ")));
+        }
     }
     s
 }
@@ -338,7 +349,7 @@ pub fn apply(conn: &Connection, plan: &Plan) -> Result<Vec<i64>> {
     let mut map = std::collections::HashMap::new();
     // 1 相: 作成(requires は後で)。
     for it in &plan.items {
-        let id = store::add_outcome(conn, plan.intent_id, &it.statement, &it.verify, &[])?;
+        let id = store::add_outcome(conn, plan.intent_id, &it.statement, &it.description, &it.verify, &[])?;
         map.insert(it.r#ref.as_str(), id);
     }
     // 2 相: needs を配線(store 側でサイクル検出)。
@@ -402,7 +413,7 @@ mod tests {
         let conn = mem();
         let iid = store::add_intent(&conn, "T", "").unwrap();
         // 既存 o1 を作っておく。
-        let o1 = store::add_outcome(&conn, iid, "既存", &Verify::Human, &[]).unwrap();
+        let o1 = store::add_outcome(&conn, iid, "既存", "", &Verify::Human, &[]).unwrap();
         assert_eq!(o1, 1);
 
         let json = r#"{
