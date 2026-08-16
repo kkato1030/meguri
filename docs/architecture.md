@@ -62,7 +62,7 @@ meguri repo    ls | fetch <name> | rm <name>
 meguri intent  add "<title>" [--description <d>] [--repo <name>]
 meguri intent  ls
 meguri intent  edit <i> [--title <t>] [--description <d>] [--repo <name>]
-meguri intent  rm   <i>              # 配下の Outcome / 辺 / Work ごと削除
+meguri intent  rm   <i>              # 配下の Outcome / 辺 / Work(+ その worktree 実体)ごと削除
 meguri outcome add "<statement>" [--intent <i>] [--description <d>] [--check "<cmd>" | --milestone] [--needs o1,o2]
 meguri outcome ls   [--intent <i>]
 meguri outcome show <o>              # statement / description / verify / needs をまとめて表示
@@ -73,7 +73,7 @@ meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
-meguri work    rm   <w>
+meguri work    rm   <w>              # DB 行 + spawn 済みなら git worktree/ブランチも掃除
 meguri run <o>                       # o14: ready Outcome → Work を起こし bare から隔離 worktree を切る
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
