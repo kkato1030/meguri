@@ -64,11 +64,17 @@ enum PlanCmd {
     },
     /// Validate proposal.json and show the outcomes it would add
     Diff {
+        /// Read this Intent's proposal (proposals/i<N>.json). Symmetric with `plan run --intent`
+        #[arg(long)]
+        intent: Option<String>,
+        /// Read an explicit file instead (overrides --intent)
         #[arg(long)]
         file: Option<PathBuf>,
     },
     /// Approve proposal.json and apply it (additive)
     Apply {
+        #[arg(long)]
+        intent: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
         /// Skip the confirmation prompt
@@ -82,10 +88,13 @@ enum PlanCmd {
         /// Override the agent command (default: config `agent`)
         #[arg(long)]
         agent: Option<String>,
+        /// Launch + inject, then return immediately (talk in the pane; harvest later with `plan diff/apply --intent`)
+        #[arg(long)]
+        detach: bool,
         /// Seconds to wait after launching the agent before injecting the prompt
         #[arg(long, default_value_t = 8)]
         grace_secs: u64,
-        /// Seconds to wait for the proposal to appear
+        /// Seconds to wait for the proposal to appear (ignored with --detach)
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
         /// Skip the confirmation prompt
@@ -177,26 +186,31 @@ fn main() -> Result<()> {
 }
 
 fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
-    let path = |f: Option<PathBuf>| -> Result<PathBuf> {
-        match f {
-            Some(p) => Ok(p),
-            None => plan::default_proposal_path(),
+    // proposal パスの解決: --file 最優先、次に --intent(session パス)、どちらも
+    // 無ければ既定の proposal.json。これで run と diff/apply の --intent が一致する。
+    let resolve_path = |file: Option<PathBuf>, intent: Option<&str>| -> Result<PathBuf> {
+        if let Some(f) = file {
+            Ok(f)
+        } else if intent.is_some() {
+            plan::session_proposal_path_for(conn, intent)
+        } else {
+            plan::default_proposal_path()
         }
     };
     match c {
         PlanCmd::Prompt { intent, file } => {
-            let out = path(file)?;
+            let out = resolve_path(file, intent.as_deref())?;
             let lang = config::load()?.lang;
             let text = plan::prompt(conn, intent.as_deref(), &out, &lang)?;
             print!("{text}");
         }
-        PlanCmd::Diff { file } => {
-            let p = path(file)?;
+        PlanCmd::Diff { intent, file } => {
+            let p = resolve_path(file, intent.as_deref())?;
             let plan = plan::resolve(conn, &plan::load(&p)?)?;
             print!("{}", plan::diff_text(&plan));
         }
-        PlanCmd::Apply { file, yes } => {
-            let p = path(file)?;
+        PlanCmd::Apply { intent, file, yes } => {
+            let p = resolve_path(file, intent.as_deref())?;
             let plan = plan::resolve(conn, &plan::load(&p)?)?;
             print!("{}", plan::diff_text(&plan));
             if !yes && !confirm("Apply?")? {
@@ -207,7 +221,7 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
             let list: Vec<String> = ids.iter().map(|i| format!("o{i}")).collect();
             println!("applied: added {}", list.join(", "));
         }
-        PlanCmd::Run { intent, agent, grace_secs, timeout_secs, yes } => {
+        PlanCmd::Run { intent, agent, detach, grace_secs, timeout_secs, yes } => {
             let cfg = config::load()?;
             let agent = agent.unwrap_or(cfg.agent);
             let mux = mux::select();
@@ -218,6 +232,15 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
                 grace: Duration::from_secs(grace_secs),
                 timeout: Duration::from_secs(timeout_secs),
             };
+            if detach {
+                // launch だけして返す。人間が pane で対話 → あとで harvest する。
+                eprintln!("[plan] launching agent in a pane and injecting the prompt...");
+                let l = plan::launch(conn, intent.as_deref(), &rt)?;
+                println!("launched. talk to the agent in the pane. when it has written a proposal:");
+                println!("  meguri plan diff  --intent i{}   # review", l.intent_id);
+                println!("  meguri plan apply --intent i{}   # apply", l.intent_id);
+                return Ok(());
+            }
             eprintln!("[plan] launching agent in a pane and injecting the prompt...");
             eprintln!("[plan] waiting for the proposal (up to {timeout_secs}s). the pane stays alive.");
             let (path, plan) = plan::run(conn, intent.as_deref(), &rt)?;

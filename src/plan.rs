@@ -15,20 +15,26 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use serde::Deserialize;
 
-use crate::mux::Mux;
+use crate::mux::{Mux, PaneId};
 use crate::store::{self, Verify};
 
-/// proposal.json の既定パス(`MEGURI_HOME/proposal.json`)。
+/// proposal.json の既定パス(`MEGURI_HOME/proposal.json`)。--intent も --file も無いとき。
 pub fn default_proposal_path() -> Result<PathBuf> {
     Ok(crate::db::meguri_home()?.join("proposal.json"))
 }
 
-/// Intent ごとの proposal パス(`MEGURI_HOME/proposals/i<N>.json`)。`plan run` 用。
-/// Intent 単位に分けることで、複数 Intent の並行計画が衝突しない(§ 単一ファイル問題)。
+/// Intent ごとの proposal パス(`MEGURI_HOME/proposals/i<N>.json`)。
+/// Intent 単位に分けることで、複数 Intent の並行計画が衝突しない(単一ファイル問題)。
 fn session_proposal_path(intent_id: i64) -> Result<PathBuf> {
     let dir = crate::db::meguri_home()?.join("proposals");
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     Ok(dir.join(format!("i{intent_id}.json")))
+}
+
+/// Intent を解決して、その session proposal パスを返す(`plan diff/apply --intent` 用)。
+/// これで `plan run --intent i3` と `plan diff/apply --intent i3` のパスが一致する。
+pub fn session_proposal_path_for(conn: &Connection, intent_opt: Option<&str>) -> Result<PathBuf> {
+    session_proposal_path(resolve_intent(conn, intent_opt)?)
 }
 
 /// p2.2c: pane を開いてエージェントを起動し、planning プロンプトを注入し、
@@ -46,7 +52,16 @@ pub struct Runtimes<'a> {
     pub timeout: Duration,
 }
 
-pub fn run(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result<(PathBuf, Option<Plan>)> {
+/// 起動結果。harvest(`wait_proposal`)や detach 後の案内に使う。
+pub struct Launched {
+    pub intent_id: i64,
+    pub proposal_path: PathBuf,
+    pub pane: PaneId,
+}
+
+/// pane を開いてエージェントを起動し、プロンプトを注入する(**待たない**)。
+/// detach 実行(launch だけして人間が対話)にも、blocking な `run` にも使う。
+pub fn launch(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result<Launched> {
     let intent_id = resolve_intent(conn, intent_opt)?;
     let proposal_path = session_proposal_path(intent_id)?;
     // 前回の残骸を消しておく(新しい出現を検知するため)。
@@ -68,14 +83,17 @@ pub fn run(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result
         &pane,
         &format!("Read {} and complete it (write the JSON proposal as instructed).", prompt_path.display()),
     )?;
+    Ok(Launched { intent_id, proposal_path, pane })
+}
 
-    // proposal 出現をポーリング(pane 死亡でも打ち切り)。
+/// proposal.json が書かれるのを待って検証済み Plan にする。時間切れ / pane 死亡なら None。
+pub fn wait_proposal(conn: &Connection, rt: &Runtimes, l: &Launched) -> Result<Option<Plan>> {
     let start = Instant::now();
     let appeared = loop {
-        if proposal_path.exists() {
+        if l.proposal_path.exists() {
             break true;
         }
-        if !rt.mux.is_alive(&pane).unwrap_or(false) {
+        if !rt.mux.is_alive(&l.pane).unwrap_or(false) {
             break false; // pane が死んだ = エージェント終了/失敗
         }
         if start.elapsed() >= rt.timeout {
@@ -83,13 +101,17 @@ pub fn run(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-
     if !appeared {
-        return Ok((proposal_path, None));
+        return Ok(None);
     }
-    let json = load(&proposal_path)?;
-    let plan = resolve(conn, &json)?;
-    Ok((proposal_path, Some(plan)))
+    Ok(Some(resolve(conn, &load(&l.proposal_path)?)?))
+}
+
+/// blocking なワンショット(draft モード): launch して最初の proposal を待つ。
+pub fn run(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result<(PathBuf, Option<Plan>)> {
+    let l = launch(conn, intent_opt, rt)?;
+    let plan = wait_proposal(conn, rt, &l)?;
+    Ok((l.proposal_path, plan))
 }
 
 // ---- proposal.json のスキーマ(エージェントが書く形) ----

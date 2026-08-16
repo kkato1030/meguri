@@ -63,14 +63,24 @@ meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri graph [--intent <i>] [--mermaid]
 
-meguri plan prompt [--intent <i>] [--file <path>]   # planning プロンプトを出力
-meguri plan diff              [--file <path>]        # proposal.json の追加内容を検証・表示
-meguri plan apply             [--file <path>] [--yes]  # 承認して反映(additive)
-meguri plan run  [--intent <i>] [--agent <cmd>] [--grace-secs N] [--timeout-secs N] [--yes]
-                              # pane 起動→agent 実行→プロンプト注入→proposal 検知→diff→反映
+meguri plan prompt [--intent <i>] [--file <path>]        # planning プロンプトを出力
+meguri plan diff   [--intent <i>] [--file <path>]        # proposal の追加内容を検証・表示
+meguri plan apply  [--intent <i>] [--file <path>] [--yes]  # 承認して反映(additive)
+meguri plan run    [--intent <i>] [--agent <cmd>] [--detach] [--grace-secs N] [--timeout-secs N] [--yes]
+                              # pane 起動→agent 実行→プロンプト注入→(proposal 検知→diff→反映)
 ```
 
-`proposal.json` の既定パスは `MEGURI_HOME/proposal.json`。スキーマ:
+**proposal パスの解決**(prompt / diff / apply / run 共通):`--file` 最優先 → `--intent i<N>`
+なら `MEGURI_HOME/proposals/i<N>.json`(session パス)→ どちらも無ければ `MEGURI_HOME/proposal.json`。
+これで `plan run --intent i3` と `plan diff/apply --intent i3` のパスが一致する。
+
+**モード**:
+- **ワンショット(draft)**: `plan run --intent i3` — 起動して最初の proposal を待ち(blocking)、diff → 承認。
+- **対話(反復)**: `plan run --intent i3 --detach` — 起動+注入して即返る。人間が pane で対話 →
+  `plan diff --intent i3`(その時点の proposal を収穫)→ さらに対話 → `plan apply --intent i3`。
+  launch と harvest を分離。pane は残す(§3.5)。
+
+`proposal.json` のスキーマ:
 
 ```json
 { "intent": "i1",
