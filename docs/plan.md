@@ -200,6 +200,8 @@ verify の種類は 3 つ(**v0.1 はこの 3 つに絞る**):
 
 `command` は権威 tree のコミットでキャッシュし、**コードが変われば自動で再評価**(先祖返りで達成が自動的に外れる)。`human` は sticky。どの Outcome も verify を必ず持つ(既定 `human`)— 計画対話で「達成をどう確かめる?」を毎回問わせ、受け入れ基準を鋭くするため。
 
+> **verify の芯**(§23 Q6、北極星): この 3 種は「**誰が verify するか**」の射影 —— `command`=computer Actor / `human`=human Actor / `rollup`=Actor でなく**構造**(meguri がグラフから導出)。4 種目の `ci`(GitHub Actions Actor、adapter 供給)は p3 で足す。verify は execute(Work の executor、§23 Q2)と同じ Actor 台帳を引く。
+
 **v0.1 では作らない(が塞がない)確かめ方**: 「本番で実際に動いている(URL が応答する等の runtime 観測)」「外部ステータス(CI 緑等)」。これらは**コードが変わらなくても状態が変わる**ので、コミットでのキャッシュに乗らず別の観測サイクルが要る。delivery を名乗る以上ロードマップには残す(§23 Q4)。
 
 例:
@@ -409,6 +411,8 @@ meguri とエージェントの接点は **1 つの抽象**に統一する:
 両方で使い回せる。エージェント起動レシピの差(program / args / 除去する環境変数)
 だけが相手ごとに変わる(p0 で実測: claude はネイティブ ACP 無しで CLAUDECODE の
 unset が要る等 —— `archive/p0-acp-spike` ブランチ参照)。
+
+> **Actor × Runtime**(§23 Q6、北極星): この境界の向こうにいるのは **Actor**(具体エージェントや human/ci)で、その届き方が **Runtime**(下記 Herdr/Tmux=ローカル pane / Remote=Web・cloud)。`Claude Code (CLI)` と `Claude Code Web` は Actor はほぼ同系で Runtime だけ違う。cloud Actor の耐久チャネルは多くが PR(GitHub adapter で観測)になるが、契約の形は不変。
 
 初期実装では pane 供給に **herdr を優先**する。
 
@@ -1051,7 +1055,8 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 
 **将来レバー(v0.1 では作らないが塞がない)**:
 - **案B(stacked 実行)**: 上流が verify を通った時点で下流を解禁(上流ブランチ基点で積む)。鎖状依存の直列化を緩めるが、上流がレビューで覆ると下流は作り直し。旧 meguri は「土台が動く」痛みを実測済み。throughput が実測で問題化したら投入。実装は worktree を上流ブランチ基点にする仕組みが v0.2 に増える。
-- **runtime / 外部ステータス確認**: 「本番で実際に動いている(URL 応答等)」「CI 緑等の外部状態」を satisfied の確かめ方に追加。コードが変わらなくても状態が変わるので、コミットキャッシュでなく別の観測サイクルが要る。**delivery を名乗る以上ロードマップに残す**(候補: v0.4 前後)。
+- **ci(GitHub Actions)= 4 種目の verify**: adapter が供給する Actor(§23 Q6)。`command` と同じ SHA 固定なので扱いやすく、**PR が要る = p3(GitHub)で入れる**のが自然(v0.4 でなく p3 に寄せる)。
+- **runtime 観測**: 「本番で実際に動いている(URL 応答等)」。コードが変わらなくても状態が変わる(time-varying)ので、コミットキャッシュでなく別の観測サイクルが要る。ci より後。**delivery を名乗る以上ロードマップに残す**。
 
 **より深い律速の所在**: 進みの本当のボトルネックは依存の張り方ではなく**人間レビューのゲート**。案B は実装の並行化にしか効かない。レビューの捌き方(pr-reviewer の役割・自動化の範囲)は v0.4 以降の独立論点(Q3 の defer とも接続、旧 review-convergence 診断を参照)。
 
@@ -1070,3 +1075,40 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 **ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `archive/p0-acp-spike` ブランチから再開する。
 
 **手段の段階**(§7): 第一は **pane(B)**(人間が生の pane で対話 → proposal.json 収穫)。人間が pane に attach せず meguri の CLI で完結させたくなったら **headless 仲介(C)**(`claude -p --resume` / `codex exec resume` を叩き proposal.json を受ける)を足す。B/C は同じファイル契約を共有するので B→C は追加であって作り直しではない。
+
+## Q6. Actor モデル(北極星・2026-08-16)
+
+**これは決定ではなく target model(北極星)**。実装は増分で結晶させる(下の timing)。executor(Q2/Q3)と verify(Q4)に散っていた「誰が」を、**1 つの Actor 概念**に畳む整理。
+
+**Actor** = execute(変更を作る)/ verify(状態を確かめる)を行う主体。core が供給するもの(human)と、**adapter が供給するもの**(GitHub adapter → CI Actor + merge シグナル)がある。
+
+- **executor も verify も同じ Actor 台帳**を引く。「誰が実装するか」「誰が確かめるか」が 1 つの語彙。
+- **rollup だけは Actor ではない**(誰も確かめない・meguri がグラフから導く**構造**)。よって verify = **structural(rollup)** か **actor-attested(human / computer / ci / 将来 ai-reviewer)**。
+- 能力(capability)は Actor ごと。全 AI を交換可能と仮定しない(p0 で Cursor adapter は返答すら返さなかった)。
+
+| Actor | execute | verify | 供給元 |
+|---|---|---|---|
+| human | ✓ | ✓(判断) | core |
+| ai(Claude/Codex…) | ✓ | ✓(ai-reviewer) | pane+契約(§8) |
+| computer(ローカル) | △(機械的 op) | ✓(command) | core/ローカル |
+| ci(GitHub Actions) | ✗ | ✓(pipeline) | GitHub adapter |
+
+### Actor × Runtime(具体エージェントの表し方)
+
+「AI」は粗すぎる。単位は具体エージェントだが、それは **2 軸の掛け算**で表す:
+
+- **Actor(何者か)**: identity + capability + profile(モデル/速度/コスト)。
+- **Runtime / Transport(どう届くか、§8)**: `Herdr`/`Tmux`(ローカル pane + ファイル契約)/ `Remote`(ブラウザ自動化 or cloud API)。
+
+例: `Claude Code (CLI)` と `Claude Code Web` は **Actor はほぼ同系・Runtime だけ違う**(ローカル pane vs Web)。`Codex CLI`=ローカル、`Cursor Agent (Web)`=Remote。**耐久チャネルは Runtime で変わる**(ローカル=ファイル契約 / cloud=多くは PR を作る → GitHub adapter で観測)が、§8 の契約の形(文脈を送る→耐久チャネルで構造化結果)は不変。
+
+### verify アクションと adapter
+
+adapter は **Actor を供給し、Actor が verify/execute する**。verify の名前(例 `pass_ci`)は「その Actor に投げるチェックの種類」。CI は **最初の adapter 供給 Actor** で、`command` と同じく **SHA 固定**(コミットに対して走る)。だから time-varying な runtime 観測(本番で動いているか)より**先に入れやすい** → **ci は p3、runtime はその後**。
+
+### timing(規律・§20 を守る)
+
+- v0.x は **local-CLI(Herdr)Actor + verify 3 種(command/human/rollup)** のみ実装。
+- 抽象(Actor trait / adapter-actor レジストリ / 複数 Runtime)は **2 つ目の実例が実際に現れた時**に結晶: **ci = 2 つ目の check Actor(p3)** / **Remote Runtime(Web エージェント)= その後**。今作ると premature(§20)。
+- **単一の code trait を急がない**: Actor ごとに呼び方・観測が全然違う(shell / GitHub API / 人に聞く / pane 契約)。Actor は概念の芯として持ち、配管は Actor 別でよい。
+- v1 前例: 旧 meguri は既に「agent = profile(モデル/ハーネス)+ launch」で異種モデルを扱っていた。Actor × Runtime はその一般化(発明ではない)。
