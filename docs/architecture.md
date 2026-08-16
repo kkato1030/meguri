@@ -5,15 +5,17 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.1 p1(データモデル + 永続化 + CLI)** 時点。
+最終更新: **v0.1 p2.1(Planning 契約)** 時点。
 
 ## いまできること
 
-Intent → **Outcome Graph** の作成と表示を CLI で行える。Outcome の状態
-(satisfied / ready / blocked)は保存せず**毎回導出**して表示する。
+- Intent → **Outcome Graph** の作成と表示(状態は保存せず**毎回導出**)。
+- **Planning 契約**(§7): `plan prompt` で planning プロンプトを出す → エージェントが
+  `proposal.json` を書く → `plan diff` で追加内容を検証・表示 → `plan apply` で承認・反映。
+  ACP でなく**ファイル契約**(§8。画面は読まない)。**pane 自動化は未実装**(p2.2)—
+  いまはプロンプトを人間が手でエージェントへ渡す。
 
-まだ無いもの: planning 対話(pane + proposal.json)/ Work の実行 / GitHub 連携 /
-watch・reconciler。つまり「グラフを作って眺める」までで、実行系は未実装。
+まだ無いもの: pane 自動化(p2.2)/ Work の実行 / GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
 
@@ -24,6 +26,7 @@ watch・reconciler。つまり「グラフを作って眺める」までで、�
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid) |
+| `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映。単体テストあり |
 
 ## ドメインモデル(§4/§5)
 
@@ -55,7 +58,22 @@ meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri graph [--intent <i>] [--mermaid]
+
+meguri plan prompt [--intent <i>] [--file <path>]   # planning プロンプトを出力
+meguri plan diff              [--file <path>]        # proposal.json の追加内容を検証・表示
+meguri plan apply             [--file <path>] [--yes]  # 承認して反映(additive)
 ```
+
+`proposal.json` の既定パスは `MEGURI_HOME/proposal.json`。スキーマ:
+
+```json
+{ "intent": "i1",
+  "outcomes": [
+    { "ref": "<ローカル名>", "statement": "<到達状態>",
+      "verify": {"kind":"human"} | {"kind":"command","command":"<cmd>"} | {"kind":"rollup"},
+      "needs": ["<ref>" または "o<id>"] } ] }
+```
+`ref` は proposal 内のローカル名(needs から参照)。既存ノードは `o<id>` で参照。**additive**(追加のみ)。
 
 - verify は **`--check "<cmd>"`=command / `--milestone`=rollup / 無指定=human(既定)**。
 - `--intent` は省略可 — Intent が 1 件ならそれを使い、複数なら指定を求める(0 件はエラー)。

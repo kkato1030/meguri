@@ -750,7 +750,9 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 
 * **p0: ACP spike(済)** — Claude/Gemini/Codex/Cursor で ACP 往復を実測。結論: ACP は動くが未成熟で、**pane + 構造化ファイル契約の方が筋が良い**と判断(§7 / §23 Q5)。捨てコードは main に入れず `archive/p0-acp-spike` ブランチに退避(PR は不採用で close)
 * **p1: データモデル + 永続化 + CLI(済)** — Intent / Outcome(statement/verify/requires)/ Work の CRUD、sqlite、satisfied・ready・blocked 導出、Mermaid 出力。実装は `src/`(architecture.md 参照)
-* **p2: Planning 対話** — pane で生の Claude/Codex と対話 → エージェントが `proposal.json` を書く → meguri が読んで Graph Diff 表示 → Human approval で確定
+* **p2: Planning 対話** — 2 枚に分割:
+  * **p2.1 契約(済)** — pane なしで契約を確立: `plan prompt`(Intent+現グラフ+スキーマ)→ エージェントが `proposal.json` を書く → `plan diff`(検証)→ `plan apply`(承認で additive 反映、ref→id 配線)。実装は `src/plan.rs`
+  * **p2.2 pane 自動化** — `meguri plan` が herdr/tmux pane にエージェントを起動し文脈を注入(ここで mux 層=§8 を導入)
 
 ### 完了条件
 
