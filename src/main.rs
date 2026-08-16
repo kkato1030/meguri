@@ -64,6 +64,11 @@ enum Cmd {
     /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
     Plan(PlanCmd),
+    /// Run a ready Outcome: spawn a Work and cut its isolated worktree
+    Run {
+        /// The Outcome to work on (must be ready; e.g. o13)
+        outcome: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,21 +144,27 @@ enum RepoCmd {
 
 #[derive(Subcommand)]
 enum IntentCmd {
-    /// e.g. meguri intent add "Make auth production-ready"
+    /// e.g. meguri intent add "Make auth production-ready" --repo meguri
     Add {
         /// Title
         title: String,
         #[arg(long, default_value = "")]
         description: String,
+        /// Bind to a registered repo (name)
+        #[arg(long)]
+        repo: Option<String>,
     },
     Ls,
-    /// Edit an Intent's title / description
+    /// Edit an Intent's title / description / repo
     Edit {
         id: String,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
         description: Option<String>,
+        /// Bind to a registered repo (name)
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Remove an Intent and everything under it (outcomes, edges, works)
     Rm { id: String },
@@ -274,7 +285,60 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
+        Cmd::Run { outcome } => run_cmd(&conn, &outcome)?,
     }
+    Ok(())
+}
+
+/// o14: ready な Outcome を Work にし、その repo の bare から隔離 worktree を切る。
+fn run_cmd(conn: &rusqlite::Connection, outcome: &str) -> Result<()> {
+    let oid = parse_id(outcome, 'o')?;
+    let o = store::get_outcome(conn, oid)?;
+    if o.verify == Verify::Rollup {
+        bail!("o{oid} is a milestone (rollup); it has no work to run");
+    }
+
+    // repo を解決(Intent に紐付いていること)。
+    let it = store::get_intent(conn, o.intent_id)?;
+    let repo_id = it.repo_id.with_context(|| {
+        format!("intent i{} has no repo; bind one: meguri intent edit i{} --repo <name>", it.id, it.id)
+    })?;
+    let repo = store::get_repo(conn, repo_id)?;
+
+    // ready 判定(その Intent の導出状態)。
+    let outcomes = store::list_outcomes(conn, Some(o.intent_id))?;
+    let states = derive::states(&outcomes);
+    match states.get(&oid) {
+        Some(derive::State::Ready) => {}
+        Some(s) => bail!("o{oid} is not ready (currently {})", s.label()),
+        None => bail!("o{oid} not found in its intent"),
+    }
+
+    // bare を最新化 → Work を作る → worktree を切って紐付け(失敗なら Work を戻す)。
+    let bare = bare_path(&repo.name)?;
+    gitops::fetch(&bare)?;
+    let wid = store::add_work(conn, oid, &o.statement, "ai")?;
+    let key = format!("w{wid}");
+    let wt_parent = db::worktrees_dir()?.join(&repo.name);
+    let wt = match gitops::create_worktree(&bare, &repo.default_branch, &wt_parent, &key) {
+        Ok(wt) => wt,
+        Err(e) => {
+            let _ = store::remove_work(conn, wid);
+            return Err(e);
+        }
+    };
+    store::set_work_worktree(
+        conn,
+        wid,
+        wt.path.to_str().unwrap_or_default(),
+        &wt.branch,
+        &wt.base_sha,
+    )?;
+
+    let short = wt.base_sha.chars().take(7).collect::<String>();
+    println!("spawned w{wid} for o{oid} (repo {})", repo.name);
+    println!("  worktree: {}", wt.path.display());
+    println!("  branch:   {} (base {short})", wt.branch);
     Ok(())
 }
 
@@ -417,8 +481,12 @@ fn repo(conn: &rusqlite::Connection, c: RepoCmd) -> Result<()> {
 
 fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
     match c {
-        IntentCmd::Add { title, description } => {
+        IntentCmd::Add { title, description, repo } => {
             let id = store::add_intent(conn, &title, &description)?;
+            if let Some(name) = repo {
+                let r = store::get_repo_by_name(conn, &name)?;
+                store::set_intent_repo(conn, id, r.id)?;
+            }
             println!("created i{id}");
         }
         IntentCmd::Ls => {
@@ -429,12 +497,16 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
                 }
             }
         }
-        IntentCmd::Edit { id, title, description } => {
+        IntentCmd::Edit { id, title, description, repo } => {
             let iid = parse_id(&id, 'i')?;
-            if title.is_none() && description.is_none() {
-                bail!("nothing to edit (pass --title and/or --description)");
+            if title.is_none() && description.is_none() && repo.is_none() {
+                bail!("nothing to edit (pass --title / --description / --repo)");
             }
             store::edit_intent(conn, iid, title.as_deref(), description.as_deref())?;
+            if let Some(name) = repo {
+                let r = store::get_repo_by_name(conn, &name)?;
+                store::set_intent_repo(conn, iid, r.id)?;
+            }
             println!("edited i{iid}");
         }
         IntentCmd::Rm { id } => {
@@ -539,6 +611,9 @@ fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
             let sid = r#for.map(|s| parse_id(&s, 'o')).transpose()?;
             for w in store::list_works(conn, sid)? {
                 println!("w{}  for o{}  [{}/{}]  {}", w.id, w.serves_id, w.executor, w.state, w.objective);
+                if let Some(p) = &w.worktree_path {
+                    println!("     worktree: {p}");
+                }
             }
         }
         WorkCmd::Edit { id, objective, by } => {

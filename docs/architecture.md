@@ -17,8 +17,9 @@
     猶予後にプロンプトを注入、`proposal.json` の出現を待って diff → 承認・反映まで一気通貫。
     pane は残す(§3.5)。
 
-まだ無いもの: Work の実行(v0.2 着手中 — `src/gitops.rs` の worktree 作成=o13 まで。
-spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconciler。
+まだ無いもの: Work の実行(v0.2 着手中 — repo 管理(bare)+ **`meguri run` で spawn +
+隔離 worktree=o14 まで**。エージェント起動(o15)/ 検証 / Artifact / 失敗経路は未)/
+GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
 
@@ -39,7 +40,8 @@ spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconci
 * **Intent** — 実現したいこと。グラフの根。
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
-* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` を持つ。p1 では登録のみ(実行は未実装)。
+* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こる(o14)。エージェント起動・検証は未実装。
+* **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。
 **保存しない(導出)**: satisfied / ready / blocked。
@@ -57,9 +59,9 @@ spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconci
 ```
 meguri repo    add <name> --from <url|path> [--branch <b>]  # bare clone を作って登録
 meguri repo    ls | fetch <name> | rm <name>
-meguri intent  add "<title>" [--description <d>]
+meguri intent  add "<title>" [--description <d>] [--repo <name>]
 meguri intent  ls
-meguri intent  edit <i> [--title <t>] [--description <d>]
+meguri intent  edit <i> [--title <t>] [--description <d>] [--repo <name>]
 meguri intent  rm   <i>              # 配下の Outcome / 辺 / Work ごと削除
 meguri outcome add "<statement>" [--intent <i>] [--description <d>] [--check "<cmd>" | --milestone] [--needs o1,o2]
 meguri outcome ls   [--intent <i>]
@@ -72,6 +74,7 @@ meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
 meguri work    rm   <w>
+meguri run <o>                       # o14: ready Outcome → Work を起こし bare から隔離 worktree を切る
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
