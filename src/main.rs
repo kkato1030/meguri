@@ -6,6 +6,8 @@
 mod config;
 mod db;
 mod derive;
+#[allow(dead_code)] // v0.2: o14(spawn)で `meguri run` から配線する
+mod gitops;
 mod mux;
 mod plan;
 mod render;

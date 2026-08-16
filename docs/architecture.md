@@ -17,7 +17,8 @@
     猶予後にプロンプトを注入、`proposal.json` の出現を待って diff → 承認・反映まで一気通貫。
     pane は残す(§3.5)。
 
-まだ無いもの: Work の実行 / GitHub 連携 / watch・reconciler。
+まだ無いもの: Work の実行(v0.2 着手中 — `src/gitops.rs` の worktree 作成=o13 まで。
+spawn / 検証 / Artifact / 失敗経路は未)/ GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
 
@@ -30,6 +31,7 @@
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
+| `src/gitops.rs` | **v0.2 execution の土台(o13)**: base から隔離 worktree + ブランチを切り base SHA を記録。`.meguri/` を共有 exclude へ。まだ CLI 未配線(o14 spawn で使う)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` から使う。両 backend の実機単体テストあり |
 
 ## ドメインモデル(§4/§5)
