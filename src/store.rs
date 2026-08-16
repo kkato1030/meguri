@@ -43,7 +43,7 @@ impl Verify {
             "command" => Verify::Command(command.unwrap_or_default()),
             "human" => Verify::Human,
             "rollup" => Verify::Rollup,
-            other => bail!("未知の verify.kind: {other}"),
+            other => bail!("unknown verify.kind: {other}"),
         })
     }
 }
@@ -105,7 +105,7 @@ pub fn add_outcome(
     requires: &[i64],
 ) -> Result<i64> {
     if !intent_exists(conn, intent_id)? {
-        bail!("intent i{intent_id} が存在しない");
+        bail!("intent i{intent_id} does not exist");
     }
     // 前提の存在チェック(同じ intent 内)。
     for &req in requires {
@@ -113,7 +113,7 @@ pub fn add_outcome(
             .query_row("SELECT intent_id = ?2 FROM outcomes WHERE id = ?1", params![req, intent_id], |r| r.get(0))
             .optional_bool()?;
         if !ok {
-            bail!("requires 先 o{req} が存在しないか、別の intent に属している");
+            bail!("required o{req} does not exist or belongs to another intent");
         }
     }
     conn.execute(
@@ -130,11 +130,11 @@ pub fn add_outcome(
 /// requires 辺を足す。DAG を保つため、逆到達(サイクル)を弾く。
 pub fn add_requires(conn: &Connection, outcome_id: i64, requires_id: i64) -> Result<()> {
     if outcome_id == requires_id {
-        bail!("o{outcome_id} が自分自身を requires にできない");
+        bail!("o{outcome_id} cannot require itself");
     }
     // requires_id から outcome_id に到達できるなら、この辺はサイクルを作る。
     if reachable(conn, requires_id, outcome_id)? {
-        bail!("o{outcome_id} → o{requires_id} はサイクルを作る(DAG 違反)");
+        bail!("o{outcome_id} -> o{requires_id} would create a cycle (DAG violation)");
     }
     conn.execute(
         "INSERT OR IGNORE INTO outcome_requires (outcome_id, requires_id) VALUES (?1, ?2)",
@@ -177,7 +177,7 @@ pub fn get_outcome(conn: &Connection, id: i64) -> Result<Outcome> {
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0)),
         )
-        .with_context(|| format!("outcome o{id} が無い"))?;
+        .with_context(|| format!("no outcome o{id}"))?;
     Ok(Outcome {
         id,
         intent_id,
@@ -209,7 +209,7 @@ pub fn list_outcomes(conn: &Connection, intent_id: Option<i64>) -> Result<Vec<Ou
 pub fn set_human_satisfied(conn: &Connection, id: i64, value: bool) -> Result<()> {
     let o = get_outcome(conn, id)?;
     if o.verify != Verify::Human {
-        bail!("o{id} は verify.kind={} なので human 表明は無効(human のみ)", o.verify.kind_str());
+        bail!("o{id} has verify.kind={}, so a human mark is invalid (human only)", o.verify.kind_str());
     }
     conn.execute(
         "UPDATE outcomes SET human_satisfied = ?2 WHERE id = ?1",
@@ -221,9 +221,9 @@ pub fn set_human_satisfied(conn: &Connection, id: i64, value: bool) -> Result<()
 // ---- Work ----
 
 pub fn add_work(conn: &Connection, serves_id: i64, objective: &str, executor: &str) -> Result<i64> {
-    get_outcome(conn, serves_id).with_context(|| format!("serves 先 o{serves_id} が無い"))?;
+    get_outcome(conn, serves_id).with_context(|| format!("no outcome o{serves_id} to serve"))?;
     if executor != "ai" && executor != "human" {
-        bail!("executor は ai か human(与えられた: {executor})");
+        bail!("executor must be ai or human (got: {executor})");
     }
     conn.execute(
         "INSERT INTO works (serves_id, objective, executor) VALUES (?1, ?2, ?3)",
