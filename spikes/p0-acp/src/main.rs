@@ -19,23 +19,39 @@ use serde_json::{json, Value};
 /// spike が相手にする ACP エージェントの起動レシピ。
 struct AgentRecipe {
     program: &'static str,
-    args: &'static [&'static str],
+    args: Vec<String>,
     /// 子プロセスから取り除く環境変数(Claude の入れ子ガード対策)。
     env_remove: &'static [&'static str],
 }
 
 fn agent_recipe() -> (&'static str, AgentRecipe) {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     match std::env::var("MEGURI_ACP_AGENT").as_deref() {
         Ok("gemini") => (
             "gemini",
-            AgentRecipe { program: "gemini", args: &["--acp", "--skip-trust"], env_remove: &[] },
+            AgentRecipe { program: "gemini", args: s(&["--acp", "--skip-trust"]), env_remove: &[] },
+        ),
+        // Codex: ネイティブ ACP 無し → @zed-industries/codex-acp adapter 経由。
+        // 既定 model が CLI に新しすぎる場合は MEGURI_CODEX_MODEL で上書き(-c model=…)。
+        Ok("codex") => {
+            let mut args = Vec::new();
+            if let Ok(m) = std::env::var("MEGURI_CODEX_MODEL") {
+                args.push("-c".to_string());
+                args.push(format!("model={m}"));
+            }
+            ("codex", AgentRecipe { program: "codex-acp", args, env_remove: &[] })
+        }
+        // Cursor: ネイティブ ACP 無し → 第三者製 cursor-agent-acp adapter 経由(cursor-agent を包む)。
+        Ok("cursor") => (
+            "cursor",
+            AgentRecipe { program: "cursor-agent-acp", args: Vec::new(), env_remove: &[] },
         ),
         // 既定は本命の Claude。CLAUDECODE を消さないと「Claude の中で Claude は起動不可」で弾かれる。
         _ => (
             "claude",
             AgentRecipe {
                 program: "claude-code-acp",
-                args: &[],
+                args: Vec::new(),
                 env_remove: &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
             },
         ),
@@ -54,7 +70,7 @@ impl Acp {
     fn spawn(recipe: &AgentRecipe) -> std::io::Result<Self> {
         // stderr は捨てる(エージェントのログが応答に混ざらないように)。
         let mut cmd = Command::new(recipe.program);
-        cmd.args(recipe.args)
+        cmd.args(&recipe.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -120,6 +136,11 @@ impl Acp {
                 // 通知。返答テキスト片だけ拾って表示、他は捨てる。
                 (true, None) => {
                     if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+                        if std::env::var("MEGURI_ACP_DEBUG").is_ok() {
+                            if let Some(update) = msg.pointer("/params/update") {
+                                eprintln!("[debug] update = {}", update);
+                            }
+                        }
                         if let Some(update) = msg.pointer("/params/update") {
                             if update.get("sessionUpdate").and_then(Value::as_str)
                                 == Some("agent_message_chunk")
@@ -196,6 +217,9 @@ fn main() {
         )
         .expect("send session/prompt");
     let resp = acp.await_response(id).expect("prompt の応答が来ない");
+    if std::env::var("MEGURI_ACP_DEBUG").is_ok() {
+        eprintln!("[debug] prompt response = {}", resp);
+    }
     println!(); // stream 表示の改行
 
     if let Some(err) = resp.get("error") {

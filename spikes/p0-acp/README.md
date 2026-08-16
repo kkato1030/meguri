@@ -11,30 +11,47 @@
 ## 動かし方
 
 ```sh
-# 本命: Claude(claude-code-acp adapter 経由)
-cargo run -- "Reply with one short sentence."
-
-# Gemini(ネイティブ ACP)
-MEGURI_ACP_AGENT=gemini cargo run -- "Reply with one short sentence."
+cargo run -- "Reply with one short sentence."                      # 既定 = Claude
+MEGURI_ACP_AGENT=gemini cargo run -- "..."                          # Gemini
+MEGURI_ACP_AGENT=codex  MEGURI_CODEX_MODEL=<model> cargo run -- "..." # Codex
+MEGURI_ACP_AGENT=cursor cargo run -- "..."                          # Cursor
+MEGURI_ACP_DEBUG=1 ... cargo run -- "..."                           # 生の session/update を stderr に出す
 ```
 
-前提:
+## エージェント別の検証結果(2026-08-16)
 
-- **Claude**: `claude-code-acp`(`npm i -g @zed-industries/claude-code-acp`)が PATH にあり、
-  実体の `claude` バイナリ(例 `~/.local/bin/claude`)がログイン済みであること。
-- **Gemini**: `gemini`(0.49.0 で確認)が PATH にあり oauth 済みであること。
+| agent | ACP 経路 | handshake+session | prompt→返答 | 判定 |
+|---|---|---|---|---|
+| **Claude**(本命) | adapter `@zed-industries/claude-code-acp` | ✓ | ✓ テキスト返る | **使える** |
+| Gemini | ネイティブ `gemini --acp` | ✓ | ✓ テキスト返る | 使える |
+| Codex | adapter `@zed-industries/codex-acp` | ✓ | △ トランスポートは往復するが、生成が **codex-cli の版数**で失敗(下記) | ACP は OK・要 `codex update` |
+| Cursor | 第三者製 `cursor-agent-acp`(0.1.1) | ✓ | ✗ end_turn は返るが **返答テキスト・session/update が一切来ない** | 現状使えない |
+
+前提: 各エージェントの実体 CLI がログイン済みで PATH にあること。adapter は
+`npm i -g @zed-industries/claude-code-acp @zed-industries/codex-acp cursor-agent-acp`。
+
+### Codex の詳細
+ACP は initialize → session/new → session/prompt → 構造化応答まで完全に往復する
+(モデル API まで到達している)。ただしこのアカウントの Codex は既定モデルが
+`gpt-5.6-luna` で、**codex-cli 0.145.0 では新しすぎて使えない**("requires a newer
+version of Codex")。他モデル(gpt-5-codex / o3 等)は "ChatGPT account では非対応"。
+→ **ACP の問題ではなく Codex の版数問題。`codex update` で解ける見込み。**
+
+### Cursor の詳細
+`cursor-agent-acp`(第三者製・v0.1.1)は handshake と prompt ライフサイクル
+(end_turn)は通すが、**session/update 通知を 1 つも送らず、prompt 応答も
+`{stopReason:end_turn}` のみでアシスタントのテキストを一切運ばない**。会話として
+成立しないので現状は不採用。Zed 純正の cursor adapter は存在しない。
 
 ## 何が確認できたか
 
 - **ACP = JSON-RPC 2.0 を stdio で流すだけ**。SDK なしで手書きできた(このスパイクは
   serde_json のみ、非同期ランタイムなし)。
-- **相手ごとの起動**:
-  - **Claude はネイティブ ACP を持たず、adapter 経由**(`@zed-industries/claude-code-acp`
-    0.16.2)。adapter が実体の `claude` を子として起動する。agentInfo は "Claude Code"、
-    モデルは Opus/Sonnet/Haiku が見えた。
-  - **Gemini はネイティブ ACP**(`gemini --acp`、adapter 不要)。
-  - **Codex** はネイティブ ACP 無し(`codex` の subcommand に acp 無し。mcp-server は別物)。
-    adapter は `@zed-industries/codex-acp`(npm、0.16 系)が存在する。**未検証**。
+- **相手ごとの起動**(結果は上の matrix):
+  - **Claude / Codex / Cursor はネイティブ ACP を持たず adapter 経由**、**Gemini だけネイティブ**。
+    adapter は実体 CLI を子プロセスとして起動する。
+  - Zed 純正 adapter があるのは Claude(`@zed-industries/claude-code-acp`)と
+    Codex(`@zed-industries/codex-acp`)。Cursor 用は第三者製 `cursor-agent-acp` のみ。
 - **往復の手順**:
   `initialize`(protocolVersion=1 / clientCapabilities / clientInfo)
   → `session/new`(cwd は絶対パス / mcpServers)→ sessionId を得る
