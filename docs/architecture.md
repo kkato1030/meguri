@@ -28,7 +28,7 @@
 | `src/db.rs` | sqlite 接続とスキーマ(`~/.meguri/meguri.db`、`MEGURI_HOME` で移動可)。**保存は事実のみ** |
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
-| `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid) |
+| `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は Mermaid 描画 + ノードクリックで詳細パネル(自己完結・ローカルで開く) |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` から使う。両 backend の実機単体テストあり |
 
@@ -62,7 +62,7 @@ meguri outcome done   <o>      # 達成を表明(verify=human のみ)
 meguri outcome undone <o>
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
-meguri graph [--intent <i>] [--mermaid]
+meguri graph [--intent <i>] [--mermaid | --html]   # --html: クリックで詳細の自己完結グラフ
 
 meguri plan prompt [--intent <i>] [--file <path>]        # planning プロンプトを出力
 meguri plan diff   [--intent <i>] [--file <path>]        # proposal の追加内容を検証・表示

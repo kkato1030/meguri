@@ -46,6 +46,9 @@ enum Cmd {
         /// Output as Mermaid
         #[arg(long)]
         mermaid: bool,
+        /// Output a self-contained clickable HTML graph (open it in a browser)
+        #[arg(long)]
+        html: bool,
     },
     /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
@@ -176,10 +179,12 @@ fn main() -> Result<()> {
         Cmd::Intent(c) => intent(&conn, c)?,
         Cmd::Outcome(c) => outcome(&conn, c)?,
         Cmd::Work(c) => work(&conn, c)?,
-        Cmd::Graph { intent, mermaid } => {
+        Cmd::Graph { intent, mermaid, html } => {
             let iid = intent.map(|s| parse_id(&s, 'i')).transpose()?;
             let outcomes = store::list_outcomes(&conn, iid)?;
-            if mermaid {
+            if html {
+                print!("{}", render::html(&outcomes));
+            } else if mermaid {
                 print!("{}", render::mermaid(&outcomes));
             } else {
                 print!("{}", render::text(&outcomes));
