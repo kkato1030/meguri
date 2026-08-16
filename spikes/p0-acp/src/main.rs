@@ -1,6 +1,10 @@
 //! p0 スパイク: meguri が ACP クライアントとして既存エージェントを駆動できるかの検証。
 //!
-//! 相手は Gemini CLI(`gemini --acp`。ネイティブ ACP、adapter 不要)。
+//! 相手はエージェント可変(env `MEGURI_ACP_AGENT`):
+//!   - `claude`(既定): `claude-code-acp` adapter 経由(`@zed-industries/claude-code-acp`)。
+//!     本命はこれ。入れ子起動ガードを越えるため CLAUDECODE を unset して起動する。
+//!   - `gemini`: `gemini --acp`(ネイティブ ACP、adapter 不要)。最初に往復を実証した相手。
+//!
 //! ACP は JSON-RPC 2.0 を stdio で流すだけなので、ここでは SDK を使わず手書きする
 //! —— 目的は「往復が本当に通るか」であって、綺麗な抽象を作ることではない。
 //!
@@ -12,6 +16,32 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{json, Value};
 
+/// spike が相手にする ACP エージェントの起動レシピ。
+struct AgentRecipe {
+    program: &'static str,
+    args: &'static [&'static str],
+    /// 子プロセスから取り除く環境変数(Claude の入れ子ガード対策)。
+    env_remove: &'static [&'static str],
+}
+
+fn agent_recipe() -> (&'static str, AgentRecipe) {
+    match std::env::var("MEGURI_ACP_AGENT").as_deref() {
+        Ok("gemini") => (
+            "gemini",
+            AgentRecipe { program: "gemini", args: &["--acp", "--skip-trust"], env_remove: &[] },
+        ),
+        // 既定は本命の Claude。CLAUDECODE を消さないと「Claude の中で Claude は起動不可」で弾かれる。
+        _ => (
+            "claude",
+            AgentRecipe {
+                program: "claude-code-acp",
+                args: &[],
+                env_remove: &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
+            },
+        ),
+    }
+}
+
 /// gemini --acp の子プロセスと、その stdio に張った JSON-RPC の最小クライアント。
 struct Acp {
     child: Child,
@@ -21,15 +51,17 @@ struct Acp {
 }
 
 impl Acp {
-    fn spawn() -> std::io::Result<Self> {
-        // --skip-trust: fresh cwd の folder-trust ゲートで固まらないため。
-        // stderr は捨てる(gemini のログが応答に混ざらないように)。
-        let mut child = Command::new("gemini")
-            .args(["--acp", "--skip-trust"])
+    fn spawn(recipe: &AgentRecipe) -> std::io::Result<Self> {
+        // stderr は捨てる(エージェントのログが応答に混ざらないように)。
+        let mut cmd = Command::new(recipe.program);
+        cmd.args(recipe.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        for k in recipe.env_remove {
+            cmd.env_remove(k);
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("child stdin");
         let stdout = child.stdout.take().expect("child stdout");
         Ok(Self { child, stdin, reader: BufReader::new(stdout), next_id: 0 })
@@ -116,7 +148,10 @@ fn main() {
         "Reply with one short friendly sentence to confirm the ACP round-trip works.".to_string()
     });
 
-    let mut acp = Acp::spawn().expect("gemini --acp を起動できなかった(PATH に gemini はある?)");
+    let (agent_name, recipe) = agent_recipe();
+    eprintln!("[spike] agent = {} ({})", agent_name, recipe.program);
+    let mut acp = Acp::spawn(&recipe)
+        .unwrap_or_else(|e| panic!("{} を起動できなかった({}): {e}", recipe.program, agent_name));
 
     // 1) initialize —— バージョン折衝と capability 交換。
     let id = acp

@@ -1,5 +1,5 @@
 [package]
-name = "p0-acp-gemini"
+name = "p0-acp"
 version = "0.0.0"
 edition = "2021"
 publish = false
