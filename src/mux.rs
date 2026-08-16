@@ -25,6 +25,8 @@ pub trait Mux {
     fn send_line(&self, pane: &PaneId, text: &str) -> Result<()>;
     /// pane がまだ生きているか。
     fn is_alive(&self, pane: &PaneId) -> Result<bool>;
+    /// 人間がその session の pane を覗くためのコマンド案内(detached な場所で開くため)。
+    fn attach_hint(&self, session: &str) -> String;
 }
 
 /// backend の自動選択: herdr サーバが生きていれば herdr(§8 の優先)、いなければ tmux。
@@ -86,6 +88,10 @@ impl Mux for Tmux {
         // window が一覧に居るか。
         let ok = Self::run(&["display-message", "-p", "-t", &pane.0, "#{window_id}"])?.status.success();
         Ok(ok)
+    }
+
+    fn attach_hint(&self, session: &str) -> String {
+        format!("tmux attach -t {session}")
     }
 }
 
@@ -188,6 +194,11 @@ impl Mux for Herdr {
             .map(|o| o.status.success())
             .unwrap_or(false);
         Ok(ok)
+    }
+
+    fn attach_hint(&self, session: &str) -> String {
+        // `herdr` で永続セッションを開き、label=<session> の workspace を見る。
+        format!("herdr   (then open workspace \"{session}\")")
     }
 }
 
