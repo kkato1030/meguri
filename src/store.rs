@@ -449,6 +449,12 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
     Ok(rows)
 }
 
+/// Work の状態を更新する(planned → running → …)。
+pub fn set_work_state(conn: &Connection, id: i64, state: &str) -> Result<()> {
+    conn.execute("UPDATE works SET state = ?2 WHERE id = ?1", params![id, state])?;
+    Ok(())
+}
+
 /// spawn 時に worktree 情報を Work に書き込む(§9 の作業場)。
 pub fn set_work_worktree(conn: &Connection, id: i64, path: &str, branch: &str, base_sha: &str) -> Result<()> {
     conn.execute(

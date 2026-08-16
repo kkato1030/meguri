@@ -73,7 +73,7 @@ pub fn launch(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Res
     std::fs::write(&prompt_path, &prompt_text)
         .with_context(|| format!("cannot write {}", prompt_path.display()))?;
 
-    let pane = rt.mux.open_pane("meguri", &format!("plan-i{intent_id}"))?;
+    let pane = rt.mux.open_pane("meguri", &format!("plan-i{intent_id}"), None)?;
     // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(herdr で実測、p2.2b)。
     // エージェント起動は 1 回だけ送りたい(再送すると多重起動する)ので、先に少し待つ。
     std::thread::sleep(Duration::from_millis(800));

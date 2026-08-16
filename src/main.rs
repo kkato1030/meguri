@@ -6,7 +6,7 @@
 mod config;
 mod db;
 mod derive;
-#[allow(dead_code)] // v0.2: o14(spawn)で `meguri run` から配線する
+mod exec;
 mod gitops;
 mod mux;
 mod plan;
@@ -339,6 +339,37 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str) -> Result<()> {
     println!("spawned w{wid} for o{oid} (repo {})", repo.name);
     println!("  worktree: {}", wt.path.display());
     println!("  branch:   {} (base {short})", wt.branch);
+
+    // o15: worktree の pane でエージェントを起動し、実装プロンプトを注入する。
+    launch_work(conn, wid, &o, &wt.path)?;
+    Ok(())
+}
+
+/// o15: Work の worktree で pane を開き、実装プロンプトを書いてエージェントに注入する。
+/// pane は残す(§3.5)。完了検知(result.json のポーリング)は o16。
+fn launch_work(conn: &rusqlite::Connection, wid: i64, o: &store::Outcome, worktree: &std::path::Path) -> Result<()> {
+    let cfg = config::load()?;
+    let scratch = worktree.join(".meguri");
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("cannot create {}", scratch.display()))?;
+    let result_path = scratch.join("result.json");
+    let prompt_path = scratch.join("prompt.md");
+    let _ = std::fs::remove_file(&result_path); // 古い残骸を消す
+
+    let prompt = exec::impl_prompt(o, worktree, &result_path, &cfg.lang);
+    std::fs::write(&prompt_path, &prompt)
+        .with_context(|| format!("cannot write {}", prompt_path.display()))?;
+
+    let mux = mux::select();
+    let pane = mux.open_pane("meguri", &format!("w{wid}"), Some(worktree))?;
+    // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(p2.2b の学び)。
+    std::thread::sleep(Duration::from_millis(800));
+    mux.send_line(&pane, &cfg.agent)?;
+    std::thread::sleep(Duration::from_secs(8)); // spawn_grace: CLI 起動待ち
+    mux.send_line(&pane, "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).")?;
+
+    store::set_work_state(conn, wid, "running")?;
+    println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
     Ok(())
 }
 
