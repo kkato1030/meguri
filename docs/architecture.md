@@ -43,20 +43,23 @@ watch・reconciler。つまり「グラフを作って眺める」までで、�
 
 ## CLI
 
+主内容(タイトル / 宣言 / 目的)は**位置引数**。修飾は平易なフラグ。
+
 ```
-meguri intent  add --title <t> [--description <d>]
+meguri intent  add "<title>" [--description <d>]
 meguri intent  ls
-meguri outcome add --intent <i> --statement <s>
-                   [--verify-command <cmd> | --milestone] [--requires o1,o2]
-meguri outcome ls [--intent <i>]
-meguri outcome satisfy   <o>      # human 充足表明を立てる(verify=human のみ)
-meguri outcome unsatisfy <o>
-meguri work    add --serves <o> --objective <s> [--executor ai|human]
-meguri work    ls [--serves <o>]
+meguri outcome add "<statement>" [--intent <i>] [--check "<cmd>" | --milestone] [--needs o1,o2]
+meguri outcome ls   [--intent <i>]
+meguri outcome done   <o>      # 達成を表明(verify=human のみ)
+meguri outcome undone <o>
+meguri work    add "<objective>" --for <o> [--by ai|human]
+meguri work    ls   [--for <o>]
 meguri graph [--intent <i>] [--mermaid]
 ```
 
-id は接頭辞つき(`i1`/`o3`/`w2`)でも数字だけでも受ける。
+- verify は **`--check "<cmd>"`=command / `--milestone`=rollup / 無指定=human(既定)**。
+- `--intent` は省略可 — Intent が 1 件ならそれを使い、複数なら指定を求める(0 件はエラー)。
+- id は接頭辞つき(`i1`/`o3`/`w2`)でも数字だけでも受ける。
 
 ## 永続化 / ファイルシステム
 

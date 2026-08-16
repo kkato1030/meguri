@@ -44,8 +44,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum IntentCmd {
+    /// 例: meguri intent add "認証を production-ready にする"
     Add {
-        #[arg(long)]
+        /// タイトル
         title: String,
         #[arg(long, default_value = "")]
         description: String,
@@ -55,48 +56,49 @@ enum IntentCmd {
 
 #[derive(Subcommand)]
 enum OutcomeCmd {
+    /// 例: meguri outcome add "不正な state が弾かれる" --check "cargo test" --needs o1
     Add {
-        /// 所属 Intent(例: i1 / 1)
-        #[arg(long)]
-        intent: String,
         /// 到達状態の宣言(「〜されている」)
-        #[arg(long)]
         statement: String,
-        /// verify=command: 充足を確かめるコマンド(exit 0 で達成)
+        /// 所属 Intent(省略時: Intent が 1 件ならそれ。例: i1 / 1)
         #[arg(long)]
-        verify_command: Option<String>,
-        /// verify=rollup: まとめ節点(子が全て満たされたら達成)。--verify-command とは排他
+        intent: Option<String>,
+        /// verify=command: 達成を確かめるコマンド(exit 0 で達成)
+        #[arg(long)]
+        check: Option<String>,
+        /// verify=rollup: まとめ節点(子が全て満たされたら達成)。--check と排他
         #[arg(long)]
         milestone: bool,
         /// 前提 Outcome(カンマ区切り。例: o1,o2)
         #[arg(long)]
-        requires: Option<String>,
+        needs: Option<String>,
     },
     Ls {
         #[arg(long)]
         intent: Option<String>,
     },
-    /// human 充足表明を立てる(verify=human のみ)
-    Satisfy { id: String },
-    /// human 充足表明を外す
-    Unsatisfy { id: String },
+    /// 達成を表明する(verify=human のみ)
+    Done { id: String },
+    /// 達成表明を外す
+    Undone { id: String },
 }
 
 #[derive(Subcommand)]
 enum WorkCmd {
+    /// 例: meguri work add "state 検証を実装" --for o2
     Add {
-        /// 満たそうとする Outcome(例: o1 / 1)
-        #[arg(long)]
-        serves: String,
-        #[arg(long)]
+        /// 何をするか
         objective: String,
+        /// 満たそうとする Outcome(例: o2 / 2)
+        #[arg(long)]
+        r#for: String,
         /// 実装フェーズの担当(ai | human)
         #[arg(long, default_value = "ai")]
-        executor: String,
+        by: String,
     },
     Ls {
         #[arg(long)]
-        serves: Option<String>,
+        r#for: Option<String>,
     },
 }
 
@@ -141,15 +143,15 @@ fn intent(conn: &rusqlite::Connection, c: IntentCmd) -> Result<()> {
 
 fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
     match c {
-        OutcomeCmd::Add { intent, statement, verify_command, milestone, requires } => {
-            let iid = parse_id(&intent, 'i')?;
-            let verify = match (verify_command, milestone) {
-                (Some(_), true) => bail!("--verify-command と --milestone は同時指定できない"),
+        OutcomeCmd::Add { statement, intent, check, milestone, needs } => {
+            let iid = resolve_intent(conn, intent.as_deref())?;
+            let verify = match (check, milestone) {
+                (Some(_), true) => bail!("--check と --milestone は同時指定できない"),
                 (Some(cmd), false) => Verify::Command(cmd),
                 (None, true) => Verify::Rollup,
                 (None, false) => Verify::Human, // 既定
             };
-            let reqs = parse_id_list(requires.as_deref(), 'o')?;
+            let reqs = parse_id_list(needs.as_deref(), 'o')?;
             let id = store::add_outcome(conn, iid, &statement, &verify, &reqs)?;
             println!("o{id} を作成([{}] {})", verify.kind_str(), statement);
         }
@@ -165,15 +167,15 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
                 println!("o{}  [{}] {}{}", o.id, o.verify.kind_str(), o.statement, reqs);
             }
         }
-        OutcomeCmd::Satisfy { id } => {
+        OutcomeCmd::Done { id } => {
             let oid = parse_id(&id, 'o')?;
             store::set_human_satisfied(conn, oid, true)?;
-            println!("o{oid} を satisfied(human 表明)に");
+            println!("o{oid} を達成に(human 表明)");
         }
-        OutcomeCmd::Unsatisfy { id } => {
+        OutcomeCmd::Undone { id } => {
             let oid = parse_id(&id, 'o')?;
             store::set_human_satisfied(conn, oid, false)?;
-            println!("o{oid} の human 表明を外した");
+            println!("o{oid} の達成表明を外した");
         }
     }
     Ok(())
@@ -181,19 +183,41 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
 
 fn work(conn: &rusqlite::Connection, c: WorkCmd) -> Result<()> {
     match c {
-        WorkCmd::Add { serves, objective, executor } => {
-            let sid = parse_id(&serves, 'o')?;
-            let id = store::add_work(conn, sid, &objective, &executor)?;
-            println!("w{id} を作成(serves o{sid}, executor {executor})");
+        WorkCmd::Add { objective, r#for, by } => {
+            let sid = parse_id(&r#for, 'o')?;
+            let id = store::add_work(conn, sid, &objective, &by)?;
+            println!("w{id} を作成(for o{sid}, by {by})");
         }
-        WorkCmd::Ls { serves } => {
-            let sid = serves.map(|s| parse_id(&s, 'o')).transpose()?;
+        WorkCmd::Ls { r#for } => {
+            let sid = r#for.map(|s| parse_id(&s, 'o')).transpose()?;
             for w in store::list_works(conn, sid)? {
-                println!("w{}  serves o{}  [{}/{}]  {}", w.id, w.serves_id, w.executor, w.state, w.objective);
+                println!("w{}  for o{}  [{}/{}]  {}", w.id, w.serves_id, w.executor, w.state, w.objective);
             }
         }
     }
     Ok(())
+}
+
+/// outcome add 用: Intent を解決する。明示指定が最優先。省略時は Intent が
+/// ちょうど 1 件ならそれ、0 件ならエラー、複数なら --intent を要求する
+/// (v2 の「1 件だけ設定済みなら --project 省略可」と同じ発想)。
+fn resolve_intent(conn: &rusqlite::Connection, opt: Option<&str>) -> Result<i64> {
+    if let Some(s) = opt {
+        let id = parse_id(s, 'i')?;
+        if !store::intent_exists(conn, id)? {
+            bail!("intent i{id} が存在しない");
+        }
+        return Ok(id);
+    }
+    let intents = store::list_intents(conn)?;
+    match intents.as_slice() {
+        [] => bail!("Intent がまだ無い(先に `meguri intent add \"...\"`)"),
+        [only] => Ok(only.id),
+        many => {
+            let ids: Vec<String> = many.iter().map(|i| format!("i{}", i.id)).collect();
+            bail!("Intent が複数あるので --intent で指定を({})", ids.join(", "))
+        }
+    }
 }
 
 /// "o3" でも "3" でも受ける(prefix は任意)。
