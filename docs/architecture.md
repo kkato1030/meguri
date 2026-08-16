@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。
 
-最終更新: **v0.1 p2.2(Planning の pane 自動化)** 時点。
+最終更新: **v0.2 o15(run で worktree の pane にエージェントを起動・実装プロンプト注入)** 時点。
 
 ## いまできること
 
@@ -18,7 +18,8 @@
     pane は残す(§3.5)。
 
 まだ無いもの: Work の実行(v0.2 着手中 — repo 管理(bare)+ **`meguri run` で spawn +
-隔離 worktree=o14 まで**。エージェント起動(o15)/ 検証 / Artifact / 失敗経路は未)/
+隔離 worktree(o14)+ その worktree の pane にエージェント起動・実装プロンプト注入(o15)まで**。
+完了検知(result.json のポーリング=o16)/ 検証 / Artifact / 失敗経路は未)/
 GitHub 連携 / watch・reconciler。
 
 ## コンポーネント(ソースと 1:1)
@@ -33,14 +34,15 @@ GitHub 連携 / watch・reconciler。
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
-| `src/mux.rs` | pane 供給(§8): pane を作る・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` から使う。両 backend の実機単体テストあり |
+| `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
+| `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示。verify 種別ごとに DoD を出し分ける。画面は読まず result.json で完了を判定する契約 |
 
 ## ドメインモデル(§4/§5)
 
 * **Intent** — 実現したいこと。グラフの根。
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
-* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こる(o14)。エージェント起動・検証は未実装。
+* **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、続けてその worktree の pane にエージェントを起動して実装プロンプトを注入し、state を `running` にする(o15)。完了検知(result.json)・検証は未実装。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明。
@@ -74,7 +76,8 @@ meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
 meguri work    rm   <w>              # DB 行 + spawn 済みなら git worktree/ブランチも掃除
-meguri run <o>                       # o14: ready Outcome → Work を起こし bare から隔離 worktree を切る
+meguri run <o>                       # o14/o15: ready Outcome → Work を起こし bare から隔離 worktree を切り、
+                                     #   その worktree の pane にエージェントを起動して実装プロンプトを注入(state=running)
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
@@ -117,7 +120,9 @@ meguri plan run    [--intent <i>] [--agent <cmd>] [--detach] [--grace-secs N] [-
 ~/.meguri/meguri.db          sqlite(MEGURI_HOME で移動可)
 ~/.meguri/config.toml        設定(lang / agent、無ければ既定)
 ~/.meguri/repos/<name>.git   管理 repo の bare clone(repo add で作る)
-~/.meguri/worktrees/         Work の隔離 worktree(o14 で使う)
+~/.meguri/worktrees/<repo>/w<id>/          Work の隔離 worktree(o14)
+~/.meguri/worktrees/<repo>/w<id>/.meguri/prompt.md   実装プロンプト(o15、commit しない)
+~/.meguri/worktrees/<repo>/w<id>/.meguri/result.json エージェントが書く完了結果(o16 で検知予定)
 ~/.meguri/proposal.json      手動 planning の作業ファイル(既定パス)
 ~/.meguri/proposals/i<N>.json  `plan run` の Intent 別 proposal(並行 Intent が衝突しない)
 ~/.meguri/plan-prompt-i<N>.md  `plan run` がエージェントに読ませるプロンプト

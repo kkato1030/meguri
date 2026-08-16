@@ -7,6 +7,7 @@
 //! 抽象(trait)は §8 が herdr / tmux / remote を想定しているため導入する。最初の
 //! backend は **tmux**(自動検証しやすい)。herdr backend は p2.2b で足す(§8 の優先)。
 
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -18,7 +19,8 @@ pub struct PaneId(pub String);
 
 pub trait Mux {
     /// 名前付き session に pane(シェル)を開き、ハンドルを返す。
-    fn open_pane(&self, session: &str, title: &str) -> Result<PaneId>;
+    /// `cwd` を渡すとそのディレクトリで開く(execution は worktree で開く)。
+    fn open_pane(&self, session: &str, title: &str, cwd: Option<&Path>) -> Result<PaneId>;
     /// pane に 1 行打ち込む(末尾で Enter)。
     fn send_line(&self, pane: &PaneId, text: &str) -> Result<()>;
     /// pane がまだ生きているか。
@@ -56,16 +58,21 @@ impl Tmux {
 }
 
 impl Mux for Tmux {
-    fn open_pane(&self, session: &str, title: &str) -> Result<PaneId> {
+    fn open_pane(&self, session: &str, title: &str, cwd: Option<&Path>) -> Result<PaneId> {
         // session が無ければ作る(detached)。window にはコマンドを渡さない =
         // 既定シェルが動き続けるので、あとで送るエージェントが exit しても pane は残る。
         let exists = Self::run(&["has-session", "-t", session])?.status.success();
-        let id = if exists {
-            Self::ok(&["new-window", "-t", session, "-n", title, "-P", "-F", "#{window_id}"])?
+        let mut args: Vec<&str> = if exists {
+            vec!["new-window", "-t", session, "-n", title, "-P", "-F", "#{window_id}"]
         } else {
-            Self::ok(&["new-session", "-d", "-s", session, "-n", title, "-P", "-F", "#{window_id}"])?
+            vec!["new-session", "-d", "-s", session, "-n", title, "-P", "-F", "#{window_id}"]
         };
-        Ok(PaneId(id))
+        let cwd_str = cwd.map(|c| c.to_string_lossy().into_owned());
+        if let Some(s) = &cwd_str {
+            args.push("-c");
+            args.push(s);
+        }
+        Ok(PaneId(Self::ok(&args)?))
     }
 
     fn send_line(&self, pane: &PaneId, text: &str) -> Result<()> {
@@ -136,11 +143,24 @@ impl Herdr {
 }
 
 impl Mux for Herdr {
-    fn open_pane(&self, session: &str, title: &str) -> Result<PaneId> {
+    fn open_pane(&self, session: &str, title: &str, cwd: Option<&Path>) -> Result<PaneId> {
         // workspace は label で再利用、無ければ作る。どちらも root_pane が今回の pane。
+        let cwd_str = cwd.map(|c| c.to_string_lossy().into_owned());
+        let cwd_args: Vec<&str> = match &cwd_str {
+            Some(s) => vec!["--cwd", s],
+            None => vec![],
+        };
         let result = match Self::find_workspace(session)? {
-            Some(ws) => Self::json(&["tab", "create", "--workspace", &ws, "--label", title, "--no-focus"])?,
-            None => Self::json(&["workspace", "create", "--label", session, "--no-focus"])?,
+            Some(ws) => {
+                let mut a = vec!["tab", "create", "--workspace", &ws, "--label", title, "--no-focus"];
+                a.extend(&cwd_args);
+                Self::json(&a)?
+            }
+            None => {
+                let mut a = vec!["workspace", "create", "--label", session, "--no-focus"];
+                a.extend(&cwd_args);
+                Self::json(&a)?
+            }
         };
         let pane_id = result["root_pane"]["pane_id"]
             .as_str()
@@ -188,7 +208,7 @@ mod tests {
         let m = Tmux;
         // 衝突しない session 名(pid ベース)。
         let session = format!("meguri-test-{}", std::process::id());
-        let pane = m.open_pane(&session, "smoke").unwrap();
+        let pane = m.open_pane(&session, "smoke", None).unwrap();
         assert!(m.is_alive(&pane).unwrap());
 
         // シェルにファイル書き込みを打ち込み、結果を確認する。
@@ -222,7 +242,7 @@ mod tests {
         }
         let m = Herdr;
         let session = format!("meguri-test-{}", std::process::id());
-        let pane = m.open_pane(&session, "smoke").unwrap();
+        let pane = m.open_pane(&session, "smoke", None).unwrap();
         assert!(m.is_alive(&pane).unwrap());
 
         let dir = std::env::temp_dir().join(format!("meguri-herdr-{}", std::process::id()));

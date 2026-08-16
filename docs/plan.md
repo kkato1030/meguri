@@ -764,12 +764,12 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 
 Outcome Graph を実際の AI coding に接続する。
 
-* [ ] `ready` 導出からの Work 選択
-* [ ] HerdrRuntime(interface 化は 2 実装目まで待つ)
-* [ ] workspace / worktree 作成(repo 排他、exclude、preflight — §9.3)
-* [ ] Claude Code / Codex 起動
-* [ ] Work instruction injection(完了コントラクト込み)
-* [ ] result 待機(耐久シグナルのみ)
+* [x] `ready` 導出からの Work 選択(o14: `meguri run <o>`)
+* [x] HerdrRuntime(interface 化は 2 実装目まで待つ) — mux 層(tmux/herdr、`src/mux.rs`)
+* [x] workspace / worktree 作成(repo bare clone + 隔離 worktree、exclude — o13/o14、§9.3。preflight は未)
+* [x] Claude Code / Codex 起動(o15: worktree の pane に config の agent を起動)
+* [x] Work instruction injection(完了コントラクト込み)(o15: `src/exec.rs` の impl_prompt を注入、state=running)
+* [ ] result 待機(耐久シグナルのみ)(o16: `.meguri/result.json` のポーリング)
 * [ ] meguri 側の独立検証 + fix turn 差し戻し(上限付き)
 * [ ] 沈黙 nudge / タイムアウト / pane 死亡の失敗経路
 * [ ] Artifact registration
