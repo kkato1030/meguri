@@ -391,7 +391,7 @@ execution が**同じ 1 つの型**を共有し、一級・最新・全エージ
 (Codex/Cursor もネイティブ headless なら動く)。ACP を再検討するトリガーは、
 meguri が**自前のチャット UI をホストする**か **人間なしで自律 planning を回す**
 必要が出た時、または ACP がベンダー純正・1.0 まで成熟した時。p0 のスパイクは
-`archive/p0-acp-spike` ブランチ に残す。
+`archive/p0-acp-spike` ブランチに残す。
 
 ---
 
@@ -408,7 +408,7 @@ meguri とエージェントの接点は **1 つの抽象**に統一する:
 同じ「完了契約」の型なので、pane 起動・完了契約・trust-but-verify の機構が
 両方で使い回せる。エージェント起動レシピの差(program / args / 除去する環境変数)
 だけが相手ごとに変わる(p0 で実測: claude はネイティブ ACP 無しで CLAUDECODE の
-unset が要る等 —— `archive/p0-acp-spike` ブランチ 参照)。
+unset が要る等 —— `archive/p0-acp-spike` ブランチ参照)。
 
 初期実装では pane 供給に **herdr を優先**する。
 
@@ -1067,6 +1067,6 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 3. 一級・最新・全エージェント対応(素の headless なら Codex の luna も Cursor も動く。アダプタ版 churn を回避)。
 4. planning に必要なのは「多ターン + 構造化提案の収穫」だけで、ACP の richness(meguri がチャット UI をホスト / 人間なし自律ターン)は今は不要。
 
-**ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `archive/p0-acp-spike` ブランチ から再開する。
+**ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `archive/p0-acp-spike` ブランチから再開する。
 
 **手段の段階**(§7): 第一は **pane(B)**(人間が生の pane で対話 → proposal.json 収穫)。人間が pane に attach せず meguri の CLI で完結させたくなったら **headless 仲介(C)**(`claude -p --resume` / `codex exec resume` を叩き proposal.json を受ける)を足す。B/C は同じファイル契約を共有するので B→C は追加であって作り直しではない。
