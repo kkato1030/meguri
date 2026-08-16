@@ -128,26 +128,32 @@ pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path) -> R
 # 出力(必ずこの JSON をファイルに書く)
 "#,
     );
+    s.push_str(&format!("- proposal の \"intent\" は必ず \"i{}\"(この Intent)にする。\n\n", it.id));
     s.push_str(&format!("書き出し先: {}\n\n", out_path.display()));
-    s.push_str(SCHEMA_EXAMPLE);
+    s.push_str(&schema_example(it.id));
     s.push('\n');
     Ok(s)
 }
 
-const SCHEMA_EXAMPLE: &str = r#"```json
-{
-  "intent": "i1",
+/// スキーマ例。`"intent"` は今の Intent の id を埋める(別 Intent に書かせないため)。
+fn schema_example(intent_id: i64) -> String {
+    format!(
+        r#"```json
+{{
+  "intent": "i{intent_id}",
   "outcomes": [
-    { "ref": "provider", "statement": "OAuth プロバイダ設定が存在する",
-      "verify": {"kind": "human"} },
-    { "ref": "state", "statement": "不正な state が弾かれる",
-      "verify": {"kind": "command", "command": "cargo test state_validation"},
-      "needs": ["provider"] },
-    { "ref": "e2e", "statement": "認証が E2E で検証されている",
-      "verify": {"kind": "rollup"}, "needs": ["state", "provider"] }
+    {{ "ref": "provider", "statement": "OAuth プロバイダ設定が存在する",
+      "verify": {{"kind": "human"}} }},
+    {{ "ref": "state", "statement": "不正な state が弾かれる",
+      "verify": {{"kind": "command", "command": "cargo test state_validation"}},
+      "needs": ["provider"] }},
+    {{ "ref": "e2e", "statement": "認証が E2E で検証されている",
+      "verify": {{"kind": "rollup"}}, "needs": ["state", "provider"] }}
   ]
+}}
+```"#
+    )
 }
-```"#;
 
 // ---- load + resolve(検証) ----
 
