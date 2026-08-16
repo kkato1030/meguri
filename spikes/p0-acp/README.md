@@ -24,7 +24,7 @@ MEGURI_ACP_DEBUG=1 ... cargo run -- "..."                           # 生の ses
 |---|---|---|---|---|
 | **Claude**(本命) | adapter `@zed-industries/claude-code-acp` | ✓ | ✓ テキスト返る | **使える** |
 | Gemini | ネイティブ `gemini --acp` | ✓ | ✓ テキスト返る | 使える |
-| Codex | adapter `@zed-industries/codex-acp` | ✓ | △ トランスポートは往復するが、生成が **codex-cli の版数**で失敗(下記) | ACP は OK・要 `codex update` |
+| Codex | adapter `@zed-industries/codex-acp` | ✓ | △ トランスポートは往復するが、生成が **adapter 埋め込み codex-core の版数**で失敗(下記) | ACP は OK・adapter 待ち |
 | Cursor | 第三者製 `cursor-agent-acp`(0.1.1) | ✓ | ✗ end_turn は返るが **返答テキスト・session/update が一切来ない** | 現状使えない |
 
 前提: 各エージェントの実体 CLI がログイン済みで PATH にあること。adapter は
@@ -33,9 +33,15 @@ MEGURI_ACP_DEBUG=1 ... cargo run -- "..."                           # 生の ses
 ### Codex の詳細
 ACP は initialize → session/new → session/prompt → 構造化応答まで完全に往復する
 (モデル API まで到達している)。ただしこのアカウントの Codex は既定モデルが
-`gpt-5.6-luna` で、**codex-cli 0.145.0 では新しすぎて使えない**("requires a newer
-version of Codex")。他モデル(gpt-5-codex / o3 等)は "ChatGPT account では非対応"。
-→ **ACP の問題ではなく Codex の版数問題。`codex update` で解ける見込み。**
+`gpt-5.6-luna` で、これが弾かれる("requires a newer version of Codex")。他モデル
+(gpt-5-codex / o3 等)は "ChatGPT account では非対応"。
+
+**根本原因(2026-08-16 追検証)**: `codex-acp` adapter は**自前の codex-core を埋め込んで
+おり、システムの `codex` バイナリを使わない**。だからシステム `codex` を 0.147.0 に
+上げても効かない。adapter は既に最新(0.16.0)で、その埋め込み codex-core が luna 未対応。
+adapter に外部 codex を使わせるフラグも無い。→ **ACP トランスポートは問題ないが、
+このアカウント(luna 専用)では codex-acp adapter が luna を載せるまで生成できない。
+現状は Codex 待ち。** `codex update`(システム CLI)では解けない。
 
 ### Cursor の詳細
 `cursor-agent-acp`(第三者製・v0.1.1)は handshake と prompt ライフサイクル
