@@ -11,15 +11,23 @@ pub struct Config {
     /// Outcome の statement 等、**エージェント/ユーザーが書く中身**の言語(自然言語名)。
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// pane で起動するエージェント CLI(そのまま shell に打ち込む 1 行)。
+    #[serde(default = "default_agent")]
+    pub agent: String,
 }
 
 fn default_lang() -> String {
     "English".to_string()
 }
 
+fn default_agent() -> String {
+    // planning ではエージェントが proposal.json を書くだけなので権限確認を省く。
+    "claude --dangerously-skip-permissions".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
-        Config { lang: default_lang() }
+        Config { lang: default_lang(), agent: default_agent() }
     }
 }
 
