@@ -28,6 +28,7 @@
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid) |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映。単体テストあり |
+| `src/mux.rs` | pane 供給(§8): pane を作る・1 行送る・生死を見る の trait + tmux backend。まだ `plan` 未配線(p2.2c)。tmux 実機の単体テストあり |
 
 ## ドメインモデル(§4/§5)
 
