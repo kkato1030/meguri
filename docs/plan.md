@@ -961,3 +961,45 @@ Goal
 とする。
 
 定義の核は「Intent → Work Graph → 実行・判断 → Desired State」のサイクルの管理であって、その実装がローカルかリモートかではない。初期は local-first で始めるが(§1)、それは現時点の重心であり、この定義には含めない。
+
+---
+
+# 23. 設計上の未決事項(open design questions)
+
+以下は検討済みだが**まだ確定していない**設計軸である。本文(§4〜§14)は現時点の暫定形で書いてあるが、これらの決着によって書き換わりうる。v0.1 の p1(データモデル)確定前に、少なくとも Q1 は決める。扉を閉じないために記録しておく。
+
+## Q1. グラフの土台 — Work DAG か Goal graph か
+
+本文はグラフを *activity-on-node*(ノード = Work、辺 = 依存)で書いている。代替案は *outcome/state graph*(ノード = 到達したい状態・マイルストーン、辺 = requires/enables、**Work はノードを「未充足→充足」に反転させる手段**)への読み替え。
+
+- **後者の利点**: (1) 現在別々の「Desired State」「Acceptance Criteria」「Work Graph」が1構造に畳まれる(ノード = 状態、その充足述語 = 旧 Acceptance、Work = 手段)。(2) §12 の level-triggered reconciler が K8s controller と完全一致する(「この状態は満たされているか? 未充足かつ前提充足なら Work を起こす」)。(3) §14 の再計画が「どのノードが今満たされているか」の再評価になり明快。(4) **Work でない到達点**(マイルストーン・維持したい不変条件・獲得したい能力)が特別扱いなしにノードとして載る。(5) 「この状態は複数手段のどれかで達成可(OR)」を表現できる。
+- **現時点の leaning**: framing は後者(L2)を採用しうる。ただし**機構は dumb に保つ** — 1状態1アプローチ、OR 自動探索なし、分解は ACP 提案 → 人間承認のまま、自動 planner は作らない(§18 Non-Goal「複雑な AI scheduler」を守る)。
+- **決定タイミング**: v0.1 p1 の前。ここが Q2/Q3 の土台になる。
+- **安い hedge**: v0.1 で `Work { depends_on: [WorkId] }` を唯一のグラフにしない。ノードと Work を最初から分けておけば、Work DAG のまま留まることも Goal graph へ育てることも両方開いたままにできる。
+- 先行研究: GORE(KAOS / i*)、Impact Mapping、OKR ツリー、HTN / AND-OR グラフ、K8s desired-state。
+
+## Q2. 人間が実行する Work(executor)
+
+Work の定義(§4)は actor ニュートラル(objective / acceptance / depends_on のみ)。実行系(§9)だけが AI 前提になっている。しかし本番 DNS 切替・デザイン決定・API キー発行など、**AI に委譲できない実装**が存在する。
+
+- **案**: 実装フェーズに `executor`(既定 `ai` | `human`)を持たせる。`human` のとき §9 の実行フローは「人間に提示 → 完了報告(`meguri accept` 相当)を待つ」だけに退化する。DAG・ready 導出・critical path は executor を問わず同じに効き、**人間 Work → AI Work の依存が1本の graph に乗る**。
+- **効用**: §21 の「今どこで詰まっているか」が人間タスクまで含めて説明できる(meguri の価値提案の中核)。
+- **defer**: `external` actor(CI / デプロイ / 承認 bot)への一般化は v0.x では過剰。
+
+## Q3. multi-actor ライフサイクル(phase ごとの actor)
+
+「AI が実装し、人間がレビューする」は Work 単位の actor ではなく **phase 単位の actor** の話であり、**既に §6 のライフサイクルに埋まっている**:
+
+```
+running        実装      → 既定 AI(Q2 で human もありうる)
+verifying      独立検証   → meguri 自身
+awaiting_human レビュー   → 人間
+accepted       採用判断   → 人間
+```
+
+つまり「AI 実装 + 人間レビュー」は **meguri の既定フローそのもの**で、追加構造を要しない。§13 Human Gate がこのレビュー phase。
+
+- **制約(失敗カタログ由来)**: レビューを独立した graph ノードに割らない。レビューは bounded outcome ではなく phase。旧 meguri はレビューを分離可能な escalation 単位として扱い、**ping-pong 型 escalation が throughput の主因**になった(archive の review-convergence 診断)。旧実装の最終形も「レビューは reconciler 内の role/step(pr-reviewer)、別 issue ではない」。
+- **defer**: レビュー phase の actor 可変化(`human` | `ai-reviewer`、異種モデル相互レビュー = 旧 6-role routing)は後回し。v0.x は人間レビュー固定(§13)。
+
+Q2/Q3 は Q1 の土台の上に乗る(状態グラフなら「状態を満たす手段の内訳」、Work DAG なら「Work の phase/executor 属性」)。順序は Q1 → Q2/Q3。
