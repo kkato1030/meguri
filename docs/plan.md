@@ -2,7 +2,9 @@
 
 ## 1. 概要
 
-meguri は、**Intent を実行可能な Work Graph に変換し、人間と AI による実行・判断を通して Goal への到達を管理するローカル中心の Delivery Control Plane** を目指す。
+meguri は、**Intent を実行可能な Work Graph に変換し、人間と AI による実行・判断を通して Goal への到達を管理する Delivery Control Plane** を目指す。
+
+初期は権威・実行・永続化をローカルに置く(local-first)。ただしこれは**現時点の設計の重心であって、恒久的な制約ではない**。実行系は将来リモート runtime へ拡張しうる(§8)し、権威や永続化の所在も要求が現れれば見直しうる。local-first は今の一手であり、meguri の定義ではない。
 
 AI Agent 自体やコード実行環境を独自実装するのではなく、Claude Code / Codex 等の既存 Agent、ACP、herdr / tmux、GitHub 等を組み合わせる。
 
@@ -655,7 +657,7 @@ Next Work     Re-plan
 
 meguri は「実行・判断の履歴」を所有すると言った以上、ストレージを持つ。
 
-* **sqlite 一択**とする(local-first、単一ファイル、トランザクション)。
+* 初期は **sqlite 一択**とする(単一ファイル、トランザクション、ローカル完結)。永続化の所在(ローカル / リモート)は現時点の選択であり、将来リモート runtime やチーム利用の要求が現れれば見直しうる(§1)。
 * 保存するのは事実のみ: Intent / Desired State / Work(保存状態のみ)/ 依存 / Artifact / 履歴イベント / Agent session id。
 * 導出値(ready / blocked / critical path)は保存しない。
 * クラッシュ耐性の契約: 「実行中 turn の途中進捗のみ喪失可」。それ以外はプロセス再起動で復元できること。
@@ -948,10 +950,12 @@ Goal
 
 # 22. meguri の定義
 
-> **meguri is a local-first delivery control plane that turns intent into an executable work graph and coordinates humans and AI agents toward the desired state.**
+> **meguri is a delivery control plane that turns intent into an executable work graph and coordinates humans and AI agents toward the desired state.**
 
 日本語では、
 
-> **Intent を実行可能な Work Graph に変換し、人間と AI Agent による実行・判断を通じて Desired State への到達を管理する、local-first な Delivery Control Plane。**
+> **Intent を実行可能な Work Graph に変換し、人間と AI Agent による実行・判断を通じて Desired State への到達を管理する Delivery Control Plane。**
 
 とする。
+
+定義の核は「Intent → Work Graph → 実行・判断 → Desired State」のサイクルの管理であって、その実装がローカルかリモートかではない。初期は local-first で始めるが(§1)、それは現時点の重心であり、この定義には含めない。
