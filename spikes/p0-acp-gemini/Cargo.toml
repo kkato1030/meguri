@@ -1,0 +1,11 @@
+[package]
+name = "p0-acp-gemini"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# p0 スパイク(捨てコード)。ACP 往復が成立するかの検証だけが目的。
+# 依存は最小 — JSON 組み立て/解釈に serde_json のみ。非同期ランタイムも使わない
+# (子プロセスの stdout を 1 スレッドでブロッキング読みするだけで足りる)。
+[dependencies]
+serde_json = "1"
