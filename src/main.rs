@@ -3,6 +3,7 @@
 //! ここで扱うのは「グラフを作る・見る」まで。planning 対話(pane + proposal.json)や
 //! 実行系(pane で Work を回す)は後続の増分(p2 以降)。
 
+mod config;
 mod db;
 mod derive;
 mod plan;
@@ -166,7 +167,8 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
     match c {
         PlanCmd::Prompt { intent, file } => {
             let out = path(file)?;
-            let text = plan::prompt(conn, intent.as_deref(), &out)?;
+            let lang = config::load()?.lang;
+            let text = plan::prompt(conn, intent.as_deref(), &out, &lang)?;
             print!("{text}");
         }
         PlanCmd::Diff { file } => {

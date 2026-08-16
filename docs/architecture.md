@@ -22,6 +22,7 @@
 | モジュール | 責務 |
 |---|---|
 | `src/main.rs` | CLI(clap)。id の解釈(`o3`/`3`)と各コマンドのディスパッチ |
+| `src/config.rs` | `~/.meguri/config.toml`(いまは `lang` のみ)。無ければ既定 |
 | `src/db.rs` | sqlite 接続とスキーマ(`~/.meguri/meguri.db`、`MEGURI_HOME` で移動可)。**保存は事実のみ** |
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。単体テストあり |
@@ -82,12 +83,23 @@ meguri plan apply             [--file <path>] [--yes]  # 承認して反映(addi
 ## 永続化 / ファイルシステム
 
 ```
-~/.meguri/meguri.db      sqlite(MEGURI_HOME で移動可)
+~/.meguri/meguri.db          sqlite(MEGURI_HOME で移動可)
+~/.meguri/config.toml        設定(いまは lang のみ、無ければ既定)
+~/.meguri/proposal.json      planning の作業ファイル(既定パス)
 ```
+
+## 言語(2 軸)
+
+- **chrome(meguri 自身の言葉: help / ラベル / エラー / プロンプト)= 英語固定**。
+- **content(Outcome の statement 等、書く中身)= `config.toml` の `lang`**(自然言語名、
+  既定 `"English"`)。planning プロンプトに「Write each statement in `<lang>`」と渡す。
+  `lang = "日本語"` にすれば日本語運用に切替。翻訳はしない(同一グラフの両言語表示=
+  bilingual は将来 (C) で。proposal の `statement` は前方互換に保つ)。
 
 ## 依存 crate
 
-`clap`(CLI)/ `rusqlite`(bundled = システム sqlite 不要)/ `anyhow`。
+`clap`(CLI)/ `rusqlite`(bundled = システム sqlite 不要)/ `anyhow` /
+`serde` + `serde_json`(proposal.json)/ `toml`(config.toml)。
 最小に保つ(§20)。新しい crate はそれが解く問題が現れた増分で足す。
 
 ## 既知の割り切り(p1 の意図的な穴)

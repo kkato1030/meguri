@@ -87,8 +87,9 @@ pub struct Plan {
 
 // ---- prompt(1) ----
 
-/// エージェントに渡す planning プロンプトを組み立てる。
-pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path) -> Result<String> {
+/// エージェントに渡す planning プロンプトを組み立てる。`lang` は statement を書く言語
+/// (自然言語名。config の lang)。
+pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path, lang: &str) -> Result<String> {
     let intent_id = resolve_intent(conn, intent_opt)?;
     let it = store::list_intents(conn)?
         .into_iter()
@@ -115,11 +116,11 @@ pub fn prompt(conn: &Connection, intent_opt: Option<&str>, out_path: &Path) -> R
     }
     s.push('\n');
 
+    s.push_str("# Instructions\n");
+    s.push_str("- Decompose the Intent into Outcomes phrased as desired *states* (\"... is in place\"), not tasks.\n");
+    s.push_str(&format!("- Write each statement in {lang}.\n"));
     s.push_str(
-        r#"# Instructions
-- Decompose the Intent into Outcomes phrased as desired *states* ("... is in place"), not tasks.
-- Write each statement in the same language as the Intent above.
-- Give each Outcome a `verify` (how we confirm it is achieved):
+        r#"- Give each Outcome a `verify` (how we confirm it is achieved):
     - {"kind":"command","command":"<test/check command>"}  - achieved when the command exits 0
     - {"kind":"human"}                                       - a human judges it (default)
     - {"kind":"rollup"}                                      - no check of its own; achieved when all `needs` are (a milestone)
@@ -141,12 +142,12 @@ fn schema_example(intent_id: i64) -> String {
 {{
   "intent": "i{intent_id}",
   "outcomes": [
-    {{ "ref": "provider", "statement": "OAuth プロバイダ設定が存在する",
+    {{ "ref": "provider", "statement": "OAuth provider is configured",
       "verify": {{"kind": "human"}} }},
-    {{ "ref": "state", "statement": "不正な state が弾かれる",
+    {{ "ref": "state", "statement": "Invalid state is rejected",
       "verify": {{"kind": "command", "command": "cargo test state_validation"}},
       "needs": ["provider"] }},
-    {{ "ref": "e2e", "statement": "認証が E2E で検証されている",
+    {{ "ref": "e2e", "statement": "Auth is verified end-to-end",
       "verify": {{"kind": "rollup"}}, "needs": ["state", "provider"] }}
   ]
 }}
