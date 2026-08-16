@@ -391,7 +391,7 @@ execution が**同じ 1 つの型**を共有し、一級・最新・全エージ
 (Codex/Cursor もネイティブ headless なら動く)。ACP を再検討するトリガーは、
 meguri が**自前のチャット UI をホストする**か **人間なしで自律 planning を回す**
 必要が出た時、または ACP がベンダー純正・1.0 まで成熟した時。p0 のスパイクは
-`spikes/p0-acp/` に残す。
+`archive/p0-acp-spike` ブランチに残す。
 
 ---
 
@@ -408,7 +408,7 @@ meguri とエージェントの接点は **1 つの抽象**に統一する:
 同じ「完了契約」の型なので、pane 起動・完了契約・trust-but-verify の機構が
 両方で使い回せる。エージェント起動レシピの差(program / args / 除去する環境変数)
 だけが相手ごとに変わる(p0 で実測: claude はネイティブ ACP 無しで CLAUDECODE の
-unset が要る等 —— `spikes/p0-acp/` 参照)。
+unset が要る等 —— `archive/p0-acp-spike` ブランチ参照)。
 
 初期実装では pane 供給に **herdr を優先**する。
 
@@ -744,7 +744,7 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 
 分割increments:
 
-* **p0: ACP spike(済)** — Claude/Gemini/Codex/Cursor で ACP 往復を実測。結論: ACP は動くが未成熟で、**pane + 構造化ファイル契約の方が筋が良い**と判断(§7 / §23 Q5)。捨てコードは `spikes/p0-acp/`
+* **p0: ACP spike(済)** — Claude/Gemini/Codex/Cursor で ACP 往復を実測。結論: ACP は動くが未成熟で、**pane + 構造化ファイル契約の方が筋が良い**と判断(§7 / §23 Q5)。捨てコードは main に入れず `archive/p0-acp-spike` ブランチに退避(PR は不採用で close)
 * **p1: データモデル + 永続化 + CLI** — Intent / Outcome(statement/predicate=verify/requires)/ Work の CRUD、sqlite、ready・satisfied 導出、Mermaid 出力
 * **p2: Planning 対話** — pane で生の Claude/Codex と対話 → エージェントが `proposal.json` を書く → meguri が読んで Graph Diff 表示 → Human approval で確定
 
@@ -1059,7 +1059,7 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 
 **決定(本文 §7/§8 に反映済み)**: planning の対話も、ACP ではなく **pane + 構造化ファイル契約**で実現する。エージェント境界は「文脈を送る → 耐久チャネル(ファイル/stdout-JSON)で構造化結果を受け取る・画面は読まない」の 1 抽象に統一し、planning(`proposal.json`)と execution(`result.json`)で共有する。
 
-**p0 の実測(#282、`spikes/p0-acp/`)**: ACP は JSON-RPC over stdio で動く。Claude(adapter 経由)・Gemini(ネイティブ)で往復成立。ただし未成熟 —— アダプタは 0.x、プロトコルは v1→v2 の churn、Codex はアダプタ埋め込み core がモデルに追随できず生成不可、Cursor は第三者アダプタが返答を流さない。ベンダー純正 ACP は Gemini のみで、Claude/Codex は Zed のアダプタ頼み。
+**p0 の実測(`archive/p0-acp-spike` ブランチ、PR #282 は不採用で close)**: ACP は JSON-RPC over stdio で動く。Claude(adapter 経由)・Gemini(ネイティブ)で往復成立。ただし未成熟 —— アダプタは 0.x、プロトコルは v1→v2 の churn、Codex はアダプタ埋め込み core がモデルに追随できず生成不可、Cursor は第三者アダプタが返答を流さない。ベンダー純正 ACP は Gemini のみで、Claude/Codex は Zed のアダプタ頼み。
 
 **契約ベースを採る理由**:
 1. v1/v2 で証明済みの型(生きた pane + 完了契約 + 画面を読まない)の再利用。
@@ -1067,6 +1067,6 @@ Q2/Q3 は確定した Q1(Outcome graph)の上に乗る = 「Outcome を満たす
 3. 一級・最新・全エージェント対応(素の headless なら Codex の luna も Cursor も動く。アダプタ版 churn を回避)。
 4. planning に必要なのは「多ターン + 構造化提案の収穫」だけで、ACP の richness(meguri がチャット UI をホスト / 人間なし自律ターン)は今は不要。
 
-**ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `spikes/p0-acp/` から再開する。
+**ACP を再検討するトリガー**: meguri が自前のチャット UI をホストする / 人間なしで自律 planning を回す / ACP がベンダー純正・1.0 まで成熟する。その時に `archive/p0-acp-spike` ブランチから再開する。
 
 **手段の段階**(§7): 第一は **pane(B)**(人間が生の pane で対話 → proposal.json 収穫)。人間が pane に attach せず meguri の CLI で完結させたくなったら **headless 仲介(C)**(`claude -p --resume` / `codex exec resume` を叩き proposal.json を受ける)を足す。B/C は同じファイル契約を共有するので B→C は追加であって作り直しではない。
