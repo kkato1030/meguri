@@ -752,7 +752,7 @@ Web UI(Intent View / Graph View / Status View)は v0.4 以降の増分として�
 * **p1: データモデル + 永続化 + CLI(済)** — Intent / Outcome(statement/verify/requires)/ Work の CRUD、sqlite、satisfied・ready・blocked 導出、Mermaid 出力。実装は `src/`(architecture.md 参照)
 * **p2: Planning 対話** — 2 枚に分割:
   * **p2.1 契約(済)** — pane なしで契約を確立: `plan prompt`(Intent+現グラフ+スキーマ)→ エージェントが `proposal.json` を書く → `plan diff`(検証)→ `plan apply`(承認で additive 反映、ref→id 配線)。実装は `src/plan.rs`
-  * **p2.2 pane 自動化** — `meguri plan` が herdr/tmux pane にエージェントを起動し文脈を注入(ここで mux 層=§8 を導入)
+  * **p2.2 pane 自動化(済)** — mux 層(§8: tmux/herdr backend + auto 選択、`src/mux.rs`)を導入し、`meguri plan run` が pane にエージェントを起動 → 猶予後にプロンプト注入 → `proposal.json` の出現検知 → diff → 反映まで一気通貫。config に `agent`。proposal は Intent 別パス(`proposals/i<N>.json`)
 
 ### 完了条件
 

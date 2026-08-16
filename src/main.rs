@@ -6,7 +6,6 @@
 mod config;
 mod db;
 mod derive;
-#[allow(dead_code)] // p2.2c(`meguri plan` からの起動)で配線する
 mod mux;
 mod plan;
 mod render;
@@ -14,6 +13,7 @@ mod store;
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -71,6 +71,23 @@ enum PlanCmd {
     Apply {
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Launch an agent in a pane, inject the prompt, wait for the proposal, then apply
+    Run {
+        #[arg(long)]
+        intent: Option<String>,
+        /// Override the agent command (default: config `agent`)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Seconds to wait after launching the agent before injecting the prompt
+        #[arg(long, default_value_t = 8)]
+        grace_secs: u64,
+        /// Seconds to wait for the proposal to appear
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
         /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
@@ -189,6 +206,41 @@ fn plan_cmd(conn: &rusqlite::Connection, c: PlanCmd) -> Result<()> {
             let ids = plan::apply(conn, &plan)?;
             let list: Vec<String> = ids.iter().map(|i| format!("o{i}")).collect();
             println!("applied: added {}", list.join(", "));
+        }
+        PlanCmd::Run { intent, agent, grace_secs, timeout_secs, yes } => {
+            let cfg = config::load()?;
+            let agent = agent.unwrap_or(cfg.agent);
+            let mux = mux::select();
+            let rt = plan::Runtimes {
+                mux: mux.as_ref(),
+                agent: &agent,
+                lang: &cfg.lang,
+                grace: Duration::from_secs(grace_secs),
+                timeout: Duration::from_secs(timeout_secs),
+            };
+            eprintln!("[plan] launching agent in a pane and injecting the prompt...");
+            eprintln!("[plan] waiting for the proposal (up to {timeout_secs}s). the pane stays alive.");
+            let (path, plan) = plan::run(conn, intent.as_deref(), &rt)?;
+            match plan {
+                None => {
+                    println!(
+                        "no proposal at {} yet (timed out or the pane exited). the pane is left alive; \
+                         finish in it, then run `meguri plan apply --file {}`.",
+                        path.display(),
+                        path.display()
+                    );
+                }
+                Some(plan) => {
+                    print!("{}", plan::diff_text(&plan));
+                    if !yes && !confirm("Apply?")? {
+                        println!("cancelled (proposal kept at {})", path.display());
+                        return Ok(());
+                    }
+                    let ids = plan::apply(conn, &plan)?;
+                    let list: Vec<String> = ids.iter().map(|i| format!("o{i}")).collect();
+                    println!("applied: added {}", list.join(", "));
+                }
+            }
         }
     }
     Ok(())

@@ -9,16 +9,87 @@
 //! p2.1 は **additive**(Outcome を足すだけ)。削除・変更を伴う宣言的 diff(§14 再計画)は後。
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use serde::Deserialize;
 
+use crate::mux::Mux;
 use crate::store::{self, Verify};
 
 /// proposal.json の既定パス(`MEGURI_HOME/proposal.json`)。
 pub fn default_proposal_path() -> Result<PathBuf> {
     Ok(crate::db::meguri_home()?.join("proposal.json"))
+}
+
+/// Intent ごとの proposal パス(`MEGURI_HOME/proposals/i<N>.json`)。`plan run` 用。
+/// Intent 単位に分けることで、複数 Intent の並行計画が衝突しない(§ 単一ファイル問題)。
+fn session_proposal_path(intent_id: i64) -> Result<PathBuf> {
+    let dir = crate::db::meguri_home()?.join("proposals");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    Ok(dir.join(format!("i{intent_id}.json")))
+}
+
+/// p2.2c: pane を開いてエージェントを起動し、planning プロンプトを注入し、
+/// `proposal.json` が書かれるのを待つ。書かれたら検証済み Plan とそのパスを返す。
+/// 時間切れ / pane 死亡なら None(パスは案内用に返す)。**pane は残す**(§3.5)。
+pub struct Runtimes<'a> {
+    pub mux: &'a dyn Mux,
+    /// エージェント CLI を起動する 1 行(config.agent)。
+    pub agent: &'a str,
+    /// statement を書く言語(config.lang)。
+    pub lang: &'a str,
+    /// CLI 起動から注入までの猶予。
+    pub grace: Duration,
+    /// proposal 出現を待つ上限。
+    pub timeout: Duration,
+}
+
+pub fn run(conn: &Connection, intent_opt: Option<&str>, rt: &Runtimes) -> Result<(PathBuf, Option<Plan>)> {
+    let intent_id = resolve_intent(conn, intent_opt)?;
+    let proposal_path = session_proposal_path(intent_id)?;
+    // 前回の残骸を消しておく(新しい出現を検知するため)。
+    let _ = std::fs::remove_file(&proposal_path);
+
+    // プロンプトをファイルに書き、エージェントには「これを読んで従え」と伝える。
+    let prompt_text = prompt(conn, Some(&format!("i{intent_id}")), &proposal_path, rt.lang)?;
+    let prompt_path = crate::db::meguri_home()?.join(format!("plan-prompt-i{intent_id}.md"));
+    std::fs::write(&prompt_path, &prompt_text)
+        .with_context(|| format!("cannot write {}", prompt_path.display()))?;
+
+    let pane = rt.mux.open_pane("meguri", &format!("plan-i{intent_id}"))?;
+    // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(herdr で実測、p2.2b)。
+    // エージェント起動は 1 回だけ送りたい(再送すると多重起動する)ので、先に少し待つ。
+    std::thread::sleep(Duration::from_millis(800));
+    rt.mux.send_line(&pane, rt.agent)?;
+    std::thread::sleep(rt.grace);
+    rt.mux.send_line(
+        &pane,
+        &format!("Read {} and complete it (write the JSON proposal as instructed).", prompt_path.display()),
+    )?;
+
+    // proposal 出現をポーリング(pane 死亡でも打ち切り)。
+    let start = Instant::now();
+    let appeared = loop {
+        if proposal_path.exists() {
+            break true;
+        }
+        if !rt.mux.is_alive(&pane).unwrap_or(false) {
+            break false; // pane が死んだ = エージェント終了/失敗
+        }
+        if start.elapsed() >= rt.timeout {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    if !appeared {
+        return Ok((proposal_path, None));
+    }
+    let json = load(&proposal_path)?;
+    let plan = resolve(conn, &json)?;
+    Ok((proposal_path, Some(plan)))
 }
 
 // ---- proposal.json のスキーマ(エージェントが書く形) ----
