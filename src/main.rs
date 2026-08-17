@@ -9,6 +9,7 @@ mod derive;
 mod exec;
 mod gitops;
 mod mux;
+mod outcome;
 mod plan;
 mod render;
 mod store;
@@ -62,6 +63,9 @@ enum Cmd {
         /// Don't open the HTML in a browser (with --html)
         #[arg(long)]
         no_open: bool,
+        /// Fold satisfied Outcomes; show only what's still active (ready/blocked)
+        #[arg(long)]
+        active: bool,
     },
     /// Planning (propose via an agent -> proposal.json -> apply on approval)
     #[command(subcommand)]
@@ -298,7 +302,7 @@ fn main() -> Result<()> {
         Cmd::Intent(c) => intent(&conn, c)?,
         Cmd::Outcome(c) => outcome(&conn, c)?,
         Cmd::Work(c) => work(&conn, c)?,
-        Cmd::Graph { intent, mermaid, html, out, no_open } => {
+        Cmd::Graph { intent, mermaid, html, out, no_open, active } => {
             let iid = intent.map(|s| parse_id(&s, 'i')).transpose()?;
             let outcomes = store::list_outcomes(&conn, iid)?;
             let accepted = store::accepted_outcome_ids(&conn)?;
@@ -316,7 +320,7 @@ fn main() -> Result<()> {
             } else if mermaid {
                 print!("{}", render::mermaid(&outcomes, &accepted));
             } else {
-                print!("{}", render::text(&outcomes, &accepted));
+                print!("{}", render::text(&outcomes, &accepted, active));
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
@@ -1074,25 +1078,14 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
             println!(")");
         }
         OutcomeCmd::Done { id } => {
-            // 人手で「達成済み」と表明する(o28)。verify 種別を問わず受理事実を貼る
-            // (command でも run 抜きで消し込める。ADR 0002: 受理は Work か人手表明のどちらか由来)。
+            // 人手で「達成済み」と表明する(o28)。中身は outcome::mark_done に集約。
             let oid = parse_id(&id, 'o')?;
-            let o = store::get_outcome(conn, oid)?;
-            if o.verify == Verify::Rollup {
-                bail!("o{oid} is a milestone (rollup); it is satisfied by its children, not by hand");
-            }
-            let repo_id = store::get_intent(conn, o.intent_id)?.repo_id;
-            store::remove_human_acceptances(conn, oid)?; // 二重表明を避ける
-            store::add_acceptance(conn, oid, None, repo_id, None)?;
+            outcome::done(conn, oid)?;
             println!("marked o{oid} satisfied (human)");
         }
         OutcomeCmd::Undone { id } => {
             let oid = parse_id(&id, 'o')?;
-            let o = store::get_outcome(conn, oid)?;
-            let n = store::remove_human_acceptances(conn, oid)?;
-            if o.verify == Verify::Human {
-                store::set_human_satisfied(conn, oid, false)?; // 旧データの sticky も消す
-            }
+            let n = outcome::undone(conn, oid)?;
             if n == 0 {
                 println!("o{oid} had no human mark to clear");
             } else {
