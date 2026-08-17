@@ -443,15 +443,17 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
         })
     };
     const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id";
+    // soft-delete した work(deleted=1)は一覧・reconcile から除く。
     let rows: Vec<Work> = match serves_id {
         Some(sid) => {
-            let mut stmt = conn
-                .prepare(&format!("SELECT {COLS} FROM works WHERE serves_id = ?1 ORDER BY id"))?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLS} FROM works WHERE serves_id = ?1 AND deleted = 0 ORDER BY id"
+            ))?;
             let rows = stmt.query_map([sid], map)?.collect::<rusqlite::Result<Vec<Work>>>()?;
             rows
         }
         None => {
-            let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM works ORDER BY id"))?;
+            let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM works WHERE deleted = 0 ORDER BY id"))?;
             let rows = stmt.query_map([], map)?.collect::<rusqlite::Result<Vec<Work>>>()?;
             rows
         }
@@ -555,8 +557,11 @@ pub fn edit_work(conn: &Connection, id: i64, objective: Option<&str>, executor: 
 }
 
 /// Work を削除する(何からも参照されないので単純に消える)。
+/// `work rm` は **soft-delete**(行は残して deleted=1)。DELETE すると SQLite が rowid を
+/// 再利用し w 番号が巻き戻るため。tombstone を残すことで id が単調・受理の work_id も解決可能。
+/// worktree/ブランチ/pane の掃除(ディスク解放)は呼び側(main の cleanup_worktree)が別途行う。
 pub fn remove_work(conn: &Connection, id: i64) -> Result<()> {
-    if conn.execute("DELETE FROM works WHERE id = ?1", params![id])? == 0 {
+    if conn.execute("UPDATE works SET deleted = 1 WHERE id = ?1", params![id])? == 0 {
         bail!("work w{id} does not exist");
     }
     Ok(())

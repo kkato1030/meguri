@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 run の detach を即返りに(注入は watch が初回発見で担う)** 時点。
+最終更新: **v0.2 work rm を soft-delete に(id を再利用しない)+ run の detach 即返り** 時点。
 
 ## いまできること
 
@@ -97,7 +97,7 @@ meguri outcome undone <o>      # 人手表明を取り消す
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
-meguri work    rm   <w>              # DB 行 + spawn 済みなら git worktree/ブランチも掃除
+meguri work    rm   <w>              # worktree/ブランチ/pane を掃除。DB 行は soft-delete(tombstone、id を再利用しない)
 meguri run <o> [--agent <cmd>] [--wait] [--grace-secs N] [--timeout-secs N] [--nudge-secs N]
                               # o14-o16: ready Outcome → Work を起こし bare から隔離 worktree を切り、
                               #   その worktree の pane でエージェントを起動して実装プロンプトを注入(state=running)。
