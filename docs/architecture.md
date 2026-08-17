@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 harvest 芯の切り出し(reconciler 準備、挙動不変)** 時点。
+最終更新: **v0.2 `meguri watch`(最小 reconciler: running Work を harvest)** 時点。
 
 ## いまできること
 
@@ -24,6 +24,11 @@
   (clean tree=o17 / commit 進行=o18 / check_command=o19)** を rollup し、
   **全部 pass なら `verified`(検証済み commit を Artifact=branch @ sha として記録=o21)/
   一つでも落ちれば `rework` に gate(o20)**。
+- **launch / harvest の分離**: harvest 芯(検証→gate→Artifact)は `finalize_work`(**pane 不要**、
+  result.json と git 状態だけ)。`meguri run --detach` は launch だけして即返り(state=`running`)、
+  **`meguri watch`(最小 reconciler)** が running Work を走査して result が出ていれば harvest する。
+  既定は running が捌けるまでループ、`--once` で 1 パス。注: 沈黙の再注入(nudge)は pane 再取得が
+  要るので watch では未対応(`run --wait` の待機ループ内のみ)。
 - **ローカル accept**(Human Gate): `meguri accept <w>` で verified Work を受理 →
   serve 先 Outcome が **satisfied**(導出)→ 後続 Outcome が **ready** になる。
   これで `run → verified → accept → 次が ready` が一周する。
@@ -95,6 +100,9 @@ meguri run <o> [--agent <cmd>] [--detach] [--grace-secs N] [--timeout-secs N] [-
                               #   .meguri/result.json の出現を待って報告 status を state に反映(--detach で待たず即返る)。
                               #   注入落ち対策で result が出るまで --nudge-secs 間隔で最大 3 回まで再注入。attach 案内を表示
 meguri accept <w>             # ローカル Human Gate: verified Work を受理 → serve 先 Outcome が satisfied → 後続が ready
+meguri watch [--once] [--interval-secs N]
+                              # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)。
+                              #   既定は running が捌けるまでループ、--once で 1 パス
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
