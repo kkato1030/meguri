@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 work rm を soft-delete に(id を再利用しない)+ run の detach 即返り** 時点。
+最終更新: **v0.2 o22 検証落ちの上限付き fix turn 差し戻し(meguri 自作 feature + レビュー修正)** 時点。
 
 ## いまできること
 
@@ -51,6 +51,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。**worktree の base は fetch で更新される `origin/<branch>`**(bare の local `refs/heads/<branch>` は clone 時から動かないため、そこから切ると古い base になる)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る・**attach 案内**(`attach_hint`: tmux は `tmux attach -t <s>`、herdr は `herdr`)の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
+| `src/work.rs` | o22: 検証落ちの**上限付き fix turn** 方針。`FixTurn`(Retry/GiveUp)と `decide(spent, checks)`(`FIX_TURN_MAX=3` まで Retry、超えたら GiveUp)。落ちた検証子だけを診断に載せた差し戻し文を作る。pane/git 非依存の**純粋方針**(注入・state 遷移は harvest 側)。単体テストあり |
 | `src/verify.rs` | meguri 側の**独立検証**(§9.3、trust-but-verify): 各検証子は `Check{name,pass,detail}` を返す。o17 = `clean_tree`(worktree に未コミット/追跡外が残っていないか。`.meguri/` は exclude 済みで無視)、o18 = `commits_ahead`(spawn 時に記録した base SHA より commit が進んでいるか=何も作らず report した空 worktree を弾く)、o19 = `check_command`(Outcome の verify=command を worktree で実行し exit 0 を要求。human/rollup は None=対象外。落ちたら stderr 末尾を添える)。`run_all` が適用可能な検証子を集め、`all_pass` で rollup(o20)。実 git の単体テストあり |
 | `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示(verify 種別ごとに DoD を出し分け)。加えて **result.json の読み取り**(`WorkResult{status,summary}`、部分書き込みは未完了扱い)と status→Work state の対応(o16)。画面は読まず result.json で完了を判定する契約。単体テストあり |
 
@@ -60,7 +61,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。注入は CLI(例: Claude Code)の cold-start 前だと落ちるので、**result が出るまで `--nudge-secs` 間隔で最大 3 回まで再注入**する。pane は detached な場所で開くため、`run` は覗くための **attach 案内**を表示する。
-  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。**`verified` を `meguri accept` で受理すると、Outcome に受理事実(`acceptances`)が貼られ**、serve 先 Outcome が satisfied になる(Work state も `accepted` にするが、それは運用記録で根拠ではない)。**Work を掃除しても satisfied は退行しない**(ADR 0002)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=**上限付き fix turn(o22)**: 落ちた検証の診断を同じエージェントに差し戻し(`works.fix_turns` を進める)、`FIX_TURN_MAX` まで回して尽きたら `rework`(人間へ)。差し戻し中は state=`running` のまま watch が harvest し続ける。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。**`verified` を `meguri accept` で受理すると、Outcome に受理事実(`acceptances`)が貼られ**、serve 先 Outcome が satisfied になる(Work state も `accepted` にするが、それは運用記録で根拠ではない)。**Work を掃除しても satisfied は退行しない**(ADR 0002)。
   * **Artifact**(o21): verified な Work の `artifact_sha`(= worktree HEAD)。ブランチ `meguri/w<id>` は bare clone に残るので `branch @ sha` が耐久成果物になる。`work ls` に表示。GitHub PR 投影(v0.3)の material。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 

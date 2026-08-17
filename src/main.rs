@@ -408,11 +408,20 @@ fn reconcile_work(
         let pane = w.pane_id.as_ref().map(|p| mux::PaneId(p.clone()));
         let deliver = pane.as_ref().map(|p| (mux, p));
         finalize_work(conn, w.id, &o, worktree, base, branch, &r, deliver)?;
+        // fix turn の差し戻し(o22)は state を 'running' のまま残す。その場合は **未完了**として
+        // 扱い、watch に見続けさせる(finalized に数えると still==0 で watch が抜けてしまう)。
+        if store::get_work(conn, w.id)?.state == "running" {
+            return Ok(false);
+        }
         nudges.remove(&w.id);
         return Ok(true);
     }
     // まだ result 無し。pane があれば注入する。detach 既定では run が注入しないので、
     // watch が **初回発見で即注入**し(count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
+    // ただし fix turn 中(fix_turns>0)は差し戻し指示が現行の指示なので、汎用 nudge はしない。
+    if w.fix_turns > 0 {
+        return Ok(false);
+    }
     if let Some(pid) = &w.pane_id {
         let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
         let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
