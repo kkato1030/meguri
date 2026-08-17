@@ -104,8 +104,9 @@ meguri run <o> [--agent <cmd>] [--wait] [--grace-secs N] [--timeout-secs N] [--n
                               #   注入落ち対策で(--wait 中は)result が出るまで --nudge-secs 間隔で再注入。attach 案内を表示
 meguri accept <w>             # ローカル Human Gate: verified Work を受理 → serve 先 Outcome が satisfied → 後続が ready
 meguri watch [--once] [--interval-secs N]
-                              # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)。
-                              #   既定は running が捌けるまでループ、--once で 1 パス
+                              # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)、
+                              #   まだなら pane で沈黙 nudge。既定は running が捌けるまでループ、--once で 1 パス。
+                              #   TTY では要約行を同じ行で上書き更新(harvest/nudge の行は残す)
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
