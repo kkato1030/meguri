@@ -502,6 +502,15 @@ pub fn add_acceptance(
     Ok(())
 }
 
+/// 人手表明による受理(work_id が NULL の行)を消す(`outcome undone` 用)。
+/// verified Work 由来の受理(work_id あり)は残す。
+pub fn remove_human_acceptances(conn: &Connection, outcome_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM acceptances WHERE outcome_id = ?1 AND work_id IS NULL",
+        params![outcome_id],
+    )?)
+}
+
 /// 受理事実を持つ Outcome の id 集合(satisfied 導出の材料 = ローカル Human Gate)。
 /// **Work の state ではなく acceptances(耐久事実)**を見るので、Work を消しても退行しない。
 pub fn accepted_outcome_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {

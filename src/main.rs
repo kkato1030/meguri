@@ -250,9 +250,9 @@ enum OutcomeCmd {
     },
     /// Remove an Outcome (its requires edges both ways and serving works go too)
     Rm { id: String },
-    /// Mark as achieved (verify=human only)
+    /// Mark satisfied by hand (human assertion; any non-rollup Outcome, no Work needed)
     Done { id: String },
-    /// Clear the achieved mark
+    /// Clear the human mark
     Undone { id: String },
 }
 
@@ -950,14 +950,30 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
             println!(")");
         }
         OutcomeCmd::Done { id } => {
+            // 人手で「達成済み」と表明する(o28)。verify 種別を問わず受理事実を貼る
+            // (command でも run 抜きで消し込める。ADR 0002: 受理は Work か人手表明のどちらか由来)。
             let oid = parse_id(&id, 'o')?;
-            store::set_human_satisfied(conn, oid, true)?;
-            println!("marked o{oid} done (human)");
+            let o = store::get_outcome(conn, oid)?;
+            if o.verify == Verify::Rollup {
+                bail!("o{oid} is a milestone (rollup); it is satisfied by its children, not by hand");
+            }
+            let repo_id = store::get_intent(conn, o.intent_id)?.repo_id;
+            store::remove_human_acceptances(conn, oid)?; // 二重表明を避ける
+            store::add_acceptance(conn, oid, None, repo_id, None)?;
+            println!("marked o{oid} satisfied (human)");
         }
         OutcomeCmd::Undone { id } => {
             let oid = parse_id(&id, 'o')?;
-            store::set_human_satisfied(conn, oid, false)?;
-            println!("cleared o{oid} done mark");
+            let o = store::get_outcome(conn, oid)?;
+            let n = store::remove_human_acceptances(conn, oid)?;
+            if o.verify == Verify::Human {
+                store::set_human_satisfied(conn, oid, false)?; // 旧データの sticky も消す
+            }
+            if n == 0 {
+                println!("o{oid} had no human mark to clear");
+            } else {
+                println!("cleared o{oid} human mark");
+            }
         }
     }
     Ok(())
