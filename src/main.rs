@@ -14,7 +14,7 @@ mod render;
 mod store;
 mod verify;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -345,7 +345,16 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
     // Work ごとの nudge 記録(回数, 最後に送った時刻)。この watch プロセスの寿命でのみ持つ。
     let mut nudges: std::collections::HashMap<i64, (u32, std::time::Instant)> =
         std::collections::HashMap::new();
+    // TTY かつループ時のみ、要約行を同じ行で上書きする(harvest/nudge の恒久行はそのまま残す)。
+    let interactive = std::io::stdout().is_terminal() && !once;
+    let mut transient = false; // 上書き対象の要約行が出ている最中か
     loop {
+        // 前パスの一時要約行を消してから、恒久イベント(harvest/nudge)を新しい行に出す。
+        if transient {
+            print!("\r\x1b[2K");
+            let _ = std::io::stdout().flush();
+            transient = false;
+        }
         let running: Vec<store::Work> = store::list_works(conn, None)?
             .into_iter()
             .filter(|w| w.state == "running")
@@ -361,8 +370,16 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
             }
         }
         let still = running.len() - finalized;
-        println!("reconciled {finalized} / {} running ({still} still running)", running.len());
-        if once || still == 0 {
+        let msg = format!("reconciled {finalized} / {} running ({still} still running)", running.len());
+        let last = once || still == 0;
+        if interactive && !last {
+            print!("\r\x1b[2K{msg}"); // 同じ行を上書き(改行しない)
+            let _ = std::io::stdout().flush();
+            transient = true;
+        } else {
+            println!("{msg}");
+        }
+        if last {
             break;
         }
         std::thread::sleep(interval);
