@@ -544,6 +544,11 @@ Pull Request
 
 # 11. GitHub Integration
 
+> **前提の一般化(ADR [0001](adr/0001-delivery-and-projection-layers.md))**: GitHub は配送の
+> **下段(projection/integration 面)の 1 実装**であって前提ではない。配送は 3 モード
+> (① github / ② local-git / ③ git-less)に一般化し、**delivery target は repo 単位**で宣言する
+> (global config でも Intent 単位でもない)。以下はそのうち github モードの詳細。
+
 GitHub は外部 projection として扱う。実態が双方向同期に膨らむと所有権の衝突(人間が GitHub 側で編集したら?)が必ず起きるため、**所有権を明示的に列挙して固定する**。
 
 ## 11.1 meguri → GitHub(outbound projection)
