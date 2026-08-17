@@ -72,9 +72,9 @@ enum Cmd {
         /// Override the agent command (default: config `agent`)
         #[arg(long)]
         agent: Option<String>,
-        /// Launch + inject, then return immediately (state stays 'running'; check the pane yourself)
+        /// Block here until the Work finishes (verify + gate), instead of detaching (the default)
         #[arg(long)]
-        detach: bool,
+        wait: bool,
         /// Seconds to wait after launching the agent before injecting the prompt
         #[arg(long, default_value_t = 8)]
         grace_secs: u64,
@@ -316,12 +316,12 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Plan(c) => plan_cmd(&conn, c)?,
-        Cmd::Run { outcome, agent, detach, grace_secs, timeout_secs, nudge_secs } => run_cmd(
+        Cmd::Run { outcome, agent, wait, grace_secs, timeout_secs, nudge_secs } => run_cmd(
             &conn,
             &outcome,
             &RunOpts {
                 agent,
-                detach,
+                wait,
                 grace: Duration::from_secs(grace_secs),
                 timeout: Duration::from_secs(timeout_secs),
                 nudge: Duration::from_secs(nudge_secs),
@@ -333,11 +333,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// step 2 (o27): 最小 reconciler。running な Work を走査し、result が出ていれば harvest する。
-/// **pane を要らない**(`finalize_work` は result.json と git 状態だけを見る)。まだ result が
-/// 無い Work は次パスへ持ち越す。既定は running が捌け切るまでループ、`--once` で 1 パス。
-/// 注: 沈黙の再注入(nudge)は pane 再取得が要るので今は未対応(reconciler が pane を持つのは後の増分)。
+/// watch が沈黙 Work に再注入する間隔。launch の初回注入が cold-start で落ちた場合の救済。
+const WATCH_NUDGE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// step 2/3 (o27): 最小 reconciler。running な Work を走査し、result が出ていれば harvest、
+/// まだなら(pane があれば上限付き・間隔付きで)再注入する。level-triggered delivery の芽(§3.5)。
+/// `finalize_work` は **pane を要らない**ので harvest 自体は live ハンドル無しで回る。
+/// 既定は running が捌け切るまでループ、`--once` で 1 パス。
 fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Result<()> {
+    let mux = mux::select();
+    // Work ごとの nudge 記録(回数, 最後に送った時刻)。この watch プロセスの寿命でのみ持つ。
+    let mut nudges: std::collections::HashMap<i64, (u32, std::time::Instant)> =
+        std::collections::HashMap::new();
     loop {
         let running: Vec<store::Work> = store::list_works(conn, None)?
             .into_iter()
@@ -349,7 +356,7 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
         }
         let mut finalized = 0;
         for w in &running {
-            if reconcile_work(conn, w)? {
+            if reconcile_work(conn, w, mux.as_ref(), &mut nudges)? {
                 finalized += 1;
             }
         }
@@ -363,22 +370,39 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
     Ok(())
 }
 
-/// running な Work を 1 件 reconcile する。result があれば harvest して `true`、無ければ `false`。
-fn reconcile_work(conn: &rusqlite::Connection, w: &store::Work) -> Result<bool> {
+/// running な Work を 1 件 reconcile する。result があれば harvest して `true`、無ければ(必要なら
+/// 沈黙 nudge して)`false`。
+fn reconcile_work(
+    conn: &rusqlite::Connection,
+    w: &store::Work,
+    mux: &dyn mux::Mux,
+    nudges: &mut std::collections::HashMap<i64, (u32, std::time::Instant)>,
+) -> Result<bool> {
     let (Some(wt), Some(base), Some(branch)) = (&w.worktree_path, &w.base_sha, &w.branch) else {
         return Ok(false); // worktree 未紐付け(通常ありえない)
     };
     let worktree = std::path::Path::new(wt);
     let result_path = worktree.join(".meguri").join("result.json");
-    match exec::read_result(&result_path)? {
-        Some(r) => {
-            let o = store::get_outcome(conn, w.serves_id)?;
-            println!("w{} (o{}):", w.id, w.serves_id);
-            finalize_work(conn, w.id, &o, worktree, base, branch, &r)?;
-            Ok(true)
-        }
-        None => Ok(false), // まだ実っていない
+    if let Some(r) = exec::read_result(&result_path)? {
+        let o = store::get_outcome(conn, w.serves_id)?;
+        println!("w{} (o{}):", w.id, w.serves_id);
+        finalize_work(conn, w.id, &o, worktree, base, branch, &r)?;
+        nudges.remove(&w.id);
+        return Ok(true);
     }
+    // まだ result 無し。pane があれば、上限付き・間隔付きで再注入する(初回注入落ちの救済)。
+    if let Some(pid) = &w.pane_id {
+        let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
+        if count < NUDGE_MAX && last.elapsed() >= WATCH_NUDGE_INTERVAL {
+            let pane = mux::PaneId(pid.clone());
+            if mux.is_alive(&pane).unwrap_or(false) {
+                let _ = mux.send_line(&pane, INJECT_INSTRUCTION);
+                nudges.insert(w.id, (count + 1, std::time::Instant::now()));
+                println!("  w{} nudged ({}/{})", w.id, count + 1, NUDGE_MAX);
+            }
+        }
+    }
+    Ok(false) // まだ実っていない
 }
 
 /// ローカル Human Gate: verified な Work を accept する。
@@ -415,7 +439,8 @@ fn accept_cmd(conn: &rusqlite::Connection, work: &str) -> Result<()> {
 /// `meguri run` の実行オプション(o15 の起動・o16 の待機を制御)。
 struct RunOpts {
     agent: Option<String>,
-    detach: bool,
+    /// true なら完了(検証・gate)までここでブロックする。既定 false = detach(watch が harvest)。
+    wait: bool,
     grace: Duration,
     /// 初回注入が落ちた場合の保険。この間隔で上限付き再注入する。
     nudge: Duration,
@@ -505,26 +530,28 @@ fn launch_work(
 
     let mux = mux::select();
     let pane = mux.open_pane("meguri", &format!("w{wid}"), Some(worktree))?;
+    // pane ハンドルを保存(watch が沈黙 Work を再注入するのに使う)。
+    store::set_work_pane(conn, wid, &pane.0)?;
     // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(p2.2b の学び)。
     std::thread::sleep(Duration::from_millis(800));
     mux.send_line(&pane, &agent_cmd)?;
     std::thread::sleep(opts.grace); // spawn_grace: CLI 起動待ち
-    let instruction = "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).";
-    mux.send_line(&pane, instruction)?; // 初回注入(grace 経過後)
+    mux.send_line(&pane, INJECT_INSTRUCTION)?; // 初回注入(grace 経過後)
 
     store::set_work_state(conn, wid, "running")?;
     println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
     // pane は detached な場所で開く。人間が覗けるように案内する(§3.5)。
     println!("  watch it:  {}", mux.attach_hint("meguri"));
 
-    if opts.detach {
-        println!("  detached — state stays 'running'. watch it above; harvest with `meguri watch`.");
+    if !opts.wait {
+        // 既定: launch だけして即返る。harvest(検証・gate)と沈黙の再注入は `meguri watch` が担う。
+        println!("  detached (default) — harvest with `meguri watch`, or re-run with --wait to block here.");
         return Ok(());
     }
 
-    // o16: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
+    // --wait: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
     // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
-    match wait_result(mux.as_ref(), &pane, &result_path, instruction, opts.nudge, opts.timeout) {
+    match wait_result(mux.as_ref(), &pane, &result_path, INJECT_INSTRUCTION, opts.nudge, opts.timeout) {
         Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r)?,
         None => {
             // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
@@ -582,6 +609,10 @@ fn print_check(c: &verify::Check) {
     let mark = if c.pass { "PASS" } else { "FAIL" };
     println!("  verify {}: {mark} — {}", c.name, c.detail);
 }
+
+/// pane を開いたエージェントに送る初回・再注入の指示(launch と watch で共有)。
+const INJECT_INSTRUCTION: &str =
+    "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).";
 
 /// 初回注入が落ちても最大この回数まで再注入する(cold-start 保険)。以降は静かに待つ
 /// (作業中のエージェントを叩き続けないため)。本格的な沈黙 nudge は o23。

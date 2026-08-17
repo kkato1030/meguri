@@ -57,6 +57,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "branch", "TEXT")?;
     add_column_if_missing(conn, "works", "base_sha", "TEXT")?;
     add_column_if_missing(conn, "works", "artifact_sha", "TEXT")?; // o21: verified な commit
+    add_column_if_missing(conn, "works", "pane_id", "TEXT")?; // watch が nudge するための pane ハンドル
     Ok(())
 }
 
@@ -118,6 +119,7 @@ pub(crate) const SCHEMA: &str = r#"
             worktree_path TEXT,                          -- spawn 時に埋まる
             branch        TEXT,
             base_sha      TEXT,
-            artifact_sha  TEXT                            -- verified な commit(o21)
+            artifact_sha  TEXT,                           -- verified な commit(o21)
+            pane_id       TEXT                            -- watch が nudge するための pane ハンドル
         );
         "#;

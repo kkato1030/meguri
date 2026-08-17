@@ -90,6 +90,8 @@ pub struct Work {
     pub base_sha: Option<String>,
     /// verified に達したとき記録する commit(o21 の Artifact)。
     pub artifact_sha: Option<String>,
+    /// launch 時の pane ハンドル。watch が沈黙 Work を再注入(nudge)するのに使う。
+    pub pane_id: Option<String>,
 }
 
 // ---- Repo ----
@@ -432,9 +434,10 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
             branch: r.get(6)?,
             base_sha: r.get(7)?,
             artifact_sha: r.get(8)?,
+            pane_id: r.get(9)?,
         })
     };
-    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha";
+    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id";
     let rows: Vec<Work> = match serves_id {
         Some(sid) => {
             let mut stmt = conn
@@ -472,6 +475,12 @@ pub fn set_work_artifact(conn: &Connection, id: i64, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// launch 時の pane ハンドルを記録する(watch が nudge するのに使う)。
+pub fn set_work_pane(conn: &Connection, id: i64, pane_id: &str) -> Result<()> {
+    conn.execute("UPDATE works SET pane_id = ?2 WHERE id = ?1", params![id, pane_id])?;
+    Ok(())
+}
+
 /// accept された Work が serve する Outcome の id 集合(satisfied 導出の材料、o22 系のローカル Human Gate)。
 pub fn accepted_outcome_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
     let mut stmt = conn.prepare("SELECT DISTINCT serves_id FROM works WHERE state = 'accepted'")?;
@@ -487,12 +496,12 @@ fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
 
 pub fn get_work(conn: &Connection, id: i64) -> Result<Work> {
     conn.query_row(
-        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha FROM works WHERE id = ?1",
+        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id FROM works WHERE id = ?1",
         [id],
         |r| Ok(Work {
             id: r.get(0)?, serves_id: r.get(1)?, objective: r.get(2)?, executor: r.get(3)?,
             state: r.get(4)?, worktree_path: r.get(5)?, branch: r.get(6)?, base_sha: r.get(7)?,
-            artifact_sha: r.get(8)?,
+            artifact_sha: r.get(8)?, pane_id: r.get(9)?,
         }),
     )
     .with_context(|| format!("no work w{id}"))
