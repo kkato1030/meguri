@@ -388,8 +388,9 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
     Ok(())
 }
 
-/// running な Work を 1 件 reconcile する。result があれば harvest して `true`、無ければ(必要なら
-/// 沈黙 nudge して)`false`。
+/// running な Work を 1 件 reconcile する。result があれば harvest して `true`。無ければ pane を
+/// mux の生死で見張り、**結果を残さず死んでいれば failed に表面化して `true`**(o25)。まだ生きて
+/// いれば(必要なら沈黙 nudge して)`false`。
 fn reconcile_work(
     conn: &rusqlite::Connection,
     w: &store::Work,
@@ -416,24 +417,37 @@ fn reconcile_work(
         nudges.remove(&w.id);
         return Ok(true);
     }
-    // まだ result 無し。pane があれば注入する。detach 既定では run が注入しないので、
-    // watch が **初回発見で即注入**し(count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
+    // まだ result 無し。pane が無ければ判定材料が無いので見張るだけ(通常ありえない)。
+    let Some(pid) = &w.pane_id else {
+        return Ok(false);
+    };
+    let pane = mux::PaneId(pid.clone());
+    // pane を mux の生死で一度だけ見る。is_alive が Err(生死不明)のときは判断を保留し、
+    // 死と断定して落とさない(次パスで見直す)。
+    let alive = match mux.is_alive(&pane) {
+        Ok(a) => a,
+        Err(_) => return Ok(false),
+    };
+    // o25: 結果を残さないまま pane が死んだら、failed として表面化する(running から外れる)。
+    if work::judge_pane(alive, false) == work::PaneVerdict::Failed {
+        store::set_work_state(conn, w.id, "failed")?;
+        nudges.remove(&w.id);
+        println!("  w{} pane died without a result → [failed]", w.id);
+        return Ok(true);
+    }
+    // pane は生きている。detach 既定では run が注入しないので、watch が **初回発見で即注入**し
+    // (count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
     // ただし fix turn 中(fix_turns>0)は差し戻し指示が現行の指示なので、汎用 nudge はしない。
     if w.fix_turns > 0 {
         return Ok(false);
     }
-    if let Some(pid) = &w.pane_id {
-        let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
-        let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
-        if count < NUDGE_MAX && due {
-            let pane = mux::PaneId(pid.clone());
-            if mux.is_alive(&pane).unwrap_or(false) {
-                let _ = mux.send_line(&pane, INJECT_INSTRUCTION);
-                nudges.insert(w.id, (count + 1, std::time::Instant::now()));
-                let kind = if count == 0 { "injected" } else { "nudged" };
-                println!("  w{} {kind} ({}/{})", w.id, count + 1, NUDGE_MAX);
-            }
-        }
+    let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
+    let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
+    if count < NUDGE_MAX && due {
+        let _ = mux.send_line(&pane, INJECT_INSTRUCTION);
+        nudges.insert(w.id, (count + 1, std::time::Instant::now()));
+        let kind = if count == 0 { "injected" } else { "nudged" };
+        println!("  w{} {kind} ({}/{})", w.id, count + 1, NUDGE_MAX);
     }
     Ok(false) // まだ実っていない
 }

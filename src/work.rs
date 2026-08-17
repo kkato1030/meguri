@@ -35,6 +35,31 @@ pub fn decide(spent: u32, checks: &[Check]) -> FixTurn {
     FixTurn::Retry { attempt, instruction: fix_instruction(attempt, checks) }
 }
 
+/// o25: pane 死亡の判定結果。running な Work を mux の生死で見張った帰結。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneVerdict {
+    /// pane が result を残さず死んだ。Work を failed として表面化する。
+    Failed,
+    /// まだ failed ではない。pane が生きている(見張り続ける)か、result が既にある
+    /// (harvest 対象)——どちらもここでは failed にしない。
+    Pending,
+}
+
+/// pane の死亡を mux の生死から検知する判定(o25)。`alive` は mux.is_alive、
+/// `has_result` は result.json(耐久の完了シグナル)が出ているか。
+///
+/// 「結果を残さないまま pane が死んだ」= エージェントが落ちた/消えた、を failed とする。
+/// result が既にあるなら、pane が死んでいても harvest に回せる(収穫は result.json と git 状態
+/// だけを見て live ハンドルを要らない)ので failed にしない —— 死んでも成果と最終画面が残る
+/// 「ブロック ≠ 失敗」(§3.5)を、結果を残した死には適用する。
+pub fn judge_pane(alive: bool, has_result: bool) -> PaneVerdict {
+    if !alive && !has_result {
+        PaneVerdict::Failed
+    } else {
+        PaneVerdict::Pending
+    }
+}
+
 /// 差し戻しの注入文。落ちた検証子だけを診断として並べ、「何を直せば通るか」を伝える。
 fn fix_instruction(attempt: u32, checks: &[Check]) -> String {
     let mut s = format!(
@@ -77,6 +102,23 @@ fn fix_turn_bounded() {
     // 上限に達したら差し戻さず GiveUp(人間へ委ねる)。上限を超えても同じ。
     assert_eq!(decide(FIX_TURN_MAX, &checks), FixTurn::GiveUp);
     assert_eq!(decide(FIX_TURN_MAX + 7, &checks), FixTurn::GiveUp);
+}
+
+/// pane の死亡を mux の生死から検知し、Work を failed として表面化する(o25)。
+/// (DoD の `cargo test work::pane_death` が指す関門。パスが一致するよう work 直下に置く。)
+#[cfg(test)]
+#[test]
+fn pane_death() {
+    // pane が死に、result も無い = 結果を残さず落ちた → failed として表面化する。
+    assert_eq!(judge_pane(false, false), PaneVerdict::Failed);
+
+    // pane が生きている間は failed ではない(まだ回している / 収穫待ち)。
+    assert_eq!(judge_pane(true, false), PaneVerdict::Pending);
+    assert_eq!(judge_pane(true, true), PaneVerdict::Pending);
+
+    // pane が死んでいても result があれば harvest に回せる。死亡だけで failed にしない
+    //(result は耐久で live ハンドルを要らない = 「ブロック ≠ 失敗」、§3.5)。
+    assert_eq!(judge_pane(false, true), PaneVerdict::Pending);
 }
 
 /// 差し戻しの診断には pass した検証子は混ぜない(直す対象だけを見せる)。
