@@ -441,13 +441,16 @@ fn reconcile_work(
     if w.fix_turns > 0 {
         return Ok(false);
     }
+    // pane は生きている(上で death 判定を通過済み)。沈黙 nudge を出すかは work の純粋方針が
+    // 決める(有界。o23)。ここは注入と記録だけ。
     let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
-    let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
-    if count < NUDGE_MAX && due {
+    if let work::Nudge::Send { attempt, first } =
+        work::nudge(count, last.elapsed(), WATCH_NUDGE_INTERVAL)
+    {
         let _ = mux.send_line(&pane, INJECT_INSTRUCTION);
         nudges.insert(w.id, (count + 1, std::time::Instant::now()));
-        let kind = if count == 0 { "injected" } else { "nudged" };
-        println!("  w{} {kind} ({}/{})", w.id, count + 1, NUDGE_MAX);
+        let kind = if first { "injected" } else { "nudged" };
+        println!("  w{} {kind} ({attempt}/{})", w.id, work::NUDGE_MAX);
     }
     Ok(false) // まだ実っていない
 }
@@ -718,10 +721,6 @@ fn print_check(c: &verify::Check) {
 const INJECT_INSTRUCTION: &str =
     "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).";
 
-/// 初回注入が落ちても最大この回数まで再注入する(cold-start 保険)。以降は静かに待つ
-/// (作業中のエージェントを叩き続けないため)。本格的な沈黙 nudge は o23。
-const NUDGE_MAX: u32 = 3;
-
 /// o16: 耐久 result ファイル(`.meguri/result.json`)の出現をポーリングで待つ。**画面は読まない**(§8)。
 /// `nudge` 間隔で `instruction` を最大 `NUDGE_MAX` 回だけ再注入する(初回送信が CLI 起動前に
 /// 落ちるケースの保険)。返り値: `Some(result)`=検知 / `None`=pane 死亡 or timeout(pane は残す)。
@@ -748,7 +747,7 @@ fn wait_result(
             return None; // timeout(詳細な扱いは o24。pane は残す)
         }
         // まだ result が無く、上限内なら再注入(初回が起動前で落ちていた場合の救済)。
-        if nudges < NUDGE_MAX && last_nudge.elapsed() >= nudge {
+        if nudges < work::NUDGE_MAX && last_nudge.elapsed() >= nudge {
             let _ = mux.send_line(pane, instruction);
             nudges += 1;
             last_nudge = std::time::Instant::now();
