@@ -90,6 +90,15 @@ enum Cmd {
         /// The Work to accept (must be verified; e.g. w3)
         work: String,
     },
+    /// Reconcile running Works: harvest any that produced a result (verify -> gate -> Artifact)
+    Watch {
+        /// Do a single reconcile pass and exit (instead of looping until drained)
+        #[arg(long)]
+        once: bool,
+        /// Seconds between passes while Works are still running
+        #[arg(long, default_value_t = 5)]
+        interval_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -319,8 +328,57 @@ fn main() -> Result<()> {
             },
         )?,
         Cmd::Accept { work } => accept_cmd(&conn, &work)?,
+        Cmd::Watch { once, interval_secs } => watch_cmd(&conn, once, Duration::from_secs(interval_secs))?,
     }
     Ok(())
+}
+
+/// step 2 (o27): 最小 reconciler。running な Work を走査し、result が出ていれば harvest する。
+/// **pane を要らない**(`finalize_work` は result.json と git 状態だけを見る)。まだ result が
+/// 無い Work は次パスへ持ち越す。既定は running が捌け切るまでループ、`--once` で 1 パス。
+/// 注: 沈黙の再注入(nudge)は pane 再取得が要るので今は未対応(reconciler が pane を持つのは後の増分)。
+fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Result<()> {
+    loop {
+        let running: Vec<store::Work> = store::list_works(conn, None)?
+            .into_iter()
+            .filter(|w| w.state == "running")
+            .collect();
+        if running.is_empty() {
+            println!("no running works to reconcile");
+            break;
+        }
+        let mut finalized = 0;
+        for w in &running {
+            if reconcile_work(conn, w)? {
+                finalized += 1;
+            }
+        }
+        let still = running.len() - finalized;
+        println!("reconciled {finalized} / {} running ({still} still running)", running.len());
+        if once || still == 0 {
+            break;
+        }
+        std::thread::sleep(interval);
+    }
+    Ok(())
+}
+
+/// running な Work を 1 件 reconcile する。result があれば harvest して `true`、無ければ `false`。
+fn reconcile_work(conn: &rusqlite::Connection, w: &store::Work) -> Result<bool> {
+    let (Some(wt), Some(base), Some(branch)) = (&w.worktree_path, &w.base_sha, &w.branch) else {
+        return Ok(false); // worktree 未紐付け(通常ありえない)
+    };
+    let worktree = std::path::Path::new(wt);
+    let result_path = worktree.join(".meguri").join("result.json");
+    match exec::read_result(&result_path)? {
+        Some(r) => {
+            let o = store::get_outcome(conn, w.serves_id)?;
+            println!("w{} (o{}):", w.id, w.serves_id);
+            finalize_work(conn, w.id, &o, worktree, base, branch, &r)?;
+            Ok(true)
+        }
+        None => Ok(false), // まだ実っていない
+    }
 }
 
 /// ローカル Human Gate: verified な Work を accept する。
@@ -460,7 +518,7 @@ fn launch_work(
     println!("  watch it:  {}", mux.attach_hint("meguri"));
 
     if opts.detach {
-        println!("  detached — state stays 'running'. use the command above to watch, then re-run to harvest.");
+        println!("  detached — state stays 'running'. watch it above; harvest with `meguri watch`.");
         return Ok(());
     }
 
