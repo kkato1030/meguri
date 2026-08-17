@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 run を detach 既定へ反転(--wait でブロック)+ watch が沈黙 Work を nudge** 時点。
+最終更新: **v0.2 worktree の base を fetch 済み origin/<branch> から切る修正(stale-base bug)** 時点。
 
 ## いまできること
 
@@ -48,7 +48,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。command/human は **accept 済み Work を持てば satisfied**(`accepted` id 集合を受け取る)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
-| `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。実 git の単体テストあり |
+| `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。**worktree の base は fetch で更新される `origin/<branch>`**(bare の local `refs/heads/<branch>` は clone 時から動かないため、そこから切ると古い base になる)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る・**attach 案内**(`attach_hint`: tmux は `tmux attach -t <s>`、herdr は `herdr`)の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
 | `src/verify.rs` | meguri 側の**独立検証**(§9.3、trust-but-verify): 各検証子は `Check{name,pass,detail}` を返す。o17 = `clean_tree`(worktree に未コミット/追跡外が残っていないか。`.meguri/` は exclude 済みで無視)、o18 = `commits_ahead`(spawn 時に記録した base SHA より commit が進んでいるか=何も作らず report した空 worktree を弾く)、o19 = `check_command`(Outcome の verify=command を worktree で実行し exit 0 を要求。human/rollup は None=対象外。落ちたら stderr 末尾を添える)。`run_all` が適用可能な検証子を集め、`all_pass` で rollup(o20)。実 git の単体テストあり |
 | `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示(verify 種別ごとに DoD を出し分け)。加えて **result.json の読み取り**(`WorkResult{status,summary}`、部分書き込みは未完了扱い)と status→Work state の対応(o16)。画面は読まず result.json で完了を判定する契約。単体テストあり |

@@ -473,12 +473,15 @@ fn run_cmd(conn: &rusqlite::Connection, outcome: &str, opts: &RunOpts) -> Result
     }
 
     // bare を最新化 → Work を作る → worktree を切って紐付け(失敗なら Work を戻す)。
+    // 基準は **fetch で更新される remote-tracking ref**(`origin/<branch>`)。bare の local
+    // `refs/heads/<branch>` は clone 時から動かないので、そこから切ると毎回古い base になる。
     let bare = bare_path(&repo.name)?;
     gitops::fetch(&bare)?;
+    let base_ref = format!("origin/{}", repo.default_branch);
     let wid = store::add_work(conn, oid, &o.statement, "ai")?;
     let key = format!("w{wid}");
     let wt_parent = db::worktrees_dir()?.join(&repo.name);
-    let wt = match gitops::create_worktree(&bare, &repo.default_branch, &wt_parent, &key) {
+    let wt = match gitops::create_worktree(&bare, &base_ref, &wt_parent, &key) {
         Ok(wt) => wt,
         Err(e) => {
             let _ = store::remove_work(conn, wid);
