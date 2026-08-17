@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 launch 堅牢化(注入の再送 nudge + pane の attach 案内)** 時点。
+最終更新: **v0.2 harvest 芯の切り出し(reconciler 準備、挙動不変)** 時点。
 
 ## いまできること
 
@@ -35,7 +35,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 
 | モジュール | 責務 |
 |---|---|
-| `src/main.rs` | CLI(clap)。id の解釈(`o3`/`3`)と各コマンドのディスパッチ |
+| `src/main.rs` | CLI(clap)。id の解釈(`o3`/`3`)と各コマンドのディスパッチ。run の実行は **launch(pane 起動+注入)** と **harvest 芯(`finalize_work`: result → 検証 → gate → Artifact、**pane 不要**)** に分離済み(将来の reconciler が harvest を再利用するため) |
 | `src/config.rs` | `~/.meguri/config.toml`(`lang` / `agent`)。無ければ既定 |
 | `src/db.rs` | sqlite 接続とスキーマ(`~/.meguri/meguri.db`、`MEGURI_HOME` で移動可)。**保存は事実のみ** |
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |

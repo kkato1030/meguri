@@ -467,39 +467,54 @@ fn launch_work(
     // o16: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
     // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
     match wait_result(mux.as_ref(), &pane, &result_path, instruction, opts.nudge, opts.timeout) {
-        Some(r) => {
-            println!("  agent reported [{}]: {}", r.status, r.summary);
-            let reported = exec::state_for(&r.status);
-            if reported == "reported" {
-                // success 報告: 申告を信じきらず meguri 側で独立検証して gate する(§3.5、o17-o20)。
-                let checks = verify::run_all(o, worktree, base_sha)?;
-                for c in &checks {
-                    print_check(c);
-                }
-                let state = if verify::all_pass(&checks) { "verified" } else { "rework" };
-                store::set_work_state(conn, wid, state)?;
-                if state == "verified" {
-                    // o21: 検証済みの commit を Artifact として記録する(Work の耐久成果物)。
-                    let sha = gitops::head_sha(worktree)?;
-                    store::set_work_artifact(conn, wid, &sha)?;
-                    let short = sha.chars().take(7).collect::<String>();
-                    println!("  w{wid} passed verification → [verified]");
-                    println!("  artifact: {branch} @ {short}");
-                } else {
-                    let n = checks.iter().filter(|c| !c.pass).count();
-                    println!("  w{wid} failed verification ({n} check(s)) → [rework] (fix turn is o22)");
-                }
-            } else {
-                // failure / needs_human はエージェント申告のまま(検証しても意味がない)。
-                store::set_work_state(conn, wid, reported)?;
-                println!("  w{wid} is now [{reported}]");
-            }
-        }
+        Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r)?,
         None => {
             // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
             // ここでは pane を残し、state は 'running' のまま人間に委ねる(§3.5)。
             println!("  no durable result detected (pane died or timed out). state stays 'running'; attach to the pane to check.");
         }
+    }
+    Ok(())
+}
+
+/// harvest の芯(o16-o21): 収穫した result を受けて、独立検証 → gate(verified/rework)→ Artifact
+/// 記録までを行う。**pane を要らない**(result.json と git 状態だけを見る)ので、将来の reconciler
+/// (`watch`)が live な pane ハンドル無しでも同じ処理を回せる。この関数が launch/harvest 分離の
+/// harvest 側の実体。
+fn finalize_work(
+    conn: &rusqlite::Connection,
+    wid: i64,
+    o: &store::Outcome,
+    worktree: &std::path::Path,
+    base_sha: &str,
+    branch: &str,
+    r: &exec::WorkResult,
+) -> Result<()> {
+    println!("  agent reported [{}]: {}", r.status, r.summary);
+    let reported = exec::state_for(&r.status);
+    if reported == "reported" {
+        // success 報告: 申告を信じきらず meguri 側で独立検証して gate する(§3.5、o17-o20)。
+        let checks = verify::run_all(o, worktree, base_sha)?;
+        for c in &checks {
+            print_check(c);
+        }
+        let state = if verify::all_pass(&checks) { "verified" } else { "rework" };
+        store::set_work_state(conn, wid, state)?;
+        if state == "verified" {
+            // o21: 検証済みの commit を Artifact として記録する(Work の耐久成果物)。
+            let sha = gitops::head_sha(worktree)?;
+            store::set_work_artifact(conn, wid, &sha)?;
+            let short = sha.chars().take(7).collect::<String>();
+            println!("  w{wid} passed verification → [verified]");
+            println!("  artifact: {branch} @ {short}");
+        } else {
+            let n = checks.iter().filter(|c| !c.pass).count();
+            println!("  w{wid} failed verification ({n} check(s)) → [rework] (fix turn is o22)");
+        }
+    } else {
+        // failure / needs_human はエージェント申告のまま(検証しても意味がない)。
+        store::set_work_state(conn, wid, reported)?;
+        println!("  w{wid} is now [{reported}]");
     }
     Ok(())
 }
