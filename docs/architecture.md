@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 受理を Outcome 側の耐久事実(acceptances)に(掃除で退行しない、ADR 0002)** 時点。
+最終更新: **v0.2 outcome done を人手の満たし表明に一般化(command も run 抜きで消し込める、o28 一部)** 時点。
 
 ## いまできること
 
@@ -66,7 +66,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明 / **受理(`acceptances`)**。
 **保存しない(導出)**: satisfied / ready / blocked。
 
-**受理(`acceptances`、ADR 0002)**: accept 時に **Outcome に貼る耐久事実**(`outcome_id`, 由来 `work_id?`, `repo_id?`, `artifact_sha?`)。satisfied の根拠はこの行で、**Work を掃除しても退行しない**(`work_id` は情報用・FK なし)。Outcome ごと 0..N 行(複数 artifact / 複数リポで満たす将来に開く)。`works.state='accepted'` は運用状態として残すが根拠ではない。旧データは起動時に backfill。
+**受理(`acceptances`、ADR 0002)**: satisfied の根拠となる **Outcome に貼る耐久事実**(`outcome_id`, 由来 `work_id?`, `repo_id?`, `artifact_sha?`)。由来は 2 通り: **verified Work の accept**(`work_id` あり)か、**人手の満たし表明 `outcome done`**(`work_id` NULL、command 含む rollup 以外の任意 Outcome を run 抜きで消し込む=o28)。**Work を掃除しても退行しない**(`work_id` は情報用・FK なし)。Outcome ごと 0..N 行(複数 artifact / 複数リポで満たす将来に開く)。`works.state='accepted'` は運用状態として残すが根拠ではない。旧データは起動時に backfill。
 
 ### 導出のルール(`derive.rs`)
 
@@ -91,8 +91,8 @@ meguri outcome ls   [--intent <i>]
 meguri outcome show <o>              # statement / description / verify / needs をまとめて表示
 meguri outcome edit <o> [--statement <s>] [--description <d>] [--check <cmd>|--milestone|--human] [--needs o1,o2]
 meguri outcome rm   <o>              # 両方向の requires 辺と serving Work も削除
-meguri outcome done   <o>      # 達成を表明(verify=human のみ)
-meguri outcome undone <o>
+meguri outcome done   <o>      # 人手で満たし表明(rollup 以外。run 抜きで消し込める=受理事実を貼る)
+meguri outcome undone <o>      # 人手表明を取り消す
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
