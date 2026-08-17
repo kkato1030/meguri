@@ -22,10 +22,17 @@ fn edges(outcomes: &[Outcome]) -> Vec<(i64, i64)> {
 }
 
 /// 人が読むテキスト表示。状態ごとにまとめる。
-pub fn text(outcomes: &[Outcome], accepted: &HashSet<i64>) -> String {
+/// テキストのグラフ。`active_only` のとき満たし済み(satisfied)を畳んで件数だけ示す
+/// (棚卸し表示。o28: 残っている ready/blocked に目を向けやすくする)。
+pub fn text(outcomes: &[Outcome], accepted: &HashSet<i64>, active_only: bool) -> String {
     let st = states(outcomes, accepted);
     let mut out = String::new();
-    for group in [State::Satisfied, State::Ready, State::Blocked] {
+    let groups: &[State] = if active_only {
+        &[State::Ready, State::Blocked]
+    } else {
+        &[State::Satisfied, State::Ready, State::Blocked]
+    };
+    for &group in groups {
         let mut any = false;
         for o in outcomes.iter().filter(|o| st[&o.id] == group) {
             if !any {
@@ -54,6 +61,12 @@ pub fn text(outcomes: &[Outcome], accepted: &HashSet<i64>) -> String {
                 o.statement,
                 reqs
             ));
+        }
+    }
+    if active_only {
+        let done = outcomes.iter().filter(|o| st[&o.id] == State::Satisfied).count();
+        if done > 0 {
+            out.push_str(&format!("(+{done} satisfied, folded — drop --active to see them)\n"));
         }
     }
     if out.is_empty() {

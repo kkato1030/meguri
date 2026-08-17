@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 o24 timeout(pane を残したまま timed_out)— meguri 自作 + watch へ配線** 時点。
+最終更新: **v0.2 o28 満たし済みの棚卸し(graph --active + outcome.rs 集約)— meguri 自作** 時点。
 
 ## いまできること
 
@@ -48,7 +48,8 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 | `src/db.rs` | sqlite 接続とスキーマ(`~/.meguri/meguri.db`、`MEGURI_HOME` で移動可)。**保存は事実のみ** |
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。command/human は **accept 済み Work を持てば satisfied**(`accepted` id 集合を受け取る)。単体テストあり |
-| `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く |
+| `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く。text は `--active` で満たし済みを畳み件数だけ示す(棚卸し、o28。mermaid/html は未対応) |
+| `src/outcome.rs` | Outcome 単位のドメイン操作(棚卸し、o28): `done`/`undone`(人手の満たし表明=受理事実の付け外し、rollup 以外の任意 Outcome に一般化)。**meguri は「実際に満たされているか」を自動照合しない**前提をここに明文化。単体テストあり |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。**worktree の base は fetch で更新される `origin/<branch>`**(bare の local `refs/heads/<branch>` は clone 時から動かないため、そこから切ると古い base になる)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る・**attach 案内**(`attach_hint`: tmux は `tmux attach -t <s>`、herdr は `herdr`)の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
@@ -110,7 +111,7 @@ meguri watch [--once] [--interval-secs N] [--timeout-secs N]
                               # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)、
                               #   まだなら pane で沈黙 nudge。pane 死亡→failed(o25)/ launch から --timeout-secs 超過→timed_out(o24、pane 残す)。
                               #   既定は running が捌けるまでループ、--once で 1 パス。TTY では要約行を同じ行で上書き更新
-meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
+meguri graph [--intent <i>] [--mermaid] [--active]       # text / mermaid は stdout。--active は満たし済みを畳む(text のみ、o28)
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
 
