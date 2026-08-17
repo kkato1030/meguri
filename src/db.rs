@@ -58,6 +58,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "base_sha", "TEXT")?;
     add_column_if_missing(conn, "works", "artifact_sha", "TEXT")?; // o21: verified な commit
     add_column_if_missing(conn, "works", "pane_id", "TEXT")?; // watch が nudge するための pane ハンドル
+    add_column_if_missing(conn, "works", "deleted", "INTEGER NOT NULL DEFAULT 0")?; // work rm は soft-delete(id 再利用を防ぐ)
     // 受理事実の後方互換: 旧来 accept 済み(works.state='accepted')を acceptances に一度だけ埋める。
     // 冪等: 既に acceptance 行がある Work は入れ直さない。
     conn.execute_batch(
@@ -128,7 +129,8 @@ pub(crate) const SCHEMA: &str = r#"
             branch        TEXT,
             base_sha      TEXT,
             artifact_sha  TEXT,                           -- verified な commit(o21)
-            pane_id       TEXT                            -- watch が nudge するための pane ハンドル
+            pane_id       TEXT,                           -- watch が nudge するための pane ハンドル
+            deleted       INTEGER NOT NULL DEFAULT 0       -- work rm は soft-delete(id を再利用しない)
         );
 
         -- 受理(accept)の耐久事実。satisfied の根拠を「消せる Work 行」から切り離す。
