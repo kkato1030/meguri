@@ -413,11 +413,14 @@ fn accept_cmd(conn: &rusqlite::Connection, work: &str) -> Result<()> {
     if w.state != "verified" {
         bail!("w{wid} is [{}], not verified — only verified Work can be accepted", w.state);
     }
-    store::set_work_state(conn, wid, "accepted")?;
+    // 受理を Outcome 側の耐久事実として記録する(この行が satisfied の根拠。Work を掃除しても残る)。
+    let o = store::get_outcome(conn, w.serves_id)?;
+    let repo_id = store::get_intent(conn, o.intent_id)?.repo_id;
+    store::add_acceptance(conn, w.serves_id, Some(wid), repo_id, w.artifact_sha.as_deref())?;
+    store::set_work_state(conn, wid, "accepted")?; // Work 側は運用状態として記録(satisfied の根拠ではない)
     println!("accepted w{wid} → o{} is now satisfied", w.serves_id);
 
     // 後続で新たに ready になった Outcome を案内する(リングが繋がったことの確認)。
-    let o = store::get_outcome(conn, w.serves_id)?;
     let outcomes = store::list_outcomes(conn, Some(o.intent_id))?;
     let accepted = store::accepted_outcome_ids(conn)?;
     let states = derive::states(&outcomes, &accepted);

@@ -28,3 +28,4 @@
 | # | タイトル | Status |
 |---|---|---|
 | [0001](0001-delivery-and-projection-layers.md) | 配送と projection のレイヤー分離・delivery target は repo 単位 | Accepted |
+| [0002](0002-acceptance-as-outcome-fact.md) | 受理は Outcome 側の耐久事実・複数 artifact / 複数リポは将来に開く | Accepted |

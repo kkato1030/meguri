@@ -363,7 +363,8 @@ pub fn remove_outcome(conn: &Connection, id: i64) -> Result<(usize, usize)> {
         .query_row("SELECT COUNT(*) FROM outcome_requires WHERE requires_id = ?1", params![id], |r| r.get::<_, i64>(0))
         .map(|n| n as usize)?;
     let works = conn.execute("DELETE FROM works WHERE serves_id = ?1", params![id])?;
-    // FK があるので、参照している辺(両方向)を先に消す。
+    // FK があるので、参照している辺(両方向)と受理を先に消す。
+    conn.execute("DELETE FROM acceptances WHERE outcome_id = ?1", params![id])?;
     conn.execute("DELETE FROM outcome_requires WHERE outcome_id = ?1 OR requires_id = ?1", params![id])?;
     conn.execute("DELETE FROM outcomes WHERE id = ?1", params![id])?;
     Ok((works, dependents))
@@ -394,9 +395,13 @@ pub fn remove_intent(conn: &Connection, id: i64) -> Result<(usize, usize)> {
     if !intent_exists(conn, id)? {
         bail!("intent i{id} does not exist");
     }
-    // FK 順に: works → requires 辺 → outcomes → intent。
+    // FK 順に: works/受理 → requires 辺 → outcomes → intent。
     let works = conn.execute(
         "DELETE FROM works WHERE serves_id IN (SELECT id FROM outcomes WHERE intent_id = ?1)",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM acceptances WHERE outcome_id IN (SELECT id FROM outcomes WHERE intent_id = ?1)",
         params![id],
     )?;
     conn.execute(
@@ -481,9 +486,26 @@ pub fn set_work_pane(conn: &Connection, id: i64, pane_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// accept された Work が serve する Outcome の id 集合(satisfied 導出の材料、o22 系のローカル Human Gate)。
+/// 受理事実を記録する(Outcome に貼る耐久事実。Work を掃除しても残る)。
+/// 複数 artifact / 複数リポで満たす将来に開くため、Outcome ごとに複数行を許す。
+pub fn add_acceptance(
+    conn: &Connection,
+    outcome_id: i64,
+    work_id: Option<i64>,
+    repo_id: Option<i64>,
+    artifact_sha: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO acceptances (outcome_id, work_id, repo_id, artifact_sha) VALUES (?1, ?2, ?3, ?4)",
+        params![outcome_id, work_id, repo_id, artifact_sha],
+    )?;
+    Ok(())
+}
+
+/// 受理事実を持つ Outcome の id 集合(satisfied 導出の材料 = ローカル Human Gate)。
+/// **Work の state ではなく acceptances(耐久事実)**を見るので、Work を消しても退行しない。
 pub fn accepted_outcome_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT serves_id FROM works WHERE state = 'accepted'")?;
+    let mut stmt = conn.prepare("SELECT DISTINCT outcome_id FROM acceptances")?;
     let ids = stmt
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?;
@@ -544,5 +566,42 @@ impl OptionalBool for rusqlite::Result<bool> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::db::SCHEMA).unwrap();
+        c
+    }
+
+    #[test]
+    fn acceptance_is_outcome_fact_and_survives_work_removal() {
+        let c = mem();
+        let iid = add_intent(&c, "I", "").unwrap();
+        let oid = add_outcome(&c, iid, "s", "", &Verify::Command("true".into()), &[]).unwrap();
+        let wid = add_work(&c, oid, "obj", "ai").unwrap();
+
+        // accept 前: 受理事実なし。
+        assert!(!accepted_outcome_ids(&c).unwrap().contains(&oid));
+
+        // accept = Outcome に受理事実を貼る(Work state とは別)。
+        add_acceptance(&c, oid, Some(wid), None, Some("deadbeef")).unwrap();
+        assert!(accepted_outcome_ids(&c).unwrap().contains(&oid));
+
+        // Work を掃除しても受理事実は残る(= satisfied が退行しない)。
+        remove_work(&c, wid).unwrap();
+        assert!(
+            accepted_outcome_ids(&c).unwrap().contains(&oid),
+            "acceptance must outlive its work"
+        );
+
+        // Outcome ごと消せば受理も消える。
+        remove_outcome(&c, oid).unwrap();
+        assert!(!accepted_outcome_ids(&c).unwrap().contains(&oid));
     }
 }

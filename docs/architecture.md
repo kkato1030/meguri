@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 worktree の base を fetch 済み origin/<branch> から切る修正(stale-base bug)** 時点。
+最終更新: **v0.2 受理を Outcome 側の耐久事実(acceptances)に(掃除で退行しない、ADR 0002)** 時点。
 
 ## いまできること
 
@@ -59,19 +59,21 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 * **Outcome** — 到達したい状態(グラフのノード)。`statement`(短い到達状態)/ `description`(詳しい説明、任意、Intent と対称)/ `verify` / `requires`(前提辺)を持つ。
   * **verify** = 達成の確かめ方。3 種: `command`(コマンド exit 0)/ `human`(人が表明・sticky)/ `rollup`(まとめ節点=子が全て満たされたら)。
 * **Work** — Outcome を満たす手段。`serves`(対象 Outcome)/ `objective` / `executor`(ai|human)/ `state` / spawn 時の worktree 情報(`worktree_path` / `branch` / `base_sha`)を持つ。`meguri run` で ready Outcome から起こし(o14)、その worktree の pane にエージェントを起動して実装プロンプトを注入(o15、state=`running`)、`.meguri/result.json` の出現を待って報告 status を state に反映する(o16)。注入は CLI(例: Claude Code)の cold-start 前だと落ちるので、**result が出るまで `--nudge-secs` 間隔で最大 3 回まで再注入**する。pane は detached な場所で開くため、`run` は覗くための **attach 案内**を表示する。
-  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。**`verified` を `meguri accept` で受理すると `accepted`** になり、serve 先 Outcome が satisfied になる(下の導出ルール)。
+  * **state の流れ**: `planned`(add_work 直後)→ `running`(o15 起動)→ report 検知(o16)。report が **success なら meguri 側の独立検証(`verify.rs`、o17-o19)を rollup(o20)して gate**: 全 pass=`verified`(そのとき `artifact_sha` に検証済み commit を記録=o21)/ 一つでも落ち=`rework`(fix turn は o22)。report が failure=`failed` / needs_human=`needs_human`。pane 死亡・timeout では `running` のまま残す(pane も残す、§3.5。詳細な失敗経路は o23-o25)。**`verified` を `meguri accept` で受理すると、Outcome に受理事実(`acceptances`)が貼られ**、serve 先 Outcome が satisfied になる(Work state も `accepted` にするが、それは運用記録で根拠ではない)。**Work を掃除しても satisfied は退行しない**(ADR 0002)。
   * **Artifact**(o21): verified な Work の `artifact_sha`(= worktree HEAD)。ブランチ `meguri/w<id>` は bare clone に残るので `branch @ sha` が耐久成果物になる。`work ls` に表示。GitHub PR 投影(v0.3)の material。
 * **Intent は repo に紐付く**(`repo_id`、任意)。別 Intent → 別 repo = マルチレポ。
 
-**保存する事実**: Intent / Outcome / requires 辺 / Work(state=…/`accepted` 含む)/ human 充足表明。
+**保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明 / **受理(`acceptances`)**。
 **保存しない(導出)**: satisfied / ready / blocked。
+
+**受理(`acceptances`、ADR 0002)**: accept 時に **Outcome に貼る耐久事実**(`outcome_id`, 由来 `work_id?`, `repo_id?`, `artifact_sha?`)。satisfied の根拠はこの行で、**Work を掃除しても退行しない**(`work_id` は情報用・FK なし)。Outcome ごと 0..N 行(複数 artifact / 複数リポで満たす将来に開く)。`works.state='accepted'` は運用状態として残すが根拠ではない。旧データは起動時に backfill。
 
 ### 導出のルール(`derive.rs`)
 
-* satisfied: `human`=人の表明**または** accept 済み Work あり / `command`=**accept 済みの担当 Work があれば満たされる**(verified→`meguri accept`=ローカル Human Gate。GitHub 化は v0.3)/ `rollup`=子が全て satisfied。
+* satisfied: `human`=人の表明**または**受理あり / `command`=**受理があれば満たされる**(verified→`meguri accept`=ローカル Human Gate。GitHub 化は v0.3)/ `rollup`=子が全て satisfied。
 * ready = 未充足 かつ requires が全て satisfied(→ ここに Work を起こせる)。
 * blocked = 未充足 かつ 未充足の requires がある。
-* 導出は `accepted`(accept 済み Work を持つ Outcome の id 集合)を受け取る。事実は Work の `accepted` 状態で、satisfied はそこから毎回導く。
+* 導出は `accepted`(受理を持つ Outcome の id 集合 = `acceptances` から)を受け取る。当面の満たし条件は「受理 1 つ以上」(複数 artifact の AND 満たしは未・ADR 0002 の open)。
 
 ## CLI
 
