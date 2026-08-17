@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 outcome done を人手の満たし表明に一般化(command も run 抜きで消し込める、o28 一部)** 時点。
+最終更新: **v0.2 run の detach を即返りに(注入は watch が初回発見で担う)** 時点。
 
 ## いまできること
 
@@ -25,11 +25,12 @@
   **全部 pass なら `verified`(検証済み commit を Artifact=branch @ sha として記録=o21)/
   一つでも落ちれば `rework` に gate(o20)**。
 - **launch / harvest の分離**(o27): harvest 芯(検証→gate→Artifact)は `finalize_work`(**pane 不要**、
-  result.json と git 状態だけ)。**`meguri run` は既定で detach** — launch(pane 起動+注入)だけして
-  即返る(state=`running`)。`--wait` で従来どおりその場でブロックして harvest する。
-  **`meguri watch`(最小 reconciler)** が running Work を走査し、result が出ていれば harvest、
-  まだなら **保存した pane ハンドルで沈黙 Work を上限付き再注入(nudge)** する(初回注入が
-  cold-start で落ちた場合の救済)。既定は running が捌けるまでループ、`--once` で 1 パス。
+  result.json と git 状態だけ)。**`meguri run` は既定で detach** — pane を開いてエージェント CLI を
+  起動したら **即返る(〜1s)**。grace 待ちも実装プロンプトの注入もしない(state=`running`)。
+  **注入と harvest は `meguri watch`(最小 reconciler)が担う**: running Work を走査し、result が
+  出ていれば harvest、まだなら保存した pane ハンドルで **初回発見時に注入 → 以降 nudge**(上限付き)。
+  `--wait` はその場で grace→注入→harvest まで同期でやる(従来挙動)。watch の既定は running が
+  捌けるまでループ、`--once` で 1 パス(注入と harvest は別パスになりうる)。
 - **ローカル accept**(Human Gate): `meguri accept <w>` で verified Work を受理 →
   serve 先 Outcome が **satisfied**(導出)→ 後続 Outcome が **ready** になる。
   これで `run → verified → accept → 次が ready` が一周する。
