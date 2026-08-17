@@ -91,6 +91,38 @@ pub fn judge_pane(alive: bool, has_result: bool) -> PaneVerdict {
     }
 }
 
+/// o24: running な Work が期限に達したときの判定。タイムアウトは握りつぶさず表面化するが、
+/// pane は殺さない —— 人間が最終画面を覗いて続きを決められる(§3.5「ブロック ≠ 失敗」)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeoutVerdict {
+    /// 期限切れ。Work を [timed_out] として表面化する(running から外す)。**pane は残す**。
+    TimedOut,
+    /// まだ期限内、あるいは result が既に出ている(harvest 対象)——ここでは何もしない。
+    Pending,
+}
+
+impl TimeoutVerdict {
+    /// o24 の核となる不変: タイムアウトの処理は pane を殺さない(どの判定でも false)。
+    /// 表面化しても最終画面は残り、人間が覗いて続きを決められる。
+    pub const fn kills_pane(&self) -> bool {
+        false
+    }
+}
+
+/// running な Work の経過時間と result 有無から、タイムアウトを表面化するか判定する(o24)。
+/// `elapsed` は起動からの経過、`timeout` は許容上限、`has_result` は result.json が出ているか。
+/// result が既にあるなら timeout ではなく harvest 対象として拾う(成果を優先、judge_pane と同じ構え)。
+pub fn judge_timeout(elapsed: Duration, timeout: Duration, has_result: bool) -> TimeoutVerdict {
+    if has_result || elapsed < timeout {
+        TimeoutVerdict::Pending
+    } else {
+        TimeoutVerdict::TimedOut
+    }
+}
+
+/// タイムアウトで表面化する Work の state 名(o24)。pane を残したまま running から外す。
+pub const TIMED_OUT_STATE: &str = "timed_out";
+
 /// 差し戻しの注入文。落ちた検証子だけを診断として並べ、「何を直せば通るか」を伝える。
 fn fix_instruction(attempt: u32, checks: &[Check]) -> String {
     let mut s = format!(
@@ -150,6 +182,33 @@ fn pane_death() {
     // pane が死んでいても result があれば harvest に回せる。死亡だけで failed にしない
     //(result は耐久で live ハンドルを要らない = 「ブロック ≠ 失敗」、§3.5)。
     assert_eq!(judge_pane(false, true), PaneVerdict::Pending);
+}
+
+/// タイムアウトは表面化するが pane は残す(o24)。
+/// (DoD の `cargo test work::timeout_keeps_pane` が指す関門。パスが一致するよう
+/// nested module に入れず work 直下に置く。)
+#[cfg(test)]
+#[test]
+fn timeout_keeps_pane() {
+    let timeout = Duration::from_secs(60);
+
+    // 期限内はまだ何もしない(pane は生きたまま回している)。
+    assert_eq!(
+        judge_timeout(timeout - Duration::from_secs(1), timeout, false),
+        TimeoutVerdict::Pending
+    );
+    assert_eq!(judge_timeout(Duration::ZERO, timeout, false), TimeoutVerdict::Pending);
+
+    // 期限に達したら握りつぶさず timeout を表面化する。上限を超えても同じ。
+    assert_eq!(judge_timeout(timeout, timeout, false), TimeoutVerdict::TimedOut);
+    assert_eq!(judge_timeout(timeout * 3, timeout, false), TimeoutVerdict::TimedOut);
+
+    // ただし result が既にあれば timeout ではなく harvest 対象(成果を優先、死んでも収穫する)。
+    assert_eq!(judge_timeout(timeout * 3, timeout, true), TimeoutVerdict::Pending);
+
+    // o24 の核: どの判定でも pane は殺さない。タイムアウトの処理は最終画面を残す。
+    assert!(!TimeoutVerdict::TimedOut.kills_pane(), "timeout は pane を残す");
+    assert!(!TimeoutVerdict::Pending.kills_pane());
 }
 
 /// 差し戻しの診断には pass した検証子は混ぜない(直す対象だけを見せる)。

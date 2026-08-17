@@ -99,6 +99,9 @@ enum Cmd {
         /// Seconds between passes while Works are still running
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
+        /// Surface a running Work as timed_out after this many seconds since launch (o24)
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
     },
 }
 
@@ -329,7 +332,9 @@ fn main() -> Result<()> {
             },
         )?,
         Cmd::Accept { work } => accept_cmd(&conn, &work)?,
-        Cmd::Watch { once, interval_secs } => watch_cmd(&conn, once, Duration::from_secs(interval_secs))?,
+        Cmd::Watch { once, interval_secs, timeout_secs } => {
+            watch_cmd(&conn, once, Duration::from_secs(interval_secs), Duration::from_secs(timeout_secs))?
+        }
     }
     Ok(())
 }
@@ -341,7 +346,7 @@ const WATCH_NUDGE_INTERVAL: Duration = Duration::from_secs(20);
 /// まだなら(pane があれば上限付き・間隔付きで)再注入する。level-triggered delivery の芽(§3.5)。
 /// `finalize_work` は **pane を要らない**ので harvest 自体は live ハンドル無しで回る。
 /// 既定は running が捌け切るまでループ、`--once` で 1 パス。
-fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Result<()> {
+fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration, timeout: Duration) -> Result<()> {
     let mux = mux::select();
     // Work ごとの nudge 記録(回数, 最後に送った時刻)。この watch プロセスの寿命でのみ持つ。
     let mut nudges: std::collections::HashMap<i64, (u32, std::time::Instant)> =
@@ -366,7 +371,7 @@ fn watch_cmd(conn: &rusqlite::Connection, once: bool, interval: Duration) -> Res
         }
         let mut finalized = 0;
         for w in &running {
-            if reconcile_work(conn, w, mux.as_ref(), &mut nudges)? {
+            if reconcile_work(conn, w, mux.as_ref(), &mut nudges, timeout)? {
                 finalized += 1;
             }
         }
@@ -396,6 +401,7 @@ fn reconcile_work(
     w: &store::Work,
     mux: &dyn mux::Mux,
     nudges: &mut std::collections::HashMap<i64, (u32, std::time::Instant)>,
+    timeout: Duration,
 ) -> Result<bool> {
     let (Some(wt), Some(base), Some(branch)) = (&w.worktree_path, &w.base_sha, &w.branch) else {
         return Ok(false); // worktree 未紐付け(通常ありえない)
@@ -434,6 +440,18 @@ fn reconcile_work(
         nudges.remove(&w.id);
         println!("  w{} pane died without a result → [failed]", w.id);
         return Ok(true);
+    }
+    // o24: launch から timeout を過ぎても result が出ない running は timed_out に表面化する。
+    // **pane は殺さない**(§3.5、人間が最終画面を覗いて続きを決められる)。
+    if let Some(secs) = store::work_elapsed_secs(conn, w.id)? {
+        if work::judge_timeout(Duration::from_secs(secs.max(0) as u64), timeout, false)
+            == work::TimeoutVerdict::TimedOut
+        {
+            store::set_work_state(conn, w.id, work::TIMED_OUT_STATE)?;
+            nudges.remove(&w.id);
+            println!("  w{} timed out → [{}] (pane kept alive)", w.id, work::TIMED_OUT_STATE);
+            return Ok(true);
+        }
     }
     // pane は生きている。detach 既定では run が注入しないので、watch が **初回発見で即注入**し
     // (count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
@@ -593,6 +611,7 @@ fn launch_work(
     mux.send_line(&pane, &agent_cmd)?; // エージェント CLI を起動
 
     store::set_work_state(conn, wid, "running")?;
+    store::mark_work_started(conn, wid)?; // o24: watch の timeout 判定の基準時刻
     println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
     // pane は detached な場所で開く。人間が覗けるように案内する(§3.5)。
     println!("  watch it:  {}", mux.attach_hint("meguri"));
@@ -609,11 +628,24 @@ fn launch_work(
     mux.send_line(&pane, INJECT_INSTRUCTION)?; // 初回注入(grace 経過後)
     // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
     match wait_result(mux.as_ref(), &pane, &result_path, INJECT_INSTRUCTION, opts.nudge, opts.timeout) {
-        Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r, Some((mux.as_ref(), &pane)))?,
-        None => {
-            // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
-            // ここでは pane を残し、state は 'running' のまま人間に委ねる(§3.5)。
-            println!("  no durable result detected (pane died or timed out). state stays 'running'; attach to the pane to check.");
+        WaitOutcome::Result(r) => {
+            finalize_work(conn, wid, o, worktree, base_sha, branch, &r, Some((mux.as_ref(), &pane)))?
+        }
+        WaitOutcome::Timeout => {
+            // o24: タイムアウトを握りつぶさず表面化する。ただし pane は殺さず残す —— 人間が
+            // 最終画面を覗いて続きを決められる(§3.5)。pane を落とさない不変を判定側に問うて明示する。
+            debug_assert!(!work::TimeoutVerdict::TimedOut.kills_pane(), "timeout は pane を残す(o24)");
+            store::set_work_state(conn, wid, work::TIMED_OUT_STATE)?;
+            println!(
+                "  w{wid} timed out → [{}] (pane kept alive — attach to check: {})",
+                work::TIMED_OUT_STATE,
+                mux.attach_hint("meguri")
+            );
+        }
+        WaitOutcome::PaneDied => {
+            // o25: 結果を残さないまま pane が死んだ = エージェントが落ちた → failed として表面化する。
+            store::set_work_state(conn, wid, "failed")?;
+            println!("  w{wid} pane died without a result → [failed]");
         }
     }
     Ok(())
@@ -721,9 +753,20 @@ fn print_check(c: &verify::Check) {
 const INJECT_INSTRUCTION: &str =
     "Read .meguri/prompt.md and complete it (implement, commit, then write the result file).";
 
+/// `wait_result` の帰結。`None` で timeout と pane 死亡を混ぜず、呼び手が別々に表面化できるよう
+/// 三分岐にする(o24: timeout は pane を残して [timed_out]、o25: pane 死亡は [failed])。
+enum WaitOutcome {
+    /// 耐久 result を検知した(harvest へ)。
+    Result(exec::WorkResult),
+    /// 期限切れ。pane は残す(o24)。
+    Timeout,
+    /// 結果を残さないまま pane が死んだ(o25)。
+    PaneDied,
+}
+
 /// o16: 耐久 result ファイル(`.meguri/result.json`)の出現をポーリングで待つ。**画面は読まない**(§8)。
 /// `nudge` 間隔で `instruction` を最大 `NUDGE_MAX` 回だけ再注入する(初回送信が CLI 起動前に
-/// 落ちるケースの保険)。返り値: `Some(result)`=検知 / `None`=pane 死亡 or timeout(pane は残す)。
+/// 落ちるケースの保険)。返り値は [`WaitOutcome`]: result 検知 / timeout(pane 残す) / pane 死亡。
 fn wait_result(
     mux: &dyn mux::Mux,
     pane: &mux::PaneId,
@@ -731,20 +774,21 @@ fn wait_result(
     instruction: &str,
     nudge: Duration,
     timeout: Duration,
-) -> Option<exec::WorkResult> {
+) -> WaitOutcome {
     let start = std::time::Instant::now();
     let mut last_nudge = std::time::Instant::now();
     let mut nudges: u32 = 0;
     loop {
         // Ok(Some)=完了 / Ok(None)=まだ / Err=書き込み途中の部分 JSON → まだ完成していない扱いで待つ。
         if let Ok(Some(r)) = exec::read_result(result_path) {
-            return Some(r);
+            return WaitOutcome::Result(r);
         }
         if !mux.is_alive(pane).unwrap_or(false) {
-            return None; // pane が死んだ(詳細な扱いは o25)
+            return WaitOutcome::PaneDied; // pane が死んだ(o25。result 無しでの死亡)
         }
-        if start.elapsed() >= timeout {
-            return None; // timeout(詳細な扱いは o24。pane は残す)
+        // o24: 期限切れは timeout として表面化する(pane は残す)。result はこの時点で無い(上で拾う)。
+        if work::judge_timeout(start.elapsed(), timeout, false) == work::TimeoutVerdict::TimedOut {
+            return WaitOutcome::Timeout;
         }
         // まだ result が無く、上限内なら再注入(初回が起動前で落ちていた場合の救済)。
         if nudges < work::NUDGE_MAX && last_nudge.elapsed() >= nudge {

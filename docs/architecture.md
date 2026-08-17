@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 o23 沈黙 nudge を上限付き純粋方針に(work::nudge)— meguri 自作** 時点。
+最終更新: **v0.2 o24 timeout(pane を残したまま timed_out)— meguri 自作 + watch へ配線** 時点。
 
 ## いまできること
 
@@ -52,7 +52,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。**worktree の base は fetch で更新される `origin/<branch>`**(bare の local `refs/heads/<branch>` は clone 時から動かないため、そこから切ると古い base になる)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る・**attach 案内**(`attach_hint`: tmux は `tmux attach -t <s>`、herdr は `herdr`)の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
-| `src/work.rs` | 失敗経路の**純粋方針**(pane/git 非依存、判定だけ持ち harvest 側が行動)。o22: `FixTurn`(Retry/GiveUp)+ `decide(spent, checks)`(`FIX_TURN_MAX=3` まで差し戻し、超えたら人間へ)。o23: `Nudge`(Send/Hold/Exhausted)+ `nudge(sent, since_last, interval)`(初回発見は即注入、以降 `interval` 間隔で `NUDGE_MAX=3` まで、超えたら黙る)。o25: `PaneVerdict`(Failed/Pending)+ `judge_pane(alive, has_result)`(**結果を残さず死んだ**pane を Failed。結果があれば死んでも harvest 可=§3.5)。単体テストあり |
+| `src/work.rs` | 失敗経路の**純粋方針**(pane/git 非依存、判定だけ持ち harvest 側が行動)。o22: `FixTurn`(Retry/GiveUp)+ `decide(spent, checks)`(`FIX_TURN_MAX=3` まで差し戻し、超えたら人間へ)。o23: `Nudge`(Send/Hold/Exhausted)+ `nudge(sent, since_last, interval)`(初回発見は即注入、以降 `interval` 間隔で `NUDGE_MAX=3` まで、超えたら黙る)。o24: `TimeoutVerdict`(TimedOut/Pending)+ `judge_timeout(elapsed, timeout, has_result)`(期限切れを表面化、`kills_pane()`=常に false で**pane を残す**不変)。o25: `PaneVerdict`(Failed/Pending)+ `judge_pane(alive, has_result)`(**結果を残さず死んだ**pane を Failed。結果があれば死んでも harvest 可=§3.5)。単体テストあり |
 | `src/verify.rs` | meguri 側の**独立検証**(§9.3、trust-but-verify): 各検証子は `Check{name,pass,detail}` を返す。o17 = `clean_tree`(worktree に未コミット/追跡外が残っていないか。`.meguri/` は exclude 済みで無視)、o18 = `commits_ahead`(spawn 時に記録した base SHA より commit が進んでいるか=何も作らず report した空 worktree を弾く)、o19 = `check_command`(Outcome の verify=command を worktree で実行し exit 0 を要求。human/rollup は None=対象外。落ちたら stderr 末尾を添える)。`run_all` が適用可能な検証子を集め、`all_pass` で rollup(o20)。実 git の単体テストあり |
 | `src/exec.rs` | v0.2 execution の**実装プロンプト**(完了契約、§9): spawn 済み Work のエージェントに「この worktree で実装 → commit → `.meguri/result.json` を書く」を指示(verify 種別ごとに DoD を出し分け)。加えて **result.json の読み取り**(`WorkResult{status,summary}`、部分書き込みは未完了扱い)と status→Work state の対応(o16)。画面は読まず result.json で完了を判定する契約。単体テストあり |
 
@@ -106,10 +106,10 @@ meguri run <o> [--agent <cmd>] [--wait] [--grace-secs N] [--timeout-secs N] [--n
                               #   既定は detach(即返る。harvest は meguri watch)。--wait でその場でブロックして検証・gate まで。
                               #   注入落ち対策で(--wait 中は)result が出るまで --nudge-secs 間隔で再注入。attach 案内を表示
 meguri accept <w>             # ローカル Human Gate: verified Work を受理 → serve 先 Outcome が satisfied → 後続が ready
-meguri watch [--once] [--interval-secs N]
+meguri watch [--once] [--interval-secs N] [--timeout-secs N]
                               # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)、
-                              #   まだなら pane で沈黙 nudge。既定は running が捌けるまでループ、--once で 1 パス。
-                              #   TTY では要約行を同じ行で上書き更新(harvest/nudge の行は残す)
+                              #   まだなら pane で沈黙 nudge。pane 死亡→failed(o25)/ launch から --timeout-secs 超過→timed_out(o24、pane 残す)。
+                              #   既定は running が捌けるまでループ、--once で 1 パス。TTY では要約行を同じ行で上書き更新
 meguri graph [--intent <i>] [--mermaid]                  # text / mermaid は stdout
 meguri graph [--intent <i>] --html [--out <path>] [--no-open]
                               # クリックで詳細の自己完結グラフを書いてブラウザで開く(既定 MEGURI_HOME/graph.html)
@@ -179,4 +179,4 @@ meguri plan run    [--intent <i>] [--agent <cmd>] [--detach] [--grace-secs N] [-
 * `command` verify の Outcome は **verified な Work を `meguri accept` するまで** satisfied にならない(ローカル Human Gate)。前提が揃えば ready にはなる。
 * サイクル防止は `add_requires` にあるが、現行 CLI(`outcome add --requires` は既存ノードのみ参照)では実際にサイクルを作れないため、防御は休眠状態。
 * accept しても **worktree・pane は残る**(§3.5 で人間が引き取れるように意図的に。後片付けは別増分)。`work rm` で明示的に掃除する。
-* 失敗経路: fix turn=o22 / 沈黙 nudge=o23 / pane 死亡=o25 は実装済み。timeout=o24 は未。`rework`/`failed` になった Work は人間が引き取る。
+* 失敗経路: fix turn=o22 / 沈黙 nudge=o23 / timeout=o24 / pane 死亡=o25 すべて実装済み。`rework`/`failed`/`timed_out` になった Work は人間が引き取る(pane は残る)。
