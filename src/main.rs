@@ -407,15 +407,18 @@ fn reconcile_work(
         nudges.remove(&w.id);
         return Ok(true);
     }
-    // まだ result 無し。pane があれば、上限付き・間隔付きで再注入する(初回注入落ちの救済)。
+    // まだ result 無し。pane があれば注入する。detach 既定では run が注入しないので、
+    // watch が **初回発見で即注入**し(count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
     if let Some(pid) = &w.pane_id {
         let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
-        if count < NUDGE_MAX && last.elapsed() >= WATCH_NUDGE_INTERVAL {
+        let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
+        if count < NUDGE_MAX && due {
             let pane = mux::PaneId(pid.clone());
             if mux.is_alive(&pane).unwrap_or(false) {
                 let _ = mux.send_line(&pane, INJECT_INSTRUCTION);
                 nudges.insert(w.id, (count + 1, std::time::Instant::now()));
-                println!("  w{} nudged ({}/{})", w.id, count + 1, NUDGE_MAX);
+                let kind = if count == 0 { "injected" } else { "nudged" };
+                println!("  w{} {kind} ({}/{})", w.id, count + 1, NUDGE_MAX);
             }
         }
     }
@@ -557,9 +560,7 @@ fn launch_work(
     store::set_work_pane(conn, wid, &pane.0)?;
     // 生成直後の pane はシェル準備前で最初の送信を落とすことがある(p2.2b の学び)。
     std::thread::sleep(Duration::from_millis(800));
-    mux.send_line(&pane, &agent_cmd)?;
-    std::thread::sleep(opts.grace); // spawn_grace: CLI 起動待ち
-    mux.send_line(&pane, INJECT_INSTRUCTION)?; // 初回注入(grace 経過後)
+    mux.send_line(&pane, &agent_cmd)?; // エージェント CLI を起動
 
     store::set_work_state(conn, wid, "running")?;
     println!("  launched agent in a pane (working). it will write .meguri/result.json when done.");
@@ -567,12 +568,15 @@ fn launch_work(
     println!("  watch it:  {}", mux.attach_hint("meguri"));
 
     if !opts.wait {
-        // 既定: launch だけして即返る。harvest(検証・gate)と沈黙の再注入は `meguri watch` が担う。
-        println!("  detached (default) — harvest with `meguri watch`, or re-run with --wait to block here.");
+        // 既定: 起動したら即返る(grace も注入もしない)。実装プロンプトの注入と harvest は
+        // `meguri watch`(reconciler)が担う — watch は初回発見で注入し、以降 nudge する。
+        println!("  detached (default) — run `meguri watch` to drive & harvest it (or re-run with --wait).");
         return Ok(());
     }
 
-    // --wait: 画面は読まず、耐久 result ファイルの出現だけを見て完了を判定する(§8)。
+    // --wait: ここで初回注入し、result が出るまで待って harvest する(同期パス)。
+    std::thread::sleep(opts.grace); // spawn_grace: CLI 起動待ち
+    mux.send_line(&pane, INJECT_INSTRUCTION)?; // 初回注入(grace 経過後)
     // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
     match wait_result(mux.as_ref(), &pane, &result_path, INJECT_INSTRUCTION, opts.nudge, opts.timeout) {
         Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r)?,
