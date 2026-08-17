@@ -497,6 +497,28 @@ pub fn set_work_pane(conn: &Connection, id: i64, pane_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// o24: launch 時刻を記録する(unix秒、SQLite が計算)。watch の timeout 判定の基準。
+pub fn mark_work_started(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE works SET started_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// o24: launch からの経過秒(started_at 未設定なら None)。SQLite が現在時刻との差を計算する。
+pub fn work_elapsed_secs(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    match conn.query_row(
+        "SELECT CAST(strftime('%s','now') AS INTEGER) - started_at FROM works WHERE id = ?1 AND started_at IS NOT NULL",
+        params![id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 受理事実を記録する(Outcome に貼る耐久事実。Work を掃除しても残る)。
 /// 複数 artifact / 複数リポで満たす将来に開くため、Outcome ごとに複数行を許す。
 pub fn add_acceptance(

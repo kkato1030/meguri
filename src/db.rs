@@ -59,6 +59,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "artifact_sha", "TEXT")?; // o21: verified な commit
     add_column_if_missing(conn, "works", "pane_id", "TEXT")?; // watch が nudge するための pane ハンドル
     add_column_if_missing(conn, "works", "deleted", "INTEGER NOT NULL DEFAULT 0")?; // work rm は soft-delete(id 再利用を防ぐ)
+    add_column_if_missing(conn, "works", "started_at", "INTEGER")?; // o24: launch 時刻(unix秒)。watch の timeout 判定用
     add_column_if_missing(conn, "works", "fix_turns", "INTEGER NOT NULL DEFAULT 0")?; // o22: 消費した fix turn 回数(上限付き差し戻し)
     // 受理事実の後方互換: 旧来 accept 済み(works.state='accepted')を acceptances に一度だけ埋める。
     // 冪等: 既に acceptance 行がある Work は入れ直さない。
@@ -132,7 +133,8 @@ pub(crate) const SCHEMA: &str = r#"
             artifact_sha  TEXT,                           -- verified な commit(o21)
             pane_id       TEXT,                           -- watch が nudge するための pane ハンドル
             deleted       INTEGER NOT NULL DEFAULT 0,      -- work rm は soft-delete(id を再利用しない)
-            fix_turns     INTEGER NOT NULL DEFAULT 0       -- o22: 消費した fix turn 回数(上限付き差し戻し)
+            fix_turns     INTEGER NOT NULL DEFAULT 0,      -- o22: 消費した fix turn 回数(上限付き差し戻し)
+            started_at    INTEGER                          -- o24: launch 時刻(unix秒)。watch の timeout 判定用
         );
 
         -- 受理(accept)の耐久事実。satisfied の根拠を「消せる Work 行」から切り離す。
