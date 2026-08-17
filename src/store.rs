@@ -92,6 +92,8 @@ pub struct Work {
     pub artifact_sha: Option<String>,
     /// launch 時の pane ハンドル。watch が沈黙 Work を再注入(nudge)するのに使う。
     pub pane_id: Option<String>,
+    /// o22: 検証落ちで消費した fix turn 回数(上限付き差し戻しの耐久カウンタ)。
+    pub fix_turns: u32,
 }
 
 // ---- Repo ----
@@ -440,9 +442,10 @@ pub fn list_works(conn: &Connection, serves_id: Option<i64>) -> Result<Vec<Work>
             base_sha: r.get(7)?,
             artifact_sha: r.get(8)?,
             pane_id: r.get(9)?,
+            fix_turns: r.get::<_, i64>(10)? as u32,
         })
     };
-    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id";
+    const COLS: &str = "id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id, fix_turns";
     // soft-delete した work(deleted=1)は一覧・reconcile から除く。
     let rows: Vec<Work> = match serves_id {
         Some(sid) => {
@@ -479,6 +482,12 @@ pub fn set_work_worktree(conn: &Connection, id: i64, path: &str, branch: &str, b
 /// o21: verified に達した Work の Artifact(検証済み commit)を記録する。
 pub fn set_work_artifact(conn: &Connection, id: i64, sha: &str) -> Result<()> {
     conn.execute("UPDATE works SET artifact_sha = ?2 WHERE id = ?1", params![id, sha])?;
+    Ok(())
+}
+
+/// o22: 消費した fix turn 回数を記録する(上限付き差し戻しの耐久カウンタ)。
+pub fn set_work_fix_turns(conn: &Connection, id: i64, fix_turns: u32) -> Result<()> {
+    conn.execute("UPDATE works SET fix_turns = ?2 WHERE id = ?1", params![id, fix_turns as i64])?;
     Ok(())
 }
 
@@ -529,12 +538,12 @@ fn work_exists(conn: &Connection, id: i64) -> Result<bool> {
 
 pub fn get_work(conn: &Connection, id: i64) -> Result<Work> {
     conn.query_row(
-        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id FROM works WHERE id = ?1",
+        "SELECT id, serves_id, objective, executor, state, worktree_path, branch, base_sha, artifact_sha, pane_id, fix_turns FROM works WHERE id = ?1",
         [id],
         |r| Ok(Work {
             id: r.get(0)?, serves_id: r.get(1)?, objective: r.get(2)?, executor: r.get(3)?,
             state: r.get(4)?, worktree_path: r.get(5)?, branch: r.get(6)?, base_sha: r.get(7)?,
-            artifact_sha: r.get(8)?, pane_id: r.get(9)?,
+            artifact_sha: r.get(8)?, pane_id: r.get(9)?, fix_turns: r.get::<_, i64>(10)? as u32,
         }),
     )
     .with_context(|| format!("no work w{id}"))

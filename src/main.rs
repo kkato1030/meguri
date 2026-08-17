@@ -13,6 +13,7 @@ mod plan;
 mod render;
 mod store;
 mod verify;
+mod work;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -403,12 +404,24 @@ fn reconcile_work(
     if let Some(r) = exec::read_result(&result_path)? {
         let o = store::get_outcome(conn, w.serves_id)?;
         println!("w{} (o{}):", w.id, w.serves_id);
-        finalize_work(conn, w.id, &o, worktree, base, branch, &r)?;
+        // pane があれば fix turn の差し戻しをそこへ注入できる(live ハンドル無しでも harvest 自体は回る)。
+        let pane = w.pane_id.as_ref().map(|p| mux::PaneId(p.clone()));
+        let deliver = pane.as_ref().map(|p| (mux, p));
+        finalize_work(conn, w.id, &o, worktree, base, branch, &r, deliver)?;
+        // fix turn の差し戻し(o22)は state を 'running' のまま残す。その場合は **未完了**として
+        // 扱い、watch に見続けさせる(finalized に数えると still==0 で watch が抜けてしまう)。
+        if store::get_work(conn, w.id)?.state == "running" {
+            return Ok(false);
+        }
         nudges.remove(&w.id);
         return Ok(true);
     }
     // まだ result 無し。pane があれば注入する。detach 既定では run が注入しないので、
     // watch が **初回発見で即注入**し(count==0)、以降は間隔をあけて上限まで再注入(nudge)する。
+    // ただし fix turn 中(fix_turns>0)は差し戻し指示が現行の指示なので、汎用 nudge はしない。
+    if w.fix_turns > 0 {
+        return Ok(false);
+    }
     if let Some(pid) = &w.pane_id {
         let (count, last) = *nudges.entry(w.id).or_insert((0, std::time::Instant::now()));
         let due = count == 0 || last.elapsed() >= WATCH_NUDGE_INTERVAL;
@@ -579,7 +592,7 @@ fn launch_work(
     mux.send_line(&pane, INJECT_INSTRUCTION)?; // 初回注入(grace 経過後)
     // 初回注入が CLI 起動前で落ちた場合の保険として、result が出るまで上限付きで再注入する。
     match wait_result(mux.as_ref(), &pane, &result_path, INJECT_INSTRUCTION, opts.nudge, opts.timeout) {
-        Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r)?,
+        Some(r) => finalize_work(conn, wid, o, worktree, base_sha, branch, &r, Some((mux.as_ref(), &pane)))?,
         None => {
             // pane 死亡 or timeout。詳細な失敗経路(nudge/timeout/pane 死亡)は o23-o25。
             // ここでは pane を残し、state は 'running' のまま人間に委ねる(§3.5)。
@@ -593,6 +606,9 @@ fn launch_work(
 /// 記録までを行う。**pane を要らない**(result.json と git 状態だけを見る)ので、将来の reconciler
 /// (`watch`)が live な pane ハンドル無しでも同じ処理を回せる。この関数が launch/harvest 分離の
 /// harvest 側の実体。
+// Work の場所(worktree/base/branch)と収穫物(result)、差し戻し先(deliver)を素の値で受ける。
+// harvest の芯なので引数は多いが、まとめ型を作るほどの再利用は無い。
+#[allow(clippy::too_many_arguments)]
 fn finalize_work(
     conn: &rusqlite::Connection,
     wid: i64,
@@ -601,6 +617,7 @@ fn finalize_work(
     base_sha: &str,
     branch: &str,
     r: &exec::WorkResult,
+    deliver: Option<(&dyn mux::Mux, &mux::PaneId)>,
 ) -> Result<()> {
     println!("  agent reported [{}]: {}", r.status, r.summary);
     let reported = exec::state_for(&r.status);
@@ -610,9 +627,8 @@ fn finalize_work(
         for c in &checks {
             print_check(c);
         }
-        let state = if verify::all_pass(&checks) { "verified" } else { "rework" };
-        store::set_work_state(conn, wid, state)?;
-        if state == "verified" {
+        if verify::all_pass(&checks) {
+            store::set_work_state(conn, wid, "verified")?;
             // o21: 検証済みの commit を Artifact として記録する(Work の耐久成果物)。
             let sha = gitops::head_sha(worktree)?;
             store::set_work_artifact(conn, wid, &sha)?;
@@ -620,13 +636,60 @@ fn finalize_work(
             println!("  w{wid} passed verification → [verified]");
             println!("  artifact: {branch} @ {short}");
         } else {
-            let n = checks.iter().filter(|c| !c.pass).count();
-            println!("  w{wid} failed verification ({n} check(s)) → [rework] (fix turn is o22)");
+            // o22: 検証落ちは、上限付きで同じエージェントに差し戻す(fix turn)。予算が尽きたら人間へ。
+            finalize_fix_turn(conn, wid, worktree, &checks, deliver)?;
         }
     } else {
         // failure / needs_human はエージェント申告のまま(検証しても意味がない)。
         store::set_work_state(conn, wid, reported)?;
         println!("  w{wid} is now [{reported}]");
+    }
+    Ok(())
+}
+
+/// o22: 検証落ちの Work を、上限付きで同じエージェントに差し戻す(fix turn)。
+///
+/// `work::decide` が耐久カウンタ(`works.fix_turns`)を見て Retry/GiveUp を決める。
+/// - Retry: 落ちた検証の診断を pane に注入し、fix_turns を 1 進め、state は 'running' のまま
+///   にして harvest 対象に残す。**古い result.json は消す**(消さないと同じ成功報告を
+///   即再検知し、エージェントが直す前に予算を空回りで焼き切ってしまう)。pane が無い経路
+///   (live ハンドル無しの watch など)では注入だけ省くが、予算と state は同じに進める。
+/// - GiveUp: 予算切れ。[rework] にして人間へ委ねる。
+fn finalize_fix_turn(
+    conn: &rusqlite::Connection,
+    wid: i64,
+    worktree: &std::path::Path,
+    checks: &[verify::Check],
+    deliver: Option<(&dyn mux::Mux, &mux::PaneId)>,
+) -> Result<()> {
+    let n = checks.iter().filter(|c| !c.pass).count();
+    let spent = store::get_work(conn, wid)?.fix_turns;
+    match work::decide(spent, checks) {
+        work::FixTurn::Retry { attempt, instruction } => {
+            store::set_work_fix_turns(conn, wid, attempt)?;
+            store::set_work_state(conn, wid, "running")?; // まだ回す(差し戻し中)
+            // 古い成功報告を消して、直した結果の新しい result.json だけを次に拾う。
+            let _ = std::fs::remove_file(worktree.join(".meguri").join("result.json"));
+            let injected = match deliver {
+                Some((mux, pane)) if mux.is_alive(pane).unwrap_or(false) => {
+                    mux.send_line(pane, &instruction).is_ok()
+                }
+                _ => false,
+            };
+            let how = if injected { "sent to agent" } else { "pending inject" };
+            println!(
+                "  w{wid} failed verification ({n} check(s)) → fix turn {attempt}/{} ({how})",
+                work::FIX_TURN_MAX
+            );
+        }
+        work::FixTurn::GiveUp => {
+            store::set_work_state(conn, wid, "rework")?;
+            println!(
+                "  w{wid} failed verification ({n} check(s)) → [rework] (fix turn budget {}/{} spent — over to a human)",
+                spent,
+                work::FIX_TURN_MAX
+            );
+        }
     }
     Ok(())
 }
