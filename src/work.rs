@@ -11,9 +11,40 @@
 //! harvest 側(main の finalize_work)が本方針の判定に従って行う。
 
 use crate::verify::Check;
+use std::time::Duration;
 
 /// 1 Work に許す fix turn の上限。使い切ったら差し戻しをやめ、人間に委ねる。
 pub const FIX_TURN_MAX: u32 = 3;
+
+/// o23: 沈黙(result 未出現)への nudge の上限。使い切ったら叩くのをやめる(有界)。
+/// これも fix turn と同じく「壊れた自動化がエージェントを叩き続けない」ための箍。
+pub const NUDGE_MAX: u32 = 3;
+
+/// 沈黙している Work(まだ result.json を書いていない)に、次の nudge を出すかの判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nudge {
+    /// 注入する。`attempt` は今回で何回目か(1..=NUDGE_MAX)。`first` は初回発見での即注入か
+    /// (以降は間隔を空けた再注入 = nudge)。
+    Send { attempt: u32, first: bool },
+    /// まだ間隔が空いていない。次のパスまで待つ(作業中のエージェントを叩き続けない)。
+    Hold,
+    /// 上限に達した。もう叩かない(有界)。
+    Exhausted,
+}
+
+/// これまで `sent` 回注入し、最後の注入から `since_last` 経過した沈黙 Work に、次の nudge を
+/// 出すか決める。初回発見(`sent == 0`)は間隔ゼロでも即注入し、以降は `interval` 間隔で
+/// `NUDGE_MAX` 回まで。ここは pane も時計も持たない**純粋な方針**(main の reconcile が従う)。
+pub fn nudge(sent: u32, since_last: Duration, interval: Duration) -> Nudge {
+    if sent >= NUDGE_MAX {
+        return Nudge::Exhausted;
+    }
+    let due = sent == 0 || since_last >= interval;
+    if !due {
+        return Nudge::Hold;
+    }
+    Nudge::Send { attempt: sent + 1, first: sent == 0 }
+}
 
 /// 検証落ちを受けての差し戻し判定。`spent`(これまで消費した fix turn 回数)で分岐する。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,4 +165,32 @@ fn fix_turn_lists_only_failures() {
     };
     assert!(instruction.contains("check_command"));
     assert!(!instruction.contains("clean_tree"), "pass した検証子は載せない");
+}
+
+/// エージェントの沈黙が、上限付きの nudge を発生させること(o23 の関門)。
+/// 初回発見は即注入、以降は間隔を空けて上限まで、上限を超えたら黙る(有界)。
+/// (DoD の `cargo test work::nudge_bounded` が指す。パスが一致するよう work 直下に置く。)
+#[cfg(test)]
+#[test]
+fn nudge_bounded() {
+    let interval = Duration::from_secs(20);
+
+    // 初回発見(sent==0)は間隔ゼロでも即注入。first=true(injected)。
+    assert_eq!(nudge(0, Duration::ZERO, interval), Nudge::Send { attempt: 1, first: true });
+
+    // 以降は間隔が空くたびに 1 回だけ、上限まで再注入(nudge)。
+    for sent in 1..NUDGE_MAX {
+        // 間隔未満なら待つ(沈黙していても叩き続けない)。
+        assert_eq!(nudge(sent, interval - Duration::from_secs(1), interval), Nudge::Hold);
+        // 間隔を満たせば注入。attempt は sent+1 で単調増加、first は初回だけ。
+        assert_eq!(
+            nudge(sent, interval, interval),
+            Nudge::Send { attempt: sent + 1, first: false },
+            "sent={sent} は間隔を満たせば再注入"
+        );
+    }
+
+    // 上限に達したら、いくら沈黙が続いても叩かない(有界)。上限を超えても同じ。
+    assert_eq!(nudge(NUDGE_MAX, interval * 100, interval), Nudge::Exhausted);
+    assert_eq!(nudge(NUDGE_MAX + 5, interval * 100, interval), Nudge::Exhausted);
 }
