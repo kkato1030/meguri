@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 `meguri watch`(最小 reconciler: running Work を harvest)** 時点。
+最終更新: **v0.2 run を detach 既定へ反転(--wait でブロック)+ watch が沈黙 Work を nudge** 時点。
 
 ## いまできること
 
@@ -24,11 +24,12 @@
   (clean tree=o17 / commit 進行=o18 / check_command=o19)** を rollup し、
   **全部 pass なら `verified`(検証済み commit を Artifact=branch @ sha として記録=o21)/
   一つでも落ちれば `rework` に gate(o20)**。
-- **launch / harvest の分離**: harvest 芯(検証→gate→Artifact)は `finalize_work`(**pane 不要**、
-  result.json と git 状態だけ)。`meguri run --detach` は launch だけして即返り(state=`running`)、
-  **`meguri watch`(最小 reconciler)** が running Work を走査して result が出ていれば harvest する。
-  既定は running が捌けるまでループ、`--once` で 1 パス。注: 沈黙の再注入(nudge)は pane 再取得が
-  要るので watch では未対応(`run --wait` の待機ループ内のみ)。
+- **launch / harvest の分離**(o27): harvest 芯(検証→gate→Artifact)は `finalize_work`(**pane 不要**、
+  result.json と git 状態だけ)。**`meguri run` は既定で detach** — launch(pane 起動+注入)だけして
+  即返る(state=`running`)。`--wait` で従来どおりその場でブロックして harvest する。
+  **`meguri watch`(最小 reconciler)** が running Work を走査し、result が出ていれば harvest、
+  まだなら **保存した pane ハンドルで沈黙 Work を上限付き再注入(nudge)** する(初回注入が
+  cold-start で落ちた場合の救済)。既定は running が捌けるまでループ、`--once` で 1 パス。
 - **ローカル accept**(Human Gate): `meguri accept <w>` で verified Work を受理 →
   serve 先 Outcome が **satisfied**(導出)→ 後続 Outcome が **ready** になる。
   これで `run → verified → accept → 次が ready` が一周する。
@@ -94,11 +95,11 @@ meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
 meguri work    rm   <w>              # DB 行 + spawn 済みなら git worktree/ブランチも掃除
-meguri run <o> [--agent <cmd>] [--detach] [--grace-secs N] [--timeout-secs N] [--nudge-secs N]
+meguri run <o> [--agent <cmd>] [--wait] [--grace-secs N] [--timeout-secs N] [--nudge-secs N]
                               # o14-o16: ready Outcome → Work を起こし bare から隔離 worktree を切り、
-                              #   その worktree の pane でエージェントを起動して実装プロンプトを注入(state=running)、
-                              #   .meguri/result.json の出現を待って報告 status を state に反映(--detach で待たず即返る)。
-                              #   注入落ち対策で result が出るまで --nudge-secs 間隔で最大 3 回まで再注入。attach 案内を表示
+                              #   その worktree の pane でエージェントを起動して実装プロンプトを注入(state=running)。
+                              #   既定は detach(即返る。harvest は meguri watch)。--wait でその場でブロックして検証・gate まで。
+                              #   注入落ち対策で(--wait 中は)result が出るまで --nudge-secs 間隔で再注入。attach 案内を表示
 meguri accept <w>             # ローカル Human Gate: verified Work を受理 → serve 先 Outcome が satisfied → 後続が ready
 meguri watch [--once] [--interval-secs N]
                               # 最小 reconciler: running Work を走査し、result が出ていれば harvest(検証→gate→Artifact)。
