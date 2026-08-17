@@ -201,4 +201,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&wtdir);
     }
+
+    #[test]
+    fn worktree_off_fetched_origin_ref_tracks_updates() {
+        // origin(src)を作って bare clone。その後 origin に新 commit を積み、fetch する。
+        let src = std::env::temp_dir().join(format!("meguri-src2-{}-{}", std::process::id(), rand_key()));
+        std::fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("README.md"), "hi").unwrap();
+        sh(&src, &["add", "."]);
+        sh(&src, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"]);
+
+        let bare = std::env::temp_dir().join(format!("meguri-bare2-{}-{}.git", std::process::id(), rand_key()));
+        bare_clone(src.to_str().unwrap(), &bare).unwrap();
+
+        // clone 後に origin へ新しい commit(= bare の local main は古いまま、origin/main が進む)。
+        std::fs::write(src.join("NEW.md"), "new").unwrap();
+        sh(&src, &["add", "."]);
+        sh(&src, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "advance"]);
+        let new_tip = git(&src, &["rev-parse", "HEAD"]).unwrap();
+
+        fetch(&bare).unwrap();
+        // local main は古い / origin/main は新しい、ことを確認(= バグの前提)。
+        assert_ne!(git(&bare, &["rev-parse", "main"]).unwrap(), new_tip);
+        assert_eq!(git(&bare, &["rev-parse", "origin/main"]).unwrap(), new_tip);
+
+        // origin/main から切れば最新に追随する(run_cmd がこの ref を使う)。
+        let wtdir = std::env::temp_dir().join(format!("meguri-wtf-{}-{}", std::process::id(), rand_key()));
+        let key = format!("w{}", rand_key());
+        let wt = create_worktree(&bare, "origin/main", &wtdir, &key).unwrap();
+        assert_eq!(wt.base_sha, new_tip, "worktree should branch off the fetched origin tip");
+        assert!(wt.path.join("NEW.md").exists());
+
+        remove_worktree(&bare, &wt).unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&wtdir);
+    }
 }
