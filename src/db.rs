@@ -58,6 +58,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "base_sha", "TEXT")?;
     add_column_if_missing(conn, "works", "artifact_sha", "TEXT")?; // o21: verified な commit
     add_column_if_missing(conn, "works", "pane_id", "TEXT")?; // watch が nudge するための pane ハンドル
+    // 受理事実の後方互換: 旧来 accept 済み(works.state='accepted')を acceptances に一度だけ埋める。
+    // 冪等: 既に acceptance 行がある Work は入れ直さない。
+    conn.execute_batch(
+        "INSERT INTO acceptances (outcome_id, work_id, artifact_sha)
+         SELECT serves_id, id, artifact_sha FROM works
+         WHERE state = 'accepted'
+           AND id NOT IN (SELECT work_id FROM acceptances WHERE work_id IS NOT NULL);",
+    )?;
     Ok(())
 }
 
@@ -121,5 +129,16 @@ pub(crate) const SCHEMA: &str = r#"
             base_sha      TEXT,
             artifact_sha  TEXT,                           -- verified な commit(o21)
             pane_id       TEXT                            -- watch が nudge するための pane ハンドル
+        );
+
+        -- 受理(accept)の耐久事実。satisfied の根拠を「消せる Work 行」から切り離す。
+        -- Outcome ごとに 0..N 行(複数 artifact / 複数リポで満たす将来に開いておく)。
+        -- work_id は情報用で FK を張らない(Work を掃除しても受理は残す)。
+        CREATE TABLE IF NOT EXISTS acceptances (
+            id           INTEGER PRIMARY KEY,
+            outcome_id   INTEGER NOT NULL REFERENCES outcomes(id),
+            work_id      INTEGER,          -- 由来 Work(掃除で消えても受理は残る=FK なし)
+            repo_id      INTEGER,          -- どの repo の artifact か(複数リポ将来対応の席)
+            artifact_sha TEXT              -- 受理した commit(human 表明では NULL 可)
         );
         "#;
