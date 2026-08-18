@@ -27,12 +27,16 @@ pub fn done(conn: &Connection, oid: i64) -> Result<()> {
     Ok(())
 }
 
-/// 人手表明を取り消す(`outcome undone`)。verified Work 由来の受理は残す。
+/// この Outcome の受理を全部消す(`outcome undone`)。人手表明・work 由来を問わない。
+/// 「この Outcome はまだ達成していない」への素直な取り消しであり、誤 accept(work を
+/// 誤って accept してしまった場合)のロールバック手段としても使う。
 /// 旧データが持つ human_satisfied(sticky)も human 種別なら一緒に落とす。
-/// 消した人手受理の件数を返す(0 なら表明が無かった)。
+/// 消した受理の件数を返す(0 なら受理が無かった)。
 pub fn undone(conn: &Connection, oid: i64) -> Result<usize> {
     let o = store::get_outcome(conn, oid)?;
-    let n = store::remove_human_acceptances(conn, oid)?;
+    let n = store::remove_all_acceptances(conn, oid)?;
+    // accept 済み Work を verified に戻す(受理を消したので状態を整える。backfill にも拾われない)。
+    store::unaccept_works(conn, oid)?;
     if o.verify == Verify::Human {
         store::set_human_satisfied(conn, oid, false)?; // 旧データの sticky も消す
     }
@@ -85,4 +89,27 @@ fn mark_done() {
 
     // rollup は手で立てられない(子から導く)。
     assert!(done(&c, roll).is_err());
+}
+
+/// 誤 accept のロールバック: `undone` は人手表明だけでなく work 由来の受理も含めて
+/// その Outcome の受理を全部消す(o29 の DoD)。
+#[cfg(test)]
+#[test]
+fn undone_clears_all_acceptances() {
+    let c = mem();
+    let iid = store::add_intent(&c, "I", "").unwrap();
+    let oid = store::add_outcome(&c, iid, "s", "", &Verify::Command("true".into()), &[]).unwrap();
+    let wid = store::add_work(&c, oid, "obj", "ai").unwrap();
+
+    // work 由来の受理(誤 accept を模す)と人手表明の両方を貼る。
+    store::add_acceptance(&c, oid, Some(wid), None, Some("deadbeef")).unwrap();
+    done(&c, oid).unwrap();
+    assert!(accepted(&c).contains(&oid));
+
+    // undone で両方消える(旧実装は work 由来の受理を残していた)。
+    assert_eq!(undone(&c, oid).unwrap(), 2);
+    assert!(!accepted(&c).contains(&oid));
+
+    // 受理が無い状態で undone しても 0 件。
+    assert_eq!(undone(&c, oid).unwrap(), 0);
 }

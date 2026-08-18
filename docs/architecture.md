@@ -5,7 +5,7 @@
 > —— それは [design/plan.md](plan.md) の仕事。ここに書いてよいのは、いまの main で
 > 実際に動くものだけ。分岐点での設計判断は [docs/adr/](adr/) に凍結する。
 
-最終更新: **v0.2 o28 満たし済みの棚卸し(graph --active + outcome.rs 集約)— meguri 自作** 時点。
+最終更新: **v0.2 o29 誤 accept のロールバック(undone 全消し)— meguri 自作 + backfill 一度きり修正** 時点。
 
 ## いまできること
 
@@ -49,7 +49,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 | `src/store.rs` | ドメイン型(Intent / Outcome / Verify / Work)と CRUD。requires 辺のサイクル防止もここ |
 | `src/derive.rs` | satisfied / ready / blocked の**導出**(保存しない)。command/human は **accept 済み Work を持てば satisfied**(`accepted` id 集合を受け取る)。単体テストあり |
 | `src/render.rs` | Outcome Graph の表示(テキスト / Mermaid / HTML)。HTML は **dagre(層状レイアウトエンジン、`src/vendor/dagre.min.js` を埋め込み)**でレイアウト。クリックで関連チェーンにフォーカス再レイアウト・ホバー/選択強調・詳細パネル。自己完結(CDN 不要)でローカルで開く。text は `--active` で満たし済みを畳み件数だけ示す(棚卸し、o28。mermaid/html は未対応) |
-| `src/outcome.rs` | Outcome 単位のドメイン操作(棚卸し、o28): `done`/`undone`(人手の満たし表明=受理事実の付け外し、rollup 以外の任意 Outcome に一般化)。**meguri は「実際に満たされているか」を自動照合しない**前提をここに明文化。単体テストあり |
+| `src/outcome.rs` | Outcome 単位のドメイン操作(棚卸し、o28/o29): `done`(人手の満たし表明=受理事実を貼る、rollup 以外の任意 Outcome に一般化)/ `undone`(**その Outcome の受理を全部消す**=人手・work 由来問わず。誤 accept のロールバック。accepted な Work は verified に戻す)。**meguri は「実際に満たされているか」を自動照合しない**前提をここに明文化。単体テストあり |
 | `src/plan.rs` | Planning 契約: プロンプト生成 / `proposal.json` の検証(ref・needs)/ 承認反映 / **`run`(pane 起動→注入→harvest の一気通貫)**。単体テストあり |
 | `src/gitops.rs` | **v0.2 execution の git 土台**: 管理 repo の **bare clone**(`bare_clone` / `fetch`、`--mirror` は使わず remote-tracking を張る)と、bare/通常 repo から **隔離 worktree**(o13、base SHA 記録・`.meguri/` を共有 exclude へ)。**worktree の base は fetch で更新される `origin/<branch>`**(bare の local `refs/heads/<branch>` は clone 時から動かないため、そこから切ると古い base になる)。実 git の単体テストあり |
 | `src/mux.rs` | pane 供給(§8): pane を作る(`cwd` 指定可=execution は worktree で開く)・1 行送る・生死を見る・**attach 案内**(`attach_hint`: tmux は `tmux attach -t <s>`、herdr は `herdr`)の trait + **tmux / herdr backend** + auto 選択(herdr が生きていれば herdr、いなければ tmux)。`plan run` / `meguri run` から使う。両 backend の実機単体テストあり |
@@ -70,7 +70,7 @@ accept 時の worktree・pane の後片付け / GitHub 連携 / watch・reconcil
 **保存する事実**: Intent / Outcome / requires 辺 / Work / human 充足表明 / **受理(`acceptances`)**。
 **保存しない(導出)**: satisfied / ready / blocked。
 
-**受理(`acceptances`、ADR 0002)**: satisfied の根拠となる **Outcome に貼る耐久事実**(`outcome_id`, 由来 `work_id?`, `repo_id?`, `artifact_sha?`)。由来は 2 通り: **verified Work の accept**(`work_id` あり)か、**人手の満たし表明 `outcome done`**(`work_id` NULL、command 含む rollup 以外の任意 Outcome を run 抜きで消し込む=o28)。**Work を掃除しても退行しない**(`work_id` は情報用・FK なし)。Outcome ごと 0..N 行(複数 artifact / 複数リポで満たす将来に開く)。`works.state='accepted'` は運用状態として残すが根拠ではない。旧データは起動時に backfill。
+**受理(`acceptances`、ADR 0002)**: satisfied の根拠となる **Outcome に貼る耐久事実**(`outcome_id`, 由来 `work_id?`, `repo_id?`, `artifact_sha?`)。由来は 2 通り: **verified Work の accept**(`work_id` あり)か、**人手の満たし表明 `outcome done`**(`work_id` NULL、command 含む rollup 以外の任意 Outcome を run 抜きで消し込む=o28)。**Work を掃除しても退行しない**(`work_id` は情報用・FK なし)。Outcome ごと 0..N 行(複数 artifact / 複数リポで満たす将来に開く)。`works.state='accepted'` は運用状態として残すが根拠ではない。旧データ(acceptances テーブル導入前の `state='accepted'`)は **`PRAGMA user_version` で一度きり** backfill する(毎回走らせると `undone` の意図的削除を打ち消してしまうため)。
 
 ### 導出のルール(`derive.rs`)
 
@@ -96,7 +96,7 @@ meguri outcome show <o>              # statement / description / verify / needs 
 meguri outcome edit <o> [--statement <s>] [--description <d>] [--check <cmd>|--milestone|--human] [--needs o1,o2]
 meguri outcome rm   <o>              # 両方向の requires 辺と serving Work も削除
 meguri outcome done   <o>      # 人手で満たし表明(rollup 以外。run 抜きで消し込める=受理事実を貼る)
-meguri outcome undone <o>      # 人手表明を取り消す
+meguri outcome undone <o> [--yes]  # 受理を全部取り消す(人手表明+work 由来。誤 accept のロールバック)
 meguri work    add "<objective>" --for <o> [--by ai|human]
 meguri work    ls   [--for <o>]
 meguri work    edit <w> [--objective <s>] [--by ai|human]
