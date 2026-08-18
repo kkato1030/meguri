@@ -535,11 +535,27 @@ pub fn add_acceptance(
     Ok(())
 }
 
-/// 人手表明による受理(work_id が NULL の行)を消す(`outcome undone` 用)。
+/// 人手表明による受理(work_id が NULL の行)を消す(`outcome done` の二重表明防止用)。
 /// verified Work 由来の受理(work_id あり)は残す。
 pub fn remove_human_acceptances(conn: &Connection, outcome_id: i64) -> Result<usize> {
     Ok(conn.execute(
         "DELETE FROM acceptances WHERE outcome_id = ?1 AND work_id IS NULL",
+        params![outcome_id],
+    )?)
+}
+
+/// その Outcome の受理をすべて消す(人手・work 由来を問わない。`outcome undone` 用)。
+/// 誤 accept のロールバック手段: 「この Outcome はまだ達成していない」への素直な取り消し。
+pub fn remove_all_acceptances(conn: &Connection, outcome_id: i64) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM acceptances WHERE outcome_id = ?1", params![outcome_id])?)
+}
+
+/// この Outcome を serve する `accepted` な Work を `verified` に戻す(`outcome undone` 用)。
+/// 受理を消したのに work が accepted のままだと表示が食い違う(satisfied の根拠は acceptances
+/// なので導出には影響しないが、状態を整える)。返り値は戻した件数。
+pub fn unaccept_works(conn: &Connection, outcome_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE works SET state = 'verified' WHERE serves_id = ?1 AND state = 'accepted'",
         params![outcome_id],
     )?)
 }

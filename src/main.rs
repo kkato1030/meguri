@@ -260,8 +260,13 @@ enum OutcomeCmd {
     Rm { id: String },
     /// Mark satisfied by hand (human assertion; any non-rollup Outcome, no Work needed)
     Done { id: String },
-    /// Clear the human mark
-    Undone { id: String },
+    /// Clear all acceptances (human mark + work-originated), rolling back a mistaken accept
+    Undone {
+        id: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1083,13 +1088,16 @@ fn outcome(conn: &rusqlite::Connection, c: OutcomeCmd) -> Result<()> {
             outcome::done(conn, oid)?;
             println!("marked o{oid} satisfied (human)");
         }
-        OutcomeCmd::Undone { id } => {
+        OutcomeCmd::Undone { id, yes } => {
             let oid = parse_id(&id, 'o')?;
+            if !yes && !confirm(&format!("Clear ALL acceptances of o{oid} (human + work-originated)?"))? {
+                bail!("aborted");
+            }
             let n = outcome::undone(conn, oid)?;
             if n == 0 {
-                println!("o{oid} had no human mark to clear");
+                println!("o{oid} had no acceptance to clear");
             } else {
-                println!("cleared o{oid} human mark");
+                println!("cleared {n} acceptance(s) of o{oid}");
             }
         }
     }

@@ -61,14 +61,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "works", "deleted", "INTEGER NOT NULL DEFAULT 0")?; // work rm は soft-delete(id 再利用を防ぐ)
     add_column_if_missing(conn, "works", "started_at", "INTEGER")?; // o24: launch 時刻(unix秒)。watch の timeout 判定用
     add_column_if_missing(conn, "works", "fix_turns", "INTEGER NOT NULL DEFAULT 0")?; // o22: 消費した fix turn 回数(上限付き差し戻し)
-    // 受理事実の後方互換: 旧来 accept 済み(works.state='accepted')を acceptances に一度だけ埋める。
-    // 冪等: 既に acceptance 行がある Work は入れ直さない。
-    conn.execute_batch(
-        "INSERT INTO acceptances (outcome_id, work_id, artifact_sha)
-         SELECT serves_id, id, artifact_sha FROM works
-         WHERE state = 'accepted'
-           AND id NOT IN (SELECT work_id FROM acceptances WHERE work_id IS NOT NULL);",
-    )?;
+    // 受理事実の後方互換: 旧来 accept 済み(works.state='accepted')を acceptances に **一度だけ** 埋める。
+    // これは毎回走らせてはいけない —— 走ると `outcome undone`(受理の意図的削除)を、accept 済み
+    // Work から即座に再生成して打ち消してしまう(受理は事実であって work.state から導出しない、ADR 0002)。
+    // user_version でガードして一度きりにする。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 1 {
+        conn.execute_batch(
+            "INSERT INTO acceptances (outcome_id, work_id, artifact_sha)
+             SELECT serves_id, id, artifact_sha FROM works
+             WHERE state = 'accepted'
+               AND id NOT IN (SELECT work_id FROM acceptances WHERE work_id IS NOT NULL);",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 1;")?;
+    }
     Ok(())
 }
 
